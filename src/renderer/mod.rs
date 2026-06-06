@@ -1,0 +1,1090 @@
+//! The renderer: owns the wgpu device/queue/surface, the scene pipelines, the
+//! offscreen HDR viewport target, the volumetric + post passes, and the egui
+//! paint pass.
+//!
+//! Per frame the CPU fills a camera uniform, per-object instance rows, the
+//! dynamic line geometry, and the volumetric uniforms (camera inverse, fog box,
+//! fixtures as spotlights); the GPU renders the forward scene into an HDR
+//! target, raymarches volumetric beams into it, then blooms + tonemaps it down
+//! to the LDR texture egui shows. See `docs/RESEARCH-volumetrics.md`.
+
+pub mod camera;
+pub mod fixture_model;
+pub mod mesh;
+mod noise;
+mod pipeline;
+pub mod viewport;
+
+use std::collections::HashMap;
+use std::f32::consts::{FRAC_PI_2, TAU};
+use std::sync::Arc;
+use std::time::Instant;
+
+use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
+use winit::window::Window;
+
+use crate::scene::library::FixtureGeometry;
+use crate::scene::{Fixture, RenderSettings, Scene, Selection};
+use camera::{CameraUniform, OrbitCamera};
+use mesh::{GpuMesh, GrowBuffer, LineVertex, MeshInstance};
+use viewport::Viewport;
+
+/// Camera + scene data for the volumetric raymarch (mirrors `Volumetric` in
+/// `volumetric.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct VolumetricUniform {
+    inv_view_proj: [[f32; 4]; 4],
+    eye_time: [f32; 4],
+    fog_min_density: [f32; 4],
+    fog_max_g: [f32; 4],
+    albedo_beam: [f32; 4],
+    counts: [f32; 4],
+}
+
+/// One fixture as a spotlight for the raymarch (mirrors `Fixture` in the WGSL).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FixtureGpu {
+    pos_range: [f32; 4],
+    dir_cos: [f32; 4],
+    color: [f32; 4],
+}
+
+/// Tonemap controls (mirrors `Post` in `post.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PostUniform {
+    exposure: f32,
+    bloom: f32,
+    _pad: [f32; 2],
+}
+
+pub struct Renderer {
+    surface: wgpu::Surface<'static>,
+    pub device: wgpu::Device,
+    queue: wgpu::Queue,
+    pub config: wgpu::SurfaceConfiguration,
+    start_time: Instant,
+
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+
+    line_pipeline: wgpu::RenderPipeline,
+    mesh_pipeline: wgpu::RenderPipeline,
+    light_layout: wgpu::BindGroupLayout,
+
+    grid_mesh: GpuMesh,
+    floor_mesh: GpuMesh,
+    cylinder_mesh: GpuMesh,
+    cone_mesh: GpuMesh,
+
+    floor_instances: GrowBuffer,
+    fixture_instances: GrowBuffer,
+    dynamic_lines: GrowBuffer,
+
+    // Imported GDTF fixture models: per-fixture-type (Arc ptr) cache of part
+    // meshes (keyed by model name), plus a per-frame instance buffer.
+    gdtf_cache: HashMap<usize, HashMap<String, GpuMesh>>,
+    gdtf_instances: GrowBuffer,
+
+    // Volumetric raymarch (rendered at half resolution, then upsampled).
+    volumetric_pipeline: wgpu::RenderPipeline,
+    volumetric_layout: wgpu::BindGroupLayout,
+    volumetric_uniform: wgpu::Buffer,
+    fixtures_storage: GrowBuffer,
+    composite_pipeline: wgpu::RenderPipeline,
+    #[allow(dead_code)]
+    noise_texture: wgpu::Texture,
+    noise_view: wgpu::TextureView,
+    noise_sampler: wgpu::Sampler,
+
+    // Post (bloom + tonemap).
+    bloom_bright: wgpu::RenderPipeline,
+    bloom_blur_h: wgpu::RenderPipeline,
+    bloom_blur_v: wgpu::RenderPipeline,
+    tonemap_pipeline: wgpu::RenderPipeline,
+    single_tex_layout: wgpu::BindGroupLayout,
+    tonemap_layout: wgpu::BindGroupLayout,
+    post_uniform: wgpu::Buffer,
+    post_sampler: wgpu::Sampler,
+
+    egui_renderer: egui_wgpu::Renderer,
+    pub viewport: Viewport,
+}
+
+impl Renderer {
+    pub async fn new(window: Arc<Window>) -> Self {
+        let instance = wgpu::Instance::default();
+
+        // `window` is an Arc<Window>, which is 'static, so the surface is too.
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("create wgpu surface");
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: Some(&surface),
+            })
+            .await
+            .expect("no suitable GPU adapter found");
+
+        log::info!("using adapter: {:?}", adapter.get_info());
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("previz-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
+            .await
+            .expect("request device");
+
+        let size = window.inner_size();
+        let (width, height) = (size.width.max(1), size.height.max(1));
+
+        let caps = surface.get_capabilities(&adapter);
+        let surface_format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+
+        // --- camera uniform (bind group 0 of the forward pipelines) ---
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera-uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera-bind-group-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera-bind-group"),
+            layout: &camera_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        let light_layout = pipeline::light_bind_group_layout(&device);
+
+        let line_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("line-pipeline-layout"),
+            bind_group_layouts: &[Some(&camera_bgl)],
+            immediate_size: 0,
+        });
+        let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh-pipeline-layout"),
+            bind_group_layouts: &[Some(&camera_bgl), Some(&light_layout)],
+            immediate_size: 0,
+        });
+
+        let line_pipeline = pipeline::line_pipeline(&device, &line_layout);
+        let mesh_pipeline = pipeline::mesh_pipeline(&device, &mesh_layout);
+
+        // --- meshes ---
+        let grid_mesh = GpuMesh::new(&device, "grid", &mesh::grid_and_axes(20.0, 1.0));
+        let floor_mesh = GpuMesh::new(&device, "floor", &mesh::floor_plane(50.0));
+        let cylinder_mesh = GpuMesh::new(
+            &device,
+            "par-cylinder",
+            &mesh::cylinder(Fixture::BODY_LENGTH, Fixture::BODY_RADIUS, 28),
+        );
+        let cone_mesh = GpuMesh::new(
+            &device,
+            "fixture-cone",
+            &mesh::cone(0.45, 0.45 * 12.0_f32.to_radians().tan(), 28),
+        );
+
+        let vertex = wgpu::BufferUsages::VERTEX;
+        let inst = std::mem::size_of::<MeshInstance>() as u64;
+        let floor_instances = GrowBuffer::new(&device, "floor-instances", vertex, inst);
+        let fixture_instances = GrowBuffer::new(&device, "fixture-instances", vertex, inst * 64);
+        let dynamic_lines = GrowBuffer::new(&device, "dynamic-lines", vertex, 8192);
+        let gdtf_instances = GrowBuffer::new(&device, "gdtf-instances", vertex, inst * 32);
+
+        // --- volumetric raymarch ---
+        let volumetric_layout = pipeline::volumetric_bind_group_layout(&device);
+        let volumetric_pipeline = pipeline::volumetric_pipeline(&device, &volumetric_layout);
+        let volumetric_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("volumetric-uniform"),
+            size: std::mem::size_of::<VolumetricUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fixtures_storage = GrowBuffer::new(
+            &device,
+            "fixtures-gpu",
+            wgpu::BufferUsages::STORAGE,
+            std::mem::size_of::<FixtureGpu>() as u64 * 16,
+        );
+
+        // Precomputed tiling 3D haze noise (sampled by the volumetric shader
+        // instead of recomputing FBM per raymarch sample).
+        let noise_size = 64u32;
+        let noise_data = noise::generate_fbm_volume(noise_size as usize);
+        let noise_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("haze-noise-3d"),
+            size: wgpu::Extent3d {
+                width: noise_size,
+                height: noise_size,
+                depth_or_array_layers: noise_size,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &noise_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &noise_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(noise_size),
+                rows_per_image: Some(noise_size),
+            },
+            wgpu::Extent3d {
+                width: noise_size,
+                height: noise_size,
+                depth_or_array_layers: noise_size,
+            },
+        );
+        let noise_view = noise_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D3),
+            ..Default::default()
+        });
+        let noise_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("noise-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // --- post (bloom + tonemap) ---
+        let single_tex_layout = pipeline::single_tex_bind_group_layout(&device);
+        let composite_pipeline = pipeline::composite_pipeline(&device, &single_tex_layout);
+        let tonemap_layout = pipeline::tonemap_bind_group_layout(&device);
+        let (bloom_bright, bloom_blur_h, bloom_blur_v) =
+            pipeline::bloom_pipelines(&device, &single_tex_layout);
+        let tonemap_pipeline = pipeline::tonemap_pipeline(&device, &tonemap_layout);
+        let post_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("post-uniform"),
+            size: std::mem::size_of::<PostUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("post-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // --- egui paint pass + offscreen viewport target ---
+        let mut egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            surface_format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                depth_stencil_format: None,
+                dithering: true,
+                predictable_texture_filtering: false,
+            },
+        );
+        let viewport = Viewport::new(&device, &mut egui_renderer, (width, height));
+
+        Self {
+            surface,
+            device,
+            queue,
+            config,
+            start_time: Instant::now(),
+            camera_buffer,
+            camera_bind_group,
+            line_pipeline,
+            mesh_pipeline,
+            light_layout,
+            grid_mesh,
+            floor_mesh,
+            cylinder_mesh,
+            cone_mesh,
+            floor_instances,
+            fixture_instances,
+            dynamic_lines,
+            gdtf_cache: HashMap::new(),
+            gdtf_instances,
+            volumetric_pipeline,
+            volumetric_layout,
+            volumetric_uniform,
+            fixtures_storage,
+            composite_pipeline,
+            noise_texture,
+            noise_view,
+            noise_sampler,
+            bloom_bright,
+            bloom_blur_h,
+            bloom_blur_v,
+            tonemap_pipeline,
+            single_tex_layout,
+            tonemap_layout,
+            post_uniform,
+            post_sampler,
+            egui_renderer,
+            viewport,
+        }
+    }
+
+    /// Reconfigure the swapchain after a window resize.
+    pub fn resize_surface(&mut self, size: (u32, u32)) {
+        if size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        self.config.width = size.0;
+        self.config.height = size.1;
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Resize the offscreen 3D target to match the viewport panel.
+    pub fn resize_viewport(&mut self, size: (u32, u32)) {
+        self.viewport
+            .resize(&self.device, &mut self.egui_renderer, size);
+    }
+
+    fn mesh_for(&self, geometry: FixtureGeometry) -> &GpuMesh {
+        match geometry {
+            FixtureGeometry::Cylinder => &self.cylinder_mesh,
+            FixtureGeometry::Cone => &self.cone_mesh,
+        }
+    }
+
+    /// Load + cache a GDTF fixture's part meshes (GLBs) the first time it is
+    /// seen. Keyed by the `Arc` pointer so all instances of a type share.
+    fn ensure_gdtf_loaded(&mut self, key: usize, gdtf: &Arc<crate::gdtf::GdtfFixture>) {
+        if self.gdtf_cache.contains_key(&key) {
+            return;
+        }
+        let mut meshes = HashMap::new();
+        for model in &gdtf.models {
+            if let Some(glb) = &model.glb {
+                let verts = fixture_model::load_glb(glb);
+                if !verts.is_empty() {
+                    meshes.insert(model.name.clone(), GpuMesh::new(&self.device, &model.name, &verts));
+                }
+            }
+        }
+        log::info!("loaded GDTF '{}' — {} mesh parts", gdtf.name, meshes.len());
+        self.gdtf_cache.insert(key, meshes);
+    }
+
+    /// Render one frame. Returns `true` if a frame was presented (a `false`
+    /// return means the surface wasn't presentable; the caller should stop
+    /// pumping redraws until the next event so we don't busy-loop).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &mut self,
+        scene: &Scene,
+        camera: &OrbitCamera,
+        selection: Selection,
+        settings: &RenderSettings,
+        paint_jobs: &[egui::ClippedPrimitive],
+        textures_delta: &egui::TexturesDelta,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+    ) -> bool {
+        // egui textures up front, before any early-out: egui hands each delta
+        // once, so dropping it loses the font atlas forever.
+        for (id, delta) in &textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        for id in &textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return false;
+            }
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                log::debug!("surface not presentable; skipping frame");
+                return false;
+            }
+            other => {
+                log::warn!("dropping frame: surface status {other:?}");
+                return false;
+            }
+        };
+        let surface_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame-encoder"),
+            });
+
+        let user_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            paint_jobs,
+            screen_descriptor,
+        );
+
+        // The 3D scene + volumetrics + post resolve into the LDR target.
+        self.record_scene(&mut encoder, scene, camera, selection, settings);
+
+        // egui (panels + the viewport image, which samples the LDR target) -> surface.
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &surface_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05,
+                                g: 0.05,
+                                b: 0.06,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                })
+                .forget_lifetime();
+
+            self.egui_renderer
+                .render(&mut pass, paint_jobs, screen_descriptor);
+        }
+
+        self.queue
+            .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+        frame.present();
+
+        true
+    }
+
+    /// Render the 3D scene into the offscreen LDR target (no window/surface,
+    /// no egui) and read it back as RGBA8 pixels. Used by the headless
+    /// `--screenshot` path so the render can be verified without a visible
+    /// window. Returns (width, height, rgba8 pixels).
+    pub fn capture(
+        &mut self,
+        scene: &Scene,
+        camera: &OrbitCamera,
+        settings: &RenderSettings,
+    ) -> (u32, u32, Vec<u8>) {
+        let (width, height) = self.viewport.size;
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("capture-encoder"),
+            });
+        self.record_scene(&mut encoder, scene, camera, Selection::None, settings);
+
+        // copy_texture_to_buffer requires bytes_per_row aligned to 256.
+        let unpadded = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture-readback"),
+            size: padded as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.viewport.ldr_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().expect("map channel").expect("map readback buffer");
+
+        let data = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity(unpadded as usize * height as usize);
+        for row in 0..height as usize {
+            let start = row * padded as usize;
+            pixels.extend_from_slice(&data[start..start + unpadded as usize]);
+        }
+        drop(data);
+        readback.unmap();
+
+        (width, height, pixels)
+    }
+
+    /// Record the full offscreen 3D frame into `encoder`: forward scene ->
+    /// volumetric beams -> bloom -> tonemap into the LDR target. Shared by
+    /// [`render`](Self::render) and [`capture`](Self::capture).
+    fn record_scene(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+        camera: &OrbitCamera,
+        selection: Selection,
+        settings: &RenderSettings,
+    ) {
+        let time = self.start_time.elapsed().as_secs_f32();
+        let aspect = self.viewport.aspect();
+
+        // --- camera uniform ---
+        let camera_uniform = camera.uniform(aspect);
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
+
+        // --- floor instance ---
+        let floor_instance = [MeshInstance {
+            model: Mat4::IDENTITY.to_cols_array_2d(),
+            color: [0.22, 0.22, 0.25],
+            intensity: 1.0,
+            selected: 0.0,
+        }];
+        self.floor_instances
+            .upload(&self.device, &self.queue, &floor_instance);
+
+        // --- fixture instances, grouped by geometry ---
+        let mut fixture_instances: Vec<MeshInstance> = Vec::with_capacity(scene.fixtures.len());
+        let mut ranges: Vec<(FixtureGeometry, u32, u32)> = Vec::new();
+        for geometry in [FixtureGeometry::Cylinder, FixtureGeometry::Cone] {
+            let start = fixture_instances.len() as u32;
+            for (i, fixture) in scene.fixtures.iter().enumerate() {
+                if fixture.is_gdtf() || fixture.geometry != geometry {
+                    continue;
+                }
+                fixture_instances.push(MeshInstance {
+                    model: fixture.model_matrix().to_cols_array_2d(),
+                    color: fixture.color,
+                    intensity: fixture.intensity,
+                    selected: if selection == Selection::Fixture(i) { 1.0 } else { 0.0 },
+                });
+            }
+            let count = fixture_instances.len() as u32 - start;
+            if count > 0 {
+                ranges.push((geometry, start, count));
+            }
+        }
+        self.fixture_instances
+            .upload(&self.device, &self.queue, &fixture_instances);
+
+        // --- GDTF fixtures: assemble parts (loading GLBs on first use) and the
+        // articulated beam (origin/direction) per fixture ---
+        let gdtf_to_world = Mat4::from_rotation_x(-FRAC_PI_2); // GDTF +Z up -> world +Y up
+        let mut gdtf_parts: Vec<MeshInstance> = Vec::new();
+        let mut gdtf_draws: Vec<(usize, String, u32)> = Vec::new();
+        let mut beam_override: Vec<Option<(Vec3, Vec3)>> = vec![None; scene.fixtures.len()];
+        for (i, fixture) in scene.fixtures.iter().enumerate() {
+            let Some(gdtf) = fixture.gdtf.clone() else {
+                continue;
+            };
+            let key = Arc::as_ptr(&gdtf) as usize;
+            self.ensure_gdtf_loaded(key, &gdtf);
+            let root = Mat4::from_translation(fixture.position) * gdtf_to_world;
+            let asm = fixture_model::assemble(&gdtf, root, fixture.pan, fixture.tilt);
+            beam_override[i] = asm.beam;
+            let selected = if selection == Selection::Fixture(i) { 1.0 } else { 0.0 };
+            for part in &asm.parts {
+                if self
+                    .gdtf_cache
+                    .get(&key)
+                    .map(|m| m.contains_key(&part.model))
+                    .unwrap_or(false)
+                {
+                    let idx = gdtf_parts.len() as u32;
+                    gdtf_parts.push(MeshInstance {
+                        model: part.world.to_cols_array_2d(),
+                        color: [0.09, 0.09, 0.10],
+                        intensity: 1.0,
+                        selected,
+                    });
+                    gdtf_draws.push((key, part.model.clone(), idx));
+                }
+            }
+        }
+        self.gdtf_instances
+            .upload(&self.device, &self.queue, &gdtf_parts);
+
+        // --- dynamic lines: fog-box wireframes + beam indicators ---
+        let mut lines: Vec<LineVertex> = Vec::new();
+        for (i, env) in scene.environments.iter().enumerate() {
+            let color = if selection == Selection::Environment(i) {
+                [0.55, 0.95, 1.0]
+            } else {
+                [0.20, 0.40, 0.50]
+            };
+            mesh::push_box_wireframe(&mut lines, env.min().to_array(), env.max().to_array(), color);
+        }
+        if settings.show_beam_wireframes {
+            for (i, fixture) in scene.fixtures.iter().enumerate() {
+                push_beam_indicator(&mut lines, &beam_spec(fixture, beam_override[i]));
+            }
+        }
+        // Selection gizmo for the selected fixture (RGB axes + marker box).
+        if let Selection::Fixture(sel) = selection
+            && let Some(f) = scene.fixtures.get(sel)
+        {
+            push_selection_gizmo(&mut lines, f.position);
+        }
+        let line_count = self.dynamic_lines.upload(&self.device, &self.queue, &lines);
+
+        // --- volumetric uniforms + fixtures (use the first fog box, if any) ---
+        let fog = scene.environments.first();
+        let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
+        let gpu_fixtures: Vec<FixtureGpu> = if scene.fixtures.is_empty() {
+            vec![FixtureGpu::zeroed()]
+        } else {
+            scene
+                .fixtures
+                .iter()
+                .enumerate()
+                .map(|(i, f)| fixture_gpu(&beam_spec(f, beam_override[i])))
+                .collect()
+        };
+        self.fixtures_storage
+            .upload(&self.device, &self.queue, &gpu_fixtures);
+
+        if let Some(fog) = fog {
+            let inv_vp = camera.view_proj(aspect).inverse();
+            let eye = camera.eye();
+            let vol = VolumetricUniform {
+                inv_view_proj: inv_vp.to_cols_array_2d(),
+                eye_time: [eye.x, eye.y, eye.z, time],
+                fog_min_density: [fog.min().x, fog.min().y, fog.min().z, fog.density],
+                fog_max_g: [fog.max().x, fog.max().y, fog.max().z, fog.anisotropy],
+                albedo_beam: [
+                    fog.color[0],
+                    fog.color[1],
+                    fog.color[2],
+                    settings.beam_intensity,
+                ],
+                counts: [scene.fixtures.len() as f32, settings.steps.max(1) as f32, 0.0, 0.0],
+            };
+            self.queue
+                .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
+        }
+
+        let post = PostUniform {
+            exposure: settings.exposure,
+            bloom: settings.bloom,
+            _pad: [0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.post_uniform, 0, bytemuck::bytes_of(&post));
+
+        // --- bind groups for this frame ---
+        // Bind only the *used* portion of the fixtures buffer, so `arrayLength`
+        // in the shaders returns the real fixture count (the buffer may be
+        // larger than what we wrote).
+        let used_fixtures = (gpu_fixtures.len() * std::mem::size_of::<FixtureGpu>()) as u64;
+        let fixtures_binding = || {
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &self.fixtures_storage.buffer,
+                offset: 0,
+                size: std::num::NonZeroU64::new(used_fixtures),
+            })
+        };
+
+        let light_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("light-bg"),
+            layout: &self.light_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: fixtures_binding(),
+            }],
+        });
+
+        let volumetric_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("volumetric-bg"),
+            layout: &self.volumetric_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.volumetric_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: fixtures_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.noise_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.noise_sampler),
+                },
+            ],
+        });
+        let composite_bg = self.single_tex_bg(self.viewport.vol_view());
+        let bright_bg = self.single_tex_bg(self.viewport.hdr_view());
+        let blur_h_bg = self.single_tex_bg(self.viewport.bloom_view(0));
+        let blur_v_bg = self.single_tex_bg(self.viewport.bloom_view(1));
+        let tonemap_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tonemap-bg"),
+            layout: &self.tonemap_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(self.viewport.hdr_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(self.viewport.bloom_view(0)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.post_uniform.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Pass 1: forward opaque scene -> HDR target.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("forward-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.viewport.hdr_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.008,
+                            g: 0.010,
+                            b: 0.018,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.viewport.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(1, &light_bg, &[]);
+
+            pass.set_pipeline(&self.mesh_pipeline);
+            pass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.floor_instances.buffer.slice(..));
+            pass.draw(0..self.floor_mesh.vertex_count, 0..1);
+
+            pass.set_vertex_buffer(1, self.fixture_instances.buffer.slice(..));
+            for (geometry, start, count) in &ranges {
+                let m = self.mesh_for(*geometry);
+                pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
+                pass.draw(0..m.vertex_count, *start..*start + *count);
+            }
+
+            // GDTF fixture model parts (each part is one instance).
+            if !gdtf_draws.is_empty() {
+                pass.set_vertex_buffer(1, self.gdtf_instances.buffer.slice(..));
+                for (key, model, idx) in &gdtf_draws {
+                    if let Some(mesh) = self.gdtf_cache.get(key).and_then(|m| m.get(model)) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
+                    }
+                }
+            }
+
+            pass.set_pipeline(&self.line_pipeline);
+            pass.set_vertex_buffer(0, self.grid_mesh.vertex_buffer.slice(..));
+            pass.draw(0..self.grid_mesh.vertex_count, 0..1);
+            if line_count > 0 {
+                pass.set_vertex_buffer(0, self.dynamic_lines.buffer.slice(..));
+                pass.draw(0..line_count, 0..1);
+            }
+        }
+
+        // Pass 2a: volumetric raymarch -> half-res vol target (scatter, transmit).
+        // Pass 2b: upsample + composite into the HDR scene.
+        if has_fog {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("volumetric-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: self.viewport.vol_view(),
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.volumetric_pipeline);
+                pass.set_bind_group(0, &volumetric_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            // Composite (blend One/SrcAlpha) is configured on the pipeline.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("composite-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.viewport.hdr_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.composite_pipeline);
+            pass.set_bind_group(0, &composite_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // Pass 3: bloom bright-pass (HDR -> bloom[0]).
+        self.fullscreen(encoder, "bloom-bright", &self.bloom_bright, self.viewport.bloom_view(0), &bright_bg);
+        // Pass 4: separable blur (bloom[0] -> bloom[1] -> bloom[0]).
+        self.fullscreen(encoder, "bloom-blur-h", &self.bloom_blur_h, self.viewport.bloom_view(1), &blur_h_bg);
+        self.fullscreen(encoder, "bloom-blur-v", &self.bloom_blur_v, self.viewport.bloom_view(0), &blur_v_bg);
+        // Pass 5: tonemap/resolve (HDR + bloom -> LDR, sRGB-encoded).
+        self.fullscreen(encoder, "tonemap", &self.tonemap_pipeline, self.viewport.ldr_view(), &tonemap_bg);
+    }
+
+    fn single_tex_bg(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("single-tex-bg"),
+            layout: &self.single_tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+            ],
+        })
+    }
+
+    /// Run a fullscreen-triangle pass writing `target`, clearing it first.
+    fn fullscreen(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        pipeline: &wgpu::RenderPipeline,
+        target: &wgpu::TextureView,
+        bind_group: &wgpu::BindGroup,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+/// Resolved beam for a fixture — either the GDTF Beam geometry's articulated
+/// origin/direction, or the placeholder fixture's lens.
+struct BeamSpec {
+    origin: Vec3,
+    dir: Vec3,
+    angle: f32,
+    color: [f32; 3],
+    intensity: f32,
+    lens_radius: f32,
+}
+
+fn beam_spec(fixture: &Fixture, gdtf_beam: Option<(Vec3, Vec3)>) -> BeamSpec {
+    let (origin, dir) =
+        gdtf_beam.unwrap_or_else(|| (fixture.lens_position(), fixture.beam_direction()));
+    let lens_radius = if fixture.is_gdtf() {
+        0.085
+    } else {
+        Fixture::BODY_RADIUS
+    };
+    BeamSpec {
+        origin,
+        dir,
+        angle: fixture.beam_angle,
+        color: fixture.color,
+        intensity: fixture.intensity,
+        lens_radius,
+    }
+}
+
+/// Convert a beam to its GPU representation for the raymarch / surface lighting.
+/// The beam is a *disc* source (radius `lens_radius`) widening with the half
+/// angle, so it starts at the lens diameter rather than a single point.
+fn fixture_gpu(spec: &BeamSpec) -> FixtureGpu {
+    let tan_half = (spec.angle * 0.5).to_radians().tan();
+    let i = spec.intensity.max(0.0);
+    FixtureGpu {
+        pos_range: [spec.origin.x, spec.origin.y, spec.origin.z, 40.0],
+        dir_cos: [spec.dir.x, spec.dir.y, spec.dir.z, tan_half],
+        color: [
+            spec.color[0] * i,
+            spec.color[1] * i,
+            spec.color[2] * i,
+            spec.lens_radius,
+        ],
+    }
+}
+
+/// Append a selection gizmo at `p`: RGB world axes plus a small amber marker
+/// box, so the selected fixture's position/orientation is clear in the view.
+fn push_selection_gizmo(out: &mut Vec<LineVertex>, p: Vec3) {
+    let len = 0.6;
+    for (dir, color) in [
+        (Vec3::X, [0.95, 0.3, 0.3]),
+        (Vec3::Y, [0.4, 0.9, 0.4]),
+        (Vec3::Z, [0.4, 0.6, 1.0]),
+    ] {
+        out.push(LineVertex { position: p.to_array(), color });
+        out.push(LineVertex { position: (p + dir * len).to_array(), color });
+    }
+    let h = Vec3::splat(0.22);
+    mesh::push_box_wireframe(out, (p - h).to_array(), (p + h).to_array(), [1.0, 0.75, 0.2]);
+}
+
+/// Append a wireframe cone showing a beam (axis, end ring, a few generatrices)
+/// in the fixture color — a placeholder gizmo alongside the volumetric beam.
+fn push_beam_indicator(out: &mut Vec<LineVertex>, spec: &BeamSpec) {
+    let dir = spec.dir;
+    if dir == Vec3::ZERO {
+        return;
+    }
+    let lens = spec.origin;
+    let length = 6.0;
+    let half_angle = (spec.angle * 0.5).to_radians();
+    let radius = length * half_angle.tan();
+    let end = lens + dir * length;
+
+    let helper = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let right = dir.cross(helper).normalize_or_zero();
+    let fwd = right.cross(dir).normalize_or_zero();
+
+    let i = 0.2 + 0.5 * spec.intensity.clamp(0.0, 1.0);
+    let color = [spec.color[0] * i, spec.color[1] * i, spec.color[2] * i];
+
+    const SEGS: usize = 24;
+    let ring: Vec<Vec3> = (0..SEGS)
+        .map(|k| {
+            let a = k as f32 / SEGS as f32 * TAU;
+            end + (right * a.cos() + fwd * a.sin()) * radius
+        })
+        .collect();
+
+    let mut line = |a: Vec3, b: Vec3| {
+        out.push(LineVertex { position: a.to_array(), color });
+        out.push(LineVertex { position: b.to_array(), color });
+    };
+
+    for k in 0..SEGS {
+        line(ring[k], ring[(k + 1) % SEGS]);
+    }
+    for k in (0..SEGS).step_by(SEGS / 8) {
+        line(lens, ring[k]);
+    }
+    line(lens, end);
+}

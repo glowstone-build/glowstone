@@ -1,0 +1,12 @@
+/Users/aidas/conductor/workspaces/archie/carthage/target/debug/deps/dispatch-e3b85cd3a7a79b7b.d: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/ffi.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/group.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/queue.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/once.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/sem.rs
+
+/Users/aidas/conductor/workspaces/archie/carthage/target/debug/deps/libdispatch-e3b85cd3a7a79b7b.rlib: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/ffi.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/group.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/queue.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/once.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/sem.rs
+
+/Users/aidas/conductor/workspaces/archie/carthage/target/debug/deps/libdispatch-e3b85cd3a7a79b7b.rmeta: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/ffi.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/group.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/queue.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/once.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/sem.rs
+
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/lib.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/ffi.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/group.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/queue.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/once.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dispatch-0.2.0/src/sem.rs:

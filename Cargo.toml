@@ -1,0 +1,40 @@
+[package]
+name = "previz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Open-source lighting previsualization for live events — real-time 3D stage and fixture preview"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-org/previz"
+readme = "README.md"
+keywords = ["lighting", "previsualization", "dmx", "stage", "wgpu"]
+categories = ["graphics", "rendering", "visualization"]
+
+[dependencies]
+winit = "0.30.13"
+wgpu = "29.0"
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = "0.34"
+egui_dock = "0.19"
+glam = { version = "0.33", features = ["bytemuck"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "0.4"
+env_logger = "0.11"
+log = "0.4"
+# Image decode/encode: headless screenshot PNG + GDTF wheel/thumbnail images.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# GDTF import (fixture library): GDTF is a ZIP of an XML description + glTF
+# models + wheel images.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+roxmltree = "0.21"
+gltf = "1.4"
+rfd = "0.17"
+
+# Faster, smoother dev: the wgpu/naga/egui stacks are slow in pure debug.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

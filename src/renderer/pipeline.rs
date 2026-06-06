@@ -1,0 +1,355 @@
+//! WGSL loading and render-pipeline construction.
+//!
+//! The forward pipelines (grid lines, lit meshes) render into the offscreen
+//! **HDR** [`Viewport`] target. The post pipelines (volumetric raymarch, bloom,
+//! tonemap) are fullscreen passes that consume/produce those targets.
+
+use super::mesh::{LineVertex, MeshInstance, MeshVertex};
+use super::viewport::Viewport;
+
+fn load(device: &wgpu::Device, label: &str, source: &'static str) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    })
+}
+
+fn depth_stencil() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: Viewport::DEPTH_FORMAT,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::Less),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+fn hdr_target() -> Option<wgpu::ColorTargetState> {
+    Some(wgpu::ColorTargetState {
+        format: Viewport::HDR_FORMAT,
+        blend: Some(wgpu::BlendState::REPLACE),
+        write_mask: wgpu::ColorWrites::ALL,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Forward pipelines
+// ---------------------------------------------------------------------------
+
+/// Pipeline for the ground grid + world axes + wireframes/beams (a `LineList`).
+pub fn line_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let shader = load(device, "grid.wgsl", include_str!("../shaders/grid.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("line-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[LineVertex::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Pipeline for the instanced, lit meshes — floor + fixtures (a `TriangleList`).
+pub fn mesh_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let shader = load(device, "mesh.wgsl", include_str!("../shaders/mesh.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mesh-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Bind-group layouts for the post passes
+// ---------------------------------------------------------------------------
+
+pub fn volumetric_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("volumetric-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Fixtures-as-spotlights storage buffer for surface lighting (mesh group 1).
+pub fn light_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("light-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+/// One sampled texture + a filtering sampler (bloom bright/blur).
+pub fn single_tex_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("single-tex-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Two sampled textures + sampler + a small uniform (tonemap/resolve).
+pub fn tonemap_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let tex = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("tonemap-bgl"),
+        entries: &[
+            tex(0),
+            tex(1),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Post pipelines (fullscreen-triangle fragment passes)
+// ---------------------------------------------------------------------------
+
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    bind_group_layout: &wgpu::BindGroupLayout,
+    shader: &wgpu::ShaderModule,
+    fs_entry: &str,
+    target: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(bind_group_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_fullscreen"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs_entry),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Volumetric raymarch — writes (scatter.rgb, transmittance.a) into the
+/// half-res volumetric target (no blend; the composite pass upsamples it).
+pub fn volumetric_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "volumetric.wgsl", include_str!("../shaders/volumetric.wgsl"));
+    fullscreen_pipeline(
+        device,
+        "volumetric-pipeline",
+        layout,
+        &shader,
+        "fs_volumetric",
+        Viewport::VOL_FORMAT,
+        None,
+    )
+}
+
+/// Composite the (upsampled) half-res volumetric target into the HDR scene:
+/// `out = scatter + scene · transmittance` (blend `One`, `SrcAlpha`).
+pub fn composite_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::SrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    fullscreen_pipeline(
+        device,
+        "composite-pipeline",
+        layout,
+        &shader,
+        "fs_composite",
+        Viewport::HDR_FORMAT,
+        Some(blend),
+    )
+}
+
+/// Bloom bright-pass + the two separable blur pipelines (share the layout).
+pub fn bloom_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
+    let bright = fullscreen_pipeline(
+        device, "bloom-bright", layout, &shader, "fs_bright", Viewport::HDR_FORMAT, None,
+    );
+    let blur_h = fullscreen_pipeline(
+        device, "bloom-blur-h", layout, &shader, "fs_blur_h", Viewport::HDR_FORMAT, None,
+    );
+    let blur_v = fullscreen_pipeline(
+        device, "bloom-blur-v", layout, &shader, "fs_blur_v", Viewport::HDR_FORMAT, None,
+    );
+    (bright, blur_h, blur_v)
+}
+
+/// Tonemap/resolve HDR scene + bloom into the LDR (sRGB-encoded) target.
+pub fn tonemap_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
+    fullscreen_pipeline(
+        device, "tonemap-pipeline", layout, &shader, "fs_tonemap", Viewport::LDR_FORMAT, None,
+    )
+}

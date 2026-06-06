@@ -1,0 +1,13 @@
+/Users/aidas/conductor/workspaces/archie/carthage/target/debug/deps/yoke-7a70976fa4f22db7.d: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/cartable_ptr.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/either.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/kinda_sorta_dangling.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/macro_impls.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/utils.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/yoke.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/yokeable.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/zero_from.rs
+
+/Users/aidas/conductor/workspaces/archie/carthage/target/debug/deps/libyoke-7a70976fa4f22db7.rmeta: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/cartable_ptr.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/either.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/kinda_sorta_dangling.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/macro_impls.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/utils.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/yoke.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/yokeable.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/zero_from.rs
+
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/lib.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/cartable_ptr.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/either.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/kinda_sorta_dangling.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/macro_impls.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/utils.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/yoke.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/yokeable.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/yoke-0.8.3/src/zero_from.rs:

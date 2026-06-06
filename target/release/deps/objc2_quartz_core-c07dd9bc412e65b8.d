@@ -1,0 +1,10 @@
+/Users/aidas/conductor/workspaces/archie/carthage/target/release/deps/objc2_quartz_core-c07dd9bc412e65b8.d: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/mod.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/CALayer.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/CAMetalLayer.rs
+
+/Users/aidas/conductor/workspaces/archie/carthage/target/release/deps/libobjc2_quartz_core-c07dd9bc412e65b8.rlib: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/mod.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/CALayer.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/CAMetalLayer.rs
+
+/Users/aidas/conductor/workspaces/archie/carthage/target/release/deps/libobjc2_quartz_core-c07dd9bc412e65b8.rmeta: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/mod.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/CALayer.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/CAMetalLayer.rs
+
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/lib.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/mod.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/CALayer.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-quartz-core-0.3.2/src/generated/CAMetalLayer.rs:

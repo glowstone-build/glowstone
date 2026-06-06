@@ -1,0 +1,115 @@
+//! A single lighting fixture instance in the scene.
+//!
+//! Plain data — no ECS. The fields are the GPU-friendly parameters the renderer
+//! consumes each frame and the volumetric pass will consume later. A fixture is
+//! created from a [`FixtureProfile`] in the library and then edited freely.
+
+use std::sync::Arc;
+
+use glam::{Mat4, Vec3};
+
+use super::library::{FixtureGeometry, FixtureProfile};
+use crate::gdtf::GdtfFixture;
+
+/// One controllable fixture.
+#[derive(Clone)]
+pub struct Fixture {
+    /// Instance name (e.g. "PAR Can 1").
+    pub name: String,
+    /// The library profile this came from (for display / grouping).
+    pub profile: String,
+    pub category: String,
+    /// Body geometry the renderer draws for the placeholder (non-GDTF) path.
+    pub geometry: FixtureGeometry,
+    /// When set, the renderer draws this GDTF fixture's real 3D model and the
+    /// beam comes from its Beam geometry.
+    pub gdtf: Option<Arc<GdtfFixture>>,
+
+    /// World position of the fixture head, in metres. Y is up.
+    pub position: Vec3,
+    /// Pan angle in degrees (rotation about world Y).
+    pub pan: f32,
+    /// Tilt angle in degrees (rotation about the fixture's local X). 0 aims
+    /// straight down `-Y`; 45 aims down-and-forward.
+    pub tilt: f32,
+
+    /// Emitted color, linear RGB in `0.0..=1.0`.
+    pub color: [f32; 3],
+    /// Master intensity / dimmer in `0.0..=1.0`.
+    pub intensity: f32,
+    /// Full beam cone angle in degrees (drives the beam indicator now, the
+    /// volumetric beam later).
+    pub beam_angle: f32,
+}
+
+impl Fixture {
+    /// Length of the PAR-can body in metres (also the lens depth).
+    pub const BODY_LENGTH: f32 = 0.32;
+    /// Radius of the PAR-can body in metres.
+    pub const BODY_RADIUS: f32 = 0.16;
+
+    /// Number of DMX channels a fixture would occupy (pan, tilt, dimmer, R, G,
+    /// B). Used by the DMX Monitor stub to lay out a faux patch.
+    pub const DMX_FOOTPRINT: u32 = 6;
+
+    /// Instantiate a fixture from a library profile at a world position.
+    pub fn from_profile(profile: &FixtureProfile, name: impl Into<String>, position: Vec3) -> Self {
+        Self {
+            name: name.into(),
+            profile: profile.name.to_string(),
+            category: profile.category.to_string(),
+            geometry: profile.geometry,
+            gdtf: None,
+            position,
+            pan: 0.0,
+            tilt: 0.0,
+            color: profile.default_color,
+            intensity: 1.0,
+            beam_angle: profile.default_beam_angle,
+        }
+    }
+
+    /// Instantiate a fixture from an imported GDTF definition.
+    pub fn from_gdtf(gdtf: Arc<GdtfFixture>, name: impl Into<String>, position: Vec3) -> Self {
+        let beam_angle = gdtf.beam_angle.max(1.0);
+        Self {
+            name: name.into(),
+            profile: gdtf.name.clone(),
+            category: gdtf.manufacturer.clone(),
+            geometry: FixtureGeometry::Cylinder,
+            gdtf: Some(gdtf),
+            position,
+            pan: 0.0,
+            tilt: 0.0,
+            color: [1.0, 0.95, 0.85],
+            intensity: 1.0,
+            beam_angle,
+        }
+    }
+
+    pub fn is_gdtf(&self) -> bool {
+        self.gdtf.is_some()
+    }
+
+    /// Model matrix that places and aims the fixture body. Local convention:
+    /// the body's lens points down `-Y` at rest; pan rotates about world Y,
+    /// then tilt about the local X axis. Rigid (no scale).
+    pub fn model_matrix(&self) -> Mat4 {
+        Mat4::from_translation(self.position)
+            * Mat4::from_rotation_y(self.pan.to_radians())
+            * Mat4::from_rotation_x(self.tilt.to_radians())
+    }
+
+    /// World-space position of the lens (where the beam exits).
+    pub fn lens_position(&self) -> Vec3 {
+        self.model_matrix()
+            .transform_point3(Vec3::new(0.0, -Self::BODY_LENGTH, 0.0))
+    }
+
+    /// World-space unit direction the beam points.
+    pub fn beam_direction(&self) -> Vec3 {
+        self.model_matrix()
+            .transform_vector3(Vec3::new(0.0, -1.0, 0.0))
+            .normalize_or_zero()
+    }
+}

@@ -1,0 +1,10 @@
+/Users/aidas/conductor/workspaces/archie/carthage/target/debug/deps/polycool-5d83e88a42fa1245.d: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/cubic.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly_dyn.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/quadratic.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/yuksel.rs
+
+/Users/aidas/conductor/workspaces/archie/carthage/target/debug/deps/libpolycool-5d83e88a42fa1245.rmeta: /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/lib.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/cubic.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly_dyn.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/quadratic.rs /Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/yuksel.rs
+
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/lib.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/cubic.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/poly_dyn.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/quadratic.rs:
+/Users/aidas/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polycool-0.4.0/src/yuksel.rs:
