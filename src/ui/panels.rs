@@ -4,10 +4,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egui::{DragValue, Grid, RichText, Sense};
+use egui::{DragValue, Grid, RichText, Sense, Slider};
+use glam::{Vec2, Vec3};
 
-use super::GdtfTextures;
+use super::{DuplicateDialog, GdtfTextures};
 use crate::gdtf::GdtfFixture;
+use crate::optics::{self, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
 use crate::scene::{Fixture, Library, RenderSettings, Scene, Selection};
@@ -27,9 +29,17 @@ pub fn scene_outliner(
     if scene.fixtures.is_empty() {
         ui.label(RichText::new("none — add from the Library").weak().small());
     }
+    // Click selects; ⌘/Ctrl/Shift-click toggles into a multi-selection.
     for (i, fixture) in scene.fixtures.iter().enumerate() {
         let label = format!("{}  ·  {}", fixture.name, fixture.profile);
-        ui.selectable_value(selection, Selection::Fixture(i), label);
+        let resp = ui.selectable_label(selection.contains_fixture(i), label);
+        if resp.clicked() {
+            if ui.input(|x| x.modifiers.command || x.modifiers.shift) {
+                selection.toggle_fixture(i);
+            } else {
+                *selection = Selection::fixture(i);
+            }
+        }
     }
 
     ui.add_space(8.0);
@@ -38,7 +48,12 @@ pub fn scene_outliner(
         ui.label(RichText::new("none — add from the Library").weak().small());
     }
     for (i, env) in scene.environments.iter().enumerate() {
-        ui.selectable_value(selection, Selection::Environment(i), env.name.as_str());
+        if ui
+            .selectable_label(selection.environment == Some(i), env.name.as_str())
+            .clicked()
+        {
+            *selection = Selection::environment(i);
+        }
     }
 
     ui.add_space(10.0);
@@ -57,7 +72,7 @@ pub fn scene_outliner(
             ui.end_row();
 
             ui.label("Beam");
-            ui.add(DragValue::new(&mut settings.beam_intensity).speed(0.1).range(0.0..=64.0));
+            ui.add(DragValue::new(&mut settings.beam_intensity).speed(2.0).range(0.0..=4000.0));
             ui.end_row();
 
             ui.label("Steps");
@@ -66,6 +81,10 @@ pub fn scene_outliner(
 
             ui.label("Beam gizmo");
             ui.checkbox(&mut settings.show_beam_wireframes, "wireframe");
+            ui.end_row();
+
+            ui.label("Origin grid");
+            ui.checkbox(&mut settings.show_grid, "show");
             ui.end_row();
         });
     ui.label(
@@ -99,7 +118,7 @@ pub fn library_browser(
             Ok(idx) => {
                 let arc = library.gdtf[idx].clone();
                 let fidx = scene.add_gdtf(arc, glam::Vec3::new(0.0, 4.0, 0.0));
-                *selection = Selection::Fixture(fidx);
+                *selection = Selection::fixture(fidx);
             }
             Err(e) => log::error!("GDTF import failed: {e}"),
         }
@@ -118,7 +137,7 @@ pub fn library_browser(
                 if ui.button("+").on_hover_text("Add to scene").clicked() {
                     let arc = library.gdtf[i].clone();
                     let fidx = scene.add_gdtf(arc, glam::Vec3::new(0.0, 4.0, 0.0));
-                    *selection = Selection::Fixture(fidx);
+                    *selection = Selection::fixture(fidx);
                 }
                 ui.label(format!("{manuf} · {name}"));
             });
@@ -137,7 +156,7 @@ pub fn library_browser(
         ui.horizontal(|ui| {
             if ui.button("+").on_hover_text("Add to scene").clicked() {
                 let idx = scene.add_fixture(profile);
-                *selection = Selection::Fixture(idx);
+                *selection = Selection::fixture(idx);
             }
             ui.label(profile.name);
         });
@@ -154,7 +173,7 @@ pub fn library_browser(
         ui.horizontal(|ui| {
             if ui.button("+").on_hover_text("Add to scene").clicked() {
                 let idx = scene.add_environment(profile);
-                *selection = Selection::Environment(idx);
+                *selection = Selection::environment(idx);
             }
             ui.label(profile.name);
         });
@@ -166,30 +185,162 @@ pub fn library_browser(
 pub fn inspector(
     ui: &mut egui::Ui,
     scene: &mut Scene,
-    selection: Selection,
+    selection: &Selection,
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
 ) {
     ui.heading("Inspector");
     ui.separator();
 
-    match selection {
-        Selection::None => {
-            ui.label("Nothing selected.");
-        }
-        Selection::Fixture(id) => match scene.fixtures.get_mut(id) {
-            Some(fixture) if fixture.is_gdtf() => gdtf_inspector(ui, fixture, gdtf_textures),
-            Some(fixture) => fixture_inspector(ui, fixture),
-            None => {
-                ui.label("Selection is no longer valid.");
-            }
-        },
-        Selection::Environment(id) => match scene.environments.get_mut(id) {
+    if let Some(env_id) = selection.environment {
+        match scene.environments.get_mut(env_id) {
             Some(env) => environment_inspector(ui, env),
             None => {
                 ui.label("Selection is no longer valid.");
             }
-        },
+        }
+        return;
     }
+
+    // Keep only still-valid fixture indices.
+    let ids: Vec<usize> = selection
+        .fixtures
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.fixtures.len())
+        .collect();
+    match ids.as_slice() {
+        [] => {
+            ui.label("Nothing selected.");
+        }
+        [id] => {
+            let fixture = &mut scene.fixtures[*id];
+            if fixture.is_gdtf() {
+                gdtf_inspector(ui, fixture, gdtf_textures);
+            } else {
+                fixture_inspector(ui, fixture);
+            }
+        }
+        many => bulk_inspector(ui, scene, many),
+    }
+}
+
+/// Bulk editor shown when several fixtures are selected: edits a shared property
+/// on **all** of them at once (set-semantics, seeded from the first selected).
+fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
+    let primary = ids[0];
+    ui.label(
+        RichText::new(format!("{} fixtures selected — bulk edit", ids.len()))
+            .strong(),
+    );
+    ui.label(RichText::new("Edits apply to all selected.").weak().small());
+    ui.separator();
+
+    Grid::new("bulk-grid")
+        .num_columns(2)
+        .spacing([12.0, 8.0])
+        .striped(true)
+        .show(ui, |ui| {
+            let mut pan = scene.fixtures[primary].pan;
+            ui.label("Pan");
+            if ui.add(DragValue::new(&mut pan).speed(0.5).range(-270.0..=270.0).suffix("°")).changed() {
+                for &i in ids {
+                    scene.fixtures[i].pan = pan;
+                }
+            }
+            ui.end_row();
+
+            let mut tilt = scene.fixtures[primary].tilt;
+            ui.label("Tilt");
+            if ui.add(DragValue::new(&mut tilt).speed(0.5).range(-180.0..=180.0).suffix("°")).changed() {
+                for &i in ids {
+                    scene.fixtures[i].tilt = tilt;
+                }
+            }
+            ui.end_row();
+
+            let mut intensity = scene.fixtures[primary].intensity;
+            ui.label("Intensity");
+            if ui.add(Slider::new(&mut intensity, 0.0..=1.0)).changed() {
+                for &i in ids {
+                    scene.fixtures[i].intensity = intensity;
+                }
+            }
+            ui.end_row();
+
+            let mut color = scene.fixtures[primary].color;
+            ui.label("Color");
+            if ui.color_edit_button_rgb(&mut color).changed() {
+                for &i in ids {
+                    scene.fixtures[i].color = color;
+                }
+            }
+            ui.end_row();
+        });
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Nudge position (all)").small().strong());
+    ui.horizontal(|ui| {
+        let mut delta = glam::Vec3::ZERO;
+        // Drag from zero applies a delta; the field snaps back each frame.
+        for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
+            let mut v = 0.0f32;
+            if ui.add(DragValue::new(&mut v).speed(0.05).prefix(format!("{label} "))).changed() {
+                delta[axis] += v;
+            }
+        }
+        if delta != glam::Vec3::ZERO {
+            for &i in ids {
+                scene.fixtures[i].position += delta;
+            }
+        }
+    });
+
+    // Shared optical controls (applied to every selected fixture).
+    egui::CollapsingHeader::new("Optics (all selected)")
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("bulk-optics")
+                .num_columns(2)
+                .spacing([10.0, 5.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    bulk_opt(ui, scene, ids, "Dimmer", |o| o.dimmer, |o, v| o.dimmer = v);
+                    bulk_opt(ui, scene, ids, "Zoom", |o| o.zoom, |o, v| o.zoom = v);
+                    bulk_opt(ui, scene, ids, "Focus", |o| o.focus, |o, v| o.focus = v);
+                    bulk_opt(ui, scene, ids, "Iris", |o| o.iris, |o, v| o.iris = v);
+                    bulk_opt(ui, scene, ids, "Frost", |o| o.frost, |o, v| o.frost = v);
+                    bulk_opt(ui, scene, ids, "CTO", |o| o.cto, |o, v| o.cto = v);
+                    bulk_opt(ui, scene, ids, "Cyan", |o| o.cmy[0], |o, v| o.cmy[0] = v);
+                    bulk_opt(ui, scene, ids, "Magenta", |o| o.cmy[1], |o, v| o.cmy[1] = v);
+                    bulk_opt(ui, scene, ids, "Yellow", |o| o.cmy[2], |o, v| o.cmy[2] = v);
+                    bulk_opt(ui, scene, ids, "Color wheel", |o| o.color, |o, v| o.color = v);
+                    bulk_opt(ui, scene, ids, "Gobo 1", |o| o.gobo1, |o, v| o.gobo1 = v);
+                    bulk_opt(ui, scene, ids, "Gobo 1 spin", |o| o.gobo1_rot, |o, v| o.gobo1_rot = v);
+                    bulk_opt(ui, scene, ids, "Prism 1", |o| o.prism1, |o, v| o.prism1 = v);
+                    bulk_opt(ui, scene, ids, "Prism 1 spin", |o| o.prism1_rot, |o, v| o.prism1_rot = v);
+                    bulk_opt(ui, scene, ids, "Shutter", |o| o.shutter, |o, v| o.shutter = v);
+                    bulk_opt(ui, scene, ids, "Chromatic ab.", |o| o.ca, |o, v| o.ca = v);
+                });
+        });
+}
+
+/// One bulk optics slider (0..1) seeded from the primary, written to all `ids`.
+fn bulk_opt(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    ids: &[usize],
+    label: &str,
+    get: impl Fn(&OpticalControls) -> f32,
+    set: impl Fn(&mut OpticalControls, f32),
+) {
+    let mut v = get(&scene.fixtures[ids[0]].optics);
+    ui.label(label);
+    if ui.add(Slider::new(&mut v, 0.0..=1.0)).changed() {
+        for &i in ids {
+            set(&mut scene.fixtures[i].optics, v);
+        }
+    }
+    ui.end_row();
 }
 
 fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture) {
@@ -332,6 +483,25 @@ fn gdtf_inspector(
         ui.image((thumb.id(), egui::vec2(w, h)));
     }
 
+    // Physical source / beam spec from the GDTF Beam geometry.
+    let b = &gdtf.beam;
+    ui.label(
+        RichText::new(format!(
+            "{} engine · {:.0} K · CRI {:.0} · {:.0} lm · {:.0} W",
+            b.lamp_type, b.color_temp, b.cri, b.luminous_flux, b.power
+        ))
+        .weak()
+        .small(),
+    );
+    ui.label(
+        RichText::new(format!(
+            "{} · beam {:.0}° / field {:.0}° · throw {:.2}",
+            b.beam_type, b.beam_angle, b.field_angle, b.throw_ratio
+        ))
+        .weak()
+        .small(),
+    );
+
     ui.separator();
     Grid::new("gdtf-params")
         .num_columns(2)
@@ -359,8 +529,10 @@ fn gdtf_inspector(
             ui.end_row();
         });
 
+    optics_section(ui, fixture, &gdtf);
+
     egui::CollapsingHeader::new(format!("Wheels ({})", gdtf.wheels.len()))
-        .default_open(true)
+        .default_open(false)
         .show(ui, |ui| {
             for (wi, wheel) in gdtf.wheels.iter().enumerate() {
                 ui.label(RichText::new(&wheel.name).strong().small());
@@ -427,6 +599,112 @@ fn gdtf_inspector(
         });
 }
 
+/// The optical-chain control bank for a GDTF fixture: sliders for every stage
+/// the fixture actually exposes (disabled if the GDTF lacks that attribute).
+/// Drives `fixture.optics`, which the renderer resolves into the beam each frame.
+fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) {
+    let beam_angle = fixture.beam_angle;
+    let o = &mut fixture.optics;
+    let has = |a: &str| gdtf.has_attribute(a);
+
+    egui::CollapsingHeader::new("Optics")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label(RichText::new("BEAM SHAPING").small().strong());
+            Grid::new("optics-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                ui.label("Dimmer");
+                ui.add(Slider::new(&mut o.dimmer, 0.0..=1.0));
+                ui.end_row();
+
+                let zoom_deg = optics::map_attr(gdtf, "Zoom", o.zoom, (beam_angle, beam_angle));
+                ui.label("Zoom");
+                ui.add_enabled(has("Zoom"), Slider::new(&mut o.zoom, 0.0..=1.0).text(format!("{zoom_deg:.0}°")));
+                ui.end_row();
+
+                ui.label("Focus");
+                ui.add_enabled(has("Focus1"), Slider::new(&mut o.focus, 0.0..=1.0));
+                ui.end_row();
+
+                ui.label("Iris");
+                ui.add_enabled(has("Iris"), Slider::new(&mut o.iris, 0.0..=1.0));
+                ui.end_row();
+
+                ui.label("Frost");
+                ui.add_enabled(has("Frost1") || has("Frost2"), Slider::new(&mut o.frost, 0.0..=1.0));
+                ui.end_row();
+
+                ui.label("Chromatic ab.");
+                ui.add(Slider::new(&mut o.ca, 0.0..=1.0));
+                ui.end_row();
+            });
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("COLOR").small().strong());
+            Grid::new("optics-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                ui.label("CTO (warm)");
+                ui.add_enabled(has("CTO"), Slider::new(&mut o.cto, 0.0..=1.0));
+                ui.end_row();
+                let cmy = has("ColorSub_C") || has("ColorSub_M") || has("ColorSub_Y");
+                ui.label("Cyan");
+                ui.add_enabled(cmy, Slider::new(&mut o.cmy[0], 0.0..=1.0));
+                ui.end_row();
+                ui.label("Magenta");
+                ui.add_enabled(cmy, Slider::new(&mut o.cmy[1], 0.0..=1.0));
+                ui.end_row();
+                ui.label("Yellow");
+                ui.add_enabled(cmy, Slider::new(&mut o.cmy[2], 0.0..=1.0));
+                ui.end_row();
+                ui.label("Color wheel");
+                ui.add_enabled(has("Color1"), Slider::new(&mut o.color, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Color spin");
+                ui.add_enabled(has("Color1"), Slider::new(&mut o.color_spin, 0.0..=1.0).text("0.5=stop"));
+                ui.end_row();
+            });
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("CONTENT").small().strong());
+            Grid::new("optics-content").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                ui.label("Gobo 1");
+                ui.add_enabled(has("Gobo1"), Slider::new(&mut o.gobo1, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Gobo 1 index");
+                ui.add_enabled(has("Gobo1"), Slider::new(&mut o.gobo1_index, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Gobo 1 spin");
+                ui.add_enabled(has("Gobo1"), Slider::new(&mut o.gobo1_rot, 0.0..=1.0).text("0.5=stop"));
+                ui.end_row();
+                ui.label("Gobo 2");
+                ui.add_enabled(has("Gobo2"), Slider::new(&mut o.gobo2, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Gobo 2 spin");
+                ui.add_enabled(has("Gobo2"), Slider::new(&mut o.gobo2_rot, 0.0..=1.0).text("0.5=stop"));
+                ui.end_row();
+                ui.label("Animation");
+                ui.add_enabled(has("AnimationWheel1"), Slider::new(&mut o.anim, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Anim. spin");
+                ui.add_enabled(has("AnimationWheel1"), Slider::new(&mut o.anim_spin, 0.0..=1.0).text("0.5=stop"));
+                ui.end_row();
+                ui.label("Prism 1");
+                ui.add_enabled(has("Prism1"), Slider::new(&mut o.prism1, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Prism 1 spin");
+                ui.add_enabled(has("Prism1"), Slider::new(&mut o.prism1_rot, 0.0..=1.0).text("0.5=stop"));
+                ui.end_row();
+                ui.label("Prism 2");
+                ui.add_enabled(has("Prism2"), Slider::new(&mut o.prism2, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Shutter");
+                ui.add_enabled(has("Shutter1"), Slider::new(&mut o.shutter, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Strobe");
+                ui.add_enabled(has("Shutter1"), Slider::new(&mut o.strobe, 0.0..=1.0));
+                ui.end_row();
+            });
+        });
+}
+
 fn load_gdtf_textures(ctx: &egui::Context, gdtf: &GdtfFixture) -> GdtfTextures {
     let thumbnail = gdtf
         .thumbnail
@@ -460,10 +738,16 @@ fn decode_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui:
 }
 
 /// Central tab: the 3D scene, rendered offscreen and shown as a texture.
-/// Drag to orbit, shift+drag to pan, scroll to zoom.
+/// Drag to orbit, shift+drag to pan, scroll to zoom, click to select, `d` to
+/// duplicate the selected fixture.
+#[allow(clippy::too_many_arguments)]
 pub fn viewport(
     ui: &mut egui::Ui,
     camera: &mut OrbitCamera,
+    scene: &Scene,
+    selection: &mut Selection,
+    viewport_focused: &mut bool,
+    duplicate: &mut Option<DuplicateDialog>,
     texture: egui::TextureId,
     requested_px: &mut (u32, u32),
     fps: f32,
@@ -484,6 +768,14 @@ pub fn viewport(
         egui::Color32::WHITE,
     );
 
+    // Focus follows the most recent pointer press: inside the viewport focuses
+    // it, anywhere else releases it (so the `d` shortcut only fires in here).
+    if ui.input(|i| i.pointer.any_pressed())
+        && let Some(p) = ui.input(|i| i.pointer.interact_pos())
+    {
+        *viewport_focused = rect.contains(p);
+    }
+
     if response.dragged() {
         let delta = response.drag_delta();
         if ui.input(|i| i.modifiers.shift) {
@@ -499,10 +791,55 @@ pub fn viewport(
         }
     }
 
+    // Click to select: cast a ray through the cursor and pick the nearest object.
+    // ⌘/Ctrl-click toggles a fixture into a multi-selection (shift is pan here).
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+        let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        let aspect = rect.width() / rect.height().max(1.0);
+        let (ro, rd) = camera.ray(ndc, aspect);
+        let multi = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+        match pick(scene, ro, rd) {
+            Some(Hit::Fixture(i)) if multi => selection.toggle_fixture(i),
+            Some(Hit::Fixture(i)) => *selection = Selection::fixture(i),
+            Some(Hit::Environment(i)) => *selection = Selection::environment(i),
+            None if !multi => *selection = Selection::default(),
+            None => {}
+        }
+    }
+
+    // `d` opens the Duplicate dialog for the selected fixture.
+    if *viewport_focused
+        && duplicate.is_none()
+        && ui.input(|i| i.key_pressed(egui::Key::D))
+        && let Some(idx) = selection.primary_fixture()
+    {
+        *duplicate = Some(DuplicateDialog {
+            fixture: idx,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            y_angle: 36.0,
+            count: 9,
+        });
+    }
+
+    // Focus border.
+    if *viewport_focused {
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 170, 255)),
+            egui::StrokeKind::Inside,
+        );
+    }
+
     ui.painter().text(
         rect.left_bottom() + egui::vec2(8.0, -6.0),
         egui::Align2::LEFT_BOTTOM,
-        "drag: orbit   ·   shift+drag: pan   ·   scroll: zoom",
+        "drag: orbit · shift+drag: pan · scroll: zoom · click: select · d: duplicate",
         egui::FontId::proportional(11.0),
         egui::Color32::from_white_alpha(110),
     );
@@ -568,8 +905,116 @@ pub fn dmx_monitor(ui: &mut egui::Ui, scene: &Scene) {
         });
 }
 
+/// What a viewport ray hit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Hit {
+    Fixture(usize),
+    Environment(usize),
+}
+
+/// Pick the object a world-space ray hits. Fixtures take priority (so you can
+/// always click a head even when it sits inside the fog box); only if none is
+/// hit do we test the environment volumes.
+fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
+    let mut best: Option<(f32, usize)> = None;
+    for (i, f) in scene.fixtures.iter().enumerate() {
+        // Bounding sphere around the head; a bit generous so it's easy to click.
+        if let Some(t) = ray_sphere(ro, rd, f.position, 0.5)
+            && best.is_none_or(|(bt, _)| t < bt)
+        {
+            best = Some((t, i));
+        }
+    }
+    if let Some((_, i)) = best {
+        return Some(Hit::Fixture(i));
+    }
+    let mut env: Option<(f32, usize)> = None;
+    for (i, e) in scene.environments.iter().enumerate() {
+        if let Some(t) = ray_aabb(ro, rd, e.min(), e.max())
+            && env.is_none_or(|(bt, _)| t < bt)
+        {
+            env = Some((t, i));
+        }
+    }
+    env.map(|(_, i)| Hit::Environment(i))
+}
+
+/// Nearest positive ray–sphere intersection distance, if any.
+fn ray_sphere(ro: Vec3, rd: Vec3, center: Vec3, radius: f32) -> Option<f32> {
+    let oc = ro - center;
+    let b = oc.dot(rd);
+    let c = oc.dot(oc) - radius * radius;
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return None;
+    }
+    let s = disc.sqrt();
+    let t = -b - s;
+    if t > 0.0 {
+        Some(t)
+    } else {
+        let t2 = -b + s;
+        (t2 > 0.0).then_some(t2)
+    }
+}
+
+/// Nearest positive ray–AABB intersection distance (slab test), if any.
+fn ray_aabb(ro: Vec3, rd: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+    let inv = rd.recip(); // inf for parallel components is fine
+    let t0 = (min - ro) * inv;
+    let t1 = (max - ro) * inv;
+    let tmin = t0.min(t1);
+    let tmax = t0.max(t1);
+    let near = tmin.x.max(tmin.y).max(tmin.z);
+    let far = tmax.x.min(tmax.y).min(tmax.z);
+    if far < near.max(0.0) {
+        return None;
+    }
+    Some(if near > 0.0 { near } else { far })
+}
+
 fn unit_to_dmx(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    #[test]
+    fn ray_sphere_front_and_back() {
+        let ro = Vec3::new(0.0, 0.0, -5.0);
+        let rd = Vec3::new(0.0, 0.0, 1.0);
+        let t = ray_sphere(ro, rd, Vec3::ZERO, 1.0).expect("hit");
+        assert!((t - 4.0).abs() < 1e-3);
+        // Sphere behind the ray origin: no hit.
+        assert!(ray_sphere(Vec3::new(0.0, 0.0, 5.0), rd, Vec3::ZERO, 1.0).is_none());
+        // Ray missing the sphere sideways.
+        assert!(ray_sphere(ro, rd, Vec3::new(3.0, 0.0, 0.0), 1.0).is_none());
+    }
+
+    #[test]
+    fn ray_aabb_hit() {
+        let t = ray_aabb(
+            Vec3::new(0.0, 0.0, -5.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::splat(-1.0),
+            Vec3::splat(1.0),
+        )
+        .expect("hit");
+        assert!((t - 4.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn pick_prefers_fixture_over_fog_box() {
+        // Demo scene: one fixture at (0,4,0) inside a large fog box.
+        let scene = Scene::demo();
+        let f = scene.fixtures[0].position;
+        // Ray from in front of the fixture, aimed at it.
+        let ro = f + Vec3::new(0.0, 0.0, 6.0);
+        let rd = (f - ro).normalize();
+        assert_eq!(pick(&scene, ro, rd), Some(Hit::Fixture(0)));
+    }
 }
 
 /// Map a symmetric angle range (±span/2) onto a single 8-bit DMX channel.

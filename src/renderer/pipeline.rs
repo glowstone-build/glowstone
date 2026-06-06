@@ -14,6 +14,18 @@ fn load(device: &wgpu::Device, label: &str, source: &'static str) -> wgpu::Shade
     })
 }
 
+/// Shared beam-optics helpers (`optics.wgsl`) prepended to a shader source. WGSL
+/// has no `#include`, so the beam (`volumetric.wgsl`) and floor (`mesh.wgsl`)
+/// shaders that share these helpers are built from the concatenated source.
+const OPTICS_WGSL: &str = include_str!("../shaders/optics.wgsl");
+
+fn load_with_optics(device: &wgpu::Device, label: &str, body: &str) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(format!("{OPTICS_WGSL}\n{body}").into()),
+    })
+}
+
 fn depth_stencil() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: Viewport::DEPTH_FORMAT,
@@ -65,9 +77,40 @@ pub fn line_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
     })
 }
 
+/// Pipeline for the glass/dust lens discs (instanced `TriangleList`, camera-only
+/// bind group, no backface cull so the lens reads from either side).
+pub fn lens_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let shader = load(device, "lens.wgsl", include_str!("../shaders/lens.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("lens-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// Pipeline for the instanced, lit meshes — floor + fixtures (a `TriangleList`).
 pub fn mesh_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
-    let shader = load(device, "mesh.wgsl", include_str!("../shaders/mesh.wgsl"));
+    let shader = load_with_optics(device, "mesh.wgsl", include_str!("../shaders/mesh.wgsl"));
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("mesh-pipeline"),
         layout: Some(layout),
@@ -149,24 +192,60 @@ pub fn volumetric_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 5: gobo atlas (texture_2d_array), 6: its filtering sampler.
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
 
-/// Fixtures-as-spotlights storage buffer for surface lighting (mesh group 1).
+/// Fixtures-as-spotlights storage buffer + the gobo atlas for surface lighting
+/// (mesh group 1): binding 0 = fixtures, 1 = atlas texture, 2 = atlas sampler.
 pub fn light_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("light-bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
             },
-            count: None,
-        }],
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
     })
 }
 
@@ -283,7 +362,7 @@ pub fn volumetric_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
-    let shader = load(device, "volumetric.wgsl", include_str!("../shaders/volumetric.wgsl"));
+    let shader = load_with_optics(device, "volumetric.wgsl", include_str!("../shaders/volumetric.wgsl"));
     fullscreen_pipeline(
         device,
         "volumetric-pipeline",

@@ -28,6 +28,9 @@ struct State {
     ui: Ui,
     last_frame: Instant,
     fps: f32,
+    /// Whether to keep driving redraws (false while the window is occluded), so
+    /// the live preview animates continuously instead of only on input.
+    awake: bool,
 }
 
 #[derive(Default)]
@@ -76,6 +79,7 @@ impl ApplicationHandler for App {
             ui: Ui::new(),
             last_frame: Instant::now(),
             fps: 0.0,
+            awake: true,
         });
 
         // Optional GDTF auto-import for testing: PREVIZ_GDTF=path.gdtf loads a
@@ -89,11 +93,29 @@ impl ApplicationHandler for App {
                         .scene
                         .add_gdtf(std::sync::Arc::new(fixture), glam::Vec3::new(0.0, 4.0, 0.0));
                     state.scene.fixtures[idx].tilt = 20.0;
-                    state.ui.selection = crate::scene::Selection::Fixture(idx);
+                    state.ui.selection = crate::scene::Selection::fixture(idx);
                     log::info!("imported GDTF: {path}");
                 }
                 Err(e) => log::error!("GDTF import failed: {e}"),
             }
+        }
+
+        // Headless optical contact sheet: PREVIZ_SHEET=dir (with PREVIZ_GDTF)
+        // renders one screenshot per optical feature so the whole chain can be
+        // verified without the UI. Dev harness, like PREVIZ_BENCH.
+        if let Ok(dir) = std::env::var("PREVIZ_SHEET") {
+            render_optics_sheet(self.state.as_mut().unwrap(), &dir);
+            event_loop.exit();
+            return;
+        }
+
+        // Headless animation check: PREVIZ_ANIM=dir (with PREVIZ_GDTF) sets a
+        // spinning gobo / animation / colour / prism and renders a frame
+        // sequence, advancing the scene between frames — to verify wheel motion.
+        if let Ok(dir) = std::env::var("PREVIZ_ANIM") {
+            render_anim_sequence(self.state.as_mut().unwrap(), &dir);
+            event_loop.exit();
+            return;
         }
 
         // Headless screenshot path: PREVIZ_SCREENSHOT=path.png renders the
@@ -164,17 +186,18 @@ impl ApplicationHandler for App {
                 state.renderer.resize_surface((size.width, size.height));
                 state.window.request_redraw();
             }
-            WindowEvent::Occluded(false) => {
-                // Window is visible again — restart the live-preview loop.
-                state.window.request_redraw();
-            }
-            WindowEvent::RedrawRequested => {
-                // Keep a live preview running, paced by vsync (Fifo) in present.
-                // Only re-arm while we're actually presenting, so a minimized or
-                // occluded window idles instead of busy-looping.
-                if state.render() {
+            WindowEvent::Occluded(occluded) => {
+                // Idle while hidden; resume the continuous loop when visible.
+                state.awake = !occluded;
+                if !occluded {
                     state.window.request_redraw();
                 }
+            }
+            WindowEvent::RedrawRequested => {
+                // Render the frame; the next redraw is re-armed in `about_to_wait`
+                // (requesting a redraw from inside RedrawRequested is unreliable
+                // on some platforms, which froze the haze/wheel animation).
+                state.render();
             }
             _ => {
                 if response.repaint {
@@ -183,6 +206,182 @@ impl ApplicationHandler for App {
             }
         }
     }
+
+    /// Re-arm the next frame so the live preview animates continuously (haze
+    /// drift, wheel spin, gobo scroll) without needing input. Paced by vsync
+    /// (the Fifo present in `render`). Idles while occluded.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &self.state
+            && state.awake
+        {
+            state.window.request_redraw();
+        }
+    }
+}
+
+/// Render one screenshot per optical feature into `dir` (dev verification of the
+/// full beam chain). Requires a GDTF fixture in the scene (set `PREVIZ_GDTF`).
+fn render_optics_sheet(state: &mut State, dir: &str) {
+    use crate::optics::WheelMotion;
+
+    let _ = std::fs::create_dir_all(dir);
+    let Some(idx) = state.scene.fixtures.iter().position(|f| f.is_gdtf()) else {
+        log::error!("PREVIZ_SHEET needs a GDTF fixture (set PREVIZ_GDTF)");
+        return;
+    };
+    // Heavier haze for the contact sheet so the beam-in-fog look is visible.
+    if let Some(env) = state.scene.environments.first_mut() {
+        env.density = 0.14;
+    }
+
+    // Each preset configures the fixture's optics + a fixed motion phase.
+    let presets: [(&str, fn(&mut crate::scene::Fixture)); 15] = [
+        ("01_neutral", |_f| {}),
+        ("02_gobo_target", |f| { f.optics.gobo1 = 5.0 / 6.0; f.optics.zoom = 0.25; }),
+        ("03_gobo_vortex_spin", |f| {
+            f.optics.gobo1 = 4.0 / 6.0; f.optics.gobo1_rot = 0.85; f.optics.zoom = 0.25;
+            f.motion.gobo1_angle = 0.8;
+        }),
+        ("04_gobo2_smokerings", |f| { f.optics.gobo2 = 2.0 / 6.0; f.optics.zoom = 0.25; }),
+        ("05_color_red", |f| { f.optics.color = 1.0; }),
+        ("06_cmy_magenta", |f| { f.optics.cmy = [0.0, 0.85, 0.0]; }),
+        ("07_cto_warm", |f| { f.optics.cto = 1.0; }),
+        ("08_prism5", |f| { f.optics.prism1 = 1.0; f.optics.zoom = 0.0; }),
+        ("08b_prism_gobo", |f| { f.optics.prism1 = 1.0; f.optics.gobo1 = 5.0 / 6.0; f.optics.zoom = 0.0; }),
+        ("09_frost", |f| { f.optics.frost = 0.85; f.optics.gobo1 = 5.0 / 6.0; f.optics.zoom = 0.25; }),
+        ("10_zoom_narrow", |f| { f.optics.zoom = 0.0; }),
+        ("11_iris_closed", |f| { f.optics.iris = 0.25; }),
+        ("12_animation", |f| {
+            f.optics.anim = 1.0; f.optics.anim_spin = 0.9; f.optics.gobo1 = 5.0 / 6.0;
+            f.optics.zoom = 0.25; f.motion.anim_scroll = 0.3;
+        }),
+        ("13_chromatic_ab", |f| { f.optics.ca = 1.0; f.optics.gobo1 = 5.0 / 6.0; f.optics.zoom = 0.12; }),
+        ("14_combo", |f| {
+            // Color + gobo + prism + frost together (stages compose).
+            f.optics.cmy = [0.6, 0.0, 0.0];     // cyan tint
+            f.optics.gobo1 = 4.0 / 6.0;          // vortex
+            f.optics.prism1 = 1.0;               // 5-facet fan
+            f.optics.frost = 0.15;
+            f.optics.zoom = 0.18;
+            f.motion.prism1_angle = 0.4;
+        }),
+    ];
+
+    for (name, apply) in presets {
+        {
+            let f = &mut state.scene.fixtures[idx];
+            f.optics = Default::default();
+            f.motion = WheelMotion::default();
+            f.pan = 0.0;
+            f.tilt = 28.0;
+            apply(f);
+        }
+        let (w, h, px) = state
+            .renderer
+            .capture(&state.scene, &state.camera, &state.ui.settings);
+        match image::RgbaImage::from_raw(w, h, px) {
+            Some(img) => {
+                let path = format!("{dir}/sheet_{name}.png");
+                match img.save(&path) {
+                    Ok(()) => log::info!("sheet: wrote {path}"),
+                    Err(e) => log::error!("sheet: {path}: {e}"),
+                }
+            }
+            None => log::error!("sheet: bad buffer for {name}"),
+        }
+    }
+
+    // Overhead prism shot: confirm the facet copies separate into distinct pools.
+    {
+        let f = &mut state.scene.fixtures[idx];
+        f.optics = Default::default();
+        f.tilt = 0.0; // straight down
+        f.optics.zoom = 0.0; // narrow
+        f.optics.prism1 = 1.0;
+    }
+    let mut cam = state.camera.clone();
+    cam.target = glam::Vec3::new(0.0, 0.0, 0.0);
+    cam.pitch = 1.3; // look down
+    cam.distance = 9.0;
+    let (w, h, px) = state.renderer.capture(&state.scene, &cam, &state.ui.settings);
+    if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
+        let _ = img.save(format!("{dir}/sheet_16_prism_top.png"));
+    }
+
+    // Lens close-up: the glass/dust front-lens material.
+    {
+        let f = &mut state.scene.fixtures[idx];
+        f.optics = Default::default();
+        f.pan = 0.0;
+        f.tilt = 35.0;
+        f.optics.zoom = 0.3;
+    }
+    {
+        let frame = state.scene.fixtures[idx].position;
+        let mut cam = state.camera.clone();
+        // Look up the beam axis, face-on into the lens.
+        cam.target = frame + glam::Vec3::new(0.0, -0.45, -0.45);
+        cam.distance = 1.8;
+        cam.pitch = -0.85;
+        cam.yaw = std::f32::consts::PI;
+        let (w, h, px) = state.renderer.capture(&state.scene, &cam, &state.ui.settings);
+        if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
+            let _ = img.save(format!("{dir}/sheet_17_lens.png"));
+        }
+    }
+
+    // Array demo: duplicate the fixture into a 36°/9 fan (the `d`-key dialog).
+    {
+        let f = &mut state.scene.fixtures[idx];
+        f.optics = Default::default();
+        f.optics.zoom = 0.08;
+        f.tilt = 38.0;
+    }
+    state
+        .scene
+        .duplicate_fixture(idx, glam::Vec3::new(0.0, 0.0, 0.0), 36.0, 9);
+    let (w, h, px) = state
+        .renderer
+        .capture(&state.scene, &state.camera, &state.ui.settings);
+    if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
+        let _ = img.save(format!("{dir}/sheet_15_duplicate_fan.png"));
+    }
+}
+
+/// Render a wheel-motion sequence (advancing the scene between frames) to verify
+/// that gobo/colour/animation/prism wheels actually animate over time.
+fn render_anim_sequence(state: &mut State, dir: &str) {
+    let _ = std::fs::create_dir_all(dir);
+    let Some(idx) = state.scene.fixtures.iter().position(|f| f.is_gdtf()) else {
+        log::error!("PREVIZ_ANIM needs a GDTF fixture (set PREVIZ_GDTF)");
+        return;
+    };
+    if let Some(env) = state.scene.environments.first_mut() {
+        env.density = 0.12;
+    }
+    {
+        let f = &mut state.scene.fixtures[idx];
+        f.tilt = 30.0;
+        f.optics = Default::default();
+        f.optics.zoom = 0.02; // narrow so the prism copies separate cleanly
+        f.optics.prism1 = 1.0; // 5-facet prism …
+        f.optics.prism1_rot = 0.92; // … rotating, so the fan revolves
+        f.optics.gobo1 = 4.0 / 6.0; // vortex gobo, replicated per facet
+        f.optics.gobo1_rot = 0.95; // and spinning
+    }
+    for frame in 0..6 {
+        let (w, h, px) = state
+            .renderer
+            .capture(&state.scene, &state.camera, &state.ui.settings);
+        if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
+            let _ = img.save(format!("{dir}/anim_{frame:02}.png"));
+        }
+        // Advance ~0.33 s of motion between captured frames.
+        for _ in 0..3 {
+            state.scene.advance(0.11);
+        }
+    }
+    log::info!("anim: wrote 6 frames to {dir}");
 }
 
 impl State {
@@ -203,6 +402,10 @@ impl State {
             self.fps = if self.fps == 0.0 { inst } else { self.fps * 0.9 + inst * 0.1 };
         }
         let fps = self.fps;
+
+        // Advance time-based wheel motion once per real frame (not in the
+        // renderer, which also runs for headless capture).
+        self.scene.advance(dt);
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let viewport_texture = self.renderer.viewport.texture_id;
@@ -233,7 +436,7 @@ impl State {
         self.renderer.render(
             &self.scene,
             &self.camera,
-            self.ui.selection,
+            &self.ui.selection,
             &self.ui.settings,
             &paint_jobs,
             &full_output.textures_delta,

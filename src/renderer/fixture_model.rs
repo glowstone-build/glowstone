@@ -87,11 +87,23 @@ pub struct PartDraw {
     pub world: Mat4,
 }
 
-/// The assembled fixture: parts to draw plus the beam's world transform.
+/// The beam's world-space frame: where it exits, the direction it points, and a
+/// stable lens-plane basis (`right`/`up`) for projecting gobo cookies. Taken
+/// from the Beam geometry's articulated world matrix so it never flips (unlike a
+/// basis derived from the direction alone when the head points straight down).
+#[derive(Clone, Copy)]
+pub struct BeamFrame {
+    pub origin: Vec3,
+    pub dir: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+}
+
+/// The assembled fixture: parts to draw plus the beam's world frame.
 pub struct Assembly {
     pub parts: Vec<PartDraw>,
-    /// Beam origin (world) and unit direction, if the fixture has a Beam.
-    pub beam: Option<(Vec3, Vec3)>,
+    /// Beam frame, if the fixture has a Beam geometry.
+    pub beam: Option<BeamFrame>,
 }
 
 /// Walk the geometry tree with pan/tilt applied, in world space (`root` already
@@ -101,7 +113,7 @@ pub fn assemble(fixture: &GdtfFixture, root: Mat4, pan_deg: f32, tilt_deg: f32) 
     let tilt_geom = fixture.geometry_for_attribute("Tilt").map(str::to_string);
 
     let mut parts = Vec::new();
-    let mut beam = None;
+    let mut beam: Option<BeamFrame> = None;
     walk(
         &fixture.geometry,
         root,
@@ -124,7 +136,7 @@ fn walk(
     pan_geom: Option<&str>,
     tilt_geom: Option<&str>,
     parts: &mut Vec<PartDraw>,
-    beam: &mut Option<(Vec3, Vec3)>,
+    beam: &mut Option<BeamFrame>,
 ) {
     let mut local = node.matrix;
     // GDTF axes rotate about their local axis: pan about +Z (up), tilt about +X.
@@ -147,9 +159,12 @@ fn walk(
     }
     if node.kind == GeometryKind::Beam {
         let origin = world.transform_point3(Vec3::ZERO);
-        // The beam emits along the geometry's local -Z (GDTF "down").
+        // The beam emits along the geometry's local -Z (GDTF "down"); local X/Y
+        // are the stable cookie basis (carried through pan/tilt by `world`).
         let dir = world.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
-        *beam = Some((origin, dir));
+        let right = world.transform_vector3(Vec3::X).normalize_or_zero();
+        let up = world.transform_vector3(Vec3::Y).normalize_or_zero();
+        *beam = Some(BeamFrame { origin, dir, right, up });
     }
 
     for child in &node.children {

@@ -21,8 +21,13 @@ struct Volumetric {
 
 struct Fixture {
     pos_range: vec4<f32>, // xyz = lens position, w = range (m)
-    dir_cos: vec4<f32>,   // xyz = beam dir (unit), w = tan(half-angle)
-    color: vec4<f32>,     // rgb = color * intensity, w = lens radius (m)
+    dir_cos: vec4<f32>,   // xyz = beam dir (unit), w = tan(half zoom angle)
+    color: vec4<f32>,     // rgb = tint*intensity*candela*shutter, w = lens radius (m)
+    cookie_r: vec4<f32>,  // xyz = lens-plane right, w = gobo1 atlas layer (frac; <0 none)
+    cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = gobo1 rotation (rad)
+    extra: vec4<f32>,     // x = gobo2 layer, y = gobo2 rot, z = anim layer, w = anim scroll
+    shape: vec4<f32>,     // x = super-Gaussian order, y = focus dist, z = iris frac, w = frost
+    misc: vec4<f32>,      // x = CA strength, y/z/w = reserved
 };
 
 @group(0) @binding(0) var<uniform> u: Volumetric;
@@ -30,6 +35,8 @@ struct Fixture {
 @group(0) @binding(2) var depth_tex: texture_depth_2d;
 @group(0) @binding(3) var noise_tex: texture_3d<f32>;
 @group(0) @binding(4) var noise_samp: sampler;
+@group(0) @binding(5) var gobo_tex: texture_2d_array<f32>;
+@group(0) @binding(6) var gobo_samp: sampler;
 
 const PI: f32 = 3.14159265359;
 
@@ -132,7 +139,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     let albedo = u.albedo_beam.rgb;
     let beam = u.albedo_beam.w;
     let time = u.eye_time.w;
-    let ambient = albedo * 0.05; // dim ambient light so haze reads everywhere
+    let ambient = albedo * 0.012; // very dim ambient haze; beams do the lighting
 
     let seg = t_far - t_near;
     let dt = seg / f32(steps);
@@ -162,17 +169,41 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             if (depth < 0.0 || depth > range) {
                 continue;
             }
-            let axis_pt = lpos + bdir * depth;
-            let axis_dist = length(p - axis_pt);
-            // Disc beam: radius grows from the lens radius with the beam angle.
-            let beam_r = lens_r + depth * tan_half;
-            let radial = smoothstep(beam_r, beam_r * 0.45, axis_dist);
-            if (radial <= 0.0) {
+            // Lens-plane coordinates of the sample (along the cookie basis), used
+            // for both the radial falloff and the lateral chromatic aberration.
+            let pu = dot(rel, fx.cookie_r.xyz);
+            let pv = dot(rel, fx.cookie_u.xyz);
+
+            // Disc beam widening with zoom, cropped by iris; super-Gaussian edge
+            // (hard spot → soft with frost) with two-sided chromatic fringe.
+            let n_order = fx.shape.x;
+            let iris = fx.shape.z;
+            let frost = fx.shape.w;
+            let cone_r = lens_r + depth * tan_half;     // un-iris cone (cookie scale)
+            let beam_r = cone_r * iris;                  // iris crops the lit radius
+            let rad3 = opt_radial_ca(pu, pv, beam_r, n_order, fx.misc.x);
+            let rad_max = max(rad3.x, max(rad3.y, rad3.z));
+            if (rad_max <= 0.002) {
                 continue;
             }
-            let atten = 1.0 / (1.0 + depth * depth * 0.04);
+
+            // Projected optical cookie: gobo wheel 1 × wheel 2 × animation glass,
+            // blurred by focus error + frost (mip LOD), with per-channel chromatic
+            // aberration so the gobo's pattern edges fringe too. Skip if occluded.
+            let guv = opt_project(rel, depth, fx.cookie_r.xyz, fx.cookie_u.xyz, cone_r);
+            let lod = opt_lod(depth, fx.shape.y, frost);
+            let trans = opt_cookie_ca(
+                gobo_tex, gobo_samp, guv,
+                fx.cookie_r.w, fx.cookie_u.w, fx.extra.x, fx.extra.y,
+                i32(fx.extra.z), fx.extra.w, lod, fx.misc.x,
+            );
+            if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
+                continue;
+            }
+
+            let atten = 1.0 / (1.0 + depth * depth * 0.015);
             let phase = max(hg(dot(bdir, -rd), g), 0.05);
-            lin += fx.color.rgb * (radial * atten * phase * beam);
+            lin += fx.color.rgb * trans * (rad3 * (atten * phase * beam));
         }
 
         let step_tr = exp(-sigma_t * dt);

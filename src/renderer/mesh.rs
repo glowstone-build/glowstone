@@ -294,6 +294,23 @@ pub fn cone(length: f32, radius: f32, segments: u32) -> Vec<MeshVertex> {
     verts
 }
 
+/// A unit disc in the local XY plane (radius 1, normal +Z), as a triangle fan of
+/// non-indexed triangles. `position.xy` doubles as a `-1..1` radial coordinate
+/// the lens shader uses for the glass/dust look. Oriented by its instance matrix.
+pub fn disc(segments: u32) -> Vec<MeshVertex> {
+    let seg = segments.max(8);
+    let mut verts = Vec::with_capacity(seg as usize * 3);
+    let n = [0.0, 0.0, 1.0];
+    for i in 0..seg {
+        let a0 = i as f32 / seg as f32 * TAU;
+        let a1 = (i + 1) as f32 / seg as f32 * TAU;
+        verts.push(MeshVertex { position: [0.0, 0.0, 0.0], normal: n, emissive: 1.0 });
+        verts.push(MeshVertex { position: [a0.cos(), a0.sin(), 0.0], normal: n, emissive: 1.0 });
+        verts.push(MeshVertex { position: [a1.cos(), a1.sin(), 0.0], normal: n, emissive: 1.0 });
+    }
+    verts
+}
+
 /// Generate the ground grid (on `y = 0`) plus the three world axes as a
 /// LineList. Grid lines are dim grey; axes are RGB.
 pub fn grid_and_axes(half_extent: f32, step: f32) -> Vec<LineVertex> {

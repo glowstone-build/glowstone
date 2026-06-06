@@ -1,0 +1,201 @@
+//! The gobo / animation-glass texture atlas.
+//!
+//! A single persistent `texture_2d_array` (one slot per layer, full mip chain)
+//! holds every projectable wheel image of every loaded GDTF fixture. Layer 0 is
+//! solid white ("open / no gobo"). Gobo and animation wheels are allocated a
+//! consecutive block of layers (one per slot, white for slots without media) so
+//! the shader can cross-fade between adjacent slots during a wheel move by
+//! sampling `floor(layer)` and `ceil(layer)`.
+//!
+//! Color wheels (CPU-side tint) and prism wheels (CPU beam-expansion) are *not*
+//! allocated here. Mips are built on the CPU (box filter) so the focus/frost
+//! mip-LOD blur has something to read.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::gdtf::GdtfFixture;
+
+/// Edge length of each atlas layer (square). 256 is plenty for previz gobos.
+const RES: u32 = 256;
+/// Total layers the array can hold (white + all wheels of all fixtures).
+const LAYERS: u32 = 64;
+
+pub struct GoboAtlas {
+    texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    /// Mip-filtering clamp sampler (gobo edges read black past `[0,1]`).
+    pub sampler: wgpu::Sampler,
+    mip_count: u32,
+    next_layer: u32,
+    /// `(gdtf Arc ptr, wheel name) -> base layer` for projectable wheels.
+    base_of: HashMap<(usize, String), u32>,
+}
+
+impl GoboAtlas {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let mip_count = 32 - (RES.leading_zeros()) ; // floor(log2(RES)) + 1
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gobo-atlas"),
+            size: wgpu::Extent3d {
+                width: RES,
+                height: RES,
+                depth_or_array_layers: LAYERS,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("gobo-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+
+        let mut atlas = Self {
+            texture,
+            view,
+            sampler,
+            mip_count,
+            next_layer: 0,
+            base_of: HashMap::new(),
+        };
+        // Layer 0: solid white (open / no gobo).
+        let white = vec![255u8; (RES * RES * 4) as usize];
+        atlas.write_layer(queue, 0, &white);
+        atlas.next_layer = 1;
+        atlas
+    }
+
+    pub fn layer_count(&self) -> u32 {
+        LAYERS
+    }
+
+    /// Base layer of a projectable wheel for a loaded fixture, if allocated.
+    pub fn base_layer(&self, key: usize, wheel: &str) -> Option<u32> {
+        self.base_of.get(&(key, wheel.to_string())).copied()
+    }
+
+    /// Allocate + upload the projectable wheels (gobo / animation) of a fixture
+    /// the first time it is seen. Idempotent per `(key, wheel)`.
+    pub fn ensure(&mut self, queue: &wgpu::Queue, key: usize, gdtf: &Arc<GdtfFixture>) {
+        for wheel in &gdtf.wheels {
+            // Projectable = has imagery, but is not a prism (facets) wheel.
+            let has_media = wheel.slots.iter().any(|s| s.media.is_some());
+            let is_prism = wheel.slots.iter().any(|s| !s.facets.is_empty());
+            if !has_media || is_prism {
+                continue;
+            }
+            let k = (key, wheel.name.clone());
+            if self.base_of.contains_key(&k) {
+                continue;
+            }
+            let count = wheel.slots.len() as u32;
+            if self.next_layer + count > LAYERS {
+                log::warn!("gobo atlas full; skipping wheel '{}'", wheel.name);
+                continue;
+            }
+            let base = self.next_layer;
+            for (i, slot) in wheel.slots.iter().enumerate() {
+                let layer = base + i as u32;
+                let rgba = slot
+                    .media
+                    .as_ref()
+                    .and_then(|bytes| decode_gobo(bytes))
+                    .unwrap_or_else(|| vec![255u8; (RES * RES * 4) as usize]);
+                self.write_with_mips(queue, layer, rgba);
+            }
+            self.next_layer += count;
+            self.base_of.insert(k, base);
+            log::info!("gobo atlas: wheel '{}' -> layers {base}..{}", wheel.name, base + count);
+        }
+    }
+
+    /// Write one mip-0 layer (RES×RES RGBA8).
+    fn write_layer(&self, queue: &wgpu::Queue, layer: u32, rgba: &[u8]) {
+        self.write_mip(queue, layer, 0, RES, rgba);
+    }
+
+    fn write_mip(&self, queue: &wgpu::Queue, layer: u32, mip: u32, dim: u32, rgba: &[u8]) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(dim * 4),
+                rows_per_image: Some(dim),
+            },
+            wgpu::Extent3d { width: dim, height: dim, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Write a layer and its full box-filtered mip chain.
+    fn write_with_mips(&self, queue: &wgpu::Queue, layer: u32, base_rgba: Vec<u8>) {
+        let mut dim = RES;
+        let mut cur = base_rgba;
+        self.write_mip(queue, layer, 0, dim, &cur);
+        for mip in 1..self.mip_count {
+            let next_dim = (dim / 2).max(1);
+            cur = box_downsample(&cur, dim, next_dim);
+            dim = next_dim;
+            self.write_mip(queue, layer, mip, dim, &cur);
+        }
+    }
+}
+
+/// Decode a gobo PNG to RES×RES RGBA8: keep its color, set alpha to the
+/// transmittance mask (luminance × source alpha) so dark/holder areas occlude.
+fn decode_gobo(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let img = img
+        .resize_exact(RES, RES, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let mut out = img.into_raw();
+    for px in out.chunks_exact_mut(4) {
+        let (r, g, b, a) = (px[0] as f32, px[1] as f32, px[2] as f32, px[3] as f32);
+        let lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+        px[3] = (lum * (a / 255.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    Some(out)
+}
+
+/// Box-downsample an RGBA8 image from `src_dim`² to `dst_dim`² (dst = src/2).
+fn box_downsample(src: &[u8], src_dim: u32, dst_dim: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (dst_dim * dst_dim * 4) as usize];
+    let scale = src_dim / dst_dim.max(1);
+    for y in 0..dst_dim {
+        for x in 0..dst_dim {
+            for ch in 0..4 {
+                let mut sum = 0u32;
+                let mut n = 0u32;
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let px = (x * scale + sx).min(src_dim - 1);
+                        let py = (y * scale + sy).min(src_dim - 1);
+                        sum += src[((py * src_dim + px) * 4 + ch) as usize] as u32;
+                        n += 1;
+                    }
+                }
+                out[((y * dst_dim + x) * 4 + ch) as usize] = (sum / n.max(1)) as u8;
+            }
+        }
+    }
+    out
+}

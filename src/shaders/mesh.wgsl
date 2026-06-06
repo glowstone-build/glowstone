@@ -15,12 +15,19 @@ var<uniform> camera: Camera;
 // The array length comes from the sized buffer binding.
 struct Light {
     pos_range: vec4<f32>, // xyz = lens, w = range
-    dir_cos: vec4<f32>,   // xyz = beam dir, w = tan(half-angle)
-    color: vec4<f32>,     // rgb = color * intensity, w = lens radius
+    dir_cos: vec4<f32>,   // xyz = beam dir, w = tan(half zoom angle)
+    color: vec4<f32>,     // rgb = tint*intensity*candela*shutter, w = lens radius
+    cookie_r: vec4<f32>,  // xyz = lens-plane right, w = gobo1 layer (frac; <0 none)
+    cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = gobo1 rotation (rad)
+    extra: vec4<f32>,     // x = gobo2 layer, y = gobo2 rot, z = anim layer, w = anim scroll
+    shape: vec4<f32>,     // x = super-Gaussian order, y = focus dist, z = iris frac, w = frost
+    misc: vec4<f32>,      // x = CA strength, y/z/w = reserved
 };
 
 @group(1) @binding(0)
 var<storage, read> lights: array<Light>;
+@group(1) @binding(1) var gobo_tex: texture_2d_array<f32>;
+@group(1) @binding(2) var gobo_samp: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -65,9 +72,10 @@ fn vs_main(in: VsIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let normal = normalize(in.world_normal);
 
-    // Soft key light + ambient fill (kept dim so fixtures dominate the look).
+    // Near-zero ambient: surfaces read dark like a blacked-out venue and are lit
+    // almost entirely by the fixtures (the floor is dark except in beam pools).
     let key_dir = normalize(vec3<f32>(0.4, 1.0, 0.6));
-    let key = 0.09 + max(dot(normal, key_dir), 0.0) * 0.28;
+    let key = 0.012 + max(dot(normal, key_dir), 0.0) * 0.03;
 
     // Illumination from every fixture spotlight reaching this surface point.
     var fixture_light = vec3<f32>(0.0);
@@ -84,19 +92,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         if (depth < 0.0 || depth > lt.pos_range.w) {
             continue;
         }
-        // Same disc-beam footprint as the volumetric pass, so the lit pool on
-        // the floor lines up with the beam.
-        let axis_pt = lpos + bdir * depth;
-        let axis_dist = length(in.world_pos - axis_pt);
-        let beam_r = lens_r + depth * tan_half;
-        let radial = smoothstep(beam_r, beam_r * 0.45, axis_dist);
-        if (radial <= 0.0) {
+        // Same disc-beam footprint + cookie + falloff as the volumetric pass, so
+        // the lit pool on the floor matches the beam shaft exactly.
+        let pu = dot(rel, lt.cookie_r.xyz);
+        let pv = dot(rel, lt.cookie_u.xyz);
+        let cone_r = lens_r + depth * tan_half;
+        let beam_r = cone_r * lt.shape.z;
+        let rad3 = opt_radial_ca(pu, pv, beam_r, lt.shape.x, lt.misc.x);
+        let rad_max = max(rad3.x, max(rad3.y, rad3.z));
+        if (rad_max <= 0.002) {
+            continue;
+        }
+        let guv = opt_project(rel, depth, lt.cookie_r.xyz, lt.cookie_u.xyz, cone_r);
+        let lod = opt_lod(depth, lt.shape.y, lt.shape.w);
+        let trans = opt_cookie_ca(
+            gobo_tex, gobo_samp, guv,
+            lt.cookie_r.w, lt.cookie_u.w, lt.extra.x, lt.extra.y,
+            i32(lt.extra.z), lt.extra.w, lod, lt.misc.x,
+        );
+        if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
             continue;
         }
         let l = normalize(lpos - in.world_pos);
         let ndl = max(dot(normal, l), 0.0);
-        let atten = 1.0 / (1.0 + depth * depth * 0.04);
-        fixture_light += lt.color.rgb * (radial * ndl * atten * 3.0);
+        let atten = 1.0 / (1.0 + depth * depth * 0.015);
+        fixture_light += lt.color.rgb * trans * (rad3 * (ndl * atten * 9.0));
     }
 
     let albedo = in.color;
@@ -105,7 +125,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Self-illuminated surface (a fixture lens): a bright bloomy disc (HDR,
     // well above 1 so it blooms strongly like a real lamp face).
-    let emit = in.color * max(in.intensity, 0.2) * 14.0;
+    let emit = in.color * max(in.intensity, 0.2) * 24.0;
     var rgb = mix(lit, emit, clamp(in.emissive, 0.0, 1.0));
 
     // Selection highlight: additive amber rim on shaded surfaces.

@@ -30,8 +30,54 @@ pub struct GdtfFixture {
     pub models: Vec<Model>,
     pub geometry: Geometry,
     pub modes: Vec<DmxMode>,
-    /// Beam cone angle in degrees (from the Beam geometry), if present.
+    /// Beam cone angle in degrees (from the Beam geometry), if present. Kept as
+    /// a top-level field for back-compat; the full optics live in [`beam`].
     pub beam_angle: f32,
+    /// Physical source/optics parameters from the `Beam` geometry.
+    pub beam: BeamData,
+}
+
+/// The physical light-source + beam optics declared on the GDTF `Beam`
+/// geometry. These drive the source color/intensity and the cone shape.
+#[derive(Clone, Debug)]
+pub struct BeamData {
+    /// Cone angle at 50% intensity, degrees.
+    pub beam_angle: f32,
+    /// Cone angle at 10% intensity (the soft outer field), degrees.
+    pub field_angle: f32,
+    /// Physical lens radius where the beam exits, metres.
+    pub beam_radius: f32,
+    /// "Spot" / "Wash" / "None" / "Rectangle".
+    pub beam_type: String,
+    /// Correlated color temperature of the source, Kelvin.
+    pub color_temp: f32,
+    /// Color rendering index (0..100).
+    pub cri: f32,
+    /// Rated luminous flux, lumens.
+    pub luminous_flux: f32,
+    /// "LED" / "Halogen" / "Discharge" / "Tungsten".
+    pub lamp_type: String,
+    /// Throw ratio (distance / image width).
+    pub throw_ratio: f32,
+    /// Power draw, watts.
+    pub power: f32,
+}
+
+impl Default for BeamData {
+    fn default() -> Self {
+        Self {
+            beam_angle: 15.0,
+            field_angle: 15.0,
+            beam_radius: 0.08,
+            beam_type: "Spot".into(),
+            color_temp: 6500.0,
+            cri: 90.0,
+            luminous_flux: 10000.0,
+            lamp_type: "LED".into(),
+            throw_ratio: 1.0,
+            power: 300.0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -47,6 +93,9 @@ pub struct WheelSlot {
     pub color: Option<[f32; 3]>,
     /// Gobo/animation image PNG bytes, if the slot references media.
     pub media: Option<Vec<u8>>,
+    /// Prism facets: each `[dx, dy]` is the beam-deflection offset of one facet
+    /// (from the GDTF `Facet` rotation matrix). Empty for non-prism slots.
+    pub facets: Vec<[f32; 2]>,
 }
 
 #[allow(dead_code)]
@@ -94,9 +143,31 @@ pub struct DmxMode {
 pub struct DmxChannel {
     pub geometry: String,
     pub offsets: Vec<u32>,
+    /// Primary attribute (the channel's first logical channel).
     pub attribute: String,
+    /// First channel-function name (kept for the inspector table).
     pub function: String,
     pub sets: Vec<String>,
+    /// Byte resolution: 1 = 8-bit, 2 = 16-bit, … (= `offsets.len()`).
+    pub resolution: u8,
+    /// Every channel function across this channel's logical channels, in DMX
+    /// order. Each carries the physical range and wheel link the engine needs.
+    pub functions: Vec<ChannelFunction>,
+}
+
+/// One GDTF `ChannelFunction`: a DMX sub-range mapped linearly onto a physical
+/// range, optionally linked to a wheel.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct ChannelFunction {
+    pub attribute: String,
+    pub name: String,
+    /// DMX start value normalized to `0..1` over the channel's full range.
+    pub dmx_from: f32,
+    pub physical_from: f32,
+    pub physical_to: f32,
+    /// Linked wheel name (color/gobo/prism/animation), if any.
+    pub wheel: Option<String>,
 }
 
 impl GdtfFixture {
@@ -145,10 +216,16 @@ impl GdtfFixture {
                         |m| resolve(&names, &format!("wheels/{m}.png")),
                     );
                     let media = media.and_then(|n| read_entry(&mut archive, &n));
+                    let facets = s
+                        .children()
+                        .filter(|f| f.has_tag_name("Facet"))
+                        .filter_map(|f| f.attribute("Rotation").and_then(parse_facet_offset))
+                        .collect();
                     slots.push(WheelSlot {
                         name: attr(&s, "Name"),
                         color,
                         media,
+                        facets,
                     });
                 }
                 wheels.push(Wheel {
@@ -190,12 +267,28 @@ impl GdtfFixture {
             .map(|root| parse_geometry(&root))
             .ok_or("no geometry")?;
 
-        let beam_angle = doc
+        let beam = doc
             .descendants()
             .find(|n| n.has_tag_name("Beam"))
-            .and_then(|b| b.attribute("BeamAngle"))
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(15.0);
+            .map(|b| {
+                let f = |k: &str, d: f32| b.attribute(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+                let s = |k: &str, d: &str| b.attribute(k).unwrap_or(d).to_string();
+                let beam_angle = f("BeamAngle", 15.0);
+                BeamData {
+                    beam_angle,
+                    field_angle: f("FieldAngle", beam_angle),
+                    beam_radius: f("BeamRadius", 0.08),
+                    beam_type: s("BeamType", "Spot"),
+                    color_temp: f("ColorTemperature", 6500.0),
+                    cri: f("ColorRenderingIndex", 90.0),
+                    luminous_flux: f("LuminousFlux", 10000.0),
+                    lamp_type: s("LampType", "LED"),
+                    throw_ratio: f("ThrowRatio", 1.0),
+                    power: f("PowerConsumption", 300.0),
+                }
+            })
+            .unwrap_or_default();
+        let beam_angle = beam.beam_angle;
 
         // --- DMX modes ---
         let mut modes = Vec::new();
@@ -212,6 +305,26 @@ impl GdtfFixture {
                             .filter_map(|s| s.trim().parse::<u32>().ok())
                             .collect();
                         footprint = footprint.max(offsets.iter().copied().max().unwrap_or(0));
+                        let resolution = offsets.len().max(1) as u8;
+
+                        // Every channel function across every logical channel.
+                        let mut functions = Vec::new();
+                        for lc in ch.children().filter(|n| n.has_tag_name("LogicalChannel")) {
+                            let lc_attr = lc.attribute("Attribute").unwrap_or("");
+                            for cf in lc.children().filter(|c| c.has_tag_name("ChannelFunction")) {
+                                let pf = cf.attribute("PhysicalFrom").and_then(|v| v.parse().ok());
+                                let pt = cf.attribute("PhysicalTo").and_then(|v| v.parse().ok());
+                                functions.push(ChannelFunction {
+                                    attribute: cf.attribute("Attribute").unwrap_or(lc_attr).to_string(),
+                                    name: cf.attribute("Name").unwrap_or("").to_string(),
+                                    dmx_from: cf.attribute("DMXFrom").map(parse_dmx_norm).unwrap_or(0.0),
+                                    physical_from: pf.unwrap_or(0.0),
+                                    physical_to: pt.unwrap_or(1.0),
+                                    wheel: cf.attribute("Wheel").filter(|w| !w.is_empty()).map(String::from),
+                                });
+                            }
+                        }
+
                         let lc = ch.children().find(|n| n.has_tag_name("LogicalChannel"));
                         let attribute = lc
                             .and_then(|n| n.attribute("Attribute"))
@@ -236,6 +349,8 @@ impl GdtfFixture {
                             attribute,
                             function,
                             sets,
+                            resolution,
+                            functions,
                         });
                     }
                 }
@@ -259,7 +374,36 @@ impl GdtfFixture {
             geometry,
             modes,
             beam_angle,
+            beam,
         })
+    }
+
+    /// Look up a wheel by name.
+    pub fn wheel(&self, name: &str) -> Option<&Wheel> {
+        self.wheels.iter().find(|w| w.name == name)
+    }
+
+    /// The first channel function for `attribute` in the first DMX mode, if the
+    /// fixture exposes that attribute. Carries the physical range + wheel link.
+    pub fn channel_function(&self, attribute: &str) -> Option<&ChannelFunction> {
+        self.modes.first()?.channels.iter().find_map(|c| {
+            c.functions.iter().find(|f| f.attribute == attribute)
+        })
+    }
+
+    /// The physical `(from, to)` range mapped by `attribute`'s first channel
+    /// function (e.g. Zoom → (7.8, 58)). `None` if the fixture lacks it.
+    pub fn physical_range(&self, attribute: &str) -> Option<(f32, f32)> {
+        let f = self.channel_function(attribute)?;
+        Some((f.physical_from, f.physical_to))
+    }
+
+    /// Whether the fixture exposes a control attribute at all.
+    pub fn has_attribute(&self, attribute: &str) -> bool {
+        self.modes
+            .first()
+            .map(|m| m.channels.iter().any(|c| c.functions.iter().any(|f| f.attribute == attribute)))
+            .unwrap_or(false)
     }
 
     /// Geometry name driven by an attribute (e.g. "Pan", "Tilt") in mode 0.
@@ -327,6 +471,32 @@ fn parse_matrix(s: &str) -> Option<Mat4> {
     ]))
 }
 
+/// Parse a GDTF prism `Facet` rotation matrix `{a,b,c}{d,e,f}{dx,dy,1}` and
+/// return the facet's beam-deflection offset `[dx, dy]` (its 3rd row's x,y).
+fn parse_facet_offset(s: &str) -> Option<[f32; 2]> {
+    let nums: Vec<f32> = s
+        .split(['{', '}', ','])
+        .filter_map(|t| {
+            let t = t.trim();
+            if t.is_empty() { None } else { t.parse::<f32>().ok() }
+        })
+        .collect();
+    if nums.len() < 8 {
+        return None;
+    }
+    Some([nums[6], nums[7]])
+}
+
+/// Parse a GDTF DMX value `"value/bytes"` into a `0..1` fraction over the
+/// channel's full range (e.g. `"32768/2"` → 0.5, `"11/1"` → 0.043).
+fn parse_dmx_norm(s: &str) -> f32 {
+    let mut it = s.split('/');
+    let value: f64 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+    let bytes: u32 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(1);
+    let max = 2f64.powi(8 * bytes as i32);
+    (value / max).clamp(0.0, 1.0) as f32
+}
+
 /// Parse a GDTF CIE `x,y,Y` color string into approximate linear RGB.
 fn parse_cie_xyy(s: &str) -> Option<[f32; 3]> {
     let v: Vec<f32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
@@ -370,4 +540,59 @@ fn read_entry(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str)
     let mut buf = Vec::with_capacity(f.size() as usize);
     f.read_to_end(&mut buf).ok()?;
     Some(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end check of the optical extraction against the bundled Khamsin.
+    /// Skips silently if the test fixture isn't present on this machine.
+    #[test]
+    fn khamsin_optics() {
+        let path = format!(
+            "{}/Downloads/Ayrton@Khamsin@V2.22_New_SVG.gdtf",
+            std::env::var("HOME").unwrap_or_default()
+        );
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skip: {path} not found");
+            return;
+        }
+        let g = GdtfFixture::load_path(std::path::Path::new(&path)).expect("load");
+
+        // Source physics.
+        assert_eq!(g.beam.lamp_type, "LED");
+        assert!((g.beam.color_temp - 6800.0).abs() < 1.0);
+        assert!((g.beam.luminous_flux - 40000.0).abs() < 1.0);
+        assert!((g.beam.beam_angle - 25.0).abs() < 0.1);
+
+        // Optical attribute ranges.
+        let zoom = g.physical_range("Zoom").expect("zoom");
+        assert!((zoom.0 - 7.8).abs() < 0.1 && (zoom.1 - 58.0).abs() < 0.1, "zoom {zoom:?}");
+        let iris = g.physical_range("Iris").expect("iris");
+        assert!((iris.0 - 1.0).abs() < 0.01 && (iris.1 - 0.15).abs() < 0.01, "iris {iris:?}");
+        assert!(g.has_attribute("Frost1"));
+        assert!(g.has_attribute("ColorSub_C"));
+        assert!(g.has_attribute("Prism1"));
+        assert!(g.has_attribute("AnimationWheel1"));
+
+        // Wheels + prism facets.
+        assert_eq!(g.wheel("ColorWheel 1").unwrap().slots.len(), 7);
+        assert_eq!(g.wheel("GoboWheel 1").unwrap().slots.len(), 7);
+        let p1 = g.wheel("Prism1").unwrap();
+        assert_eq!(p1.slots[1].facets.len(), 5, "5-facet circular prism");
+        let p2 = g.wheel("Prism2").unwrap();
+        assert_eq!(p2.slots[1].facets.len(), 4, "4-facet linear prism");
+
+        eprintln!(
+            "Khamsin OK: {} wheels, beam {}°/{}° field, {}K {} {}lm; zoom {:?}",
+            g.wheels.len(),
+            g.beam.beam_angle,
+            g.beam.field_angle,
+            g.beam.color_temp,
+            g.beam.lamp_type,
+            g.beam.luminous_flux,
+            zoom,
+        );
+    }
 }

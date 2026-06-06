@@ -10,6 +10,7 @@ use glam::{Mat4, Vec3};
 
 use super::library::{FixtureGeometry, FixtureProfile};
 use crate::gdtf::GdtfFixture;
+use crate::optics::{OpticalControls, WheelMotion};
 
 /// One controllable fixture.
 #[derive(Clone)]
@@ -40,6 +41,13 @@ pub struct Fixture {
     /// Full beam cone angle in degrees (drives the beam indicator now, the
     /// volumetric beam later).
     pub beam_angle: f32,
+
+    /// The optical-chain control values (focus / frost / prism / color / gobo /
+    /// animation / shutter …). Drives the GDTF optical model; neutral by default.
+    pub optics: OpticalControls,
+    /// Accumulated wheel-motion phases, advanced once per frame by
+    /// [`Scene::advance`](super::Scene::advance).
+    pub motion: WheelMotion,
 }
 
 impl Fixture {
@@ -66,6 +74,8 @@ impl Fixture {
             color: profile.default_color,
             intensity: 1.0,
             beam_angle: profile.default_beam_angle,
+            optics: OpticalControls::default(),
+            motion: WheelMotion::default(),
         }
     }
 
@@ -84,6 +94,8 @@ impl Fixture {
             color: [1.0, 0.95, 0.85],
             intensity: 1.0,
             beam_angle,
+            optics: OpticalControls::default(),
+            motion: WheelMotion::default(),
         }
     }
 

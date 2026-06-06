@@ -8,6 +8,7 @@
 //! target, raymarches volumetric beams into it, then blooms + tonemaps it down
 //! to the LDR texture egui shows. See `docs/RESEARCH-volumetrics.md`.
 
+mod atlas;
 pub mod camera;
 pub mod fixture_model;
 pub mod mesh;
@@ -24,6 +25,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use winit::window::Window;
 
+use crate::optics;
 use crate::scene::library::FixtureGeometry;
 use crate::scene::{Fixture, RenderSettings, Scene, Selection};
 use camera::{CameraUniform, OrbitCamera};
@@ -43,13 +45,32 @@ struct VolumetricUniform {
     counts: [f32; 4],
 }
 
-/// One fixture as a spotlight for the raymarch (mirrors `Fixture` in the WGSL).
+/// One beam as the GPU sees it — a disc spotlight plus its full optical state
+/// (mirrors `Fixture` in `volumetric.wgsl` / `Light` in `mesh.wgsl`). A fixture
+/// with an active prism contributes several of these (one per facet copy).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct FixtureGpu {
-    pos_range: [f32; 4],
-    dir_cos: [f32; 4],
-    color: [f32; 4],
+    pos_range: [f32; 4],   // xyz = lens pos, w = range (m)
+    dir_cos: [f32; 4],     // xyz = beam dir (unit), w = tan(half zoom angle)
+    color: [f32; 4],       // rgb = tint*intensity*candela*shutter, w = lens radius (m)
+    cookie_r: [f32; 4],    // xyz = lens-plane right basis, w = gobo1 atlas layer (frac; <0 none)
+    cookie_u: [f32; 4],    // xyz = lens-plane up basis,    w = gobo1 rotation (rad)
+    extra: [f32; 4],       // x = gobo2 layer (<0 none), y = gobo2 rot, z = anim layer (<0 none), w = anim scroll
+    shape: [f32; 4],       // x = super-Gaussian order, y = focus dist (m), z = iris frac, w = frost 0..1
+    misc: [f32; 4],        // x = CA strength, y = unused, z = atlas layer count, w = unused
+}
+
+impl FixtureGpu {
+    /// A disabled (zero-radiance) beam — used to keep the storage buffer's bound
+    /// length ≥ 1 when the scene has no fixtures.
+    fn disabled() -> Self {
+        let mut f = Self::zeroed();
+        f.cookie_r[3] = -1.0;
+        f.extra[0] = -1.0;
+        f.extra[2] = -1.0;
+        f
+    }
 }
 
 /// Tonemap controls (mirrors `Post` in `post.wgsl`).
@@ -73,21 +94,27 @@ pub struct Renderer {
 
     line_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
+    lens_pipeline: wgpu::RenderPipeline,
     light_layout: wgpu::BindGroupLayout,
 
     grid_mesh: GpuMesh,
     floor_mesh: GpuMesh,
     cylinder_mesh: GpuMesh,
     cone_mesh: GpuMesh,
+    disc_mesh: GpuMesh,
 
     floor_instances: GrowBuffer,
     fixture_instances: GrowBuffer,
+    lens_instances: GrowBuffer,
     dynamic_lines: GrowBuffer,
 
     // Imported GDTF fixture models: per-fixture-type (Arc ptr) cache of part
     // meshes (keyed by model name), plus a per-frame instance buffer.
     gdtf_cache: HashMap<usize, HashMap<String, GpuMesh>>,
     gdtf_instances: GrowBuffer,
+
+    // Gobo/animation texture atlas (built from GDTF wheel media on first load).
+    gobo_atlas: atlas::GoboAtlas,
 
     // Volumetric raymarch (rendered at half resolution, then upsampled).
     volumetric_pipeline: wgpu::RenderPipeline,
@@ -211,6 +238,7 @@ impl Renderer {
 
         let line_pipeline = pipeline::line_pipeline(&device, &line_layout);
         let mesh_pipeline = pipeline::mesh_pipeline(&device, &mesh_layout);
+        let lens_pipeline = pipeline::lens_pipeline(&device, &line_layout);
 
         // --- meshes ---
         let grid_mesh = GpuMesh::new(&device, "grid", &mesh::grid_and_axes(20.0, 1.0));
@@ -225,11 +253,13 @@ impl Renderer {
             "fixture-cone",
             &mesh::cone(0.45, 0.45 * 12.0_f32.to_radians().tan(), 28),
         );
+        let disc_mesh = GpuMesh::new(&device, "lens-disc", &mesh::disc(48));
 
         let vertex = wgpu::BufferUsages::VERTEX;
         let inst = std::mem::size_of::<MeshInstance>() as u64;
         let floor_instances = GrowBuffer::new(&device, "floor-instances", vertex, inst);
         let fixture_instances = GrowBuffer::new(&device, "fixture-instances", vertex, inst * 64);
+        let lens_instances = GrowBuffer::new(&device, "lens-instances", vertex, inst * 64);
         let dynamic_lines = GrowBuffer::new(&device, "dynamic-lines", vertex, 8192);
         let gdtf_instances = GrowBuffer::new(&device, "gdtf-instances", vertex, inst * 32);
 
@@ -336,6 +366,8 @@ impl Renderer {
         );
         let viewport = Viewport::new(&device, &mut egui_renderer, (width, height));
 
+        let gobo_atlas = atlas::GoboAtlas::new(&device, &queue);
+
         Self {
             surface,
             device,
@@ -346,16 +378,20 @@ impl Renderer {
             camera_bind_group,
             line_pipeline,
             mesh_pipeline,
+            lens_pipeline,
             light_layout,
             grid_mesh,
             floor_mesh,
             cylinder_mesh,
             cone_mesh,
+            disc_mesh,
             floor_instances,
             fixture_instances,
+            lens_instances,
             dynamic_lines,
             gdtf_cache: HashMap::new(),
             gdtf_instances,
+            gobo_atlas,
             volumetric_pipeline,
             volumetric_layout,
             volumetric_uniform,
@@ -403,6 +439,8 @@ impl Renderer {
     /// Load + cache a GDTF fixture's part meshes (GLBs) the first time it is
     /// seen. Keyed by the `Arc` pointer so all instances of a type share.
     fn ensure_gdtf_loaded(&mut self, key: usize, gdtf: &Arc<crate::gdtf::GdtfFixture>) {
+        // The atlas allocates its own (key, wheel) blocks and is idempotent.
+        self.gobo_atlas.ensure(&self.queue, key, gdtf);
         if self.gdtf_cache.contains_key(&key) {
             return;
         }
@@ -427,7 +465,7 @@ impl Renderer {
         &mut self,
         scene: &Scene,
         camera: &OrbitCamera,
-        selection: Selection,
+        selection: &Selection,
         settings: &RenderSettings,
         paint_jobs: &[egui::ClippedPrimitive],
         textures_delta: &egui::TexturesDelta,
@@ -531,7 +569,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture-encoder"),
             });
-        self.record_scene(&mut encoder, scene, camera, Selection::None, settings);
+        self.record_scene(&mut encoder, scene, camera, &Selection::default(), settings);
 
         // copy_texture_to_buffer requires bytes_per_row aligned to 256.
         let unpadded = width * 4;
@@ -594,7 +632,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         scene: &Scene,
         camera: &OrbitCamera,
-        selection: Selection,
+        selection: &Selection,
         settings: &RenderSettings,
     ) {
         let time = self.start_time.elapsed().as_secs_f32();
@@ -608,7 +646,7 @@ impl Renderer {
         // --- floor instance ---
         let floor_instance = [MeshInstance {
             model: Mat4::IDENTITY.to_cols_array_2d(),
-            color: [0.22, 0.22, 0.25],
+            color: [0.16, 0.16, 0.19],
             intensity: 1.0,
             selected: 0.0,
         }];
@@ -628,7 +666,7 @@ impl Renderer {
                     model: fixture.model_matrix().to_cols_array_2d(),
                     color: fixture.color,
                     intensity: fixture.intensity,
-                    selected: if selection == Selection::Fixture(i) { 1.0 } else { 0.0 },
+                    selected: if selection.contains_fixture(i) { 1.0 } else { 0.0 },
                 });
             }
             let count = fixture_instances.len() as u32 - start;
@@ -644,7 +682,8 @@ impl Renderer {
         let gdtf_to_world = Mat4::from_rotation_x(-FRAC_PI_2); // GDTF +Z up -> world +Y up
         let mut gdtf_parts: Vec<MeshInstance> = Vec::new();
         let mut gdtf_draws: Vec<(usize, String, u32)> = Vec::new();
-        let mut beam_override: Vec<Option<(Vec3, Vec3)>> = vec![None; scene.fixtures.len()];
+        let mut beam_override: Vec<Option<fixture_model::BeamFrame>> =
+            vec![None; scene.fixtures.len()];
         for (i, fixture) in scene.fixtures.iter().enumerate() {
             let Some(gdtf) = fixture.gdtf.clone() else {
                 continue;
@@ -654,7 +693,7 @@ impl Renderer {
             let root = Mat4::from_translation(fixture.position) * gdtf_to_world;
             let asm = fixture_model::assemble(&gdtf, root, fixture.pan, fixture.tilt);
             beam_override[i] = asm.beam;
-            let selected = if selection == Selection::Fixture(i) { 1.0 } else { 0.0 };
+            let selected = if selection.contains_fixture(i) { 1.0 } else { 0.0 };
             for part in &asm.parts {
                 if self
                     .gdtf_cache
@@ -679,10 +718,10 @@ impl Renderer {
         // --- dynamic lines: fog-box wireframes + beam indicators ---
         let mut lines: Vec<LineVertex> = Vec::new();
         for (i, env) in scene.environments.iter().enumerate() {
-            let color = if selection == Selection::Environment(i) {
-                [0.55, 0.95, 1.0]
+            let color = if selection.environment == Some(i) {
+                [0.6, 0.95, 1.0]
             } else {
-                [0.20, 0.40, 0.50]
+                [0.30, 0.55, 0.72]
             };
             mesh::push_box_wireframe(&mut lines, env.min().to_array(), env.max().to_array(), color);
         }
@@ -691,29 +730,36 @@ impl Renderer {
                 push_beam_indicator(&mut lines, &beam_spec(fixture, beam_override[i]));
             }
         }
-        // Selection gizmo for the selected fixture (RGB axes + marker box).
-        if let Selection::Fixture(sel) = selection
-            && let Some(f) = scene.fixtures.get(sel)
-        {
-            push_selection_gizmo(&mut lines, f.position);
+        // Selection gizmo for every selected fixture (RGB axes + marker box).
+        for &sel in &selection.fixtures {
+            if let Some(f) = scene.fixtures.get(sel) {
+                push_selection_gizmo(&mut lines, f.position);
+            }
         }
         let line_count = self.dynamic_lines.upload(&self.device, &self.queue, &lines);
 
         // --- volumetric uniforms + fixtures (use the first fog box, if any) ---
         let fog = scene.environments.first();
         let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
-        let gpu_fixtures: Vec<FixtureGpu> = if scene.fixtures.is_empty() {
-            vec![FixtureGpu::zeroed()]
-        } else {
-            scene
-                .fixtures
-                .iter()
-                .enumerate()
-                .map(|(i, f)| fixture_gpu(&beam_spec(f, beam_override[i])))
-                .collect()
-        };
+        // Resolve each fixture's optics → one (or, with a prism, several) GPU
+        // beams. The shaders loop `arrayLength(&fixtures)`, so prism expansion is
+        // transparent to them.
+        let mut gpu_fixtures: Vec<FixtureGpu> = Vec::with_capacity(scene.fixtures.len());
+        let mut lens_instances: Vec<MeshInstance> = Vec::with_capacity(scene.fixtures.len());
+        for (i, f) in scene.fixtures.iter().enumerate() {
+            let key = f.gdtf.as_ref().map(|g| Arc::as_ptr(g) as usize).unwrap_or(0);
+            let built = build_beam_gpus(f, beam_override[i], key, &self.gobo_atlas, time);
+            gpu_fixtures.extend(built.beams);
+            lens_instances.push(built.lens);
+        }
+        if gpu_fixtures.is_empty() {
+            gpu_fixtures.push(FixtureGpu::disabled());
+        }
         self.fixtures_storage
             .upload(&self.device, &self.queue, &gpu_fixtures);
+        let lens_count = self
+            .lens_instances
+            .upload(&self.device, &self.queue, &lens_instances);
 
         if let Some(fog) = fog {
             let inv_vp = camera.view_proj(aspect).inverse();
@@ -729,7 +775,7 @@ impl Renderer {
                     fog.color[2],
                     settings.beam_intensity,
                 ],
-                counts: [scene.fixtures.len() as f32, settings.steps.max(1) as f32, 0.0, 0.0],
+                counts: [gpu_fixtures.len() as f32, settings.steps.max(1) as f32, 0.0, 0.0],
             };
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
@@ -759,10 +805,20 @@ impl Renderer {
         let light_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("light-bg"),
             layout: &self.light_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: fixtures_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fixtures_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.gobo_atlas.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.gobo_atlas.sampler),
+                },
+            ],
         });
 
         let volumetric_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -788,6 +844,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&self.noise_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.gobo_atlas.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.gobo_atlas.sampler),
                 },
             ],
         });
@@ -828,9 +892,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.008,
-                            g: 0.010,
-                            b: 0.018,
+                            r: 0.002,
+                            g: 0.0025,
+                            b: 0.005,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -873,9 +937,21 @@ impl Renderer {
                 }
             }
 
+            // Glass/dust front lenses (one disc per fixture, camera-only pipeline).
+            if lens_count > 0 {
+                pass.set_pipeline(&self.lens_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.disc_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.lens_instances.buffer.slice(..));
+                pass.draw(0..self.disc_mesh.vertex_count, 0..lens_count);
+            }
+
             pass.set_pipeline(&self.line_pipeline);
-            pass.set_vertex_buffer(0, self.grid_mesh.vertex_buffer.slice(..));
-            pass.draw(0..self.grid_mesh.vertex_count, 0..1);
+            if settings.show_grid {
+                pass.set_vertex_buffer(0, self.grid_mesh.vertex_buffer.slice(..));
+                pass.draw(0..self.grid_mesh.vertex_count, 0..1);
+            }
+            // The fog-box border + gizmos (dynamic_lines) are always drawn.
             if line_count > 0 {
                 pass.set_vertex_buffer(0, self.dynamic_lines.buffer.slice(..));
                 pass.draw(0..line_count, 0..1);
@@ -984,51 +1060,179 @@ impl Renderer {
     }
 }
 
-/// Resolved beam for a fixture — either the GDTF Beam geometry's articulated
-/// origin/direction, or the placeholder fixture's lens.
+/// Lightweight beam description for the wireframe indicator gizmo only.
 struct BeamSpec {
     origin: Vec3,
     dir: Vec3,
     angle: f32,
     color: [f32; 3],
     intensity: f32,
-    lens_radius: f32,
 }
 
-fn beam_spec(fixture: &Fixture, gdtf_beam: Option<(Vec3, Vec3)>) -> BeamSpec {
-    let (origin, dir) =
-        gdtf_beam.unwrap_or_else(|| (fixture.lens_position(), fixture.beam_direction()));
-    let lens_radius = if fixture.is_gdtf() {
-        0.085
-    } else {
-        Fixture::BODY_RADIUS
+fn beam_spec(fixture: &Fixture, frame: Option<fixture_model::BeamFrame>) -> BeamSpec {
+    let (origin, dir) = match frame {
+        Some(f) => (f.origin, f.dir),
+        None => (fixture.lens_position(), fixture.beam_direction()),
+    };
+    // Show the indicator at the current (zoomed) angle for GDTF fixtures.
+    let angle = match &fixture.gdtf {
+        Some(g) => optics::map_attr(g, "Zoom", fixture.optics.zoom, (fixture.beam_angle, fixture.beam_angle)),
+        None => fixture.beam_angle,
     };
     BeamSpec {
         origin,
         dir,
-        angle: fixture.beam_angle,
+        angle,
         color: fixture.color,
         intensity: fixture.intensity,
-        lens_radius,
     }
 }
 
-/// Convert a beam to its GPU representation for the raymarch / surface lighting.
-/// The beam is a *disc* source (radius `lens_radius`) widening with the half
-/// angle, so it starts at the lens diameter rather than a single point.
-fn fixture_gpu(spec: &BeamSpec) -> FixtureGpu {
-    let tan_half = (spec.angle * 0.5).to_radians().tan();
-    let i = spec.intensity.max(0.0);
-    FixtureGpu {
-        pos_range: [spec.origin.x, spec.origin.y, spec.origin.z, 40.0],
-        dir_cos: [spec.dir.x, spec.dir.y, spec.dir.z, tan_half],
-        color: [
-            spec.color[0] * i,
-            spec.color[1] * i,
-            spec.color[2] * i,
-            spec.lens_radius,
-        ],
+/// The lens-plane geometry of a fixture's beam: where it exits, the direction it
+/// points, and a stable `right`/`up` cookie basis.
+fn beam_geometry(fixture: &Fixture, frame: Option<fixture_model::BeamFrame>) -> (Vec3, Vec3, Vec3, Vec3) {
+    match frame {
+        Some(f) => (f.origin, f.dir, f.right, f.up),
+        None => {
+            let m = fixture.model_matrix();
+            (
+                fixture.lens_position(),
+                fixture.beam_direction(),
+                m.transform_vector3(Vec3::X).normalize_or_zero(),
+                m.transform_vector3(Vec3::Z).normalize_or_zero(),
+            )
+        }
     }
+}
+
+/// An orthonormal lens-plane basis `(right, up)` perpendicular to `dir`, kept
+/// close to `hint_up` (falls back to a stable axis when `dir ‖ hint_up`).
+fn ortho_basis(dir: Vec3, hint_up: Vec3) -> (Vec3, Vec3) {
+    let mut right = hint_up.cross(dir);
+    if right.length_squared() < 1e-6 {
+        right = Vec3::X.cross(dir);
+    }
+    let right = right.normalize_or_zero();
+    let up = dir.cross(right).normalize_or_zero();
+    (right, up)
+}
+
+/// The GPU beams for a fixture plus its front-lens disc instance.
+struct BeamBuild {
+    beams: Vec<FixtureGpu>,
+    lens: MeshInstance,
+}
+
+/// Build a lens-disc instance facing `dir` at `origin`, radius `r`.
+fn lens_instance(origin: Vec3, dir: Vec3, right: Vec3, up: Vec3, r: f32, color: [f32; 3], intensity: f32) -> MeshInstance {
+    let model = Mat4::from_cols(
+        (right * r).extend(0.0),
+        (up * r).extend(0.0),
+        (dir * r).extend(0.0),
+        origin.extend(1.0),
+    );
+    MeshInstance { model: model.to_cols_array_2d(), color, intensity, selected: 0.0 }
+}
+
+/// Resolve a fixture's optical chain into the GPU beam(s) the shaders consume
+/// plus the front-lens disc. Returns one beam normally, or N (one per facet)
+/// when a prism is engaged. `key` is the GDTF Arc pointer; `time` drives strobe.
+fn build_beam_gpus(
+    fixture: &Fixture,
+    frame: Option<fixture_model::BeamFrame>,
+    key: usize,
+    atlas: &atlas::GoboAtlas,
+    time: f32,
+) -> BeamBuild {
+    let (origin, dir, right, up) = beam_geometry(fixture, frame);
+    let atlas_layers = atlas.layer_count() as f32;
+    const RANGE: f32 = 40.0;
+
+    let Some(gdtf) = &fixture.gdtf else {
+        // Placeholder (non-GDTF) fixture: a plain super-Gaussian cone, no cookie.
+        let i = fixture.intensity.max(0.0);
+        let tan_half = (fixture.beam_angle * 0.5).to_radians().tan().max(1e-3);
+        return BeamBuild {
+            beams: vec![FixtureGpu {
+                pos_range: [origin.x, origin.y, origin.z, RANGE],
+                dir_cos: [dir.x, dir.y, dir.z, tan_half],
+                color: [fixture.color[0] * i, fixture.color[1] * i, fixture.color[2] * i, Fixture::BODY_RADIUS],
+                cookie_r: [right.x, right.y, right.z, -1.0],
+                cookie_u: [up.x, up.y, up.z, 0.0],
+                extra: [-1.0, 0.0, -1.0, 0.0],
+                shape: [6.0, 8.0, 1.0, 0.0],
+                misc: [0.0, 0.0, atlas_layers, 0.0],
+            }],
+            lens: lens_instance(origin + dir * 0.02, dir, right, up, Fixture::BODY_RADIUS * 0.95, fixture.color, i),
+        };
+    };
+
+    let o = optics::resolve(gdtf, &fixture.optics, &fixture.motion, time, fixture.beam_angle);
+    let lens_radius = gdtf.beam.beam_radius.max(0.02);
+
+    // Gobo/animation wheel selections → absolute fractional atlas layers.
+    let layer_of = |sel: &Option<optics::WheelSel>| -> (f32, f32) {
+        match sel {
+            Some(s) => match atlas.base_layer(key, &s.wheel) {
+                Some(base) => (base as f32 + s.slot_frac, s.rot),
+                None => (-1.0, 0.0),
+            },
+            None => (-1.0, 0.0),
+        }
+    };
+    let (g1_layer, g1_rot) = layer_of(&o.gobo1);
+    let (g2_layer, g2_rot) = layer_of(&o.gobo2);
+    let (anim_layer, anim_scroll) = match &o.anim {
+        // Slot 0 = open (white), slot 1 = the animation glass.
+        Some((wheel, scroll)) => match atlas.base_layer(key, wheel) {
+            Some(base) => ((base + 1) as f32, *scroll),
+            None => (-1.0, 0.0),
+        },
+        None => (-1.0, 0.0),
+    };
+
+    let scale = fixture.intensity.max(0.0)
+        * fixture.optics.dimmer.max(0.0)
+        * o.candela
+        * o.shutter_gain;
+    let base_color = [o.tint[0] * scale, o.tint[1] * scale, o.tint[2] * scale];
+
+    // Each beam carries its OWN lens-plane basis (perpendicular to its own
+    // direction) — the radial falloff + cookie measure distance from that axis,
+    // so deflected prism copies render along their own axes, not the original.
+    let make = |bdir: Vec3, r: Vec3, u: Vec3, col: [f32; 3]| FixtureGpu {
+        pos_range: [origin.x, origin.y, origin.z, RANGE],
+        dir_cos: [bdir.x, bdir.y, bdir.z, o.tan_half],
+        color: [col[0], col[1], col[2], lens_radius],
+        cookie_r: [r.x, r.y, r.z, g1_layer],
+        cookie_u: [u.x, u.y, u.z, g1_rot],
+        extra: [g2_layer, g2_rot, anim_layer, anim_scroll],
+        shape: [o.n_order, o.focus_dist, o.iris, o.frost],
+        misc: [o.ca_strength, 0.0, atlas_layers, 0.0],
+    };
+
+    let beams = if o.prism.is_empty() {
+        vec![make(dir, right, up, base_color)]
+    } else {
+        // Each facet is a separated aerial beam: deflect the axis, rebuild its
+        // basis, split energy.
+        o.prism
+            .iter()
+            .map(|p| {
+                let d = (dir + right * p.offset[0] + up * p.offset[1]).normalize_or_zero();
+                let (r2, u2) = ortho_basis(d, up);
+                let c = [base_color[0] * p.weight, base_color[1] * p.weight, base_color[2] * p.weight];
+                make(d, r2, u2, c)
+            })
+            .collect()
+    };
+
+    // Physical front lens: at the beam exit, facing the (undeflected) beam, tinted
+    // by the colour chain and dimming/strobing with the source.
+    let lens_intensity = (fixture.intensity * fixture.optics.dimmer).max(0.0) * o.shutter_gain;
+    // Nudge the lens just in front of the head so it isn't occluded by the model.
+    let lens = lens_instance(origin + dir * 0.04, dir, right, up, lens_radius * 1.25, o.tint, lens_intensity);
+    BeamBuild { beams, lens }
 }
 
 /// Append a selection gizmo at `p`: RGB world axes plus a small amber marker

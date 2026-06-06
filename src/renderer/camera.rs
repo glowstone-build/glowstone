@@ -4,7 +4,7 @@
 //! uniform buffer / bind group and uploads [`CameraUniform`] each frame.
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 
 /// Camera data as the shaders see it (`grid.wgsl` / `mesh.wgsl` `Camera`).
 #[repr(C)]
@@ -94,6 +94,17 @@ impl OrbitCamera {
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         self.proj_matrix(aspect) * self.view_matrix()
+    }
+
+    /// Build a world-space picking ray for a normalized-device-coordinate point
+    /// (`ndc` in `-1..1`, y up). Returns `(origin, unit direction)`.
+    pub fn ray(&self, ndc: Vec2, aspect: f32) -> (Vec3, Vec3) {
+        let inv = self.view_proj(aspect).inverse();
+        let near = inv * Vec4::new(ndc.x, ndc.y, 0.0, 1.0);
+        let far = inv * Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+        let np = near.truncate() / near.w;
+        let fp = far.truncate() / far.w;
+        (np, (fp - np).normalize_or_zero())
     }
 
     pub fn uniform(&self, aspect: f32) -> CameraUniform {

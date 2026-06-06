@@ -5,6 +5,7 @@
 
 mod app;
 mod gdtf;
+mod optics;
 mod renderer;
 mod scene;
 mod ui;

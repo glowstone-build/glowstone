@@ -6,9 +6,24 @@ mod panels;
 use std::collections::HashMap;
 
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
+use glam::Vec3;
 
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::{Library, RenderSettings, Scene, Selection};
+
+/// State of the open Duplicate dialog (the `d`-key array tool). `None` = closed.
+pub struct DuplicateDialog {
+    /// Fixture being duplicated.
+    pub fixture: usize,
+    /// Per-copy translation (metres) — copy `i` is offset by `i × this`.
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// Per-copy pan rotation (degrees) about world Y — copy `i` pans by `i × this`.
+    pub y_angle: f32,
+    /// Number of copies to make.
+    pub count: u32,
+}
 
 /// egui textures decoded from a GDTF fixture's images (thumbnail + wheel slot
 /// media), cached per fixture type so they load once.
@@ -52,6 +67,11 @@ pub struct Ui {
     pub selection: Selection,
     pub settings: RenderSettings,
     pub requested_viewport_px: (u32, u32),
+    /// Whether the 3D viewport currently has interaction focus (drives the focus
+    /// border and whether the `d` shortcut opens the Duplicate dialog).
+    viewport_focused: bool,
+    /// The open Duplicate dialog, if any.
+    duplicate: Option<DuplicateDialog>,
 }
 
 impl Ui {
@@ -69,9 +89,11 @@ impl Ui {
             dock,
             library: Library::standard(),
             gdtf_textures: HashMap::new(),
-            selection: Selection::Fixture(0),
+            selection: Selection::fixture(0),
             settings: RenderSettings::default(),
             requested_viewport_px: (1, 1),
+            viewport_focused: false,
+            duplicate: None,
         }
     }
 
@@ -101,10 +123,85 @@ impl Ui {
             settings: &mut self.settings,
             viewport_texture,
             requested_viewport_px: &mut self.requested_viewport_px,
+            viewport_focused: &mut self.viewport_focused,
+            duplicate: &mut self.duplicate,
             fps,
         };
 
         DockArea::new(&mut self.dock).show(ctx, &mut viewer);
+
+        // The Duplicate dialog floats above the dock (the viewer's borrows are
+        // released now, so the scene/selection are free again).
+        duplicate_window(ctx, scene, &mut self.selection, &mut self.duplicate);
+    }
+}
+
+/// The modal Duplicate dialog: array the selected fixture by offset + Y angle.
+fn duplicate_window(
+    ctx: &egui::Context,
+    scene: &mut Scene,
+    selection: &mut Selection,
+    dialog: &mut Option<DuplicateDialog>,
+) {
+    let mut do_dup = false;
+    let mut close = false;
+
+    if let Some(d) = dialog.as_mut() {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        egui::Window::new("Duplicate")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("duplicate-grid")
+                    .num_columns(2)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("X offset");
+                        ui.add(egui::DragValue::new(&mut d.x).speed(0.05).suffix(" m"));
+                        ui.end_row();
+                        ui.label("Y offset");
+                        ui.add(egui::DragValue::new(&mut d.y).speed(0.05).suffix(" m"));
+                        ui.end_row();
+                        ui.label("Z offset");
+                        ui.add(egui::DragValue::new(&mut d.z).speed(0.05).suffix(" m"));
+                        ui.end_row();
+                        ui.label("Y angle");
+                        ui.add(egui::DragValue::new(&mut d.y_angle).speed(0.5).suffix("°"));
+                        ui.end_row();
+                        ui.label("Number of duplicates");
+                        ui.add(egui::DragValue::new(&mut d.count).speed(1.0).range(1..=500));
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Duplicate").clicked() {
+                        do_dup = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+    }
+
+    if do_dup {
+        if let Some(d) = dialog.as_ref()
+            && let Some(first) = scene.duplicate_fixture(
+                d.fixture,
+                Vec3::new(d.x, d.y, d.z),
+                d.y_angle,
+                d.count,
+            )
+        {
+            *selection = Selection::fixture(first);
+        }
+        close = true;
+    }
+    if close {
+        *dialog = None;
     }
 }
 
@@ -124,6 +221,8 @@ struct PanelViewer<'a> {
     settings: &'a mut RenderSettings,
     viewport_texture: egui::TextureId,
     requested_viewport_px: &'a mut (u32, u32),
+    viewport_focused: &'a mut bool,
+    duplicate: &'a mut Option<DuplicateDialog>,
     fps: f32,
 }
 
@@ -139,6 +238,10 @@ impl TabViewer for PanelViewer<'_> {
             Tab::Viewport => panels::viewport(
                 ui,
                 self.camera,
+                self.scene,
+                self.selection,
+                self.viewport_focused,
+                self.duplicate,
                 self.viewport_texture,
                 self.requested_viewport_px,
                 self.fps,
@@ -148,7 +251,7 @@ impl TabViewer for PanelViewer<'_> {
                 panels::library_browser(ui, self.library, self.scene, self.selection)
             }
             Tab::Inspector => {
-                panels::inspector(ui, self.scene, *self.selection, self.gdtf_textures)
+                panels::inspector(ui, self.scene, self.selection, self.gdtf_textures)
             }
             Tab::DmxMonitor => panels::dmx_monitor(ui, self.scene),
         }
