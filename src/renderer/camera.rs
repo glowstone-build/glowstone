@@ -67,6 +67,17 @@ impl OrbitCamera {
             .clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
     }
 
+    /// Frame a bounding sphere (`center`, `radius`): aim at the center and dolly
+    /// out far enough to fit it in view. Used after an MVR import to frame the
+    /// whole rig instead of the default single-fixture shot.
+    pub fn frame(&mut self, center: Vec3, radius: f32) {
+        self.target = center;
+        let half_fov = (self.fov_y * 0.5).max(0.1);
+        // Upper bound tracks the far plane so even a large imported rig fits.
+        let max = (self.zfar * 0.9).max(2.0);
+        self.distance = (radius / half_fov.sin()).clamp(2.0, max);
+    }
+
     /// Dolly in/out. `scroll` is a wheel delta; positive zooms in.
     pub fn zoom(&mut self, scroll: f32) {
         let factor = (1.0 - scroll * 0.1).clamp(0.5, 1.5);

@@ -35,6 +35,14 @@ pub struct GdtfFixture {
     pub beam_angle: f32,
     /// Physical source/optics parameters from the `Beam` geometry.
     pub beam: BeamData,
+    /// The fixture-definition file name — the MVR `GDTFSpec` / on-disk file name
+    /// (e.g. "Robe Lighting@Robin Esprite.gdtf"). Empty for ad-hoc loads; set by
+    /// [`load_path`](Self::load_path) and the MVR importer so an exported scene
+    /// can reference and re-bundle the right `.gdtf`.
+    pub spec: String,
+    /// The original `.gdtf` archive bytes, retained so an imported scene can be
+    /// re-bundled on MVR export without re-reading from disk.
+    pub raw: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// The physical light-source + beam optics declared on the GDTF `Beam`
@@ -173,7 +181,13 @@ pub struct ChannelFunction {
 impl GdtfFixture {
     pub fn load_path(path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        Self::load_bytes(&bytes)
+        let mut f = Self::load_bytes(&bytes)?;
+        f.spec = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        Ok(f)
     }
 
     pub fn load_bytes(bytes: &[u8]) -> Result<Self, String> {
@@ -375,6 +389,8 @@ impl GdtfFixture {
             modes,
             beam_angle,
             beam,
+            spec: String::new(),
+            raw: Some(std::sync::Arc::new(bytes.to_vec())),
         })
     }
 
@@ -497,8 +513,9 @@ fn parse_dmx_norm(s: &str) -> f32 {
     (value / max).clamp(0.0, 1.0) as f32
 }
 
-/// Parse a GDTF CIE `x,y,Y` color string into approximate linear RGB.
-fn parse_cie_xyy(s: &str) -> Option<[f32; 3]> {
+/// Parse a GDTF/MVR CIE `x,y,Y` color string into approximate linear RGB. Shared
+/// with the MVR importer (a `<Fixture>`'s `<Color>` uses the same xyY format).
+pub(crate) fn parse_cie_xyy(s: &str) -> Option<[f32; 3]> {
     let v: Vec<f32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
     if v.len() < 2 {
         return None;
@@ -537,7 +554,9 @@ fn resolve(names: &[String], want: &str) -> Option<String> {
 
 fn read_entry(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<Vec<u8>> {
     let mut f = archive.by_name(name).ok()?;
-    let mut buf = Vec::with_capacity(f.size() as usize);
+    // Cap the pre-allocation hint: the declared size is untrusted (a crafted
+    // archive could claim gigabytes). `read_to_end` still grows to real length.
+    let mut buf = Vec::with_capacity((f.size() as usize).min(16 * 1024 * 1024));
     f.read_to_end(&mut buf).ok()?;
     Some(buf)
 }

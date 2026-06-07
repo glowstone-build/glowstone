@@ -95,6 +95,38 @@ All parameters are pulled from the GDTF (validated against the Ayrton Khamsin:
 5-/4-facet prisms, CMY/CTO, frost, iris). The Inspector exposes a fader for every
 stage the fixture actually has.
 
+## MVR scene exchange
+
+[MVR](https://gdtf-share.com) (*My Virtual Rig*) is how lighting consoles and CAD
+tools exchange a whole show: an `.mvr` is a ZIP of a `GeneralSceneDescription.xml`
+scene graph plus the resources it references — embedded `.gdtf` fixture
+definitions and `.glb` 3D models for the stage, truss, and set.
+
+**Import** (`Library ▸ Import MVR…`) walks the layer/`ChildList` hierarchy and
+produces a flat scene:
+
+- **Fixtures** resolve their embedded GDTF (parsed once and shared across the
+  often-hundreds of instances), keep their real **hang orientation**, and carry
+  the **patch** (DMX address + break, `FixtureID`, mode, class/position refs,
+  custom commands) through for round-trip — shown in the Inspector. Imported
+  rigs start **blacked out** (no DMX = no output); bring fixtures up in the
+  Inspector or via a bulk selection.
+- **Scene objects** (stage decks, truss, set pieces, screens) load their `.glb`
+  meshes and draw as lit geometry that **occludes** the beams.
+
+**Export** (`Export MVR…`) writes the scene back to a valid `.mvr` — regenerating
+the XML (world→MVR matrices, metre→millimetre) and re-bundling every GDTF +
+model — preserving UUIDs, addresses, modes, and placement so it round-trips
+through other tools.
+
+The one thing to get right is coordinates: MVR is **right-handed, +Z-up**, with
+`<Matrix>` translations in **millimetres** while geometry vertices are in
+**metres**; a `<Matrix>` is four 3-vectors `{u}{v}{w}{o}` whose `u/v/w` are the
+rotation *columns*. The importer maps all of that onto the app's +Y-up metre
+world with a single −90° X basis change (the same one the GDTF path uses), and
+the exporter inverts it. `src/mvr.rs` carries the parser, the writer, and the
+unit tests that pin the convention.
+
 ## Design
 
 Pure **wgpu + winit**. No game engine, no ECS — the renderer is written by
@@ -104,6 +136,8 @@ hand. The scene is plain structs and `Vec`s.
 src/
   main.rs            winit event loop; creates App; drives update/render
   app.rs             App: owns Renderer, Scene, Ui; orchestrates per frame
+  gdtf.rs            GDTF fixture import (zip + XML + glTF models + wheels)
+  mvr.rs             MVR scene import/export (scene graph, matrices, re-bundling)
   renderer/
     mod.rs           device/queue/surface/config; frame passes; instancing;
                      build_beam_gpus() resolves optics + prism beam-expansion
@@ -211,6 +245,12 @@ PREVIZ_BENCH=120 RUST_LOG=previz=info cargo run --release
 # CMY, CTO, frost, zoom, iris, animation, chromatic aberration) for the imported
 # fixture, to verify the whole beam chain without the UI:
 PREVIZ_GDTF=fixture.gdtf PREVIZ_SHEET=out_dir cargo run --release
+
+# Import an MVR scene and render it (the camera frames the rig). An imported rig
+# is blacked out by default, so add PREVIZ_EXPOSURE (boost) and/or PREVIZ_LEVELS
+# (bring all fixtures up) to see it; PREVIZ_MVR_EXPORT writes it back out:
+PREVIZ_MVR=scene.mvr PREVIZ_EXPOSURE=30 PREVIZ_SCREENSHOT=shot.png cargo run --release
+PREVIZ_MVR=scene.mvr PREVIZ_MVR_EXPORT=roundtrip.mvr cargo run --release
 ```
 
 ### Platform notes
@@ -233,8 +273,8 @@ Minimal and idiomatic; minimal `unsafe` (only what wgpu/bytemuck require).
 | `bytemuck` | POD casts for vertex/uniform buffers |
 | `pollster` | block on async wgpu init |
 | `env_logger`, `log` | logging |
-| `zip`, `roxmltree`, `gltf`, `image` | GDTF import (archive / XML / models / wheels) |
-| `rfd` | native "Import GDTF…" file dialog |
+| `zip`, `roxmltree`, `gltf`, `image` | GDTF + MVR import/export (archive / XML / models / wheels) |
+| `rfd` | native Import/Export file dialogs (GDTF, MVR) |
 
 Exact versions are pinned in `Cargo.toml`.
 
@@ -260,7 +300,20 @@ them:
   chromatic aberration — see [The beam engine](#the-beam-engine)). Tested with
   the Ayrton Khamsin. Still TODO: live per-channel DMX patch/control feeding the
   optical controls, GeometryReference instancing, framing-shutter blades.
-- **MVR** import/export — scene exchange with consoles and other previz tools.
+- **MVR** import/export — *first cut implemented*: **Library ▸ Import MVR…**
+  loads an `.mvr` scene (a ZIP of a `GeneralSceneDescription.xml` scene graph +
+  embedded `.gdtf` fixtures + `.glb` stage/truss geometry) exported by a console
+  or CAD tool (grandMA3, Vectorworks, Capture, Depence…). It places every
+  **fixture** (resolving + sharing its embedded GDTF, with the real hang
+  orientation and the DMX patch / FixtureID / mode preserved) and every static
+  **scene object** (stage decks, truss, set, screens) as lit geometry that
+  occludes the beams. **Export MVR…** writes the scene back out — fixtures,
+  placement, patch, bundled GDTF + geometry — round-tripping UUIDs / addresses /
+  modes / matrices. Coordinate handling (MVR is +Z-up, millimetres; geometry is
+  metres) and the column-vector `<Matrix>` are converted to the app's +Y-up
+  metre world. Tested with a 146-fixture / 52-object festival stage. Still TODO:
+  Symdef/Symbol instancing, FocusPoint aim targets, GDTF-defined trusses,
+  per-layer visibility toggles. See [MVR](#mvr-scene-exchange).
 - **Live DMX input** — sACN / Art-Net feeding the fixture parameters.
 
 ## License

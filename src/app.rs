@@ -100,6 +100,108 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Optional MVR scene import for testing: PREVIZ_MVR=scene.mvr loads a full
+        // scene (fixtures + static stage/truss geometry), replacing the demo
+        // fixtures, and frames the camera on the rig.
+        if let Ok(path) = std::env::var("PREVIZ_MVR") {
+            match crate::mvr::MvrImport::load_path(std::path::Path::new(&path)) {
+                Ok(import) => {
+                    let state = self.state.as_mut().unwrap();
+                    state.scene.import_mvr(import);
+                    if let Some((center, radius)) = state.scene.scene_frame() {
+                        state.camera.frame(center, radius * 1.15);
+                    }
+                    state.ui.selection = crate::scene::Selection::default();
+                    {
+                        let s = &state.scene;
+                        let pts: Vec<glam::Vec3> = s
+                            .fixtures
+                            .iter()
+                            .map(|f| f.position)
+                            .chain(s.geometry.iter().map(|g| g.transform.w_axis.truncate()))
+                            .collect();
+                        if let Some(first) = pts.first() {
+                            let (mut lo, mut hi) = (*first, *first);
+                            for p in &pts {
+                                lo = lo.min(*p);
+                                hi = hi.max(*p);
+                            }
+                            log::info!("mvr bounds: min {lo:?} max {hi:?}");
+                        }
+                    }
+                    log::info!("imported MVR: {path}");
+                }
+                Err(e) => log::error!("MVR import failed: {e}"),
+            }
+        }
+
+        // PREVIZ_LOOK builds a designed multi-colour stage look on the imported
+        // rig (using each fixture's CMY / zoom / gobo / prism / frost functions),
+        // plus haze + camera. The PREVIZ_FOG / EXPOSURE / CAM_* knobs override it.
+        if std::env::var("PREVIZ_LOOK").is_ok() {
+            apply_stage_look(self.state.as_mut().unwrap());
+        }
+
+        // Dev knobs for the headless capture paths below: override exposure and
+        // bring every fixture up to a level (so an imported, blacked-out rig is
+        // visible in a verification screenshot without wiring DMX).
+        if let Ok(v) = std::env::var("PREVIZ_EXPOSURE")
+            && let Ok(v) = v.parse::<f32>()
+        {
+            self.state.as_mut().unwrap().ui.settings.exposure = v;
+        }
+        if let Ok(v) = std::env::var("PREVIZ_LEVELS")
+            && let Ok(v) = v.parse::<f32>()
+        {
+            let state = self.state.as_mut().unwrap();
+            // PREVIZ_LEVELS_N=N lights only ~N fixtures, spread evenly across the
+            // rig (the rest stay blacked out) — a cleaner look than all-on.
+            let total = state.scene.fixtures.len().max(1);
+            let step = std::env::var("PREVIZ_LEVELS_N")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0 && n < total)
+                .map(|n| (total / n).max(1))
+                .unwrap_or(1);
+            // PREVIZ_TILT / PREVIZ_PAN aim the lit fixtures (degrees).
+            let tilt = std::env::var("PREVIZ_TILT").ok().and_then(|s| s.parse::<f32>().ok());
+            let pan = std::env::var("PREVIZ_PAN").ok().and_then(|s| s.parse::<f32>().ok());
+            for (i, f) in state.scene.fixtures.iter_mut().enumerate() {
+                if i % step == 0 {
+                    f.intensity = v;
+                    if let Some(t) = tilt {
+                        f.tilt = t;
+                    }
+                    if let Some(p) = pan {
+                        f.pan = p;
+                    }
+                } else {
+                    f.intensity = 0.0;
+                }
+            }
+        }
+
+        // PREVIZ_FOG=density overrides the haze density of the first environment
+        // (thinner haze → distinct beams instead of a uniform wash).
+        if let Ok(d) = std::env::var("PREVIZ_FOG")
+            && let Ok(d) = d.parse::<f32>()
+            && let Some(env) = self.state.as_mut().unwrap().scene.environments.first_mut()
+        {
+            env.density = d;
+        }
+
+        // Headless MVR export: PREVIZ_MVR_EXPORT=out.mvr writes the current scene
+        // (typically after a PREVIZ_MVR import) back out and exits — for
+        // round-trip verification.
+        if let Ok(out) = std::env::var("PREVIZ_MVR_EXPORT") {
+            match crate::mvr::export_path(&self.state.as_ref().unwrap().scene, std::path::Path::new(&out)) {
+                Ok(()) => log::info!("exported MVR: {out}"),
+                Err(e) => log::error!("MVR export failed: {e}"),
+            }
+            event_loop.exit();
+            return;
+        }
+
         // Headless optical contact sheet: PREVIZ_SHEET=dir (with PREVIZ_GDTF)
         // renders one screenshot per optical feature so the whole chain can be
         // verified without the UI. Dev harness, like PREVIZ_BENCH.
@@ -123,6 +225,40 @@ impl ApplicationHandler for App {
         // verifying the renderer without a visible window / CI.
         if let Ok(path) = std::env::var("PREVIZ_SCREENSHOT") {
             let state = self.state.as_mut().unwrap();
+            // Optional PREVIZ_RES=WIDTHxHEIGHT to render the screenshot at an
+            // explicit resolution instead of the window size.
+            if let Some((w, h)) = std::env::var("PREVIZ_RES").ok().and_then(|r| {
+                let (w, h) = r.split_once('x')?;
+                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+            }) {
+                state.renderer.resize_viewport((w.max(1), h.max(1)));
+            }
+            // PREVIZ_ZOOM scales the camera dolly distance (<1 = closer);
+            // PREVIZ_CAM_Y nudges the look-at height (metres).
+            if let Some(z) = std::env::var("PREVIZ_ZOOM").ok().and_then(|s| s.parse::<f32>().ok()) {
+                state.camera.distance *= z;
+            }
+            if let Some(dy) = std::env::var("PREVIZ_CAM_Y").ok().and_then(|s| s.parse::<f32>().ok()) {
+                state.camera.target.y += dy;
+            }
+            // Full camera override: PREVIZ_CAM_TARGET=x,y,z and PREVIZ_CAM_YAW /
+            // _PITCH (radians) / _DIST (metres) for an explicit eye-level shot.
+            let envf = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
+            if let Some(t) = std::env::var("PREVIZ_CAM_TARGET").ok().and_then(|s| {
+                let p: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (p.len() == 3).then(|| glam::Vec3::new(p[0], p[1], p[2]))
+            }) {
+                state.camera.target = t;
+            }
+            if let Some(y) = envf("PREVIZ_CAM_YAW") {
+                state.camera.yaw = y;
+            }
+            if let Some(p) = envf("PREVIZ_CAM_PITCH") {
+                state.camera.pitch = p;
+            }
+            if let Some(d) = envf("PREVIZ_CAM_DIST") {
+                state.camera.distance = d;
+            }
             let (w, h, pixels) =
                 state
                     .renderer
@@ -217,6 +353,106 @@ impl ApplicationHandler for App {
             state.window.request_redraw();
         }
     }
+}
+
+/// Build a designed multi-colour stage look on the imported rig, exercising each
+/// fixture's optical functions (CMY colour, zoom, gobo, prism, frost) plus a
+/// fanned pan/tilt, and tune haze + camera for it. Lights a spread subset (~24)
+/// so the beams read as a fan rather than a wash. Triggered by `PREVIZ_LOOK`.
+fn apply_stage_look(state: &mut State) {
+    use crate::optics::OpticalControls;
+
+    // Atmosphere + tone. Thin haze + forward scattering keeps the beams crisp
+    // shafts instead of flooding the fog with glow.
+    if let Some(env) = state.scene.environments.first_mut() {
+        env.density = 0.013;
+        env.color = [0.72, 0.74, 0.82];
+        // Moderate scattering so beam shafts read from the side, not only head-on.
+        env.anisotropy = 0.35;
+    }
+    state.ui.settings.exposure = 0.3;
+    state.ui.settings.bloom = 0.8;
+    state.ui.settings.beam_intensity = 430.0;
+
+    // A cool concert palette (blues/teal/lavender) with a single warm amber
+    // accent — reads cleanly and avoids the hot-pink fog wash.
+    let palette: [[f32; 3]; 6] = [
+        [0.15, 0.40, 1.0], // blue
+        [0.0, 0.85, 1.0],  // azure
+        [0.10, 1.0, 0.70], // teal
+        [1.0, 0.70, 0.20], // amber accent
+        [0.55, 0.40, 1.0], // lavender
+        [0.85, 0.95, 1.0], // cool white
+    ];
+
+    let n = state.scene.fixtures.len();
+    // Split by capability so the textured beams come from real gobo fixtures.
+    let gobo_idx: Vec<usize> = (0..n)
+        .filter(|&i| {
+            state.scene.fixtures[i]
+                .gdtf
+                .as_ref()
+                .map(|g| g.has_attribute("Gobo1"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let other_idx: Vec<usize> = (0..n).filter(|i| !gobo_idx.contains(i)).collect();
+    // Evenly sample `count` indices from a list.
+    let pick = |v: &[usize], count: usize| -> Vec<usize> {
+        if v.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let step = (v.len() / count).max(1);
+        v.iter().copied().step_by(step).take(count).collect()
+    };
+    let gobo_lit = pick(&gobo_idx, 10);
+    let color_lit = pick(&other_idx, 8);
+
+    // White textured gobo beams (WIDE, fanned) — these are the shafts.
+    let g = gobo_lit.len().max(2);
+    for (k, &i) in gobo_lit.iter().enumerate() {
+        let t = k as f32 / (g - 1) as f32;
+        let f = &mut state.scene.fixtures[i];
+        f.intensity = 1.0;
+        f.color = [1.0, 1.0, 1.0];
+        f.pan = -55.0 + t * 110.0;
+        f.tilt = 30.0 + (k % 3) as f32 * 8.0;
+        f.optics = OpticalControls::default();
+        f.optics.dimmer = 1.0;
+        f.optics.gobo1 = 4.0 / 6.0;
+        f.optics.zoom = 0.45; // wide so the cookie shows in the shaft, not just the floor
+        f.motion.gobo1_angle = 0.5 * t;
+    }
+    // Colour wash beams (narrow) — fill behind the gobo shafts.
+    let c = color_lit.len().max(2);
+    for (k, &i) in color_lit.iter().enumerate() {
+        let t = k as f32 / (c - 1) as f32;
+        let col = palette[k % palette.len()];
+        let f = &mut state.scene.fixtures[i];
+        f.intensity = 1.0;
+        f.color = col;
+        f.pan = -50.0 + t * 100.0;
+        f.tilt = 34.0 + (k % 2) as f32 * 8.0;
+        f.optics = OpticalControls::default();
+        f.optics.dimmer = 1.0;
+        f.optics.cmy = [1.0 - col[0], 1.0 - col[1], 1.0 - col[2]];
+        f.optics.zoom = 0.05 + (k % 3) as f32 * 0.05;
+        if k % 3 == 0 {
+            f.optics.prism1 = 1.0;
+            f.motion.prism1_angle = 0.5 * t;
+        }
+    }
+    log::info!(
+        "stage look: {} gobo shafts + {} colour beams",
+        gobo_lit.len(),
+        color_lit.len()
+    );
+
+    // 3/4 audience-level camera framing the fan (overridable via PREVIZ_CAM_*).
+    state.camera.target = glam::Vec3::new(-2.0, 3.0, -0.5);
+    state.camera.yaw = 0.4;
+    state.camera.pitch = -0.05;
+    state.camera.distance = 14.0;
 }
 
 /// Render one screenshot per optical feature into `dir` (dev verification of the

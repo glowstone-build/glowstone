@@ -64,7 +64,10 @@ fn collect_node(node: &gltf::Node, parent: Mat4, blob: Option<&[u8]>, out: &mut 
 
             for &i in &indices {
                 let i = i as usize;
-                let p = world.transform_point3(Vec3::from(positions[i]));
+                // Bounds-guard the index buffer: a malformed GLB (now reachable
+                // via untrusted MVR/GDTF import) can reference out-of-range verts.
+                let Some(&pos) = positions.get(i) else { continue };
+                let p = world.transform_point3(Vec3::from(pos));
                 let n = (normal_mat * Vec3::from(normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])))
                     .normalize_or_zero();
                 out.push(MeshVertex {

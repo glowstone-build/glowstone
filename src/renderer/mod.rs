@@ -113,6 +113,15 @@ pub struct Renderer {
     gdtf_cache: HashMap<usize, HashMap<String, GpuMesh>>,
     gdtf_instances: GrowBuffer,
 
+    // Imported MVR static geometry (stage/truss/set): cache of baked meshes
+    // keyed by the model blob's Arc pointer, plus a per-frame instance buffer.
+    scene_geom_cache: HashMap<usize, GpuMesh>,
+    scene_geom_instances: GrowBuffer,
+
+    // Placeholder cone bodies for GDTF fixtures whose 3D models didn't bake
+    // (absent / unsupported model format) — so the fixture is still visible.
+    gdtf_placeholder_instances: GrowBuffer,
+
     // Gobo/animation texture atlas (built from GDTF wheel media on first load).
     gobo_atlas: atlas::GoboAtlas,
 
@@ -262,6 +271,10 @@ impl Renderer {
         let lens_instances = GrowBuffer::new(&device, "lens-instances", vertex, inst * 64);
         let dynamic_lines = GrowBuffer::new(&device, "dynamic-lines", vertex, 8192);
         let gdtf_instances = GrowBuffer::new(&device, "gdtf-instances", vertex, inst * 32);
+        let scene_geom_instances =
+            GrowBuffer::new(&device, "scene-geom-instances", vertex, inst * 64);
+        let gdtf_placeholder_instances =
+            GrowBuffer::new(&device, "gdtf-placeholder-instances", vertex, inst * 16);
 
         // --- volumetric raymarch ---
         let volumetric_layout = pipeline::volumetric_bind_group_layout(&device);
@@ -391,6 +404,9 @@ impl Renderer {
             dynamic_lines,
             gdtf_cache: HashMap::new(),
             gdtf_instances,
+            scene_geom_cache: HashMap::new(),
+            scene_geom_instances,
+            gdtf_placeholder_instances,
             gobo_atlas,
             volumetric_pipeline,
             volumetric_layout,
@@ -455,6 +471,24 @@ impl Renderer {
         }
         log::info!("loaded GDTF '{}' — {} mesh parts", gdtf.name, meshes.len());
         self.gdtf_cache.insert(key, meshes);
+    }
+
+    /// Bake an imported MVR static-geometry model (a GLB blob) into a cached
+    /// mesh, keyed by the blob's `Arc` pointer so identical instances share and
+    /// re-imports allocate fresh entries. Returns the cache key, or `None` if the
+    /// GLB had no drawable geometry.
+    fn ensure_scene_geom_loaded(&mut self, model: &crate::mvr::GeometryModel) -> Option<usize> {
+        let key = Arc::as_ptr(&model.glb) as usize;
+        if !self.scene_geom_cache.contains_key(&key) {
+            let verts = fixture_model::load_glb(&model.glb);
+            if verts.is_empty() {
+                log::warn!("mvr: model '{}' baked to 0 triangles", model.file);
+                return None;
+            }
+            let mesh = GpuMesh::new(&self.device, &model.file, &verts);
+            self.scene_geom_cache.insert(key, mesh);
+        }
+        Some(key)
     }
 
     /// Render one frame. Returns `true` if a frame was presented (a `false`
@@ -682,6 +716,8 @@ impl Renderer {
         let gdtf_to_world = Mat4::from_rotation_x(-FRAC_PI_2); // GDTF +Z up -> world +Y up
         let mut gdtf_parts: Vec<MeshInstance> = Vec::new();
         let mut gdtf_draws: Vec<(usize, String, u32)> = Vec::new();
+        // GDTF fixtures whose models didn't bake get a placeholder cone instead.
+        let mut gdtf_placeholders: Vec<MeshInstance> = Vec::new();
         let mut beam_override: Vec<Option<fixture_model::BeamFrame>> =
             vec![None; scene.fixtures.len()];
         for (i, fixture) in scene.fixtures.iter().enumerate() {
@@ -690,10 +726,16 @@ impl Renderer {
             };
             let key = Arc::as_ptr(&gdtf) as usize;
             self.ensure_gdtf_loaded(key, &gdtf);
-            let root = Mat4::from_translation(fixture.position) * gdtf_to_world;
+            // Place the fixture: translate, then the MVR hang orientation (identity
+            // for app-created fixtures), then GDTF +Z-up → world +Y-up. Pan/tilt
+            // are articulated inside `assemble`.
+            let root = Mat4::from_translation(fixture.position)
+                * Mat4::from_quat(fixture.orientation)
+                * gdtf_to_world;
             let asm = fixture_model::assemble(&gdtf, root, fixture.pan, fixture.tilt);
             beam_override[i] = asm.beam;
             let selected = if selection.contains_fixture(i) { 1.0 } else { 0.0 };
+            let drawn_before = gdtf_draws.len();
             for part in &asm.parts {
                 if self
                     .gdtf_cache
@@ -711,9 +753,56 @@ impl Renderer {
                     gdtf_draws.push((key, part.model.clone(), idx));
                 }
             }
+            // No model parts baked for this fixture type — show a placeholder cone
+            // at the fixture (placed + aimed by its model matrix) so it's visible.
+            if gdtf_draws.len() == drawn_before {
+                gdtf_placeholders.push(MeshInstance {
+                    model: fixture.model_matrix().to_cols_array_2d(),
+                    color: [0.16, 0.16, 0.19],
+                    intensity: 1.0,
+                    selected,
+                });
+            }
         }
         self.gdtf_instances
             .upload(&self.device, &self.queue, &gdtf_parts);
+        let gdtf_placeholder_count = self
+            .gdtf_placeholder_instances
+            .upload(&self.device, &self.queue, &gdtf_placeholders);
+
+        // --- imported MVR static geometry (stage decks / truss / set pieces) ---
+        // Each model is baked once and drawn as one lit instance; the +Y-up GLB
+        // is flipped into the object's geometry frame before its world transform.
+        let glb_flip = crate::mvr::glb_yup_to_zup();
+        let mut scene_geom_instances: Vec<MeshInstance> = Vec::new();
+        let mut scene_geom_draws: Vec<(usize, u32)> = Vec::new();
+        for obj in &scene.geometry {
+            for model in &obj.models {
+                if let Some(key) = self.ensure_scene_geom_loaded(model) {
+                    let idx = scene_geom_instances.len() as u32;
+                    scene_geom_instances.push(MeshInstance {
+                        model: (obj.transform * glb_flip).to_cols_array_2d(),
+                        color: [0.13, 0.13, 0.15],
+                        intensity: 1.0,
+                        selected: 0.0,
+                    });
+                    scene_geom_draws.push((key, idx));
+                }
+            }
+        }
+        self.scene_geom_instances
+            .upload(&self.device, &self.queue, &scene_geom_instances);
+        // Drop baked meshes no longer referenced by the scene (e.g. after a new
+        // MVR import replaces the geometry) so the cache can't grow unbounded.
+        // Guarded so the steady state pays nothing.
+        if self.scene_geom_cache.len() > scene_geom_draws.len() {
+            let live: std::collections::HashSet<usize> = scene
+                .geometry
+                .iter()
+                .flat_map(|o| o.models.iter().map(|m| Arc::as_ptr(&m.glb) as usize))
+                .collect();
+            self.scene_geom_cache.retain(|k, _| live.contains(k));
+        }
 
         // --- dynamic lines: fog-box wireframes + beam indicators ---
         let mut lines: Vec<LineVertex> = Vec::new();
@@ -935,6 +1024,24 @@ impl Renderer {
                         pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
                     }
                 }
+            }
+
+            // Imported MVR static geometry (each model is one instance).
+            if !scene_geom_draws.is_empty() {
+                pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
+                for (key, idx) in &scene_geom_draws {
+                    if let Some(mesh) = self.scene_geom_cache.get(key) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
+                    }
+                }
+            }
+
+            // Placeholder cones for GDTF fixtures with no baked model.
+            if gdtf_placeholder_count > 0 {
+                pass.set_vertex_buffer(0, self.cone_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.gdtf_placeholder_instances.buffer.slice(..));
+                pass.draw(0..self.cone_mesh.vertex_count, 0..gdtf_placeholder_count);
             }
 
             // Glass/dust front lenses (one disc per fixture, camera-only pipeline).

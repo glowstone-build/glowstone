@@ -248,7 +248,7 @@ impl TabViewer for PanelViewer<'_> {
             ),
             Tab::Scene => panels::scene_outliner(ui, self.scene, self.selection, self.settings),
             Tab::Library => {
-                panels::library_browser(ui, self.library, self.scene, self.selection)
+                panels::library_browser(ui, self.library, self.scene, self.selection, self.camera)
             }
             Tab::Inspector => {
                 panels::inspector(ui, self.scene, self.selection, self.gdtf_textures)

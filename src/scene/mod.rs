@@ -10,7 +10,35 @@ pub use environment::Environment;
 pub use fixture::Fixture;
 pub use library::{EnvironmentProfile, FixtureProfile, Library};
 
-use glam::Vec3;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use glam::{Mat4, Vec3};
+
+use crate::mvr::{GeometryModel, MvrHeader, MvrImport, MvrObjectMeta};
+
+/// A static, non-fixture object placed in the scene — a stage deck, truss,
+/// set piece, or screen imported from MVR. Drawn as lit geometry that occludes
+/// beams; not a light source.
+pub struct SceneGeometry {
+    pub name: String,
+    /// World-space placement (Y-up, metres) of the object's frame. The renderer
+    /// applies the glTF +Y-up → geometry +Z-up flip to each model on top.
+    pub transform: Mat4,
+    /// The placed 3D models (file name + glTF bytes). Usually one per object.
+    pub models: Vec<GeometryModel>,
+    /// MVR round-trip metadata (UUID, class, layer). `None` for app-created.
+    pub mvr: Option<MvrObjectMeta>,
+}
+
+/// Document-level MVR data retained from an import so the scene can be written
+/// back out: the header (version/provider, layer/class/position tables) and
+/// every original resource blob (the `.gdtf`/`.glb`/texture bytes), keyed by
+/// archive file name.
+pub struct MvrSceneData {
+    pub header: MvrHeader,
+    pub resources: HashMap<String, Arc<Vec<u8>>>,
+}
 
 /// Global look/post-processing controls, edited in the UI and read by the
 /// renderer each frame (exposure/bloom tonemapping + the volumetric beam look).
@@ -84,6 +112,11 @@ impl Selection {
 pub struct Scene {
     pub fixtures: Vec<Fixture>,
     pub environments: Vec<Environment>,
+    /// Static imported geometry (stage, truss, set) — drawn but not a light.
+    pub geometry: Vec<SceneGeometry>,
+    /// Retained MVR document data, present when the scene came from an MVR
+    /// import, so it can be exported back out faithfully.
+    pub mvr: Option<MvrSceneData>,
 }
 
 impl Scene {
@@ -103,6 +136,8 @@ impl Scene {
         Self {
             fixtures: vec![fixture],
             environments: vec![environment],
+            geometry: Vec::new(),
+            mvr: None,
         }
     }
 
@@ -149,6 +184,51 @@ impl Scene {
             self.fixtures.push(f);
         }
         (count > 0).then_some(first)
+    }
+
+    /// Replace the scene's fixtures + static geometry with an imported MVR
+    /// scene. The environment volumes are kept (so the volumetric haze still
+    /// reads), and the document data is retained for round-trip export.
+    pub fn import_mvr(&mut self, import: MvrImport) {
+        self.fixtures.clear();
+        self.geometry.clear();
+        for f in import.fixtures {
+            self.fixtures.push(Fixture::from_mvr(f));
+        }
+        for o in import.objects {
+            self.geometry.push(SceneGeometry {
+                name: o.name,
+                transform: o.world,
+                models: o.models,
+                mvr: Some(o.meta),
+            });
+        }
+        self.mvr = Some(MvrSceneData {
+            header: import.header,
+            resources: import.resources,
+        });
+        log::info!(
+            "scene: imported MVR — {} fixtures, {} static objects",
+            self.fixtures.len(),
+            self.geometry.len()
+        );
+    }
+
+    /// Bounding sphere `(center, radius)` of all fixtures and static-geometry
+    /// origins, for framing the camera after an import. `None` if the scene is
+    /// empty.
+    pub fn scene_frame(&self) -> Option<(Vec3, f32)> {
+        let mut pts = self.fixtures.iter().map(|f| f.position).collect::<Vec<_>>();
+        pts.extend(self.geometry.iter().map(|g| g.transform.w_axis.truncate()));
+        let first = *pts.first()?;
+        let (mut lo, mut hi) = (first, first);
+        for p in &pts {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        let center = (lo + hi) * 0.5;
+        let radius = ((hi - lo).length() * 0.5).max(3.0);
+        Some((center, radius))
     }
 
     /// Add an imported GDTF fixture; returns its new index.

@@ -56,6 +56,22 @@ pub fn scene_outliner(
         }
     }
 
+    // Imported MVR static geometry (stage / truss / set) — read-only list.
+    if !scene.geometry.is_empty() {
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(
+            RichText::new(format!("GEOMETRY ({})", scene.geometry.len()))
+                .small()
+                .strong(),
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            for g in &scene.geometry {
+                ui.label(RichText::new(&g.name).weak().small());
+            }
+        });
+    }
+
     ui.add_space(10.0);
     ui.separator();
     ui.label(RichText::new("VIEW").small().strong());
@@ -101,6 +117,7 @@ pub fn library_browser(
     library: &mut Library,
     scene: &mut Scene,
     selection: &mut Selection,
+    camera: &mut OrbitCamera,
 ) {
     ui.heading("Library");
     ui.separator();
@@ -123,6 +140,46 @@ pub fn library_browser(
             Err(e) => log::error!("GDTF import failed: {e}"),
         }
     }
+
+    // Import / export a full MVR scene (fixtures + stage/truss geometry).
+    ui.horizontal(|ui| {
+        if ui
+            .button("📦  Import MVR…")
+            .on_hover_text("Load an .mvr scene (fixtures + stage geometry) from a console or CAD tool")
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("MVR scene", &["mvr"])
+                .pick_file()
+        {
+            match crate::mvr::MvrImport::load_path(&path) {
+                Ok(import) => {
+                    scene.import_mvr(import);
+                    if let Some((center, radius)) = scene.scene_frame() {
+                        camera.frame(center, radius * 1.15);
+                    }
+                    *selection = Selection::default();
+                }
+                Err(e) => log::error!("MVR import failed: {e}"),
+            }
+        }
+
+        // Export is only meaningful once there's something to write.
+        let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
+        if ui
+            .add_enabled(can_export, egui::Button::new("💾  Export MVR…"))
+            .on_hover_text("Write the current scene to an .mvr (fixtures, patch, placement, bundled GDTF + geometry)")
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("MVR scene", &["mvr"])
+                .set_file_name("scene.mvr")
+                .save_file()
+        {
+            match crate::mvr::export_path(scene, &path) {
+                Ok(()) => log::info!("exported MVR: {}", path.display()),
+                Err(e) => log::error!("MVR export failed: {e}"),
+            }
+        }
+    });
 
     // Imported GDTF fixtures (click + to add another instance).
     if !library.gdtf.is_empty() {
@@ -501,6 +558,23 @@ fn gdtf_inspector(
         .weak()
         .small(),
     );
+
+    // MVR patch identity (FixtureID, DMX address, mode) when imported from a scene.
+    if let Some(m) = fixture.mvr.as_deref() {
+        let id = if m.fixture_id.is_empty() { "—" } else { m.fixture_id.as_str() };
+        let addr = m
+            .addresses
+            .first()
+            .map(|a| format!("{}.{:03}", a.universe(), a.channel()))
+            .unwrap_or_else(|| "—".into());
+        let mode = if m.gdtf_mode.is_empty() { "—" } else { m.gdtf_mode.as_str() };
+        ui.label(
+            RichText::new(format!("MVR · ID {id} · addr {addr} · {mode}"))
+                .weak()
+                .small(),
+        )
+        .on_hover_text("Fixture ID · DMX universe.channel · mode, from the imported MVR patch");
+    }
 
     ui.separator();
     Grid::new("gdtf-params")
