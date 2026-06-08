@@ -41,10 +41,17 @@ fn opt_radial(axis_dist: f32, beam_r: f32, n: f32) -> f32 {
 // sample's lens-plane coordinates (distance-from-axis along right/up). The core
 // is white (all three overlap), so energy is conserved; only the edge separates.
 fn opt_radial_ca(pu: f32, pv: f32, beam_r: f32, n: f32, k: f32) -> vec3<f32> {
+    // Green is always centred; compute it once. With no chromatic aberration the
+    // red/blue images coincide with green (off = 0), so collapse to a single
+    // broadcast — byte-for-byte identical, but 2 of 3 super-Gaussian pow() gone.
+    let green = opt_radial(length(vec2<f32>(pu, pv)), beam_r, n);
+    if (abs(k) <= 0.001) {
+        return vec3<f32>(green, green, green);
+    }
     let off = k * beam_r;
     return vec3<f32>(
         opt_radial(length(vec2<f32>(pu + off, pv)), beam_r, n), // red  shifts −u (amber edge)
-        opt_radial(length(vec2<f32>(pu, pv)), beam_r, n),       // green centred
+        green,                                                  // green centred
         opt_radial(length(vec2<f32>(pu - off, pv)), beam_r, n), // blue shifts +u (cool edge)
     );
 }
@@ -111,10 +118,16 @@ fn opt_cookie_ca(
     g1: f32, r1: f32, g2: f32, r2: f32,
     anim_layer: i32, anim_scroll: f32, lod: f32, ca: f32,
 ) -> vec3<f32> {
+    // Green/centre cookie + animation are always needed; sample once. With no
+    // chromatic aberration the red/blue offset samples coincide with green, so
+    // skip them — byte-for-byte identical, up to 2 fewer cookie evaluations.
+    let cg = opt_cookie_at(t, s, guv, g1, r1, g2, r2, lod);
+    let anim = opt_anim(t, s, guv, anim_layer, anim_scroll, lod);
+    if (abs(ca) <= 0.001) {
+        return vec3<f32>(cg.r * cg.a, cg.g * cg.a, cg.b * cg.a) * anim;
+    }
     let off = vec2<f32>(ca * 0.5, 0.0);
     let cr = opt_cookie_at(t, s, guv + off, g1, r1, g2, r2, lod);
-    let cg = opt_cookie_at(t, s, guv, g1, r1, g2, r2, lod);
     let cb = opt_cookie_at(t, s, guv - off, g1, r1, g2, r2, lod);
-    let anim = opt_anim(t, s, guv, anim_layer, anim_scroll, lod);
     return vec3<f32>(cr.r * cr.a, cg.g * cg.a, cb.b * cb.a) * anim;
 }

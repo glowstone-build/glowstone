@@ -59,6 +59,11 @@ impl Default for RenderSettings {
             exposure: 1.0,
             bloom: 0.85,
             beam_intensity: 650.0,
+            // Max marching steps for a full-fog-box ray; the constant-dt cap scales
+            // it down for shorter rays at the SAME per-metre density. Kept at the
+            // pre-optimisation value because aerial gobo cross-sections alias into
+            // longitudinal stripes below ~64 samples — the speed-up comes from the
+            // lossless per-fixture pre-cull, not from marching fewer steps.
             steps: 80,
             show_beam_wireframes: false,
             show_grid: true,
@@ -131,7 +136,11 @@ impl Scene {
         fixture.intensity = 1.0;
 
         let fog = &library.environments[0];
-        let environment = Environment::from_profile(fog, "Fog Box", Vec3::ZERO);
+        // Sit the fog box ON the floor (y=0), not centred at the origin — otherwise
+        // its lower half is buried below the ground plane, where the raymarch wastes
+        // steps and, from a low camera, beams visibly render under the floor.
+        let on_floor = Vec3::new(0.0, fog.default_size[1] * 0.5, 0.0);
+        let environment = Environment::from_profile(fog, "Fog Box", on_floor);
 
         Self {
             fixtures: vec![fixture],
@@ -247,8 +256,10 @@ impl Scene {
     pub fn add_environment(&mut self, profile: &EnvironmentProfile) -> usize {
         let n = self.environments.len() + 1;
         let name = format!("{} {}", profile.name, n);
+        // Rest the box on the floor (see Scene::demo) so it doesn't sink below ground.
+        let on_floor = Vec3::new(0.0, profile.default_size[1] * 0.5, 0.0);
         self.environments
-            .push(Environment::from_profile(profile, name, Vec3::ZERO));
+            .push(Environment::from_profile(profile, name, on_floor));
         self.environments.len() - 1
     }
 }

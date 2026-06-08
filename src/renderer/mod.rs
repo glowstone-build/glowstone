@@ -853,6 +853,11 @@ impl Renderer {
         if let Some(fog) = fog {
             let inv_vp = camera.view_proj(aspect).inverse();
             let eye = camera.eye();
+            // Constant-dt target for the raymarch: a full-diagonal ray spends the
+            // whole `steps` budget; shorter clipped rays scale their step count down
+            // to keep per-metre sampling (dt) roughly constant. See volumetric.wgsl.
+            let steps = settings.steps.max(1);
+            let target_dt = (fog.max() - fog.min()).length() / steps as f32;
             let vol = VolumetricUniform {
                 inv_view_proj: inv_vp.to_cols_array_2d(),
                 eye_time: [eye.x, eye.y, eye.z, time],
@@ -864,7 +869,7 @@ impl Renderer {
                     fog.color[2],
                     settings.beam_intensity,
                 ],
-                counts: [gpu_fixtures.len() as f32, settings.steps.max(1) as f32, 0.0, 0.0],
+                counts: [gpu_fixtures.len() as f32, steps as f32, target_dt, 0.0],
             };
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
@@ -1260,16 +1265,24 @@ fn build_beam_gpus(
         let i = fixture.intensity.max(0.0);
         let tan_half = (fixture.beam_angle * 0.5).to_radians().tan().max(1e-3);
         return BeamBuild {
-            beams: vec![FixtureGpu {
-                pos_range: [origin.x, origin.y, origin.z, RANGE],
-                dir_cos: [dir.x, dir.y, dir.z, tan_half],
-                color: [fixture.color[0] * i, fixture.color[1] * i, fixture.color[2] * i, Fixture::BODY_RADIUS],
-                cookie_r: [right.x, right.y, right.z, -1.0],
-                cookie_u: [up.x, up.y, up.z, 0.0],
-                extra: [-1.0, 0.0, -1.0, 0.0],
-                shape: [6.0, 8.0, 1.0, 0.0],
-                misc: [0.0, 0.0, atlas_layers, 0.0],
-            }],
+            // A blacked-out fixture emits nothing, so it must not cost anything in the
+            // per-step raymarch / floor-pool loops — emit no beam. (The lens instance
+            // is still built; it's dark too.) Big win for "patch the whole rig, light
+            // a few" scenes, where most fixtures sit at intensity 0.
+            beams: if i < 1e-4 {
+                Vec::new()
+            } else {
+                vec![FixtureGpu {
+                    pos_range: [origin.x, origin.y, origin.z, RANGE],
+                    dir_cos: [dir.x, dir.y, dir.z, tan_half],
+                    color: [fixture.color[0] * i, fixture.color[1] * i, fixture.color[2] * i, Fixture::BODY_RADIUS],
+                    cookie_r: [right.x, right.y, right.z, -1.0],
+                    cookie_u: [up.x, up.y, up.z, 0.0],
+                    extra: [-1.0, 0.0, -1.0, 0.0],
+                    shape: [6.0, 8.0, 1.0, 0.0],
+                    misc: [0.0, 0.0, atlas_layers, 0.0],
+                }]
+            },
             lens: lens_instance(origin + dir * 0.02, dir, right, up, Fixture::BODY_RADIUS * 0.95, fixture.color, i),
         };
     };
@@ -1298,10 +1311,11 @@ fn build_beam_gpus(
         None => (-1.0, 0.0),
     };
 
-    let scale = fixture.intensity.max(0.0)
-        * fixture.optics.dimmer.max(0.0)
-        * o.candela
-        * o.shutter_gain;
+    // Commanded output level (candela-independent): intensity × dimmer × shutter.
+    // ~0 means the fixture is blacked out — emit no beams so the raymarch / floor
+    // loop skips it entirely (the dominant cost in a mostly-dark patched rig).
+    let level = fixture.intensity.max(0.0) * fixture.optics.dimmer.max(0.0) * o.shutter_gain;
+    let scale = level * o.candela;
     let base_color = [o.tint[0] * scale, o.tint[1] * scale, o.tint[2] * scale];
 
     // Each beam carries its OWN lens-plane basis (perpendicular to its own
@@ -1318,7 +1332,9 @@ fn build_beam_gpus(
         misc: [o.ca_strength, 0.0, atlas_layers, 0.0],
     };
 
-    let beams = if o.prism.is_empty() {
+    let beams = if level < 1e-4 {
+        Vec::new()
+    } else if o.prism.is_empty() {
         vec![make(dir, right, up, base_color)]
     } else {
         // Each facet is a separated aerial beam: deflect the axis, rebuild its

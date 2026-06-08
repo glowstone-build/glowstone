@@ -16,7 +16,7 @@ struct Volumetric {
     fog_min_density: vec4<f32>, // xyz = box min, w = base density (sigma_t)
     fog_max_g: vec4<f32>,       // xyz = box max, w = anisotropy g
     albedo_beam: vec4<f32>,     // rgb = scattering tint, w = beam intensity
-    counts: vec4<f32>,          // y = step count
+    counts: vec4<f32>,          // y = max step count, z = constant-dt target (world m)
 };
 
 struct Fixture {
@@ -59,6 +59,13 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
+// Exact Henyey–Greenstein phase (forward peak at cosθ=+1 with the −2g·cosθ
+// convention, cosθ = dot(bdir, −rd)). We tried the Schlick pow-free approximation
+// k=1.55g−0.55g³, but k crosses 1 at |g|≳0.93 (the anisotropy slider reaches
+// ±0.95), where (1−k²) flips negative and the forward lobe inverts to backscatter
+// — a visible blow-up at exactly the sharp-beam setting users crank toward. The
+// exact form has no such edge, and its one pow() is no longer hot: the per-fixture
+// radial pre-cull already skips the phase for samples outside the beam.
 fn hg(cos_theta: f32, g: f32) -> f32 {
     let g2 = g * g;
     let denom = 1.0 + g2 - 2.0 * g * cos_theta;
@@ -132,7 +139,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0); // no media: scene passes through
     }
 
-    let steps = max(i32(u.counts.y), 1);
+    let max_steps = max(i32(u.counts.y), 1);
     let count = i32(arrayLength(&fixtures));
     let g = u.fog_max_g.w;
     let base = u.fog_min_density.w;
@@ -142,14 +149,34 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     let ambient = albedo * 0.012; // very dim ambient haze; beams do the lighting
 
     let seg = t_far - t_near;
-    let dt = seg / f32(steps);
+
+    // Constant-dt step cap (1.4): scale the step count to the clipped segment so a
+    // ray skimming a thin slice of the fog box doesn't pay the full budget. The
+    // CPU supplies target_dt = box_diagonal / steps (world m) in counts.z; keeping
+    // dt (not the count) roughly constant gives equal per-metre sampling on every
+    // ray — no seam between short and long rays.
+    var nsteps = max_steps;
+    let target_dt = u.counts.z;
+    if (target_dt > 1e-4) {
+        nsteps = clamp(i32(round(seg / target_dt)), 8, max_steps);
+    }
+    let fn_steps = f32(nsteps);
+
+    // Uniform spacing within the (constant-dt-capped) budget. We tried front-
+    // loading samples exponentially toward the fog-box entry, but in this renderer
+    // the sharp aerial detail (gobo cross-section, CA fringe) is spread along the
+    // WHOLE beam in fixture space, not near the camera — so a camera-anchored bias
+    // starves the far beam and aliases gobo structure into longitudinal stripes.
+    // Equal spacing + per-pixel jitter is the robust choice; the count reduction
+    // (and the constant-dt cap above) is where the speed comes from.
+    let dt = seg / fn_steps;
     let jitter = ign(in.pos.xy + time * 60.0);
-    var t = t_near + dt * jitter;
 
     var transmittance = 1.0;
     var scatter = vec3<f32>(0.0);
 
-    for (var i = 0; i < steps; i = i + 1) {
+    for (var i = 0; i < nsteps; i = i + 1) {
+        let t = t_near + dt * (f32(i) + jitter);
         let p = ro + rd * t;
         let dens = base * density_at(p, time);
         let sigma_t = max(dens, 1e-5);
@@ -181,6 +208,16 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             let frost = fx.shape.w;
             let cone_r = lens_r + depth * tan_half;     // un-iris cone (cookie scale)
             let beam_r = cone_r * iris;                  // iris crops the lit radius
+            // Radial pre-cull: skip the super-Gaussian + cookie work for samples
+            // far outside this beam. Past 2.5·beam_r BOTH the core and the spill
+            // tail of opt_radial fall under the rad_max ≤ 0.002 gate below for
+            // every valid n_order (clamped ≥ 1.2 in optics::resolve), and +|ca|
+            // keeps the chromatic side-samples in range — so this is a lossless
+            // early-out, not a clip.
+            let cull = beam_r * (2.5 + abs(fx.misc.x));
+            if (pu * pu + pv * pv > cull * cull) {
+                continue;
+            }
             let rad3 = opt_radial_ca(pu, pv, beam_r, n_order, fx.misc.x);
             let rad_max = max(rad3.x, max(rad3.y, rad3.z));
             if (rad_max <= 0.002) {
@@ -213,7 +250,6 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
         if (transmittance < 0.012) {
             break;
         }
-        t += dt;
     }
 
     return vec4<f32>(scatter, transmittance);

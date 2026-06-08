@@ -72,10 +72,11 @@ fn vs_main(in: VsIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let normal = normalize(in.world_normal);
 
-    // Near-zero ambient: surfaces read dark like a blacked-out venue and are lit
-    // almost entirely by the fixtures (the floor is dark except in beam pools).
+    // Low ambient/fill — the venue still reads dark and beams do the real lighting,
+    // but set geometry stays faintly readable where no beam reaches it (previz wants
+    // to see the rig, not a pure blackout).
     let key_dir = normalize(vec3<f32>(0.4, 1.0, 0.6));
-    let key = 0.012 + max(dot(normal, key_dir), 0.0) * 0.03;
+    let key = 0.03 + max(dot(normal, key_dir), 0.0) * 0.05;
 
     // Illumination from every fixture spotlight reaching this surface point.
     var fixture_light = vec3<f32>(0.0);
@@ -98,6 +99,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let pv = dot(rel, lt.cookie_u.xyz);
         let cone_r = lens_r + depth * tan_half;
         let beam_r = cone_r * lt.shape.z;
+        // Same lossless radial pre-cull as the volumetric pass (keeps the floor
+        // pool in lock-step with the beam shaft): skip the optics chain for samples
+        // past where the radial falls under the 0.002 gate for any valid n_order
+        // (≥ 1.2), with +|ca| margin for the chromatic side-samples.
+        let cull = beam_r * (2.5 + abs(lt.misc.x));
+        if (pu * pu + pv * pv > cull * cull) {
+            continue;
+        }
         let rad3 = opt_radial_ca(pu, pv, beam_r, lt.shape.x, lt.misc.x);
         let rad_max = max(rad3.x, max(rad3.y, rad3.z));
         if (rad_max <= 0.002) {
@@ -114,7 +123,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             continue;
         }
         let l = normalize(lpos - in.world_pos);
-        let ndl = max(dot(normal, l), 0.0);
+        // Half-Lambert wrap (not hard N·L): a surface edge-on to the beam (a wall or
+        // riser under a downward wash) still catches the projected gobo/pool instead
+        // of going black, so the light reads on set geometry, not just the up-facing
+        // floor. The cookie/cone gates above already decide WHERE the light lands;
+        // this only softens how brightness falls off with surface facing.
+        let ndl = clamp(dot(normal, l) * 0.5 + 0.5, 0.0, 1.0);
         let atten = 1.0 / (1.0 + depth * depth * 0.015);
         fixture_light += lt.color.rgb * trans * (rad3 * (ndl * atten * 9.0));
     }
