@@ -75,6 +75,14 @@ impl FixtureGpu {
     }
 }
 
+/// SSAO params (mirrors `Ao` in `ssao.wgsl`): near, far, world-radius-in-px-at-1m,
+/// intensity.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AoUniform {
+    params: [f32; 4],
+}
+
 /// Tonemap controls (mirrors `Post` in `post.wgsl`).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -142,6 +150,11 @@ pub struct Renderer {
     noise_texture: wgpu::Texture,
     noise_view: wgpu::TextureView,
     noise_sampler: wgpu::Sampler,
+
+    // Screen-space AO (Unlit mode only): multiply-blended onto the HDR.
+    ssao_pipeline: wgpu::RenderPipeline,
+    ssao_layout: wgpu::BindGroupLayout,
+    ao_uniform: wgpu::Buffer,
 
     // Post (bloom + tonemap).
     bloom_bright: wgpu::RenderPipeline,
@@ -364,6 +377,16 @@ impl Renderer {
             ..Default::default()
         });
 
+        // --- screen-space AO (Unlit mode) ---
+        let ssao_layout = pipeline::ssao_bind_group_layout(&device);
+        let ssao_pipeline = pipeline::ssao_pipeline(&device, &ssao_layout);
+        let ao_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ao-uniform"),
+            size: std::mem::size_of::<AoUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // --- post (bloom + tonemap) ---
         let single_tex_layout = pipeline::single_tex_bind_group_layout(&device);
         let composite_pipeline = pipeline::composite_pipeline(&device, &single_tex_layout);
@@ -437,6 +460,9 @@ impl Renderer {
             volumetric_uniform,
             fixtures_storage,
             composite_pipeline,
+            ssao_pipeline,
+            ssao_layout,
+            ao_uniform,
             noise_texture,
             noise_view,
             noise_sampler,
@@ -1210,6 +1236,48 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.dynamic_lines.buffer.slice(..));
                 pass.draw(0..line_count, 0..1);
             }
+        }
+
+        // Pass 1.5: SSAO (Unlit mode) — multiply a depth-based occlusion factor
+        // onto the otherwise-flat HDR so geometry gains contact/crevice shading.
+        if settings.mode == ViewportMode::Unlit {
+            let focal_px = self.viewport.size.1 as f32 * 0.5 / (camera.fov_y * 0.5).tan();
+            let ao = AoUniform {
+                // near, far, world-radius (~0.6 m) in px at 1 m, intensity.
+                params: [camera.znear, camera.zfar, 0.6 * focal_px, 2.1],
+            };
+            self.queue.write_buffer(&self.ao_uniform, 0, bytemuck::bytes_of(&ao));
+            let ao_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ssao-bg"),
+                layout: &self.ssao_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.ao_uniform.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ssao-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.viewport.hdr_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.ssao_pipeline);
+            pass.set_bind_group(0, &ao_bg, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         // Pass 2a: volumetric raymarch -> half-res vol target (scatter, transmit).

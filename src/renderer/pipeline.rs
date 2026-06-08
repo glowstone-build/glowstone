@@ -311,6 +311,52 @@ fn shadow_matrices_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// Depth texture + a small params uniform for the SSAO pass (group 0).
+pub fn ssao_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("ssao-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// SSAO: reads the depth buffer, MULTIPLY-blends an occlusion factor onto the HDR
+/// target (`out = ao * hdr`) so flat Unlit geometry gains contact/crevice shading.
+pub fn ssao_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgpu::RenderPipeline {
+    let shader = load(device, "ssao.wgsl", include_str!("../shaders/ssao.wgsl"));
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Dst,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent::REPLACE,
+    };
+    fullscreen_pipeline(
+        device, "ssao-pipeline", layout, &shader, "fs_ssao", Viewport::HDR_FORMAT, Some(blend),
+    )
+}
+
 /// One sampled texture + a filtering sampler (bloom bright/blur).
 pub fn single_tex_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
