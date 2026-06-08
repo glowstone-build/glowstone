@@ -209,12 +209,17 @@ pub fn volumetric_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 7: hero-beam shadow atlas, 8: comparison sampler, 9: shadow matrices.
+            shadow_atlas_entry(7),
+            shadow_sampler_entry(8),
+            shadow_matrices_entry(9),
         ],
     })
 }
 
 /// Fixtures-as-spotlights storage buffer + the gobo atlas for surface lighting
-/// (mesh group 1): binding 0 = fixtures, 1 = atlas texture, 2 = atlas sampler.
+/// (mesh group 1): binding 0 = fixtures, 1 = atlas texture, 2 = atlas sampler,
+/// 3 = hero-beam shadow atlas, 4 = its comparison sampler, 5 = shadow matrices.
 pub fn light_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("light-bgl"),
@@ -245,8 +250,49 @@ pub fn light_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            shadow_atlas_entry(3),
+            shadow_sampler_entry(4),
+            shadow_matrices_entry(5),
         ],
     })
+}
+
+/// Shadow atlas (`texture_depth_2d_array`) bind-group-layout entry.
+fn shadow_atlas_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// Shadow comparison sampler (`sampler_comparison`) bind-group-layout entry.
+fn shadow_sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+        count: None,
+    }
+}
+
+/// Shadow light view-proj matrices (`array<mat4>` storage) bind-group-layout entry.
+fn shadow_matrices_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 /// One sampled texture + a filtering sampler (bloom bright/blur).

@@ -14,6 +14,7 @@ pub mod fixture_model;
 pub mod mesh;
 mod noise;
 mod pipeline;
+mod shadow;
 pub mod viewport;
 
 use std::collections::HashMap;
@@ -69,6 +70,7 @@ impl FixtureGpu {
         f.cookie_r[3] = -1.0;
         f.extra[0] = -1.0;
         f.extra[2] = -1.0;
+        f.misc[3] = -1.0;
         f
     }
 }
@@ -124,6 +126,9 @@ pub struct Renderer {
 
     // Gobo/animation texture atlas (built from GDTF wheel media on first load).
     gobo_atlas: atlas::GoboAtlas,
+
+    // Per-beam shadow maps for the hero (sharp moving-head) beams.
+    shadow: shadow::ShadowMaps,
 
     // Volumetric raymarch (rendered at half resolution, then upsampled).
     volumetric_pipeline: wgpu::RenderPipeline,
@@ -380,6 +385,7 @@ impl Renderer {
         let viewport = Viewport::new(&device, &mut egui_renderer, (width, height));
 
         let gobo_atlas = atlas::GoboAtlas::new(&device, &queue);
+        let shadow = shadow::ShadowMaps::new(&device);
 
         Self {
             surface,
@@ -408,6 +414,7 @@ impl Renderer {
             scene_geom_instances,
             gdtf_placeholder_instances,
             gobo_atlas,
+            shadow,
             volumetric_pipeline,
             volumetric_layout,
             volumetric_uniform,
@@ -844,6 +851,48 @@ impl Renderer {
         if gpu_fixtures.is_empty() {
             gpu_fixtures.push(FixtureGpu::disabled());
         }
+
+        // --- hero-beam shadow selection: the N sharpest lit beams get a shadow
+        // map. Narrower cone (smaller tan_half) = sharper beam = most visible
+        // shadow. Each selected beam's light view-proj goes into the dynamic-offset
+        // render buffer (for the depth pass) + the packed sample buffer (for the
+        // lighting shaders), and its layer is stamped into misc.w (-1 = unshadowed).
+        let mut shadow_order: Vec<usize> = (0..gpu_fixtures.len())
+            .filter(|&i| gpu_fixtures[i].dir_cos[3] > 1e-4)
+            .collect();
+        shadow_order.sort_by(|&a, &b| {
+            gpu_fixtures[a].dir_cos[3]
+                .partial_cmp(&gpu_fixtures[b].dir_cos[3])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let n_shadows = shadow_order.len().min(shadow::MAX);
+        let mut sample_mats: Vec<[[f32; 4]; 4]> = Vec::with_capacity(n_shadows);
+        for layer in 0..n_shadows {
+            let fi = shadow_order[layer];
+            let f = &gpu_fixtures[fi];
+            let origin = Vec3::new(f.pos_range[0], f.pos_range[1], f.pos_range[2]);
+            let bdir = Vec3::new(f.dir_cos[0], f.dir_cos[1], f.dir_cos[2]);
+            let up = Vec3::new(f.cookie_u[0], f.cookie_u[1], f.cookie_u[2]);
+            let tan_half = f.dir_cos[3].max(1e-3);
+            let range = f.pos_range[3].max(1.0);
+            // Perspective from the lens, FOV = full cone angle (clamped so a wide
+            // wash doesn't make a degenerate near-180° projection).
+            let fov = (2.0 * tan_half.atan()).clamp(0.05, 2.4);
+            let vp = Mat4::perspective_rh(fov, 1.0, 0.1, range) * Mat4::look_to_rh(origin, bdir, up);
+            let cols = vp.to_cols_array_2d();
+            self.queue.write_buffer(
+                &self.shadow.render_matrices,
+                layer as u64 * self.shadow.align,
+                bytemuck::bytes_of(&cols),
+            );
+            sample_mats.push(cols);
+            gpu_fixtures[fi].misc[3] = layer as f32;
+        }
+        if !sample_mats.is_empty() {
+            self.queue
+                .write_buffer(&self.shadow.sample_matrices, 0, bytemuck::cast_slice(&sample_mats));
+        }
+
         self.fixtures_storage
             .upload(&self.device, &self.queue, &gpu_fixtures);
         let lens_count = self
@@ -912,6 +961,18 @@ impl Renderer {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.gobo_atlas.sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.shadow.array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.shadow.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.shadow.sample_matrices.as_entire_binding(),
+                },
             ],
         });
 
@@ -947,6 +1008,18 @@ impl Renderer {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(&self.gobo_atlas.sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&self.shadow.array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&self.shadow.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.shadow.sample_matrices.as_entire_binding(),
+                },
             ],
         });
         let composite_bg = self.single_tex_bg(self.viewport.vol_view());
@@ -975,6 +1048,48 @@ impl Renderer {
                 },
             ],
         });
+
+        // Pass 0: hero-beam shadow maps — one depth-only pass per selected beam,
+        // rendering the solid occluders (floor + MVR geometry + fixture models)
+        // from that beam's point of view into its atlas layer.
+        for layer in 0..n_shadows {
+            let mut spass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow-pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow.layer_views[layer],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            spass.set_pipeline(&self.shadow.pipeline);
+            spass.set_bind_group(0, &self.shadow.render_bg, &[(layer as u64 * self.shadow.align) as u32]);
+            spass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));
+            spass.set_vertex_buffer(1, self.floor_instances.buffer.slice(..));
+            spass.draw(0..self.floor_mesh.vertex_count, 0..1);
+            if !scene_geom_draws.is_empty() {
+                spass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
+                for (key, idx) in &scene_geom_draws {
+                    if let Some(mesh) = self.scene_geom_cache.get(key) {
+                        spass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        spass.draw(0..mesh.vertex_count, *idx..*idx + 1);
+                    }
+                }
+            }
+            if !gdtf_draws.is_empty() {
+                spass.set_vertex_buffer(1, self.gdtf_instances.buffer.slice(..));
+                for (key, model, idx) in &gdtf_draws {
+                    if let Some(mesh) = self.gdtf_cache.get(key).and_then(|m| m.get(model)) {
+                        spass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        spass.draw(0..mesh.vertex_count, *idx..*idx + 1);
+                    }
+                }
+            }
+        }
 
         // Pass 1: forward opaque scene -> HDR target.
         {
@@ -1280,7 +1395,7 @@ fn build_beam_gpus(
                     cookie_u: [up.x, up.y, up.z, 0.0],
                     extra: [-1.0, 0.0, -1.0, 0.0],
                     shape: [6.0, 8.0, 1.0, 0.0],
-                    misc: [0.0, 0.0, atlas_layers, 0.0],
+                    misc: [0.0, 0.0, atlas_layers, -1.0],
                 }]
             },
             lens: lens_instance(origin + dir * 0.02, dir, right, up, Fixture::BODY_RADIUS * 0.95, fixture.color, i),
@@ -1329,7 +1444,7 @@ fn build_beam_gpus(
         cookie_u: [u.x, u.y, u.z, g1_rot],
         extra: [g2_layer, g2_rot, anim_layer, anim_scroll],
         shape: [o.n_order, o.focus_dist, o.iris, o.frost],
-        misc: [o.ca_strength, 0.0, atlas_layers, 0.0],
+        misc: [o.ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
     };
 
     let beams = if level < 1e-4 {

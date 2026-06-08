@@ -37,6 +37,11 @@ struct Fixture {
 @group(0) @binding(4) var noise_samp: sampler;
 @group(0) @binding(5) var gobo_tex: texture_2d_array<f32>;
 @group(0) @binding(6) var gobo_samp: sampler;
+// Hero-beam shadow maps (a beam with misc.w >= 0 has a layer here) — so the beam
+// shaft is occluded mid-air where geometry blocks the light.
+@group(0) @binding(7) var shadow_atlas: texture_depth_2d_array;
+@group(0) @binding(8) var shadow_samp: sampler_comparison;
+@group(0) @binding(9) var<storage, read> shadow_mats: array<mat4x4<f32>>;
 
 const PI: f32 = 3.14159265359;
 
@@ -240,7 +245,14 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
 
             let atten = 1.0 / (1.0 + depth * depth * 0.015);
             let phase = max(hg(dot(bdir, -rd), g), 0.05);
-            lin += fx.color.rgb * trans * (rad3 * (atten * phase * beam));
+            // Hero beams cast shadows into the haze: darken the shaft where geometry
+            // occludes the light at this sample point (beam blocked mid-air).
+            var vis = 1.0;
+            let sidx = i32(fx.misc.w);
+            if (sidx >= 0) {
+                vis = opt_shadow(p, shadow_mats[sidx], shadow_atlas, shadow_samp, sidx);
+            }
+            lin += fx.color.rgb * trans * (rad3 * (atten * phase * beam * vis));
         }
 
         let step_tr = exp(-sigma_t * dt);

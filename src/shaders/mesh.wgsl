@@ -28,6 +28,10 @@ struct Light {
 var<storage, read> lights: array<Light>;
 @group(1) @binding(1) var gobo_tex: texture_2d_array<f32>;
 @group(1) @binding(2) var gobo_samp: sampler;
+// Hero-beam shadow maps (a beam with misc.w >= 0 has a layer here).
+@group(1) @binding(3) var shadow_atlas: texture_depth_2d_array;
+@group(1) @binding(4) var shadow_samp: sampler_comparison;
+@group(1) @binding(5) var<storage, read> shadow_mats: array<mat4x4<f32>>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -130,7 +134,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // this only softens how brightness falls off with surface facing.
         let ndl = clamp(dot(normal, l) * 0.5 + 0.5, 0.0, 1.0);
         let atten = 1.0 / (1.0 + depth * depth * 0.015);
-        fixture_light += lt.color.rgb * trans * (rad3 * (ndl * atten * 9.0));
+        // Hero beams cast shadows: occlude this surface point if geometry blocks it.
+        var vis = 1.0;
+        let sidx = i32(lt.misc.w);
+        if (sidx >= 0) {
+            vis = opt_shadow(in.world_pos, shadow_mats[sidx], shadow_atlas, shadow_samp, sidx);
+        }
+        fixture_light += lt.color.rgb * trans * (rad3 * (ndl * atten * 9.0 * vis));
     }
 
     let albedo = in.color;

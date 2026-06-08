@@ -131,3 +131,26 @@ fn opt_cookie_ca(
     let cb = opt_cookie_at(t, s, guv - off, g1, r1, g2, r2, lod);
     return vec3<f32>(cr.r * cr.a, cg.g * cg.a, cb.b * cb.a) * anim;
 }
+
+// Hard-shadow visibility (1 = lit, 0 = occluded) of a world-space point from a
+// hero beam whose light-space view-projection is `vp`, sampling that beam's layer
+// of the shared depth atlas with 2x2 hardware PCF. Returns 1 outside the map or
+// behind the light plane (unshadowed). Both the floor pool (mesh.wgsl) and the
+// beam shaft (volumetric.wgsl) call this so geometry both casts floor shadows and
+// occludes the beam mid-air. The texture/sampler are passed in so the one helper
+// serves either shader's own bindings.
+fn opt_shadow(
+    world_pos: vec3<f32>, vp: mat4x4<f32>,
+    t: texture_depth_2d_array, s: sampler_comparison, layer: i32,
+) -> f32 {
+    let lc = vp * vec4<f32>(world_pos, 1.0);
+    if (lc.w <= 0.0) {
+        return 1.0;
+    }
+    let ndc = lc.xyz / lc.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+    return textureSampleCompareLevel(t, s, uv, layer, ndc.z - 0.001);
+}
