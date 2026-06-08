@@ -40,6 +40,39 @@ pub struct MvrSceneData {
     pub resources: HashMap<String, Arc<Vec<u8>>>,
 }
 
+/// How the 3D viewport draws the scene.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ViewportMode {
+    /// Full render: lit surfaces + volumetric beams + bloom/tonemap.
+    #[default]
+    Beauty,
+    /// Flat albedo, no fixture/beam lighting and no fog — see the raw set/rig.
+    Unlit,
+    /// Scene geometry as wireframe (no fog) — read structure and fixture layout.
+    Wireframe,
+}
+
+impl ViewportMode {
+    pub const ALL: [ViewportMode; 3] = [Self::Beauty, Self::Unlit, Self::Wireframe];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Beauty => "Beauty",
+            Self::Unlit => "Unlit",
+            Self::Wireframe => "Wireframe",
+        }
+    }
+
+    /// Shader code read from `CameraUniform.render_mode.x` (mesh.wgsl branches on it).
+    pub fn shader_code(self) -> f32 {
+        match self {
+            Self::Beauty => 0.0,
+            Self::Unlit => 1.0,
+            Self::Wireframe => 2.0,
+        }
+    }
+}
+
 /// Global look/post-processing controls, edited in the UI and read by the
 /// renderer each frame (exposure/bloom tonemapping + the volumetric beam look).
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +84,8 @@ pub struct RenderSettings {
     pub show_beam_wireframes: bool,
     /// Show the origin grid + world axes.
     pub show_grid: bool,
+    /// How the viewport draws the scene (beauty / unlit / wireframe).
+    pub mode: ViewportMode,
 }
 
 impl Default for RenderSettings {
@@ -67,6 +102,7 @@ impl Default for RenderSettings {
             steps: 80,
             show_beam_wireframes: false,
             show_grid: true,
+            mode: ViewportMode::Beauty,
         }
     }
 }

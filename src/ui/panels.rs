@@ -12,7 +12,7 @@ use crate::gdtf::GdtfFixture;
 use crate::optics::{self, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
-use crate::scene::{Fixture, Library, RenderSettings, Scene, Selection};
+use crate::scene::{Fixture, Library, RenderSettings, Scene, Selection, ViewportMode};
 
 /// Left tab: the scene outliner — every fixture and environment, selectable —
 /// plus the global view/look controls.
@@ -79,6 +79,16 @@ pub fn scene_outliner(
         .num_columns(2)
         .spacing([12.0, 6.0])
         .show(ui, |ui| {
+            ui.label("Mode");
+            ui.horizontal(|ui| {
+                for m in ViewportMode::ALL {
+                    if ui.selectable_label(settings.mode == m, m.label()).clicked() {
+                        settings.mode = m;
+                    }
+                }
+            });
+            ui.end_row();
+
             ui.label("Exposure");
             ui.add(DragValue::new(&mut settings.exposure).speed(0.01).range(0.05..=8.0));
             ui.end_row();

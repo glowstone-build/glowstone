@@ -110,9 +110,24 @@ pub fn lens_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
 
 /// Pipeline for the instanced, lit meshes — floor + fixtures (a `TriangleList`).
 pub fn mesh_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    mesh_pipeline_mode(device, layout, wgpu::PolygonMode::Fill, "mesh-pipeline")
+}
+
+/// Same mesh pipeline drawn as wireframe (line polygon mode) for the Wireframe
+/// viewport mode. Requires the `POLYGON_MODE_LINE` device feature.
+pub fn mesh_wire_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    mesh_pipeline_mode(device, layout, wgpu::PolygonMode::Line, "mesh-wire-pipeline")
+}
+
+fn mesh_pipeline_mode(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    polygon_mode: wgpu::PolygonMode,
+    label: &str,
+) -> wgpu::RenderPipeline {
     let shader = load_with_optics(device, "mesh.wgsl", include_str!("../shaders/mesh.wgsl"));
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("mesh-pipeline"),
+        label: Some(label),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -123,6 +138,7 @@ pub fn mesh_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: None,
+            polygon_mode,
             ..Default::default()
         },
         depth_stencil: Some(depth_stencil()),

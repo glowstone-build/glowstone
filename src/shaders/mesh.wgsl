@@ -6,6 +6,7 @@
 struct Camera {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
+    render_mode: vec4<f32>, // x: 0 = beauty (lit), 1 = unlit/flat, 2 = wireframe
 };
 
 @group(0) @binding(0)
@@ -75,6 +76,20 @@ fn vs_main(in: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let normal = normalize(in.world_normal);
+
+    // Unlit / wireframe viewport modes: skip all fixture/beam lighting, show the
+    // raw geometry. (The volumetric pass is skipped on the CPU side for these.)
+    let mode = camera.render_mode.x;
+    if (mode > 1.5) {
+        // Wireframe (line polygon mode): bright flat so edges read clearly.
+        return vec4<f32>(in.color * 1.4 + vec3<f32>(0.12, 0.12, 0.14), 1.0);
+    }
+    if (mode > 0.5) {
+        // Unlit: flat albedo (lifted for readability); emissive surfaces still glow.
+        let flat = in.color * 1.1 + vec3<f32>(0.05, 0.05, 0.06);
+        let emit = in.color * max(in.intensity, 0.2) * 24.0;
+        return vec4<f32>(mix(flat, emit, clamp(in.emissive, 0.0, 1.0)), 1.0);
+    }
 
     // Low ambient/fill — the venue still reads dark and beams do the real lighting,
     // but set geometry stays faintly readable where no beam reaches it (previz wants

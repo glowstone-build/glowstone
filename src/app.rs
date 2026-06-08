@@ -190,6 +190,17 @@ impl ApplicationHandler for App {
             env.density = d;
         }
 
+        // PREVIZ_MODE=beauty|unlit|wireframe selects the viewport display mode
+        // (so the headless capture paths can verify each, like the other knobs).
+        if let Ok(m) = std::env::var("PREVIZ_MODE") {
+            use crate::scene::ViewportMode;
+            self.state.as_mut().unwrap().ui.settings.mode = match m.to_lowercase().as_str() {
+                "wireframe" | "wire" => ViewportMode::Wireframe,
+                "unlit" | "flat" => ViewportMode::Unlit,
+                _ => ViewportMode::Beauty,
+            };
+        }
+
         // Headless MVR export: PREVIZ_MVR_EXPORT=out.mvr writes the current scene
         // (typically after a PREVIZ_MVR import) back out and exits — for
         // round-trip verification.

@@ -28,7 +28,7 @@ use winit::window::Window;
 
 use crate::optics;
 use crate::scene::library::FixtureGeometry;
-use crate::scene::{Fixture, RenderSettings, Scene, Selection};
+use crate::scene::{Fixture, RenderSettings, Scene, Selection, ViewportMode};
 use camera::{CameraUniform, OrbitCamera};
 use mesh::{GpuMesh, GrowBuffer, LineVertex, MeshInstance};
 use viewport::Viewport;
@@ -96,6 +96,8 @@ pub struct Renderer {
 
     line_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
+    /// Wireframe variant of the mesh pipeline (None if the GPU lacks line polygon mode).
+    mesh_wire_pipeline: Option<wgpu::RenderPipeline>,
     lens_pipeline: wgpu::RenderPipeline,
     light_layout: wgpu::BindGroupLayout,
 
@@ -175,10 +177,22 @@ impl Renderer {
 
         log::info!("using adapter: {:?}", adapter.get_info());
 
+        // Wireframe viewport mode needs line polygon mode; request it when the
+        // adapter offers it (it's not a core WebGPU feature), else fall back to a
+        // solid-but-flat wireframe view.
+        let wireframe_supported = adapter
+            .features()
+            .contains(wgpu::Features::POLYGON_MODE_LINE);
+        let required_features = if wireframe_supported {
+            wgpu::Features::POLYGON_MODE_LINE
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("previz-device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 ..Default::default()
             })
@@ -252,6 +266,8 @@ impl Renderer {
 
         let line_pipeline = pipeline::line_pipeline(&device, &line_layout);
         let mesh_pipeline = pipeline::mesh_pipeline(&device, &mesh_layout);
+        let mesh_wire_pipeline =
+            wireframe_supported.then(|| pipeline::mesh_wire_pipeline(&device, &mesh_layout));
         let lens_pipeline = pipeline::lens_pipeline(&device, &line_layout);
 
         // --- meshes ---
@@ -397,6 +413,7 @@ impl Renderer {
             camera_bind_group,
             line_pipeline,
             mesh_pipeline,
+            mesh_wire_pipeline,
             lens_pipeline,
             light_layout,
             grid_mesh,
@@ -680,7 +697,8 @@ impl Renderer {
         let aspect = self.viewport.aspect();
 
         // --- camera uniform ---
-        let camera_uniform = camera.uniform(aspect);
+        let mut camera_uniform = camera.uniform(aspect);
+        camera_uniform.render_mode[0] = settings.mode.shader_code();
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
 
@@ -865,7 +883,12 @@ impl Renderer {
                 .partial_cmp(&gpu_fixtures[b].dir_cos[3])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let n_shadows = shadow_order.len().min(shadow::MAX);
+        // Shadows only matter in the lit Beauty view (unlit/wireframe skip lighting).
+        let n_shadows = if settings.mode == ViewportMode::Beauty {
+            shadow_order.len().min(shadow::MAX)
+        } else {
+            0
+        };
         let mut sample_mats: Vec<[[f32; 4]; 4]> = Vec::with_capacity(n_shadows);
         for layer in 0..n_shadows {
             let fi = shadow_order[layer];
@@ -1123,7 +1146,11 @@ impl Renderer {
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(1, &light_bg, &[]);
 
-            pass.set_pipeline(&self.mesh_pipeline);
+            let mesh_pipe = match (settings.mode, self.mesh_wire_pipeline.as_ref()) {
+                (ViewportMode::Wireframe, Some(wire)) => wire,
+                _ => &self.mesh_pipeline,
+            };
+            pass.set_pipeline(mesh_pipe);
             pass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, self.floor_instances.buffer.slice(..));
             pass.draw(0..self.floor_mesh.vertex_count, 0..1);
@@ -1187,7 +1214,7 @@ impl Renderer {
 
         // Pass 2a: volumetric raymarch -> half-res vol target (scatter, transmit).
         // Pass 2b: upsample + composite into the HDR scene.
-        if has_fog {
+        if has_fog && settings.mode == ViewportMode::Beauty {
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("volumetric-pass"),

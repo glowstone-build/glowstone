@@ -12,6 +12,9 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
     pub eye: [f32; 4],
+    /// x = viewport mode (see `ViewportMode::shader_code`); yzw reserved. Only the
+    /// mesh shader reads it; grid/lens shaders bind a prefix of this buffer.
+    pub render_mode: [f32; 4],
 }
 
 /// A camera that orbits a target point: drag to rotate, scroll to dolly.
@@ -123,6 +126,7 @@ impl OrbitCamera {
         CameraUniform {
             view_proj: self.view_proj(aspect).to_cols_array_2d(),
             eye: Vec4::new(eye.x, eye.y, eye.z, 1.0).to_array(),
+            render_mode: [0.0; 4],
         }
     }
 }
