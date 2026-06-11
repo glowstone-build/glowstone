@@ -7,24 +7,21 @@
 //! the renderer's `record_scene` (which also runs for headless capture and would
 //! double-advance the animation).
 //!
-//! GDTF max speeds for the Khamsin: gobo image ±876°/s, gobo wheel ±702°/s,
-//! animation ±702°/s, prism ±600°/s, color ±702°/s.
+//! Phases align with the GDTF mode's dynamic component list (any number of
+//! gobo/prism/color/animation wheels). Semantics per kind: gobo/prism phases
+//! are image-rotation angles in radians; color/animation phases are wrapping
+//! `0..1` scrolls. Max speeds are typical GDTF figures (Khamsin: gobo image
+//! ±876°/s, animation/color ±702°/s, prism ±600°/s).
+
+use crate::gdtf::{OpticalComponent, WheelKind};
 
 use super::OpticalControls;
 
-/// Accumulated motion phases for one fixture (radians, or 0..1 for scrolls).
-#[derive(Clone, Copy, Debug, Default)]
+/// Accumulated motion phases for one fixture, aligned with the mode's
+/// component list (radians for rotations, wrapping 0..1 for scrolls).
+#[derive(Clone, Debug, Default)]
 pub struct WheelMotion {
-    /// Rotating-gobo image angle, radians (GoboWheel 1 / 2).
-    pub gobo1_angle: f32,
-    pub gobo2_angle: f32,
-    /// Animation-glass scroll, wrapping 0..1.
-    pub anim_scroll: f32,
-    /// Prism rotation, radians (Prism 1 / 2).
-    pub prism1_angle: f32,
-    pub prism2_angle: f32,
-    /// Color-wheel continuous "rainbow" position, wrapping 0..1.
-    pub color_phase: f32,
+    pub phases: Vec<f32>,
 }
 
 /// Bipolar speed control: 0.5 = stopped, 0 = full reverse, 1 = full forward.
@@ -33,16 +30,33 @@ fn bipolar(x: f32) -> f32 {
 }
 
 impl WheelMotion {
-    /// Advance all phases by `dt` seconds given the current control values.
-    pub fn advance(&mut self, c: &OpticalControls, dt: f32) {
+    /// The accumulated phase for component `i` (0 when not yet sized).
+    pub fn phase(&self, i: usize) -> f32 {
+        self.phases.get(i).copied().unwrap_or(0.0)
+    }
+
+    /// Advance all phases by `dt` seconds given the current control values and
+    /// the fixture's component chain.
+    pub fn advance(&mut self, c: &OpticalControls, components: &[OpticalComponent], dt: f32) {
         let dt = dt.clamp(0.0, 0.1); // ignore long stalls / first-frame spikes
-        let dps = |deg: f32| deg.to_radians();
-        self.gobo1_angle += bipolar(c.gobo1_rot) * dps(876.0) * dt;
-        self.gobo2_angle += bipolar(c.gobo2_rot) * dps(876.0) * dt;
-        self.prism1_angle += bipolar(c.prism1_rot) * dps(600.0) * dt;
-        self.prism2_angle += bipolar(c.prism2_rot) * dps(600.0) * dt;
-        // Scrolls/positions wrap in 0..1. Animation glass at ±702°/s ≈ ±1.95 rev/s.
-        self.anim_scroll = (self.anim_scroll + bipolar(c.anim_spin) * (702.0 / 360.0) * dt).rem_euclid(1.0);
-        self.color_phase = (self.color_phase + bipolar(c.color_spin) * (702.0 / 360.0) * dt).rem_euclid(1.0);
+        if self.phases.len() != components.len() {
+            self.phases.resize(components.len(), 0.0);
+        }
+        for (i, comp) in components.iter().enumerate() {
+            let spin = bipolar(c.wheel(i).spin);
+            if spin.abs() < 1e-3 {
+                continue;
+            }
+            let p = &mut self.phases[i];
+            match comp.kind {
+                WheelKind::Gobo => *p += spin * 876.0_f32.to_radians() * dt,
+                WheelKind::Prism => *p += spin * 600.0_f32.to_radians() * dt,
+                // Scrolls/positions wrap in 0..1; ±702°/s ≈ ±1.95 rev/s.
+                WheelKind::Color | WheelKind::Animation => {
+                    *p = (*p + spin * (702.0 / 360.0) * dt).rem_euclid(1.0)
+                }
+                WheelKind::Frost => {}
+            }
+        }
     }
 }

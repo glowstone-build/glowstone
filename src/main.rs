@@ -4,6 +4,7 @@
 //! event loop and hands control to [`app::App`].
 
 mod app;
+mod dmx;
 mod gdtf;
 mod mvr;
 mod optics;

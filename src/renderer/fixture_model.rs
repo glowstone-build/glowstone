@@ -102,32 +102,39 @@ pub struct BeamFrame {
     pub up: Vec3,
 }
 
-/// The assembled fixture: parts to draw plus the beam's world frame.
+/// The assembled fixture: parts to draw plus every emitter's world frame.
 pub struct Assembly {
     pub parts: Vec<PartDraw>,
-    /// Beam frame, if the fixture has a Beam geometry.
-    pub beam: Option<BeamFrame>,
+    /// One frame per emitter, in the SAME depth-first order as the mode's
+    /// [`emitters`](crate::gdtf::DmxMode::emitters) list (index-aligned).
+    pub beams: Vec<BeamFrame>,
 }
 
-/// Walk the geometry tree with pan/tilt applied, in world space (`root` already
-/// maps GDTF -> world and places the fixture).
-pub fn assemble(fixture: &GdtfFixture, root: Mat4, pan_deg: f32, tilt_deg: f32) -> Assembly {
+/// Walk the mode's expanded geometry tree with pan/tilt applied, in world space
+/// (`root` already maps GDTF -> world and places the fixture).
+pub fn assemble(
+    fixture: &GdtfFixture,
+    mode_index: usize,
+    root: Mat4,
+    pan_deg: f32,
+    tilt_deg: f32,
+) -> Assembly {
     let pan_geom = fixture.geometry_for_attribute("Pan").map(str::to_string);
     let tilt_geom = fixture.geometry_for_attribute("Tilt").map(str::to_string);
 
     let mut parts = Vec::new();
-    let mut beam: Option<BeamFrame> = None;
+    let mut beams = Vec::new();
     walk(
-        &fixture.geometry,
+        fixture.root_for_mode(mode_index),
         root,
         pan_deg,
         tilt_deg,
         pan_geom.as_deref(),
         tilt_geom.as_deref(),
         &mut parts,
-        &mut beam,
+        &mut beams,
     );
-    Assembly { parts, beam }
+    Assembly { parts, beams }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -139,7 +146,7 @@ fn walk(
     pan_geom: Option<&str>,
     tilt_geom: Option<&str>,
     parts: &mut Vec<PartDraw>,
-    beam: &mut Option<BeamFrame>,
+    beams: &mut Vec<BeamFrame>,
 ) {
     let mut local = node.matrix;
     // GDTF axes rotate about their local axis: pan about +Z (up), tilt about +X.
@@ -167,10 +174,10 @@ fn walk(
         let dir = world.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
         let right = world.transform_vector3(Vec3::X).normalize_or_zero();
         let up = world.transform_vector3(Vec3::Y).normalize_or_zero();
-        *beam = Some(BeamFrame { origin, dir, right, up });
+        beams.push(BeamFrame { origin, dir, right, up });
     }
 
     for child in &node.children {
-        walk(child, world, pan, tilt, pan_geom, tilt_geom, parts, beam);
+        walk(child, world, pan, tilt, pan_geom, tilt_geom, parts, beams);
     }
 }

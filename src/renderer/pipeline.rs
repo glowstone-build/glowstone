@@ -4,7 +4,7 @@
 //! **HDR** [`Viewport`] target. The post pipelines (volumetric raymarch, bloom,
 //! tonemap) are fullscreen passes that consume/produce those targets.
 
-use super::mesh::{LineVertex, MeshInstance, MeshVertex};
+use super::mesh::{LensInstance, LineVertex, MeshInstance, MeshVertex};
 use super::viewport::Viewport;
 
 fn load(device: &wgpu::Device, label: &str, source: &'static str) -> wgpu::ShaderModule {
@@ -77,7 +77,7 @@ pub fn line_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
     })
 }
 
-/// Pipeline for the glass/dust lens discs (instanced `TriangleList`, camera-only
+/// Pipeline for the emitter lens faces (instanced `TriangleList`, camera-only
 /// bind group, no backface cull so the lens reads from either side).
 pub fn lens_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
     let shader = load(device, "lens.wgsl", include_str!("../shaders/lens.wgsl"));
@@ -88,7 +88,7 @@ pub fn lens_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
             module: &shader,
             entry_point: Some("vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+            buffers: &[MeshVertex::layout(), LensInstance::layout()],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,

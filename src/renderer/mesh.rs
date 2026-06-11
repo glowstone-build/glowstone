@@ -87,6 +87,39 @@ impl MeshInstance {
     }
 }
 
+/// One emitter lens-face instance (`lens.wgsl`): placement + emission state.
+/// The unit disc is scaled/oriented by the model matrix (column z = beam dir).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct LensInstance {
+    pub model: [[f32; 4]; 4],
+    /// rgb = cell color (linear; optics-chain tint × cell × UI master),
+    /// w = level `0..1` (0 = off → dark glass).
+    pub color: [f32; 4],
+    /// x = tan(half beam angle), y = super-Gaussian edge order, z = candela
+    /// gain (zoom concentration → face luminance), w = lens radius (m).
+    pub params: [f32; 4],
+}
+
+impl LensInstance {
+    const ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+        5 => Float32x4,
+        6 => Float32x4,
+        7 => Float32x4,
+        8 => Float32x4,
+        9 => Float32x4,
+        10 => Float32x4,
+    ];
+
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<LensInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
 /// A non-indexed vertex buffer plus its vertex count.
 pub struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,

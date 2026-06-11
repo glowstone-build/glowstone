@@ -32,6 +32,13 @@ roxmltree = "0.21"
 gltf = "1.4"
 rfd = "0.17"
 
+# DMX input sockets: SO_REUSEADDR / SO_REUSEPORT before bind, so the Art-Net
+# (6454) and sACN (5568) receivers can coexist with a console (e.g. MagicQ) that
+# already holds the port on the same machine. The Art-Net/sACN packets themselves
+# are still hand-parsed (see src/dmx/); this is only for the socket options std
+# can't set pre-bind.
+socket2 = { version = "0.5", features = ["all"] }
+
 # Faster, smoother dev: the wgpu/naga/egui stacks are slow in pure debug.
 [profile.dev]
 opt-level = 1

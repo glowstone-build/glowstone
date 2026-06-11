@@ -192,8 +192,15 @@ impl Scene {
     /// and would double-advance the animation).
     pub fn advance(&mut self, dt: f32) {
         for f in &mut self.fixtures {
-            let optics = f.optics;
-            f.motion.advance(&optics, dt);
+            let components = match &f.gdtf {
+                Some(g) => g
+                    .modes
+                    .get(f.mode_index)
+                    .map(|m| m.components.as_slice())
+                    .unwrap_or(&[]),
+                None => &[],
+            };
+            f.motion.advance(&f.optics, components, dt);
         }
     }
 

@@ -30,7 +30,7 @@ use crate::optics;
 use crate::scene::library::FixtureGeometry;
 use crate::scene::{Fixture, RenderSettings, Scene, Selection, ViewportMode};
 use camera::{CameraUniform, OrbitCamera};
-use mesh::{GpuMesh, GrowBuffer, LineVertex, MeshInstance};
+use mesh::{GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance};
 use viewport::Viewport;
 
 /// Camera + scene data for the volumetric raymarch (mirrors `Volumetric` in
@@ -769,8 +769,8 @@ impl Renderer {
         let mut gdtf_draws: Vec<(usize, String, u32)> = Vec::new();
         // GDTF fixtures whose models didn't bake get a placeholder cone instead.
         let mut gdtf_placeholders: Vec<MeshInstance> = Vec::new();
-        let mut beam_override: Vec<Option<fixture_model::BeamFrame>> =
-            vec![None; scene.fixtures.len()];
+        let mut beam_frames: Vec<Vec<fixture_model::BeamFrame>> =
+            vec![Vec::new(); scene.fixtures.len()];
         for (i, fixture) in scene.fixtures.iter().enumerate() {
             let Some(gdtf) = fixture.gdtf.clone() else {
                 continue;
@@ -783,8 +783,9 @@ impl Renderer {
             let root = Mat4::from_translation(fixture.position)
                 * Mat4::from_quat(fixture.orientation)
                 * gdtf_to_world;
-            let asm = fixture_model::assemble(&gdtf, root, fixture.pan, fixture.tilt);
-            beam_override[i] = asm.beam;
+            let asm =
+                fixture_model::assemble(&gdtf, fixture.mode_index, root, fixture.pan, fixture.tilt);
+            beam_frames[i] = asm.beams;
             let selected = if selection.contains_fixture(i) { 1.0 } else { 0.0 };
             let drawn_before = gdtf_draws.len();
             for part in &asm.parts {
@@ -867,7 +868,7 @@ impl Renderer {
         }
         if settings.show_beam_wireframes {
             for (i, fixture) in scene.fixtures.iter().enumerate() {
-                push_beam_indicator(&mut lines, &beam_spec(fixture, beam_override[i]));
+                push_beam_indicator(&mut lines, &beam_spec(fixture, beam_frames[i].first().copied()));
             }
         }
         // Selection gizmo for every selected fixture (RGB axes + marker box).
@@ -881,26 +882,50 @@ impl Renderer {
         // --- volumetric uniforms + fixtures (use the first fog box, if any) ---
         let fog = scene.environments.first();
         let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
-        // Resolve each fixture's optics → one (or, with a prism, several) GPU
-        // beams. The shaders loop `arrayLength(&fixtures)`, so prism expansion is
+        // Resolve each fixture's optics → its GPU beams (per lit emitter, per
+        // prism facet; uniform LED arrays collapse to one aggregate). The
+        // shaders loop `arrayLength(&fixtures)`, so the expansion is
         // transparent to them.
         let mut gpu_fixtures: Vec<FixtureGpu> = Vec::with_capacity(scene.fixtures.len());
-        let mut lens_instances: Vec<MeshInstance> = Vec::with_capacity(scene.fixtures.len());
+        // Which scene fixture each GPU beam came from (shadow dedupe).
+        let mut beam_fixture: Vec<usize> = Vec::with_capacity(scene.fixtures.len());
+        let mut lens_instances: Vec<LensInstance> = Vec::with_capacity(scene.fixtures.len());
+        let beam_dump = std::env::var("PREVIZ_BEAM_DUMP").is_ok();
         for (i, f) in scene.fixtures.iter().enumerate() {
             let key = f.gdtf.as_ref().map(|g| Arc::as_ptr(g) as usize).unwrap_or(0);
-            let built = build_beam_gpus(f, beam_override[i], key, &self.gobo_atlas, time);
+            let built = build_beam_gpus(f, &beam_frames[i], key, &self.gobo_atlas, time);
+            if beam_dump && !built.beams.is_empty() {
+                let cmax = built
+                    .beams
+                    .iter()
+                    .flat_map(|b| b.color[..3].iter().copied())
+                    .fold(0.0_f32, f32::max);
+                let b0 = &built.beams[0];
+                log::info!(
+                    "beams #{i} {}: n={} cmax={cmax:.3} tan_half={:.3} lens_r={:.3} n_ord={:.2}",
+                    f.name,
+                    built.beams.len(),
+                    b0.dir_cos[3],
+                    b0.color[3],
+                    b0.shape[0],
+                );
+            }
+            beam_fixture.resize(beam_fixture.len() + built.beams.len(), i);
             gpu_fixtures.extend(built.beams);
-            lens_instances.push(built.lens);
+            lens_instances.extend(built.lenses);
         }
         if gpu_fixtures.is_empty() {
             gpu_fixtures.push(FixtureGpu::disabled());
+            beam_fixture.push(usize::MAX);
         }
 
         // --- hero-beam shadow selection: the N sharpest lit beams get a shadow
         // map. Narrower cone (smaller tan_half) = sharper beam = most visible
-        // shadow. Each selected beam's light view-proj goes into the dynamic-offset
-        // render buffer (for the depth pass) + the packed sample buffer (for the
-        // lighting shaders), and its layer is stamped into misc.w (-1 = unshadowed).
+        // shadow; at most one layer per fixture so a 19-cell array can't hog
+        // the whole atlas. Each selected beam's light view-proj goes into the
+        // dynamic-offset render buffer (for the depth pass) + the packed sample
+        // buffer (for the lighting shaders), and its layer is stamped into
+        // misc.w (-1 = unshadowed).
         let mut shadow_order: Vec<usize> = (0..gpu_fixtures.len())
             .filter(|&i| gpu_fixtures[i].dir_cos[3] > 1e-4)
             .collect();
@@ -910,14 +935,21 @@ impl Renderer {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         // Shadows only matter in the lit Beauty view (unlit/wireframe skip lighting).
-        let n_shadows = if settings.mode == ViewportMode::Beauty {
-            shadow_order.len().min(shadow::MAX)
+        let max_shadows = if settings.mode == ViewportMode::Beauty {
+            shadow::MAX
         } else {
             0
         };
-        let mut sample_mats: Vec<[[f32; 4]; 4]> = Vec::with_capacity(n_shadows);
-        for layer in 0..n_shadows {
-            let fi = shadow_order[layer];
+        let mut sample_mats: Vec<[[f32; 4]; 4]> = Vec::with_capacity(max_shadows);
+        let mut shadowed_fixtures: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for fi in shadow_order {
+            if sample_mats.len() >= max_shadows {
+                break;
+            }
+            if !shadowed_fixtures.insert(beam_fixture[fi]) {
+                continue;
+            }
+            let layer = sample_mats.len();
             let f = &gpu_fixtures[fi];
             let origin = Vec3::new(f.pos_range[0], f.pos_range[1], f.pos_range[2]);
             let bdir = Vec3::new(f.dir_cos[0], f.dir_cos[1], f.dir_cos[2]);
@@ -937,6 +969,7 @@ impl Renderer {
             sample_mats.push(cols);
             gpu_fixtures[fi].misc[3] = layer as f32;
         }
+        let n_shadows = sample_mats.len();
         if !sample_mats.is_empty() {
             self.queue
                 .write_buffer(&self.shadow.sample_matrices, 0, bytemuck::cast_slice(&sample_mats));
@@ -1410,23 +1443,6 @@ fn beam_spec(fixture: &Fixture, frame: Option<fixture_model::BeamFrame>) -> Beam
     }
 }
 
-/// The lens-plane geometry of a fixture's beam: where it exits, the direction it
-/// points, and a stable `right`/`up` cookie basis.
-fn beam_geometry(fixture: &Fixture, frame: Option<fixture_model::BeamFrame>) -> (Vec3, Vec3, Vec3, Vec3) {
-    match frame {
-        Some(f) => (f.origin, f.dir, f.right, f.up),
-        None => {
-            let m = fixture.model_matrix();
-            (
-                fixture.lens_position(),
-                fixture.beam_direction(),
-                m.transform_vector3(Vec3::X).normalize_or_zero(),
-                m.transform_vector3(Vec3::Z).normalize_or_zero(),
-            )
-        }
-    }
-}
-
 /// An orthonormal lens-plane basis `(right, up)` perpendicular to `dir`, kept
 /// close to `hint_up` (falls back to a stable axis when `dir ‖ hint_up`).
 fn ortho_basis(dir: Vec3, hint_up: Vec3) -> (Vec3, Vec3) {
@@ -1439,66 +1455,106 @@ fn ortho_basis(dir: Vec3, hint_up: Vec3) -> (Vec3, Vec3) {
     (right, up)
 }
 
-/// The GPU beams for a fixture plus its front-lens disc instance.
+/// The GPU beams for a fixture plus its front-lens disc instances (one per
+/// visible emitter — a Spiider contributes 19).
 struct BeamBuild {
     beams: Vec<FixtureGpu>,
-    lens: MeshInstance,
+    lenses: Vec<LensInstance>,
 }
 
 /// Build a lens-disc instance facing `dir` at `origin`, radius `r`.
-fn lens_instance(origin: Vec3, dir: Vec3, right: Vec3, up: Vec3, r: f32, color: [f32; 3], intensity: f32) -> MeshInstance {
+fn lens_instance(
+    origin: Vec3,
+    dir: Vec3,
+    right: Vec3,
+    up: Vec3,
+    r: f32,
+    color: [f32; 3],
+    level: f32,
+    tan_half: f32,
+    n_order: f32,
+    candela: f32,
+) -> LensInstance {
     let model = Mat4::from_cols(
         (right * r).extend(0.0),
         (up * r).extend(0.0),
         (dir * r).extend(0.0),
         origin.extend(1.0),
     );
-    MeshInstance { model: model.to_cols_array_2d(), color, intensity, selected: 0.0 }
+    LensInstance {
+        model: model.to_cols_array_2d(),
+        color: [color[0], color[1], color[2], level],
+        params: [tan_half, n_order, candela, r],
+    }
 }
 
 /// Resolve a fixture's optical chain into the GPU beam(s) the shaders consume
-/// plus the front-lens disc. Returns one beam normally, or N (one per facet)
-/// when a prism is engaged. `key` is the GDTF Arc pointer; `time` drives strobe.
+/// plus the front-lens discs. A single-emitter fixture yields one beam (or one
+/// per facet when a prism is engaged); a multi-emitter fixture yields one beam
+/// per lit cell — or ONE aggregated beam when the array is uniform (the common
+/// wash case), keeping the raymarch loop off the per-pixel cliff. `key` is the
+/// GDTF Arc pointer; `time` drives strobe.
 fn build_beam_gpus(
     fixture: &Fixture,
-    frame: Option<fixture_model::BeamFrame>,
+    frames: &[fixture_model::BeamFrame],
     key: usize,
     atlas: &atlas::GoboAtlas,
     time: f32,
 ) -> BeamBuild {
-    let (origin, dir, right, up) = beam_geometry(fixture, frame);
     let atlas_layers = atlas.layer_count() as f32;
     const RANGE: f32 = 40.0;
 
+    let fallback_frame = || {
+        let m = fixture.model_matrix();
+        fixture_model::BeamFrame {
+            origin: fixture.lens_position(),
+            dir: fixture.beam_direction(),
+            right: m.transform_vector3(Vec3::X).normalize_or_zero(),
+            up: m.transform_vector3(Vec3::Z).normalize_or_zero(),
+        }
+    };
+
     let Some(gdtf) = &fixture.gdtf else {
         // Placeholder (non-GDTF) fixture: a plain super-Gaussian cone, no cookie.
+        let f = fallback_frame();
         let i = fixture.intensity.max(0.0);
         let tan_half = (fixture.beam_angle * 0.5).to_radians().tan().max(1e-3);
         return BeamBuild {
             // A blacked-out fixture emits nothing, so it must not cost anything in the
             // per-step raymarch / floor-pool loops — emit no beam. (The lens instance
-            // is still built; it's dark too.) Big win for "patch the whole rig, light
-            // a few" scenes, where most fixtures sit at intensity 0.
+            // is still built; it's dark glass.) Big win for "patch the whole rig,
+            // light a few" scenes, where most fixtures sit at intensity 0.
             beams: if i < 1e-4 {
                 Vec::new()
             } else {
                 vec![FixtureGpu {
-                    pos_range: [origin.x, origin.y, origin.z, RANGE],
-                    dir_cos: [dir.x, dir.y, dir.z, tan_half],
+                    pos_range: [f.origin.x, f.origin.y, f.origin.z, RANGE],
+                    dir_cos: [f.dir.x, f.dir.y, f.dir.z, tan_half],
                     color: [fixture.color[0] * i, fixture.color[1] * i, fixture.color[2] * i, Fixture::BODY_RADIUS],
-                    cookie_r: [right.x, right.y, right.z, -1.0],
-                    cookie_u: [up.x, up.y, up.z, 0.0],
+                    cookie_r: [f.right.x, f.right.y, f.right.z, -1.0],
+                    cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],
                     extra: [-1.0, 0.0, -1.0, 0.0],
                     shape: [6.0, 8.0, 1.0, 0.0],
                     misc: [0.0, 0.0, atlas_layers, -1.0],
                 }]
             },
-            lens: lens_instance(origin + dir * 0.02, dir, right, up, Fixture::BODY_RADIUS * 0.95, fixture.color, i),
+            lenses: vec![lens_instance(
+                f.origin + f.dir * 0.02,
+                f.dir,
+                f.right,
+                f.up,
+                Fixture::BODY_RADIUS * 0.95,
+                fixture.color,
+                i,
+                tan_half,
+                6.0,
+                1.0,
+            )],
         };
     };
 
-    let o = optics::resolve(gdtf, &fixture.optics, &fixture.motion, time, fixture.beam_angle);
-    let lens_radius = gdtf.beam.beam_radius.max(0.02);
+    let o = optics::resolve(gdtf, fixture.mode_index, &fixture.optics, &fixture.motion, time);
+    let emitters = fixture.emitters();
 
     // Gobo/animation wheel selections → absolute fractional atlas layers.
     let layer_of = |sel: &Option<optics::WheelSel>| -> (f32, f32) {
@@ -1521,51 +1577,253 @@ fn build_beam_gpus(
         None => (-1.0, 0.0),
     };
 
-    // Commanded output level (candela-independent): intensity × dimmer × shutter.
-    // ~0 means the fixture is blacked out — emit no beams so the raymarch / floor
-    // loop skips it entirely (the dominant cost in a mostly-dark patched rig).
+    // Commanded master level: intensity × dimmer × shutter. ~0 = blacked out →
+    // emit no beams so the raymarch / floor loop skips the fixture entirely.
     let level = fixture.intensity.max(0.0) * fixture.optics.dimmer.max(0.0) * o.shutter_gain;
-    let scale = level * o.candela;
-    let base_color = [o.tint[0] * scale, o.tint[1] * scale, o.tint[2] * scale];
+    let lens_level = (fixture.intensity * fixture.optics.dimmer).max(0.0) * o.shutter_gain;
 
-    // Each beam carries its OWN lens-plane basis (perpendicular to its own
-    // direction) — the radial falloff + cookie measure distance from that axis,
-    // so deflected prism copies render along their own axes, not the original.
-    let make = |bdir: Vec3, r: Vec3, u: Vec3, col: [f32; 3]| FixtureGpu {
-        pos_range: [origin.x, origin.y, origin.z, RANGE],
-        dir_cos: [bdir.x, bdir.y, bdir.z, o.tan_half],
-        color: [col[0], col[1], col[2], lens_radius],
+    let make = |frame: &fixture_model::BeamFrame,
+                bdir: Vec3,
+                r: Vec3,
+                u: Vec3,
+                col: [f32; 3],
+                tan_half: f32,
+                n_order: f32,
+                lens_r: f32| FixtureGpu {
+        pos_range: [frame.origin.x, frame.origin.y, frame.origin.z, RANGE],
+        dir_cos: [bdir.x, bdir.y, bdir.z, tan_half],
+        color: [col[0], col[1], col[2], lens_r],
         cookie_r: [r.x, r.y, r.z, g1_layer],
         cookie_u: [u.x, u.y, u.z, g1_rot],
         extra: [g2_layer, g2_rot, anim_layer, anim_scroll],
-        shape: [o.n_order, o.focus_dist, o.iris, o.frost],
+        shape: [n_order, o.focus_dist, o.iris, o.frost],
         misc: [o.ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
     };
 
-    let beams = if level < 1e-4 {
-        Vec::new()
-    } else if o.prism.is_empty() {
-        vec![make(dir, right, up, base_color)]
-    } else {
-        // Each facet is a separated aerial beam: deflect the axis, rebuild its
-        // basis, split energy.
-        o.prism
+    // ----- single-emitter path (classic moving head; prism expansion) -----
+    if emitters.len() <= 1 {
+        let frame = frames.first().copied().unwrap_or_else(fallback_frame);
+        let em_beam = emitters.first().map(|e| &e.beam).unwrap_or(&gdtf.beam);
+        let flux_norm =
+            (optics::FIXTURE_FLUX_CAP / optics::emitter_flux(em_beam, 1)).min(1.0);
+        let cone = optics::emitter_cone(gdtf, em_beam, &fixture.optics, o.frost, 1, flux_norm);
+        let lens_radius = em_beam.beam_radius.max(0.02);
+        let cell = fixture.cells.first().copied().unwrap_or([1.0, 1.0, 1.0]);
+        let tint = [
+            o.tint[0] * cell[0] * fixture.color[0],
+            o.tint[1] * cell[1] * fixture.color[1],
+            o.tint[2] * cell[2] * fixture.color[2],
+        ];
+        let scale = level * cone.brightness;
+        let base_color = [tint[0] * scale, tint[1] * scale, tint[2] * scale];
+        let cell_lit = cell.iter().fold(0.0_f32, |a, &b| a.max(b));
+
+        let beams = if level * cell_lit < 1e-4 || !cone.shaft {
+            Vec::new()
+        } else if o.prism.is_empty() {
+            vec![make(&frame, frame.dir, frame.right, frame.up, base_color, cone.tan_half, cone.n_order, lens_radius)]
+        } else {
+            // Each facet is a separated aerial beam: deflect the axis, rebuild
+            // its basis, split energy.
+            o.prism
+                .iter()
+                .map(|p| {
+                    let d = (frame.dir + frame.right * p.offset[0] + frame.up * p.offset[1]).normalize_or_zero();
+                    let (r2, u2) = ortho_basis(d, frame.up);
+                    let c = [base_color[0] * p.weight, base_color[1] * p.weight, base_color[2] * p.weight];
+                    make(&frame, d, r2, u2, c, cone.tan_half, cone.n_order, lens_radius)
+                })
+                .collect()
+        };
+
+        // Physical front lens at the beam exit, tinted by the colour chain.
+        let lenses = vec![lens_instance(
+            frame.origin + frame.dir * 0.04,
+            frame.dir,
+            frame.right,
+            frame.up,
+            lens_radius * 1.25,
+            tint,
+            lens_level * cell_lit.min(1.0),
+            cone.tan_half,
+            cone.n_order,
+            cone.face_gain,
+        )];
+        return BeamBuild { beams, lenses };
+    }
+
+    // ----- multi-emitter path (LED arrays / wash heads / pixel bars) -----
+    let mut beams: Vec<FixtureGpu> = Vec::new();
+    let mut lenses: Vec<LensInstance> = Vec::with_capacity(emitters.len());
+
+    struct Cell {
+        frame: fixture_model::BeamFrame,
+        color: [f32; 3], // beam color, fully scaled
+        tint: [f32; 3],  // lens face color (unscaled chain tint × cell)
+        /// Brightest channel of the raw cell value (0 = cell commanded dark).
+        cell_max: f32,
+        lit: f32,
+        cone: optics::EmitterCone,
+        lens_r: f32,
+    }
+    // Fixture-total flux cap: GDTF pixel files often duplicate group flux onto
+    // every cell — normalise so the whole array sums to a plausible fixture.
+    let total_flux: f32 = emitters
+        .iter()
+        .filter(|e| e.merged_into.is_none())
+        .map(|e| optics::emitter_flux(&e.beam, emitters.len()))
+        .sum();
+    let flux_norm = (optics::FIXTURE_FLUX_CAP / total_flux.max(1.0)).min(1.0);
+
+    let mut cells: Vec<Cell> = Vec::new();
+    for (i, em) in emitters.iter().enumerate() {
+        // An occluded emitter (fires through another's aperture) was HTP-merged
+        // into its front cell by the decode; draw nothing for it.
+        if em.merged_into.is_some() {
+            continue;
+        }
+        let Some(frame) = frames.get(i).copied() else {
+            continue;
+        };
+        let cell = fixture.cells.get(i).copied().unwrap_or([1.0, 1.0, 1.0]);
+        let cone =
+            optics::emitter_cone(gdtf, &em.beam, &fixture.optics, o.frost, emitters.len(), flux_norm);
+        let tint = [
+            o.tint[0] * cell[0] * fixture.color[0],
+            o.tint[1] * cell[1] * fixture.color[1],
+            o.tint[2] * cell[2] * fixture.color[2],
+        ];
+        let scale = level * cone.brightness;
+        let cell_max = cell.iter().fold(0.0_f32, |a, &b| a.max(b));
+        cells.push(Cell {
+            frame,
+            color: [tint[0] * scale, tint[1] * scale, tint[2] * scale],
+            tint,
+            cell_max,
+            lit: cell_max * level,
+            cone,
+            lens_r: em.beam.beam_radius.max(0.01),
+        });
+    }
+
+    // Lens faces: every visible cell, lit or dark (dark = glass).
+    for c in &cells {
+        lenses.push(lens_instance(
+            c.frame.origin + c.frame.dir * 0.006,
+            c.frame.dir,
+            c.frame.right,
+            c.frame.up,
+            c.lens_r,
+            c.tint,
+            (lens_level * c.cell_max).min(1.0),
+            c.cone.tan_half,
+            c.cone.n_order,
+            c.cone.face_gain,
+        ));
+    }
+
+    // Beams: skip dark cells, then cluster the rest by direction (a Spiider is
+    // one parallel cluster; a multi-tube blinder is several). A uniform cluster
+    // of ≥4 collapses to ONE wide disc beam (sum of cell outputs — exact in the
+    // far field where the cell cones overlap; dense-array areas match near the
+    // face). Non-uniform (pixel-mapped) clusters stay per-cell — until the
+    // fixture would exceed its beam budget, where a lossy direction-cone LOD
+    // bounds the volumetric cost (the raymarch is O(px·steps·beams); one 72-px
+    // omnidirectional blinder must not cost 72 wide cones).
+    let lit: Vec<&Cell> = cells.iter().filter(|c| c.lit > 1e-4 && c.cone.shaft).collect();
+    if lit.is_empty() {
+        return BeamBuild { beams, lenses };
+    }
+    let no_cookie = g1_layer < 0.0 && g2_layer < 0.0 && anim_layer < 0.0 && o.prism.is_empty();
+    let cluster_by = |lit: &[&'_ Cell], min_dot: f32| -> Vec<Vec<usize>> {
+        let mut out: Vec<(Vec3, Vec<usize>)> = Vec::new();
+        for (i, c) in lit.iter().enumerate() {
+            match out.iter_mut().find(|(d, _)| d.dot(c.frame.dir) > min_dot) {
+                Some((_, v)) => v.push(i),
+                None => out.push((c.frame.dir, vec![i])),
+            }
+        }
+        out.into_iter().map(|(_, v)| v).collect()
+    };
+    // One merged beam covering a cluster: centroid origin, mean direction
+    // widened by the member spread, summed output.
+    let aggregate = |cl: &[&Cell]| -> FixtureGpu {
+        let mean_dir = cl
             .iter()
-            .map(|p| {
-                let d = (dir + right * p.offset[0] + up * p.offset[1]).normalize_or_zero();
-                let (r2, u2) = ortho_basis(d, up);
-                let c = [base_color[0] * p.weight, base_color[1] * p.weight, base_color[2] * p.weight];
-                make(d, r2, u2, c)
+            .fold(Vec3::ZERO, |a, c| a + c.frame.dir)
+            .normalize_or_zero();
+        let centroid = cl.iter().fold(Vec3::ZERO, |a, c| a + c.frame.origin) / cl.len() as f32;
+        let f0 = &cl[0].frame;
+        let (right, up) = ortho_basis(mean_dir, f0.up);
+        let spread_r = cl
+            .iter()
+            .map(|c| {
+                let rel = c.frame.origin - centroid;
+                (rel - mean_dir * rel.dot(mean_dir)).length() + c.lens_r
             })
-            .collect()
+            .fold(0.0_f32, f32::max);
+        let spread_ang = cl
+            .iter()
+            .map(|c| c.frame.dir.dot(mean_dir).clamp(-1.0, 1.0).acos())
+            .fold(0.0_f32, f32::max);
+        let tan_eff = (cl[0].cone.tan_half.atan() + spread_ang).tan().clamp(
+            cl[0].cone.tan_half,
+            3.7, // ~150° full cone cap
+        );
+        let color = cl.iter().fold([0.0_f32; 3], |a, c| {
+            [a[0] + c.color[0], a[1] + c.color[1], a[2] + c.color[2]]
+        });
+        let n_order = if cl.len() > 1 {
+            cl[0].cone.n_order.min(2.0)
+        } else {
+            cl[0].cone.n_order
+        };
+        let agg_frame = fixture_model::BeamFrame { origin: centroid, dir: mean_dir, right, up };
+        make(&agg_frame, mean_dir, right, up, color, tan_eff, n_order, spread_r.max(cl[0].lens_r))
     };
 
-    // Physical front lens: at the beam exit, facing the (undeflected) beam, tinted
-    // by the colour chain and dimming/strobing with the source.
-    let lens_intensity = (fixture.intensity * fixture.optics.dimmer).max(0.0) * o.shutter_gain;
-    // Nudge the lens just in front of the head so it isn't occluded by the model.
-    let lens = lens_instance(origin + dir * 0.04, dir, right, up, lens_radius * 1.25, o.tint, lens_intensity);
-    BeamBuild { beams, lens }
+    // Pass 1: exact direction clusters; uniform ones merge losslessly.
+    let exact = cluster_by(&lit, 0.9999);
+    let mut planned: Vec<Vec<&Cell>> = Vec::new(); // clusters to merge
+    let mut single: Vec<&Cell> = Vec::new(); // cells to emit individually
+    for cl in &exact {
+        let cs: Vec<&Cell> = cl.iter().map(|&i| lit[i]).collect();
+        let uniform = cs.iter().all(|c| {
+            (0..3).all(|k| (c.color[k] - cs[0].color[k]).abs() < 0.02 * cs[0].color[k].max(0.05))
+        });
+        if cs.len() >= 4 && uniform && no_cookie {
+            planned.push(cs);
+        } else {
+            single.extend(cs);
+        }
+    }
+    const MAX_FIXTURE_BEAMS: usize = 16;
+    if planned.len() + single.len() > MAX_FIXTURE_BEAMS {
+        // Pass 2 (LOD): coarse 25° direction cones, merged unconditionally —
+        // bounded cost, slightly soft/averaged but faithful in aggregate. The
+        // per-cell lens faces above still carry the pixel-mapped detail.
+        let coarse = cluster_by(&lit, 0.906);
+        for cl in &coarse {
+            beams.push(aggregate(&cl.iter().map(|&i| lit[i]).collect::<Vec<_>>()));
+        }
+    } else {
+        for cs in &planned {
+            beams.push(aggregate(cs));
+        }
+        for c in single {
+            beams.push(make(
+                &c.frame,
+                c.frame.dir,
+                c.frame.right,
+                c.frame.up,
+                c.color,
+                c.cone.tan_half,
+                c.cone.n_order,
+                c.lens_r,
+            ));
+        }
+    }
+    BeamBuild { beams, lenses }
 }
 
 /// Append a selection gizmo at `p`: RGB world axes plus a small amber marker

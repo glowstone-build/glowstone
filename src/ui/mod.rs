@@ -41,7 +41,12 @@ pub enum Tab {
     Scene,
     Library,
     Inspector,
+    /// Live 512-channel universe + patch grid.
     DmxMonitor,
+    /// Art-Net / sACN connectivity settings + source status.
+    Connectivity,
+    /// Per-fixture DMX patch editor.
+    Patch,
 }
 
 impl Tab {
@@ -51,7 +56,9 @@ impl Tab {
             Tab::Scene => "Scene",
             Tab::Library => "Library",
             Tab::Inspector => "Inspector",
-            Tab::DmxMonitor => "DMX Monitor",
+            Tab::DmxMonitor => "DMX Universe",
+            Tab::Connectivity => "Connectivity",
+            Tab::Patch => "Patch",
         }
     }
 }
@@ -83,7 +90,13 @@ impl Ui {
         let [center, _left] =
             surface.split_left(NodeIndex::root(), 0.80, vec![Tab::Scene, Tab::Library]);
         let [center, _inspector] = surface.split_right(center, 0.76, vec![Tab::Inspector]);
-        let [_viewport, _dmx] = surface.split_below(center, 0.74, vec![Tab::DmxMonitor]);
+        // The bottom strip groups the live universe grid, the patch editor, and
+        // the connectivity settings as three tabs.
+        let [_viewport, _dmx] = surface.split_below(
+            center,
+            0.74,
+            vec![Tab::DmxMonitor, Tab::Patch, Tab::Connectivity],
+        );
 
         Self {
             dock,
@@ -109,9 +122,12 @@ impl Ui {
         ctx: &egui::Context,
         scene: &mut Scene,
         camera: &mut OrbitCamera,
+        dmx: &mut crate::dmx::DmxIo,
         viewport_texture: egui::TextureId,
         fps: f32,
     ) {
+        // One call hands back all the disjoint DMX borrows the panels need.
+        let dmx = dmx.view();
         // Split self's fields so the viewer can borrow them disjointly from the
         // dock state.
         let mut viewer = PanelViewer {
@@ -125,6 +141,16 @@ impl Ui {
             requested_viewport_px: &mut self.requested_viewport_px,
             viewport_focused: &mut self.viewport_focused,
             duplicate: &mut self.duplicate,
+            dmx_patch: dmx.patch,
+            dmx_snapshot: dmx.snapshot,
+            dmx_status: dmx.status,
+            dmx_config: dmx.config,
+            dmx_live_mask: dmx.live_mask,
+            dmx_selected_universe: dmx.selected_universe,
+            dmx_bind_ip_text: dmx.bind_ip_text,
+            dmx_universes_text: dmx.universes_text,
+            dmx_pending: dmx.pending,
+            dmx_running: dmx.running,
             fps,
         };
 
@@ -223,6 +249,17 @@ struct PanelViewer<'a> {
     requested_viewport_px: &'a mut (u32, u32),
     viewport_focused: &'a mut bool,
     duplicate: &'a mut Option<DuplicateDialog>,
+    // Live DMX borrows (from `DmxIo::view`).
+    dmx_patch: &'a mut crate::dmx::PatchTable,
+    dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
+    dmx_status: &'a crate::dmx::DmxStatus,
+    dmx_config: &'a mut crate::dmx::DmxConfig,
+    dmx_live_mask: &'a [bool],
+    dmx_selected_universe: &'a mut u16,
+    dmx_bind_ip_text: &'a mut String,
+    dmx_universes_text: &'a mut String,
+    dmx_pending: &'a mut crate::dmx::PendingNetCmd,
+    dmx_running: bool,
     fps: f32,
 }
 
@@ -246,14 +283,38 @@ impl TabViewer for PanelViewer<'_> {
                 self.requested_viewport_px,
                 self.fps,
             ),
-            Tab::Scene => panels::scene_outliner(ui, self.scene, self.selection, self.settings),
+            Tab::Scene => panels::scene_outliner(
+                ui,
+                self.scene,
+                self.selection,
+                self.settings,
+                self.dmx_patch,
+                self.dmx_live_mask,
+            ),
             Tab::Library => {
                 panels::library_browser(ui, self.library, self.scene, self.selection, self.camera)
             }
             Tab::Inspector => {
                 panels::inspector(ui, self.scene, self.selection, self.gdtf_textures)
             }
-            Tab::DmxMonitor => panels::dmx_monitor(ui, self.scene),
+            Tab::DmxMonitor => panels::dmx_universe_grid(
+                ui,
+                self.scene,
+                self.dmx_patch,
+                self.dmx_snapshot,
+                self.dmx_selected_universe,
+                self.selection,
+            ),
+            Tab::Connectivity => panels::connectivity(
+                ui,
+                self.dmx_config,
+                self.dmx_status,
+                self.dmx_bind_ip_text,
+                self.dmx_universes_text,
+                self.dmx_pending,
+                self.dmx_running,
+            ),
+            Tab::Patch => panels::patch_editor(ui, self.scene, self.dmx_patch),
         }
     }
 

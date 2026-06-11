@@ -6,6 +6,13 @@
 //! animation wheel → gobo wheels → color wheel / CMY / CTO → prism → frost →
 //! focus → zoom lens. Each stage is resolved on the CPU here so the volumetric
 //! beam (`volumetric.wgsl`) and the floor pool (`mesh.wgsl`) stay in lock-step.
+//!
+//! The wheel chain is **dynamic**: a fixture has any number of color/gobo/
+//! prism/animation/frost components (the GDTF mode declares them — see
+//! [`crate::gdtf::OpticalComponent`]). Controls and motion phases align with
+//! the mode's component list; `resolve` folds the engaged components into the
+//! renderer's fixed GPU lanes (two projected cookies, one animation glass,
+//! prism facet expansion).
 
 pub mod color;
 pub mod motion;
@@ -14,12 +21,31 @@ pub use motion::WheelMotion;
 
 use std::f32::consts::TAU;
 
-use crate::gdtf::GdtfFixture;
+use crate::gdtf::{GdtfFixture, OpticalComponent, WheelKind};
+
+/// Controls for one wheel component, aligned with the GDTF mode's
+/// [`components`](crate::gdtf::DmxMode::components) list.
+#[derive(Clone, Copy, Debug)]
+pub struct WheelControl {
+    /// Slot selection (gobo/color wheels) or insertion amount
+    /// (prism/frost/animation), `0..1`. 0 = open / removed.
+    pub value: f32,
+    /// Indexed rotation of the inserted element, `0..1` of a turn.
+    pub index: f32,
+    /// Continuous rotation/scroll speed, bipolar: 0.5 = stop.
+    pub spin: f32,
+}
+
+impl Default for WheelControl {
+    fn default() -> Self {
+        Self { value: 0.0, index: 0.0, spin: 0.5 }
+    }
+}
 
 /// The "console faders" for one fixture — normalised `0..1` control values,
-/// edited in the UI now and fed by DMX later. Defaults are neutral (open white
-/// beam, dimmer up, wheels open, prisms out, no strobe).
-#[derive(Clone, Copy, Debug)]
+/// edited in the UI and fed by DMX. Defaults are neutral (open white beam,
+/// dimmer up, wheels open, prisms out, no strobe).
+#[derive(Clone, Debug)]
 pub struct OpticalControls {
     pub dimmer: f32,
     /// Beam angle: 0 = narrow end of the GDTF Zoom range, 1 = wide.
@@ -28,36 +54,18 @@ pub struct OpticalControls {
     pub focus: f32,
     /// Iris openness: 1 = fully open, 0 = closed to the GDTF minimum.
     pub iris: f32,
-    /// Frost / diffusion amount (softens + widens the beam).
-    pub frost: f32,
     /// Color-temperature-orange filter: 0 = off, 1 = full warm.
     pub cto: f32,
     /// Subtractive cyan / magenta / yellow flags, each `0..1`.
     pub cmy: [f32; 3],
-    /// Color-wheel position (fractional slot) and continuous spin (bipolar).
-    pub color: f32,
-    pub color_spin: f32,
-    /// Gobo wheel 1: slot position, indexed rotation, continuous spin (bipolar).
-    pub gobo1: f32,
-    pub gobo1_index: f32,
-    pub gobo1_rot: f32,
-    /// Gobo wheel 2.
-    pub gobo2: f32,
-    pub gobo2_index: f32,
-    pub gobo2_rot: f32,
-    /// Animation wheel: insert amount and scroll speed (bipolar).
-    pub anim: f32,
-    pub anim_spin: f32,
-    /// Prism 1 / 2: insert amount and rotation (bipolar).
-    pub prism1: f32,
-    pub prism1_rot: f32,
-    pub prism2: f32,
-    pub prism2_rot: f32,
     /// Shutter open amount (1 = open) and strobe rate (0 = off).
     pub shutter: f32,
     pub strobe: f32,
     /// Chromatic-aberration amount (lens dispersion); 0 = none, 1 = strong.
     pub ca: f32,
+    /// Per-component wheel controls, aligned with the mode's component list.
+    /// Sized lazily by [`ensure_wheels`](Self::ensure_wheels).
+    pub wheels: Vec<WheelControl>,
 }
 
 impl Default for OpticalControls {
@@ -67,27 +75,27 @@ impl Default for OpticalControls {
             zoom: 0.3,
             focus: 0.5,
             iris: 1.0,
-            frost: 0.0,
             cto: 0.0,
             cmy: [0.0, 0.0, 0.0],
-            color: 0.0,
-            color_spin: 0.5,
-            gobo1: 0.0,
-            gobo1_index: 0.0,
-            gobo1_rot: 0.5,
-            gobo2: 0.0,
-            gobo2_index: 0.0,
-            gobo2_rot: 0.5,
-            anim: 0.0,
-            anim_spin: 0.5,
-            prism1: 0.0,
-            prism1_rot: 0.5,
-            prism2: 0.0,
-            prism2_rot: 0.5,
             shutter: 1.0,
             strobe: 0.0,
             ca: 0.25,
+            wheels: Vec::new(),
         }
+    }
+}
+
+impl OpticalControls {
+    /// Size the wheel controls to a mode's component count (id-preserving).
+    pub fn ensure_wheels(&mut self, n: usize) {
+        if self.wheels.len() != n {
+            self.wheels.resize(n, WheelControl::default());
+        }
+    }
+
+    /// The control for component `i`, defaulting when not yet sized.
+    pub fn wheel(&self, i: usize) -> WheelControl {
+        self.wheels.get(i).copied().unwrap_or_default()
     }
 }
 
@@ -108,33 +116,30 @@ pub struct PrismBeam {
     pub weight: f32,
 }
 
-/// Fully-resolved optics for one fixture this frame. The renderer turns this
-/// into `FixtureGpu` lanes (mapping wheels → atlas layers, expanding prisms).
+/// Fully-resolved optics for one fixture this frame — the *shared* part of the
+/// chain (wheels/color/shutter). Per-emitter cone shape comes from
+/// [`emitter_cone`]; the renderer turns both into `FixtureGpu` lanes (mapping
+/// wheels → atlas layers, expanding prisms).
 #[derive(Clone, Debug)]
 pub struct BeamOptics {
-    /// Linear-RGB beam tint *before* intensity/candela (source × CTO × CMY × wheel).
+    /// Linear-RGB beam tint *before* intensity/candela (source × CTO × CMY × wheels).
     pub tint: [f32; 3],
-    /// tan(half of the current zoom angle) — the cone slope.
-    pub tan_half: f32,
-    /// Relative intensity from candela conservation (tight beams brighter).
-    pub candela: f32,
     /// Iris radius fraction (1 = open).
     pub iris: f32,
-    /// Frost amount `0..1`.
+    /// Frost amount `0..1` (max over engaged frost components).
     pub frost: f32,
-    /// Super-Gaussian edge order (high = hard flat-top, ~1.5 = soft Gaussian).
-    pub n_order: f32,
     /// Focus distance in metres (the gobo is sharp here, blurred elsewhere).
     pub focus_dist: f32,
     /// Shutter/strobe gate `0..1`.
     pub shutter_gain: f32,
     /// Chromatic-aberration strength (beam-edge per-channel offset).
     pub ca_strength: f32,
+    /// Up to two engaged gobo wheels (the GPU's projected-cookie lanes).
     pub gobo1: Option<WheelSel>,
     pub gobo2: Option<WheelSel>,
     /// Animation wheel: (wheel name, scroll 0..1).
     pub anim: Option<(String, f32)>,
-    /// Prism facet copies (empty = no prism).
+    /// Prism facet copies (empty = no prism; stacked prisms compose).
     pub prism: Vec<PrismBeam>,
 }
 
@@ -150,22 +155,31 @@ fn solid_angle(deg: f32) -> f32 {
     TAU * (1.0 - (deg.to_radians() * 0.5).cos())
 }
 
-/// The wheel a control attribute drives, via its GDTF channel-function link,
-/// with a name-substring fallback for wheels not linked in the first mode.
-fn wheel_for(gdtf: &GdtfFixture, attr: &str, name_hint: &str) -> Option<String> {
-    if let Some(w) = gdtf.channel_function(attr).and_then(|f| f.wheel.clone()) {
-        return Some(w);
+/// The wheel a component drives: its GDTF channel-function link, with a
+/// kind-based name fallback for wheels not linked in the mode's functions.
+fn wheel_name(gdtf: &GdtfFixture, comp: &OpticalComponent) -> Option<String> {
+    if let Some(w) = &comp.wheel {
+        return Some(w.clone());
     }
-    gdtf.wheels
+    let hint = match comp.kind {
+        WheelKind::Color => "color",
+        WheelKind::Gobo => "gobo",
+        WheelKind::Prism => "prism",
+        WheelKind::Animation => "anim",
+        WheelKind::Frost => return None,
+    };
+    let mut hits = gdtf
+        .wheels
         .iter()
-        .find(|w| w.name.to_lowercase().contains(name_hint))
-        .map(|w| w.name.clone())
+        .filter(|w| w.name.to_lowercase().contains(hint));
+    let first = hits.nth((comp.number.max(1) - 1) as usize);
+    first.map(|w| w.name.clone())
 }
 
 /// Crossfaded color-wheel tint (linear RGB): `control` (0..1) selects across the
 /// slots, `phase` (0..1, from a continuous spin) scrolls the whole wheel.
-fn color_wheel_tint(gdtf: &GdtfFixture, control: f32, phase: f32) -> [f32; 3] {
-    let Some(w) = wheel_for(gdtf, "Color1", "color").and_then(|n| gdtf.wheel(&n).cloned()) else {
+fn color_wheel_tint(gdtf: &GdtfFixture, wheel: &str, control: f32, phase: f32) -> [f32; 3] {
+    let Some(w) = gdtf.wheel(wheel) else {
         return [1.0, 1.0, 1.0];
     };
     if w.slots.is_empty() {
@@ -192,10 +206,10 @@ fn color_wheel_tint(gdtf: &GdtfFixture, control: f32, phase: f32) -> [f32; 3] {
 /// beam and overlap on a wide one (exactly like a real fixture). The GDTF facet
 /// offsets (whose scale varies by fixture) are normalised so the largest deflects
 /// by `MAX_DEFLECT`.
-fn prism_beams(gdtf: &GdtfFixture, attr: &str, name_hint: &str, rot: f32) -> Vec<PrismBeam> {
+fn prism_beams(gdtf: &GdtfFixture, wheel: &str, rot: f32) -> Vec<PrismBeam> {
     /// Largest facet deflection, as tan(angle) in the lens plane (~15°).
     const MAX_DEFLECT: f32 = 0.27;
-    let Some(w) = wheel_for(gdtf, attr, name_hint).and_then(|n| gdtf.wheel(&n).cloned()) else {
+    let Some(w) = gdtf.wheel(wheel) else {
         return Vec::new();
     };
     let Some(slot) = w.slots.iter().find(|s| !s.facets.is_empty()) else {
@@ -221,20 +235,56 @@ fn prism_beams(gdtf: &GdtfFixture, attr: &str, name_hint: &str, rot: f32) -> Vec
         .collect()
 }
 
-/// Resolve a fixture's controls + motion into [`BeamOptics`] for this frame.
-/// `time` drives the strobe; `nominal_angle` is the GDTF beam angle (the candela
-/// reference, so the open beam keeps the existing exposure).
+/// Stack a second engaged prism onto an existing facet set: deflections add
+/// (small-angle), weights multiply (renormalised sub-linearly like a single
+/// prism). Copy count is capped to keep the GPU beam list bounded.
+fn compose_prisms(a: Vec<PrismBeam>, b: Vec<PrismBeam>) -> Vec<PrismBeam> {
+    const MAX_COPIES: usize = 24;
+    if a.is_empty() {
+        return b;
+    }
+    if b.is_empty() {
+        return a;
+    }
+    // Incoming weights are 1/√n per set, so the products are already the
+    // 1/√(total) a single combined prism would get.
+    let mut out: Vec<PrismBeam> = a
+        .iter()
+        .flat_map(|p| {
+            b.iter().map(move |q| PrismBeam {
+                offset: [p.offset[0] + q.offset[0], p.offset[1] + q.offset[1]],
+                weight: p.weight * q.weight,
+            })
+        })
+        .collect();
+    if out.len() > MAX_COPIES {
+        out.sort_by(|x, y| y.weight.partial_cmp(&x.weight).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(MAX_COPIES);
+    }
+    out
+}
+
+/// Whether a wheel component is engaged enough to light up its GPU lane.
+fn engaged(ctl: &WheelControl) -> bool {
+    ctl.value > 0.005 || (ctl.spin - 0.5).abs() > 0.02
+}
+
+/// Resolve a fixture's shared controls + motion into [`BeamOptics`] for this
+/// frame. `mode_index` selects the GDTF mode whose component chain the
+/// controls align with; `time` drives the strobe. Per-emitter cone shape and
+/// brightness live in [`emitter_cone`].
 pub fn resolve(
     gdtf: &GdtfFixture,
+    mode_index: usize,
     c: &OpticalControls,
     m: &WheelMotion,
     time: f32,
-    nominal_angle: f32,
 ) -> BeamOptics {
-    // --- zoom + candela conservation ---
-    let zoom_deg = map_attr(gdtf, "Zoom", c.zoom, (nominal_angle, nominal_angle)).clamp(1.0, 120.0);
-    let tan_half = (zoom_deg.to_radians() * 0.5).tan().max(1e-3);
-    let candela = (solid_angle(nominal_angle) / solid_angle(zoom_deg).max(1e-5)).clamp(0.25, 16.0);
+    let components: &[OpticalComponent] = gdtf
+        .modes
+        .get(mode_index)
+        .map(|md| md.components.as_slice())
+        .unwrap_or(&[]);
 
     // --- iris (openness 0..1 → physical [min,max], 1 = open) ---
     let iris = gdtf
@@ -245,16 +295,64 @@ pub fn resolve(
         })
         .unwrap_or(1.0);
 
-    // --- frost / focus / edge ---
-    // Super-Gaussian order from the real field/beam ratio: when the 10% field
-    // angle ≈ the 50% beam angle the profile is a hard flat-top (high order); a
-    // wide soft field gives a low order. Frost then softens toward a Gaussian.
-    let beam_a = gdtf.beam.beam_angle.max(1.0);
-    let field_a = gdtf.beam.field_angle.max(beam_a);
-    let ratio = (field_a.to_radians() * 0.5).tan() / (beam_a.to_radians() * 0.5).tan().max(1e-4);
-    let base_n = if ratio > 1.0001 { (0.6004 / ratio.ln()).clamp(1.2, 12.0) } else { 12.0 };
-    let frost = c.frost.clamp(0.0, 1.0);
-    let n_order = (base_n + (1.5 - base_n) * frost).max(1.2);
+    // --- walk the dynamic wheel chain ---
+    let mut tint_wheels = [1.0_f32, 1.0, 1.0];
+    let mut gobos: Vec<WheelSel> = Vec::new();
+    let mut anim: Option<(String, f32)> = None;
+    let mut prism: Vec<PrismBeam> = Vec::new();
+    let mut frost = 0.0_f32;
+    for (i, comp) in components.iter().enumerate() {
+        let ctl = c.wheel(i);
+        let phase = m.phase(i);
+        match comp.kind {
+            WheelKind::Color => {
+                if let Some(w) = wheel_name(gdtf, comp) {
+                    let t = color_wheel_tint(gdtf, &w, ctl.value, phase);
+                    tint_wheels = [tint_wheels[0] * t[0], tint_wheels[1] * t[1], tint_wheels[2] * t[2]];
+                }
+            }
+            WheelKind::Gobo => {
+                if engaged(&ctl)
+                    && let Some(w) = wheel_name(gdtf, comp)
+                {
+                    let n = gdtf.wheel(&w).map(|x| x.slots.len()).unwrap_or(0);
+                    if n > 0 {
+                        gobos.push(WheelSel {
+                            wheel: w,
+                            slot_frac: ctl.value.clamp(0.0, 1.0) * (n as f32 - 1.0),
+                            // Image rotation: accumulated spin phase + indexed turn.
+                            rot: phase + ctl.index * TAU,
+                        });
+                    }
+                }
+            }
+            WheelKind::Animation => {
+                if ctl.value > 0.01
+                    && anim.is_none()
+                    && let Some(w) = wheel_name(gdtf, comp)
+                {
+                    // Phase wraps 0..1 for scrolls (see WheelMotion::advance).
+                    anim = Some((w, phase));
+                }
+            }
+            WheelKind::Prism => {
+                if ctl.value > 0.01
+                    && let Some(w) = wheel_name(gdtf, comp)
+                {
+                    let set = prism_beams(gdtf, &w, phase + ctl.index * TAU);
+                    prism = compose_prisms(prism, set);
+                }
+            }
+            WheelKind::Frost => {
+                frost = frost.max(ctl.value.clamp(0.0, 1.0));
+            }
+        }
+    }
+    let mut gobo_it = gobos.into_iter();
+    let gobo1 = gobo_it.next();
+    let gobo2 = gobo_it.next();
+
+    // --- focus / dispersion ---
     let focus_dist = map_attr(gdtf, "Focus1Distance", c.focus, (5.0, 15.0));
     let focus_defocus = (c.focus - 0.5).abs() * 2.0;
     // Lens dispersion: a tunable base plus extra fringing when out of focus
@@ -269,7 +367,7 @@ pub fn resolve(
         c.shutter.clamp(0.0, 1.0)
     };
 
-    // --- color: source white × CTO × CMY × color wheel (all linear) ---
+    // --- color: source white × CTO × CMY × color wheels (all linear) ---
     let source = color::cct_to_linear_rgb(gdtf.beam.color_temp);
     let t_cto = if c.cto > 0.01 {
         let target_k = 6800.0 + (2800.0 - 6800.0) * c.cto.clamp(0.0, 1.0);
@@ -278,52 +376,16 @@ pub fn resolve(
         [1.0, 1.0, 1.0]
     };
     let t_cmy = color::cmy_transmittance(c.cmy);
-    let t_color = color_wheel_tint(gdtf, c.color, m.color_phase);
     let tint = [
-        source[0] * t_cto[0] * t_cmy[0] * t_color[0],
-        source[1] * t_cto[1] * t_cmy[1] * t_color[1],
-        source[2] * t_cto[2] * t_cmy[2] * t_color[2],
+        source[0] * t_cto[0] * t_cmy[0] * tint_wheels[0],
+        source[1] * t_cto[1] * t_cmy[1] * tint_wheels[1],
+        source[2] * t_cto[2] * t_cmy[2] * tint_wheels[2],
     ];
-
-    // --- gobo wheels ---
-    let gobo = |attr: &str, hint: &str, sel: f32, index: f32, angle: f32| -> Option<WheelSel> {
-        let wheel = wheel_for(gdtf, attr, hint)?;
-        let n = gdtf.wheel(&wheel).map(|w| w.slots.len()).unwrap_or(0);
-        if n == 0 {
-            return None;
-        }
-        Some(WheelSel {
-            wheel,
-            slot_frac: sel.clamp(0.0, 1.0) * (n as f32 - 1.0),
-            rot: angle + index * TAU,
-        })
-    };
-    let gobo1 = gobo("Gobo1", "gobo", c.gobo1, c.gobo1_index, m.gobo1_angle);
-    let gobo2 = gobo("Gobo2", "gobo2", c.gobo2, c.gobo2_index, m.gobo2_angle);
-
-    // --- animation wheel ---
-    let anim = if c.anim > 0.01 {
-        wheel_for(gdtf, "AnimationWheel1", "anim").map(|w| (w, m.anim_scroll))
-    } else {
-        None
-    };
-
-    // --- prism (one at a time; prism 1 takes priority) ---
-    let prism = if c.prism1 > 0.01 {
-        prism_beams(gdtf, "Prism1", "prism1", m.prism1_angle)
-    } else if c.prism2 > 0.01 {
-        prism_beams(gdtf, "Prism2", "prism2", m.prism2_angle)
-    } else {
-        Vec::new()
-    };
 
     BeamOptics {
         tint,
-        tan_half,
-        candela,
         iris,
         frost,
-        n_order,
         focus_dist,
         shutter_gain,
         ca_strength,
@@ -332,4 +394,81 @@ pub fn resolve(
         anim,
         prism,
     }
+}
+
+/// Per-emitter cone for a multi-emitter fixture: shared zoom optics drive every
+/// cell, but each emitter has its own flux (its `<Beam>`), edge order
+/// (its BeamType + field/beam ratio) and luminance.
+pub struct EmitterCone {
+    pub tan_half: f32,
+    /// Beam radiance factor: rated flux concentrated into the current cone,
+    /// anchored so the verified 40 klm hero head at 25° equals the established
+    /// exposure (1.0). Tight zoom → brighter; a 579 lm wash pixel → faint.
+    pub brightness: f32,
+    /// Face-luminance concentration (zoom only — luminance is flux/area·Ω, so
+    /// a small cell is not dimmer *per area* than a big lens).
+    pub face_gain: f32,
+    pub n_order: f32,
+    /// Per spec: BeamType None/Glow emits from the face only — draw no shaft.
+    pub shaft: bool,
+}
+
+/// Anchor: rated flux and full beam angle whose combination = brightness 1.0
+/// (the Ayrton Khamsin the renderer's exposure was tuned against).
+const FLUX_REF: f32 = 40_000.0;
+const ANGLE_REF: f32 = 25.0;
+/// Previz ceiling on one fixture's total rated flux. GDTF files in the wild
+/// duplicate group totals onto every pixel (a Roxx S2 sums to >1 Mlm); scaling
+/// the cells back to a plausible fixture total tames those without touching
+/// honest files (Spiider 11.6 klm, Astera 71 klm → mild trim, Khamsin 40 klm).
+pub const FIXTURE_FLUX_CAP: f32 = 60_000.0;
+
+/// One emitter's rated flux, with the unspecified case split across the cells.
+pub fn emitter_flux(beam: &crate::gdtf::BeamData, n_emitters: usize) -> f32 {
+    if beam.luminous_flux > 1.0 {
+        beam.luminous_flux
+    } else {
+        10_000.0 / n_emitters.max(1) as f32
+    }
+}
+
+/// Resolve the cone for one emitter. `frost` comes from the fixture-level
+/// resolve (frost components soften every cell); `n_emitters` splits the
+/// nominal fixture flux when the GDTF omits per-cell `LuminousFlux`;
+/// `flux_norm` is the fixture-total cap factor (≤ 1, from [`FIXTURE_FLUX_CAP`]).
+pub fn emitter_cone(
+    gdtf: &GdtfFixture,
+    beam: &crate::gdtf::BeamData,
+    c: &OpticalControls,
+    frost: f32,
+    n_emitters: usize,
+    flux_norm: f32,
+) -> EmitterCone {
+    let nominal = beam.beam_angle.max(1.0);
+    let zoom_deg = map_attr(gdtf, "Zoom", c.zoom, (nominal, nominal)).clamp(1.0, 150.0);
+    let tan_half = (zoom_deg.to_radians() * 0.5).tan().max(1e-3);
+
+    // Radiance ∝ flux / solid angle, in units of the reference head. This is
+    // absolute (no per-emitter "nominal" anchor): a wide blinder pixel with a
+    // default-25° Beam entry can't inflate itself via angle ratios.
+    let flux = emitter_flux(beam, n_emitters) * flux_norm.clamp(0.0, 1.0);
+    let concentration = (solid_angle(ANGLE_REF) / solid_angle(zoom_deg).max(1e-5)).clamp(0.05, 24.0);
+    let brightness = ((flux / FLUX_REF) * concentration).clamp(0.002, 24.0);
+    let face_gain = concentration.clamp(0.25, 16.0);
+
+    let beam_a = nominal;
+    let field_a = beam.field_angle.max(beam_a);
+    let ratio = (field_a.to_radians() * 0.5).tan() / (beam_a.to_radians() * 0.5).tan().max(1e-4);
+    let ratio_n = if ratio > 1.0001 { (0.6004 / ratio.ln()).clamp(1.2, 12.0) } else { 12.0 };
+    // BeamType drives the edge when the author left beam == field (most LED
+    // washes do): Wash/Fresnel/PC read soft, Spot/Rectangle keep the hard edge.
+    let type_n = match beam.beam_type.as_str() {
+        "Spot" | "Rectangle" | "None" => ratio_n,
+        "Glow" => 1.4,
+        // Wash / Fresnel / PC (and the spec default): soft shoulder.
+        _ => ratio_n.min(2.0),
+    };
+    let n_order = (type_n + (1.5 - type_n) * frost.clamp(0.0, 1.0)).max(1.2);
+    let shaft = !matches!(beam.beam_type.as_str(), "None" | "Glow");
+    EmitterCone { tan_half, brightness, face_gain, n_order, shaft }
 }

@@ -4,15 +4,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egui::{DragValue, Grid, RichText, Sense, Slider};
+use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
 use glam::{Vec2, Vec3};
 
 use super::{DuplicateDialog, GdtfTextures};
-use crate::gdtf::GdtfFixture;
+use crate::dmx::patch::channel_map;
+use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
+use crate::gdtf::{GdtfFixture, WheelKind};
 use crate::optics::{self, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
 use crate::scene::{Fixture, Library, RenderSettings, Scene, Selection, ViewportMode};
+
+/// Universe is considered live if it updated within this window.
+const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// Left tab: the scene outliner — every fixture and environment, selectable —
 /// plus the global view/look controls.
@@ -21,6 +26,8 @@ pub fn scene_outliner(
     scene: &mut Scene,
     selection: &mut Selection,
     settings: &mut RenderSettings,
+    patch: &PatchTable,
+    live_mask: &[bool],
 ) {
     ui.heading("Scene");
     ui.separator();
@@ -29,17 +36,59 @@ pub fn scene_outliner(
     if scene.fixtures.is_empty() {
         ui.label(RichText::new("none — add from the Library").weak().small());
     }
+    // Mark which fixtures are in an address conflict (computed once, not per row).
+    let mut conflicted = vec![false; scene.fixtures.len()];
+    for c in patch.conflicts() {
+        conflicted[c.a] = true;
+        conflicted[c.b] = true;
+    }
     // Click selects; ⌘/Ctrl/Shift-click toggles into a multi-selection.
     for (i, fixture) in scene.fixtures.iter().enumerate() {
-        let label = format!("{}  ·  {}", fixture.name, fixture.profile);
-        let resp = ui.selectable_label(selection.contains_fixture(i), label);
-        if resp.clicked() {
-            if ui.input(|x| x.modifiers.command || x.modifiers.shift) {
-                selection.toggle_fixture(i);
-            } else {
-                *selection = Selection::fixture(i);
+        ui.horizontal(|ui| {
+            let resp = ui.selectable_label(
+                selection.contains_fixture(i),
+                format!("{}  ·  {}", fixture.name, fixture.profile),
+            );
+            if resp.clicked() {
+                if ui.input(|x| x.modifiers.command || x.modifiers.shift) {
+                    selection.toggle_fixture(i);
+                } else {
+                    *selection = Selection::fixture(i);
+                }
             }
-        }
+            // Patch annotation: universe.address · FixtureID · mode, or "(unpatched)".
+            match patch.get(i).filter(|p| p.enabled) {
+                Some(p) => {
+                    let mut tag = format!("{}.{:03}", p.universe, p.address);
+                    if let Some(id) = fixture
+                        .mvr
+                        .as_deref()
+                        .map(|m| m.fixture_id.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        tag += &format!(" · ID {id}");
+                    }
+                    if let Some(mode) = fixture
+                        .gdtf
+                        .as_ref()
+                        .and_then(|g| g.modes.get(p.mode_index))
+                    {
+                        tag += &format!(" · {}", mode.name);
+                    }
+                    ui.label(RichText::new(tag).weak().small());
+                }
+                None => {
+                    ui.label(RichText::new("(unpatched)").weak().small());
+                }
+            }
+            if conflicted[i] {
+                ui.colored_label(Color32::from_rgb(230, 90, 90), "●")
+                    .on_hover_text("DMX address conflict");
+            }
+            if live_mask.get(i).copied().unwrap_or(false) {
+                ui.colored_label(Color32::from_rgb(120, 210, 120), RichText::new("LIVE").small());
+            }
+        });
     }
 
     ui.add_space(8.0);
@@ -362,7 +411,9 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
         }
     });
 
-    // Shared optical controls (applied to every selected fixture).
+    // Shared optical controls (applied to every selected fixture). Wheel rows
+    // come from the PRIMARY fixture's component chain and apply to matching
+    // (kind, number) components on every selected fixture.
     egui::CollapsingHeader::new("Optics (all selected)")
         .default_open(true)
         .show(ui, |ui| {
@@ -375,20 +426,63 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
                     bulk_opt(ui, scene, ids, "Zoom", |o| o.zoom, |o, v| o.zoom = v);
                     bulk_opt(ui, scene, ids, "Focus", |o| o.focus, |o, v| o.focus = v);
                     bulk_opt(ui, scene, ids, "Iris", |o| o.iris, |o, v| o.iris = v);
-                    bulk_opt(ui, scene, ids, "Frost", |o| o.frost, |o, v| o.frost = v);
                     bulk_opt(ui, scene, ids, "CTO", |o| o.cto, |o, v| o.cto = v);
                     bulk_opt(ui, scene, ids, "Cyan", |o| o.cmy[0], |o, v| o.cmy[0] = v);
                     bulk_opt(ui, scene, ids, "Magenta", |o| o.cmy[1], |o, v| o.cmy[1] = v);
                     bulk_opt(ui, scene, ids, "Yellow", |o| o.cmy[2], |o, v| o.cmy[2] = v);
-                    bulk_opt(ui, scene, ids, "Color wheel", |o| o.color, |o, v| o.color = v);
-                    bulk_opt(ui, scene, ids, "Gobo 1", |o| o.gobo1, |o, v| o.gobo1 = v);
-                    bulk_opt(ui, scene, ids, "Gobo 1 spin", |o| o.gobo1_rot, |o, v| o.gobo1_rot = v);
-                    bulk_opt(ui, scene, ids, "Prism 1", |o| o.prism1, |o, v| o.prism1 = v);
-                    bulk_opt(ui, scene, ids, "Prism 1 spin", |o| o.prism1_rot, |o, v| o.prism1_rot = v);
                     bulk_opt(ui, scene, ids, "Shutter", |o| o.shutter, |o, v| o.shutter = v);
                     bulk_opt(ui, scene, ids, "Chromatic ab.", |o| o.ca, |o, v| o.ca = v);
+
+                    let comps: Vec<(WheelKind, u32, String)> = scene.fixtures[primary]
+                        .gdtf
+                        .as_ref()
+                        .and_then(|g| g.modes.get(scene.fixtures[primary].mode_index))
+                        .map(|m| {
+                            m.components
+                                .iter()
+                                .map(|c| (c.kind, c.number, c.attribute.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for (kind, number, label) in comps {
+                        bulk_wheel(ui, scene, ids, kind, number, &label);
+                    }
                 });
         });
+}
+
+/// Bulk rows for one wheel component: value + spin sliders applied to the
+/// matching component of every selected fixture.
+fn bulk_wheel(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    ids: &[usize],
+    kind: WheelKind,
+    number: u32,
+    label: &str,
+) {
+    let read = |f: &mut Fixture| f.wheel_control_mut(kind, number).map(|w| (w.value, w.spin));
+    let Some((mut value, mut spin)) = read(&mut scene.fixtures[ids[0]]) else {
+        return;
+    };
+    ui.label(label);
+    if ui.add(Slider::new(&mut value, 0.0..=1.0)).changed() {
+        for &i in ids {
+            if let Some(w) = scene.fixtures[i].wheel_control_mut(kind, number) {
+                w.value = value;
+            }
+        }
+    }
+    ui.end_row();
+    ui.label(format!("{label} spin"));
+    if ui.add(Slider::new(&mut spin, 0.0..=1.0).text("0.5=stop")).changed() {
+        for &i in ids {
+            if let Some(w) = scene.fixtures[i].wheel_control_mut(kind, number) {
+                w.spin = spin;
+            }
+        }
+    }
+    ui.end_row();
 }
 
 /// One bulk optics slider (0..1) seeded from the primary, written to all `ids`.
@@ -568,6 +662,49 @@ fn gdtf_inspector(
         .weak()
         .small(),
     );
+    // Multi-emitter summary: cell count + the live per-cell colors (driven by
+    // per-pixel DMX; the Color picker below multiplies all of them manually).
+    let emitters = fixture.emitters();
+    if emitters.len() > 1 {
+        let visible = emitters.iter().filter(|e| e.merged_into.is_none()).count();
+        ui.label(
+            RichText::new(format!(
+                "{} emitters · {} {} · per-cell DMX in mode \"{}\"",
+                visible,
+                emitters[0].beam.beam_type,
+                if emitters.len() > visible { "(+1 overlay)" } else { "" },
+                gdtf.modes
+                    .get(fixture.mode_index)
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("?"),
+            ))
+            .weak()
+            .small(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for (i, em) in emitters.iter().enumerate() {
+                if em.merged_into.is_some() {
+                    continue;
+                }
+                let c = fixture.cells.get(i).copied().unwrap_or([1.0, 1.0, 1.0]);
+                let level = fixture.intensity.clamp(0.0, 1.0);
+                let col = egui::Color32::from_rgb(
+                    ((c[0].min(1.0) * level).powf(1.0 / 2.2) * 255.0) as u8,
+                    ((c[1].min(1.0) * level).powf(1.0 / 2.2) * 255.0) as u8,
+                    ((c[2].min(1.0) * level).powf(1.0 / 2.2) * 255.0) as u8,
+                );
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
+                ui.painter().rect_filled(rect, 7.0, col);
+                ui.painter().rect_stroke(
+                    rect,
+                    7.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                    egui::StrokeKind::Inside,
+                );
+                resp.on_hover_text(&em.name);
+            }
+        });
+    }
 
     // MVR patch identity (FixtureID, DMX address, mode) when imported from a scene.
     if let Some(m) = fixture.mvr.as_deref() {
@@ -688,12 +825,20 @@ fn gdtf_inspector(
 /// Drives `fixture.optics`, which the renderer resolves into the beam each frame.
 fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) {
     let beam_angle = fixture.beam_angle;
-    let o = &mut fixture.optics;
     let has = |a: &str| gdtf.has_attribute(a);
+    // The dynamic wheel chain of the active mode (any number of color/gobo/
+    // prism/animation/frost components).
+    let components: Vec<crate::gdtf::OpticalComponent> = gdtf
+        .modes
+        .get(fixture.mode_index)
+        .map(|m| m.components.clone())
+        .unwrap_or_default();
+    fixture.optics.ensure_wheels(components.len());
 
     egui::CollapsingHeader::new("Optics")
         .default_open(true)
         .show(ui, |ui| {
+            let o = &mut fixture.optics;
             ui.label(RichText::new("BEAM SHAPING").small().strong());
             Grid::new("optics-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
                 ui.label("Dimmer");
@@ -713,17 +858,20 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
                 ui.add_enabled(has("Iris"), Slider::new(&mut o.iris, 0.0..=1.0));
                 ui.end_row();
 
-                ui.label("Frost");
-                ui.add_enabled(has("Frost1") || has("Frost2"), Slider::new(&mut o.frost, 0.0..=1.0));
-                ui.end_row();
-
                 ui.label("Chromatic ab.");
                 ui.add(Slider::new(&mut o.ca, 0.0..=1.0));
+                ui.end_row();
+
+                ui.label("Shutter");
+                ui.add_enabled(has("Shutter1"), Slider::new(&mut o.shutter, 0.0..=1.0));
+                ui.end_row();
+                ui.label("Strobe");
+                ui.add_enabled(has("Shutter1"), Slider::new(&mut o.strobe, 0.0..=1.0));
                 ui.end_row();
             });
 
             ui.add_space(4.0);
-            ui.label(RichText::new("COLOR").small().strong());
+            ui.label(RichText::new("COLOR MIXING").small().strong());
             Grid::new("optics-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
                 ui.label("CTO (warm)");
                 ui.add_enabled(has("CTO"), Slider::new(&mut o.cto, 0.0..=1.0));
@@ -738,54 +886,40 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
                 ui.label("Yellow");
                 ui.add_enabled(cmy, Slider::new(&mut o.cmy[2], 0.0..=1.0));
                 ui.end_row();
-                ui.label("Color wheel");
-                ui.add_enabled(has("Color1"), Slider::new(&mut o.color, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Color spin");
-                ui.add_enabled(has("Color1"), Slider::new(&mut o.color_spin, 0.0..=1.0).text("0.5=stop"));
-                ui.end_row();
             });
 
-            ui.add_space(4.0);
-            ui.label(RichText::new("CONTENT").small().strong());
-            Grid::new("optics-content").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                ui.label("Gobo 1");
-                ui.add_enabled(has("Gobo1"), Slider::new(&mut o.gobo1, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Gobo 1 index");
-                ui.add_enabled(has("Gobo1"), Slider::new(&mut o.gobo1_index, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Gobo 1 spin");
-                ui.add_enabled(has("Gobo1"), Slider::new(&mut o.gobo1_rot, 0.0..=1.0).text("0.5=stop"));
-                ui.end_row();
-                ui.label("Gobo 2");
-                ui.add_enabled(has("Gobo2"), Slider::new(&mut o.gobo2, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Gobo 2 spin");
-                ui.add_enabled(has("Gobo2"), Slider::new(&mut o.gobo2_rot, 0.0..=1.0).text("0.5=stop"));
-                ui.end_row();
-                ui.label("Animation");
-                ui.add_enabled(has("AnimationWheel1"), Slider::new(&mut o.anim, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Anim. spin");
-                ui.add_enabled(has("AnimationWheel1"), Slider::new(&mut o.anim_spin, 0.0..=1.0).text("0.5=stop"));
-                ui.end_row();
-                ui.label("Prism 1");
-                ui.add_enabled(has("Prism1"), Slider::new(&mut o.prism1, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Prism 1 spin");
-                ui.add_enabled(has("Prism1"), Slider::new(&mut o.prism1_rot, 0.0..=1.0).text("0.5=stop"));
-                ui.end_row();
-                ui.label("Prism 2");
-                ui.add_enabled(has("Prism2"), Slider::new(&mut o.prism2, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Shutter");
-                ui.add_enabled(has("Shutter1"), Slider::new(&mut o.shutter, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Strobe");
-                ui.add_enabled(has("Shutter1"), Slider::new(&mut o.strobe, 0.0..=1.0));
-                ui.end_row();
-            });
+            // One block per wheel component, generated from the GDTF chain.
+            if !components.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("WHEELS").small().strong());
+                Grid::new("optics-wheels").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                    for (i, comp) in components.iter().enumerate() {
+                        let Some(w) = o.wheels.get_mut(i) else { continue };
+                        let value_label = match comp.kind {
+                            WheelKind::Gobo | WheelKind::Color => "select",
+                            WheelKind::Prism | WheelKind::Animation | WheelKind::Frost => "insert",
+                        };
+                        let name = comp
+                            .wheel
+                            .as_deref()
+                            .map(|n| format!("{} · {n}", comp.attribute))
+                            .unwrap_or_else(|| comp.attribute.clone());
+                        ui.label(RichText::new(name).strong());
+                        ui.add(Slider::new(&mut w.value, 0.0..=1.0).text(value_label));
+                        ui.end_row();
+                        if comp.has_index {
+                            ui.label("  index");
+                            ui.add(Slider::new(&mut w.index, 0.0..=1.0));
+                            ui.end_row();
+                        }
+                        if comp.has_spin || matches!(comp.kind, WheelKind::Color | WheelKind::Animation) {
+                            ui.label("  spin");
+                            ui.add(Slider::new(&mut w.spin, 0.0..=1.0).text("0.5=stop"));
+                            ui.end_row();
+                        }
+                    }
+                });
+            }
         });
 }
 
@@ -945,48 +1079,491 @@ pub fn viewport(
     );
 }
 
-/// Bottom tab: a stub DMX patch table. Live sACN / Art-Net input isn't wired
-/// up yet; this previews the channels each fixture would occupy.
-pub fn dmx_monitor(ui: &mut egui::Ui, scene: &Scene) {
+/// Bottom tab: Art-Net / sACN connectivity settings + live source status.
+pub fn connectivity(
+    ui: &mut egui::Ui,
+    config: &mut DmxConfig,
+    status: &DmxStatus,
+    bind_ip_text: &mut String,
+    universes_text: &mut String,
+    pending: &mut PendingNetCmd,
+    running: bool,
+) {
     ui.horizontal(|ui| {
-        ui.heading("DMX Monitor");
-        ui.label(RichText::new("stub").small().weak());
+        ui.heading("Connectivity");
+        let mut enabled = running;
+        if ui
+            .checkbox(&mut enabled, "Receive DMX")
+            .on_hover_text("Bind the sockets and decode live DMX into the rig (input only)")
+            .changed()
+        {
+            *pending = if enabled { PendingNetCmd::Start } else { PendingNetCmd::Stop };
+        }
+        if running {
+            let bound = match (status.bound_artnet, status.bound_sacn) {
+                (true, true) => "Art-Net + sACN",
+                (true, false) => "Art-Net",
+                (false, true) => "sACN",
+                (false, false) => "no sockets bound",
+            };
+            ui.colored_label(
+                Color32::from_rgb(120, 210, 120),
+                format!("● {bound} · {} source(s)", status.sources.len()),
+            );
+        } else {
+            ui.colored_label(Color32::from_gray(140), "○ stopped");
+        }
     });
-    ui.label(
-        RichText::new(
-            "Live DMX input (sACN / Art-Net) is not wired up yet — \
-             this previews the patch each fixture would occupy.",
-        )
-        .small()
-        .weak(),
-    );
     ui.separator();
 
-    Grid::new("dmx-grid")
-        .num_columns(8)
-        .striped(true)
-        .spacing([14.0, 4.0])
+    Grid::new("dmx-connect")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
         .show(ui, |ui| {
-            for header in ["Fixture", "Addr", "Pan", "Tilt", "Dim", "R", "G", "B"] {
-                ui.strong(header);
+            ui.label("Protocols");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut config.artnet, "Art-Net");
+                ui.checkbox(&mut config.sacn, "sACN");
+            });
+            ui.end_row();
+
+            ui.label("Bind interface");
+            let valid = bind_ip_text.parse::<std::net::IpAddr>();
+            let resp = ui.add(
+                egui::TextEdit::singleline(bind_ip_text)
+                    .desired_width(150.0)
+                    .hint_text("0.0.0.0")
+                    .text_color_opt(valid.is_err().then_some(Color32::from_rgb(230, 120, 110))),
+            );
+            if resp.changed()
+                && let Ok(ip) = bind_ip_text.parse::<std::net::IpAddr>()
+            {
+                config.bind_ip = ip;
             }
             ui.end_row();
 
-            let mut address = 1u32;
-            for fixture in &scene.fixtures {
-                ui.label(fixture.name.as_str());
-                ui.monospace(format!("{address:>3}"));
-                ui.monospace(format!("{:>3}", angle_to_dmx(fixture.pan, 540.0)));
-                ui.monospace(format!("{:>3}", angle_to_dmx(fixture.tilt, 360.0)));
-                ui.monospace(format!("{:>3}", unit_to_dmx(fixture.intensity)));
-                ui.monospace(format!("{:>3}", unit_to_dmx(fixture.color[0])));
-                ui.monospace(format!("{:>3}", unit_to_dmx(fixture.color[1])));
-                ui.monospace(format!("{:>3}", unit_to_dmx(fixture.color[2])));
+            ui.label("sACN universes");
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(universes_text)
+                        .desired_width(150.0)
+                        .hint_text("1,2,5-8"),
+                )
+                .on_hover_text(
+                    "sACN multicast groups to join. Art-Net is broadcast — all \
+                     universes are received regardless of this list.",
+                );
+            if resp.changed() {
+                config.universes = crate::dmx::parse_universe_list(universes_text);
+            }
+            ui.end_row();
+
+            ui.label("Merge");
+            ui.horizontal(|ui| {
+                for m in MergePolicy::ALL {
+                    ui.selectable_value(&mut config.merge, m, m.label());
+                }
+            });
+            ui.end_row();
+
+            ui.label("Art-Net priority");
+            ui.add(DragValue::new(&mut config.artnet_priority).range(0..=200));
+            ui.end_row();
+        });
+
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(running, egui::Button::new("Reapply"))
+            .on_hover_text("Re-bind sockets / re-join multicast after a protocol or interface change")
+            .clicked()
+        {
+            *pending = PendingNetCmd::Reapply;
+        }
+        ui.label(
+            RichText::new("Universe/merge edits apply live; protocol/interface need Reapply.")
+                .weak()
+                .small(),
+        );
+    });
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("SOURCES").small().strong());
+    if status.sources.is_empty() {
+        let msg = if running {
+            "listening — no sources seen yet"
+        } else {
+            "not receiving"
+        };
+        ui.label(RichText::new(msg).weak().small());
+        return;
+    }
+    egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
+        Grid::new("dmx-sources")
+            .num_columns(7)
+            .striped(true)
+            .spacing([12.0, 3.0])
+            .show(ui, |ui| {
+                for h in ["Proto", "Source", "Universes", "Prio", "FPS", "Lost", "Seen"] {
+                    ui.strong(RichText::new(h).small());
+                }
+                ui.end_row();
+                for s in &status.sources {
+                    ui.label(RichText::new(s.proto.label()).small());
+                    let name = if s.name.is_empty() {
+                        s.label.clone()
+                    } else {
+                        format!("{} ({})", s.name, s.label)
+                    };
+                    ui.label(RichText::new(name).small());
+                    ui.label(RichText::new(format_universes(&s.universes)).small());
+                    ui.label(RichText::new(s.priority.to_string()).small());
+                    let fps_col = if s.fps >= 30.0 {
+                        Color32::from_rgb(120, 210, 120)
+                    } else if s.fps >= 10.0 {
+                        Color32::from_rgb(230, 210, 110)
+                    } else {
+                        Color32::from_rgb(230, 120, 110)
+                    };
+                    ui.colored_label(fps_col, RichText::new(format!("{:.0}", s.fps)).small());
+                    ui.label(RichText::new(s.seq_errors.to_string()).small());
+                    ui.label(RichText::new(format!("{:.1}s", s.age().as_secs_f32())).small());
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+/// Bottom tab: the live 512-channel universe grid with patch occupants (replaces
+/// the old DMX Monitor stub). Each cell shows the channel number, its live level,
+/// and the patched fixture + attribute occupying it.
+pub fn dmx_universe_grid(
+    ui: &mut egui::Ui,
+    scene: &Scene,
+    patch: &PatchTable,
+    snapshot: &UniverseSnapshot,
+    selected_universe: &mut u16,
+    selection: &mut Selection,
+) {
+    // Universes present in the snapshot or referenced by the patch.
+    let mut universes = patch.universes();
+    for &u in snapshot.frames.keys() {
+        if !universes.contains(&u) {
+            universes.push(u);
+        }
+    }
+    universes.sort_unstable();
+    universes.dedup();
+    if universes.is_empty() {
+        universes.push(*selected_universe);
+    }
+    if !universes.contains(selected_universe) {
+        *selected_universe = universes[0];
+    }
+
+    ui.horizontal(|ui| {
+        ui.heading("DMX Universe");
+        if ui.button("◀").clicked()
+            && let Some(pos) = universes.iter().position(|u| u == selected_universe)
+        {
+            *selected_universe = universes[pos.saturating_sub(1)];
+        }
+        egui::ComboBox::from_id_salt("dmx-universe-select")
+            .selected_text(format!("Universe {selected_universe}"))
+            .show_ui(ui, |ui| {
+                for &u in &universes {
+                    ui.selectable_value(selected_universe, u, format!("Universe {u}"));
+                }
+            });
+        if ui.button("▶").clicked()
+            && let Some(pos) = universes.iter().position(|u| u == selected_universe)
+        {
+            *selected_universe = universes[(pos + 1).min(universes.len() - 1)];
+        }
+        if snapshot.is_live(*selected_universe, DMX_STALE) {
+            let n = snapshot.frames.get(selected_universe).map(|f| f.sources).unwrap_or(0);
+            ui.colored_label(Color32::from_rgb(120, 210, 120), format!("● LIVE · {n} src"));
+        } else {
+            ui.colored_label(Color32::from_gray(130), "○ idle");
+        }
+        let nconf = patch.conflicts().len();
+        if nconf > 0 {
+            ui.colored_label(Color32::from_rgb(230, 90, 90), format!("⚠ {nconf} conflict(s)"));
+        }
+    });
+    ui.separator();
+
+    let u = *selected_universe;
+
+    // Per-channel occupant (fixture index + attribute) for the selected universe,
+    // computed once so each of the 512 cells is a cheap lookup.
+    let mut occ: Vec<Option<(usize, String)>> = vec![None; 512];
+    let mut conflict_cells = [false; 512];
+    for (i, fixture) in scene.fixtures.iter().enumerate() {
+        let Some(p) = patch.get(i).filter(|p| p.enabled) else { continue };
+        if p.universe != u {
+            continue;
+        }
+        for mc in channel_map(fixture, p.mode_index).channels {
+            for k in 0..mc.width as u16 {
+                let ch = p.address.saturating_sub(1) + mc.offset + k;
+                if let Some(slot) = occ.get_mut(ch as usize) {
+                    if slot.is_none() {
+                        *slot = Some((i, mc.attribute.clone()));
+                    } else {
+                        conflict_cells[ch as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    const COLS: usize = 16;
+    const ROWS: usize = 32;
+    egui::ScrollArea::both().show(ui, |ui| {
+        let avail = ui.available_width().max(360.0);
+        let cell_w = (avail / COLS as f32).clamp(42.0, 92.0);
+        let cell_h = 34.0;
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(cell_w * COLS as f32, cell_h * ROWS as f32),
+            Sense::click(),
+        );
+        let painter = ui.painter_at(rect);
+        for r in 0..ROWS {
+            for c in 0..COLS {
+                let ch = r * COLS + c; // 0-based channel index
+                let cell = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(c as f32 * cell_w, r as f32 * cell_h),
+                    egui::vec2(cell_w - 1.0, cell_h - 1.0),
+                );
+                let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
+                let bg = cell_bg(level, occ[ch].is_some());
+                let ink = cell_ink(bg);
+                painter.rect_filled(cell, 2.0, bg);
+                // Thin separator between cells; a red outline for conflicts.
+                painter.rect_stroke(
+                    cell,
+                    2.0,
+                    egui::Stroke::new(1.0, Color32::from_gray(70)),
+                    egui::StrokeKind::Inside,
+                );
+                if conflict_cells[ch] {
+                    painter.rect_stroke(
+                        cell,
+                        2.0,
+                        egui::Stroke::new(1.6, Color32::from_rgb(214, 64, 64)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                // Channel number (top-left), level % (top-right).
+                painter.text(
+                    cell.left_top() + egui::vec2(3.0, 1.0),
+                    egui::Align2::LEFT_TOP,
+                    (ch + 1).to_string(),
+                    egui::FontId::proportional(9.0),
+                    ink.gamma_multiply(0.7),
+                );
+                if level > 0 {
+                    let pct = (level as f32 / 255.0 * 100.0).round() as u32;
+                    painter.text(
+                        cell.right_top() + egui::vec2(-3.0, 1.0),
+                        egui::Align2::RIGHT_TOP,
+                        format!("{pct}%"),
+                        egui::FontId::proportional(9.5),
+                        ink,
+                    );
+                }
+                // Patched occupant: fixture id/name + attribute, two lines.
+                if let Some((fi, attr)) = &occ[ch] {
+                    let id = scene.fixtures[*fi]
+                        .mvr
+                        .as_deref()
+                        .map(|m| m.fixture_id.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| scene.fixtures[*fi].name.clone());
+                    painter.text(
+                        cell.left_bottom() + egui::vec2(3.0, -11.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        truncate(&id, 10),
+                        egui::FontId::proportional(8.5),
+                        ink,
+                    );
+                    painter.text(
+                        cell.left_bottom() + egui::vec2(3.0, -2.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        truncate(attr, 11),
+                        egui::FontId::proportional(8.5),
+                        ink.gamma_multiply(0.8),
+                    );
+                }
+            }
+        }
+        if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let rel = pos - rect.min;
+            let (c, r) = ((rel.x / cell_w) as usize, (rel.y / cell_h) as usize);
+            if c < COLS && r < ROWS
+                && let Some((fi, _)) = patch.occupant(u, (r * COLS + c + 1) as u16)
+            {
+                *selection = Selection::fixture(fi);
+            }
+        }
+    });
+}
+
+/// Bottom tab: the per-fixture DMX patch editor.
+pub fn patch_editor(ui: &mut egui::Ui, scene: &Scene, patch: &mut PatchTable) {
+    ui.horizontal(|ui| {
+        ui.heading("Patch");
+        if ui
+            .button("Reset to imported")
+            .on_hover_text("Restore addresses from the import (MVR patch / GDTF footprints), discarding manual edits")
+            .clicked()
+        {
+            patch.reconcile_from_scene(scene);
+        }
+    });
+    ui.separator();
+
+    if scene.fixtures.is_empty() {
+        ui.label(RichText::new("No fixtures to patch.").weak().small());
+        return;
+    }
+
+    let mut conflicted = vec![false; scene.fixtures.len()];
+    for c in patch.conflicts() {
+        conflicted[c.a] = true;
+        conflicted[c.b] = true;
+    }
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        Grid::new("patch-grid")
+            .num_columns(7)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                for h in ["Fixture", "Univ", "Addr", "Mode", "Ch", "Src", ""] {
+                    ui.strong(RichText::new(h).small());
+                }
                 ui.end_row();
 
-                address += Fixture::DMX_FOOTPRINT;
-            }
-        });
+                for (i, fixture) in scene.fixtures.iter().enumerate() {
+                    ui.label(RichText::new(&fixture.name).small());
+
+                    // Universe / address (scoped &mut borrow of the entry).
+                    {
+                        let Some(p) = patch.get_mut(i) else {
+                            ui.label("");
+                            ui.label("");
+                            ui.label("");
+                            ui.label("");
+                            ui.label("");
+                            ui.end_row();
+                            continue;
+                        };
+                        let mut edited = ui.add(DragValue::new(&mut p.universe).range(1..=63999).speed(0.1)).changed();
+                        edited |= ui.add(DragValue::new(&mut p.address).range(1..=512).speed(0.2)).changed();
+                        if edited {
+                            p.enabled = true;
+                            p.source = PatchSource::Manual;
+                        }
+                    }
+
+                    // Mode selector (GDTF modes; plain fixtures are synthetic).
+                    let mut new_mode = None;
+                    match fixture.gdtf.as_ref() {
+                        Some(gdtf) if !gdtf.modes.is_empty() => {
+                            let cur = patch.get(i).map(|p| p.mode_index).unwrap_or(0);
+                            let cur_name = gdtf
+                                .modes
+                                .get(cur)
+                                .map(|m| m.name.clone())
+                                .unwrap_or_default();
+                            egui::ComboBox::from_id_salt(("patch-mode", i))
+                                .selected_text(RichText::new(cur_name).small())
+                                .show_ui(ui, |ui| {
+                                    for (mi, m) in gdtf.modes.iter().enumerate() {
+                                        if ui.selectable_label(mi == cur, &m.name).clicked() {
+                                            new_mode = Some(mi);
+                                        }
+                                    }
+                                });
+                        }
+                        _ => {
+                            ui.label(RichText::new("Synthetic").weak().small());
+                        }
+                    }
+                    if let Some(mi) = new_mode {
+                        patch.set_mode(fixture, i, mi);
+                    }
+
+                    // Footprint + source badge.
+                    ui.label(
+                        RichText::new(patch.get(i).map(|p| p.footprint.to_string()).unwrap_or_default())
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(patch.get(i).map(|p| p.source.label()).unwrap_or(""))
+                            .weak()
+                            .small(),
+                    );
+
+                    // Enabled checkbox + conflict badge.
+                    ui.horizontal(|ui| {
+                        if let Some(p) = patch.get_mut(i) {
+                            ui.checkbox(&mut p.enabled, "").on_hover_text("Occupy these channels");
+                        }
+                        if conflicted[i] {
+                            ui.colored_label(Color32::from_rgb(230, 90, 90), "⚠")
+                                .on_hover_text("Overlaps another fixture's address");
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+/// Cell background for the universe grid (high contrast, like a console patch
+/// sheet): unpatched cells are near-white, patched cells carry a blue tint that
+/// deepens with the live level.
+fn cell_bg(level: u8, patched: bool) -> Color32 {
+    if !patched {
+        return Color32::from_rgb(232, 233, 236);
+    }
+    let t = level as f32 / 255.0;
+    let lo = [206.0, 224.0, 247.0]; // patched, dark
+    let hi = [33.0, 99.0, 222.0]; // patched, full
+    Color32::from_rgb(
+        (lo[0] + (hi[0] - lo[0]) * t) as u8,
+        (lo[1] + (hi[1] - lo[1]) * t) as u8,
+        (lo[2] + (hi[2] - lo[2]) * t) as u8,
+    )
+}
+
+/// Readable text colour for a cell: dark ink on light cells, light ink on the
+/// deep-blue lit cells (luminance-based).
+fn cell_ink(bg: Color32) -> Color32 {
+    let l = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
+    if l > 140.0 {
+        Color32::from_rgb(38, 42, 50)
+    } else {
+        Color32::from_rgb(236, 239, 245)
+    }
+}
+
+/// Truncate a label to `n` chars with an ellipsis (for tight grid cells).
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() > n {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Compact a sorted universe list for the source table (e.g. `1,2,5`).
+fn format_universes(us: &[u16]) -> String {
+    us.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",")
 }
 
 /// What a viewport ray hit.
@@ -1057,9 +1634,6 @@ fn ray_aabb(ro: Vec3, rd: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     Some(if near > 0.0 { near } else { far })
 }
 
-fn unit_to_dmx(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
-}
 
 #[cfg(test)]
 mod pick_tests {
@@ -1099,10 +1673,4 @@ mod pick_tests {
         let rd = (f - ro).normalize();
         assert_eq!(pick(&scene, ro, rd), Some(Hit::Fixture(0)));
     }
-}
-
-/// Map a symmetric angle range (±span/2) onto a single 8-bit DMX channel.
-fn angle_to_dmx(angle_deg: f32, span_deg: f32) -> u8 {
-    let normalized = (angle_deg / span_deg + 0.5).clamp(0.0, 1.0);
-    (normalized * 255.0).round() as u8
 }

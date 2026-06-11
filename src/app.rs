@@ -26,6 +26,9 @@ struct State {
     scene: Scene,
     camera: OrbitCamera,
     ui: Ui,
+    /// Live Art-Net / sACN DMX input: owns the patch + receive thread and decodes
+    /// incoming universes into the fixtures each frame.
+    dmx: crate::dmx::DmxIo,
     last_frame: Instant,
     fps: f32,
     /// Whether to keep driving redraws (false while the window is occluded), so
@@ -77,6 +80,7 @@ impl ApplicationHandler for App {
             scene: Scene::demo(),
             camera: OrbitCamera::default(),
             ui: Ui::new(),
+            dmx: crate::dmx::DmxIo::new(),
             last_frame: Instant::now(),
             fps: 0.0,
             awake: true,
@@ -93,6 +97,27 @@ impl ApplicationHandler for App {
                         .scene
                         .add_gdtf(std::sync::Arc::new(fixture), glam::Vec3::new(0.0, 4.0, 0.0));
                     state.scene.fixtures[idx].tilt = 20.0;
+                    // PREVIZ_GDTF_MODE=<index or name substring> selects the DMX
+                    // mode (emitter layout + channel map) for the test fixture.
+                    if let Ok(sel) = std::env::var("PREVIZ_GDTF_MODE") {
+                        let f = &mut state.scene.fixtures[idx];
+                        let gdtf = f.gdtf.clone().unwrap();
+                        let mi = sel
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|&i| i < gdtf.modes.len())
+                            .or_else(|| {
+                                let s = sel.to_lowercase();
+                                gdtf.modes.iter().position(|m| m.name.to_lowercase().contains(&s))
+                            });
+                        if let Some(mi) = mi {
+                            f.mode_index = mi;
+                            f.sync_mode();
+                            log::info!("GDTF mode: [{}] {}", mi, gdtf.modes[mi].name);
+                        } else {
+                            log::warn!("PREVIZ_GDTF_MODE '{sel}' matched no mode");
+                        }
+                    }
                     state.ui.selection = crate::scene::Selection::fixture(idx);
                     log::info!("imported GDTF: {path}");
                 }
@@ -199,6 +224,14 @@ impl ApplicationHandler for App {
                 "unlit" | "flat" => ViewportMode::Unlit,
                 _ => ViewportMode::Beauty,
             };
+        }
+
+        // Live DMX dev knobs: PREVIZ_DMX starts the real receiver; PREVIZ_DMX_FEED
+        // / _INJECT push a synthetic universe set through the real decode path so
+        // the rig can be driven headlessly (composes with PREVIZ_SCREENSHOT below).
+        {
+            let state = self.state.as_mut().unwrap();
+            crate::dmx::apply_env_knobs(&mut state.dmx, &mut state.scene);
         }
 
         // Headless MVR export: PREVIZ_MVR_EXPORT=out.mvr writes the current scene
@@ -420,6 +453,7 @@ fn apply_stage_look(state: &mut State) {
     let color_lit = pick(&other_idx, 8);
 
     // White textured gobo beams (WIDE, fanned) — these are the shafts.
+    use crate::gdtf::WheelKind;
     let g = gobo_lit.len().max(2);
     for (k, &i) in gobo_lit.iter().enumerate() {
         let t = k as f32 / (g - 1) as f32;
@@ -429,10 +463,15 @@ fn apply_stage_look(state: &mut State) {
         f.pan = -55.0 + t * 110.0;
         f.tilt = 30.0 + (k % 3) as f32 * 8.0;
         f.optics = OpticalControls::default();
+        f.sync_mode();
         f.optics.dimmer = 1.0;
-        f.optics.gobo1 = 4.0 / 6.0;
         f.optics.zoom = 0.45; // wide so the cookie shows in the shaft, not just the floor
-        f.motion.gobo1_angle = 0.5 * t;
+        if let Some(w) = f.wheel_control_mut(WheelKind::Gobo, 1) {
+            w.value = 4.0 / 6.0;
+        }
+        if let Some(p) = f.wheel_phase_mut(WheelKind::Gobo, 1) {
+            *p = 0.5 * t;
+        }
     }
     // Colour wash beams (narrow) — fill behind the gobo shafts.
     let c = color_lit.len().max(2);
@@ -445,12 +484,17 @@ fn apply_stage_look(state: &mut State) {
         f.pan = -50.0 + t * 100.0;
         f.tilt = 34.0 + (k % 2) as f32 * 8.0;
         f.optics = OpticalControls::default();
+        f.sync_mode();
         f.optics.dimmer = 1.0;
         f.optics.cmy = [1.0 - col[0], 1.0 - col[1], 1.0 - col[2]];
         f.optics.zoom = 0.05 + (k % 3) as f32 * 0.05;
         if k % 3 == 0 {
-            f.optics.prism1 = 1.0;
-            f.motion.prism1_angle = 0.5 * t;
+            if let Some(w) = f.wheel_control_mut(WheelKind::Prism, 1) {
+                w.value = 1.0;
+            }
+            if let Some(p) = f.wheel_phase_mut(WheelKind::Prism, 1) {
+                *p = 0.5 * t;
+            }
         }
     }
     log::info!(
@@ -482,35 +526,54 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
     }
 
     // Each preset configures the fixture's optics + a fixed motion phase.
+    // Wheel components are addressed by kind+number (the chain is dynamic).
+    use crate::gdtf::WheelKind as K;
+    fn wheel(f: &mut crate::scene::Fixture, kind: crate::gdtf::WheelKind, n: u32, value: f32, spin: f32, phase: f32) {
+        if let Some(w) = f.wheel_control_mut(kind, n) {
+            w.value = value;
+            w.spin = spin;
+        }
+        if let Some(p) = f.wheel_phase_mut(kind, n) {
+            *p = phase;
+        }
+    }
     let presets: [(&str, fn(&mut crate::scene::Fixture)); 15] = [
         ("01_neutral", |_f| {}),
-        ("02_gobo_target", |f| { f.optics.gobo1 = 5.0 / 6.0; f.optics.zoom = 0.25; }),
+        ("02_gobo_target", |f| { wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0); f.optics.zoom = 0.25; }),
         ("03_gobo_vortex_spin", |f| {
-            f.optics.gobo1 = 4.0 / 6.0; f.optics.gobo1_rot = 0.85; f.optics.zoom = 0.25;
-            f.motion.gobo1_angle = 0.8;
+            wheel(f, K::Gobo, 1, 4.0 / 6.0, 0.85, 0.8);
+            f.optics.zoom = 0.25;
         }),
-        ("04_gobo2_smokerings", |f| { f.optics.gobo2 = 2.0 / 6.0; f.optics.zoom = 0.25; }),
-        ("05_color_red", |f| { f.optics.color = 1.0; }),
+        ("04_gobo2_smokerings", |f| { wheel(f, K::Gobo, 2, 2.0 / 6.0, 0.5, 0.0); f.optics.zoom = 0.25; }),
+        ("05_color_red", |f| { wheel(f, K::Color, 1, 1.0, 0.5, 0.0); }),
         ("06_cmy_magenta", |f| { f.optics.cmy = [0.0, 0.85, 0.0]; }),
         ("07_cto_warm", |f| { f.optics.cto = 1.0; }),
-        ("08_prism5", |f| { f.optics.prism1 = 1.0; f.optics.zoom = 0.0; }),
-        ("08b_prism_gobo", |f| { f.optics.prism1 = 1.0; f.optics.gobo1 = 5.0 / 6.0; f.optics.zoom = 0.0; }),
-        ("09_frost", |f| { f.optics.frost = 0.85; f.optics.gobo1 = 5.0 / 6.0; f.optics.zoom = 0.25; }),
+        ("08_prism5", |f| { wheel(f, K::Prism, 1, 1.0, 0.5, 0.0); f.optics.zoom = 0.0; }),
+        ("08b_prism_gobo", |f| {
+            wheel(f, K::Prism, 1, 1.0, 0.5, 0.0);
+            wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0);
+            f.optics.zoom = 0.0;
+        }),
+        ("09_frost", |f| {
+            wheel(f, K::Frost, 1, 0.85, 0.5, 0.0);
+            wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0);
+            f.optics.zoom = 0.25;
+        }),
         ("10_zoom_narrow", |f| { f.optics.zoom = 0.0; }),
         ("11_iris_closed", |f| { f.optics.iris = 0.25; }),
         ("12_animation", |f| {
-            f.optics.anim = 1.0; f.optics.anim_spin = 0.9; f.optics.gobo1 = 5.0 / 6.0;
-            f.optics.zoom = 0.25; f.motion.anim_scroll = 0.3;
+            wheel(f, K::Animation, 1, 1.0, 0.9, 0.3);
+            wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0);
+            f.optics.zoom = 0.25;
         }),
-        ("13_chromatic_ab", |f| { f.optics.ca = 1.0; f.optics.gobo1 = 5.0 / 6.0; f.optics.zoom = 0.12; }),
+        ("13_chromatic_ab", |f| { f.optics.ca = 1.0; wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0); f.optics.zoom = 0.12; }),
         ("14_combo", |f| {
             // Color + gobo + prism + frost together (stages compose).
-            f.optics.cmy = [0.6, 0.0, 0.0];     // cyan tint
-            f.optics.gobo1 = 4.0 / 6.0;          // vortex
-            f.optics.prism1 = 1.0;               // 5-facet fan
-            f.optics.frost = 0.15;
+            f.optics.cmy = [0.6, 0.0, 0.0]; // cyan tint
+            wheel(f, K::Gobo, 1, 4.0 / 6.0, 0.5, 0.0); // vortex
+            wheel(f, K::Prism, 1, 1.0, 0.5, 0.4); // 5-facet fan
+            wheel(f, K::Frost, 1, 0.15, 0.5, 0.0);
             f.optics.zoom = 0.18;
-            f.motion.prism1_angle = 0.4;
         }),
     ];
 
@@ -519,6 +582,7 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
             let f = &mut state.scene.fixtures[idx];
             f.optics = Default::default();
             f.motion = WheelMotion::default();
+            f.sync_mode();
             f.pan = 0.0;
             f.tilt = 28.0;
             apply(f);
@@ -542,9 +606,10 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
     {
         let f = &mut state.scene.fixtures[idx];
         f.optics = Default::default();
+        f.sync_mode();
         f.tilt = 0.0; // straight down
         f.optics.zoom = 0.0; // narrow
-        f.optics.prism1 = 1.0;
+        wheel(f, K::Prism, 1, 1.0, 0.5, 0.0);
     }
     let mut cam = state.camera.clone();
     cam.target = glam::Vec3::new(0.0, 0.0, 0.0);
@@ -607,14 +672,21 @@ fn render_anim_sequence(state: &mut State, dir: &str) {
         env.density = 0.12;
     }
     {
+        use crate::gdtf::WheelKind as K;
         let f = &mut state.scene.fixtures[idx];
         f.tilt = 30.0;
         f.optics = Default::default();
+        f.sync_mode();
         f.optics.zoom = 0.02; // narrow so the prism copies separate cleanly
-        f.optics.prism1 = 1.0; // 5-facet prism …
-        f.optics.prism1_rot = 0.92; // … rotating, so the fan revolves
-        f.optics.gobo1 = 4.0 / 6.0; // vortex gobo, replicated per facet
-        f.optics.gobo1_rot = 0.95; // and spinning
+        // 5-facet prism, rotating, with a spinning vortex gobo per facet.
+        if let Some(w) = f.wheel_control_mut(K::Prism, 1) {
+            w.value = 1.0;
+            w.spin = 0.92;
+        }
+        if let Some(w) = f.wheel_control_mut(K::Gobo, 1) {
+            w.value = 4.0 / 6.0;
+            w.spin = 0.95;
+        }
     }
     for frame in 0..6 {
         let (w, h, px) = state
@@ -650,6 +722,14 @@ impl State {
         }
         let fps = self.fps;
 
+        // Live DMX: apply any deferred connectivity command, pull the latest
+        // universes from the receive thread, and decode them into the fixtures —
+        // BEFORE advancing motion, so DMX-driven spin values feed this frame's
+        // wheel-motion integration.
+        self.dmx.apply_pending();
+        self.dmx.poll();
+        self.dmx.decode(&mut self.scene);
+
         // Advance time-based wheel motion once per real frame (not in the
         // renderer, which also runs for headless capture).
         self.scene.advance(dt);
@@ -661,8 +741,14 @@ impl State {
         // Build the UI. The closure borrows the scene/camera/ui fields; egui_ctx
         // is a separate (cloned) handle so there's no borrow conflict.
         let mut full_output = egui_ctx.run(raw_input, |ctx| {
-            self.ui
-                .show(ctx, &mut self.scene, &mut self.camera, viewport_texture, fps);
+            self.ui.show(
+                ctx,
+                &mut self.scene,
+                &mut self.camera,
+                &mut self.dmx,
+                viewport_texture,
+                fps,
+            );
         });
 
         self.egui_state.handle_platform_output(

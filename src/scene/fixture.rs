@@ -39,13 +39,22 @@ pub struct Fixture {
     /// straight down `-Y`; 45 aims down-and-forward.
     pub tilt: f32,
 
-    /// Emitted color, linear RGB in `0.0..=1.0`.
+    /// Emitted color, linear RGB in `0.0..=1.0`. For a multi-emitter GDTF
+    /// fixture this is the manual master tint multiplied over every cell.
     pub color: [f32; 3],
     /// Master intensity / dimmer in `0.0..=1.0`.
     pub intensity: f32,
     /// Full beam cone angle in degrees (drives the beam indicator now, the
     /// volumetric beam later).
     pub beam_angle: f32,
+
+    /// Active GDTF DMX mode — selects the geometry root (emitter layout), the
+    /// component chain and the channel map. Synced from the patch table.
+    pub mode_index: usize,
+    /// Per-emitter cell color (linear RGB, level premultiplied, white folded),
+    /// aligned with the mode's emitters. White at rest; live DMX rewrites it
+    /// every frame from the per-cell color layers.
+    pub cells: Vec<[f32; 3]>,
 
     /// The optical-chain control values (focus / frost / prism / color / gobo /
     /// animation / shutter …). Drives the GDTF optical model; neutral by default.
@@ -66,10 +75,6 @@ impl Fixture {
     /// Radius of the PAR-can body in metres.
     pub const BODY_RADIUS: f32 = 0.16;
 
-    /// Number of DMX channels a fixture would occupy (pan, tilt, dimmer, R, G,
-    /// B). Used by the DMX Monitor stub to lay out a faux patch.
-    pub const DMX_FOOTPRINT: u32 = 6;
-
     /// Instantiate a fixture from a library profile at a world position.
     pub fn from_profile(profile: &FixtureProfile, name: impl Into<String>, position: Vec3) -> Self {
         Self {
@@ -85,6 +90,8 @@ impl Fixture {
             color: profile.default_color,
             intensity: 1.0,
             beam_angle: profile.default_beam_angle,
+            mode_index: 0,
+            cells: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: None,
@@ -94,7 +101,7 @@ impl Fixture {
     /// Instantiate a fixture from an imported GDTF definition.
     pub fn from_gdtf(gdtf: Arc<GdtfFixture>, name: impl Into<String>, position: Vec3) -> Self {
         let beam_angle = gdtf.beam_angle.max(1.0);
-        Self {
+        let mut f = Self {
             name: name.into(),
             profile: gdtf.name.clone(),
             category: gdtf.manufacturer.clone(),
@@ -104,13 +111,17 @@ impl Fixture {
             orientation: Quat::IDENTITY,
             pan: 0.0,
             tilt: 0.0,
-            color: [1.0, 0.95, 0.85],
+            color: [1.0, 1.0, 1.0],
             intensity: 1.0,
             beam_angle,
+            mode_index: 0,
+            cells: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: None,
-        }
+        };
+        f.sync_mode();
+        f
     }
 
     /// Instantiate a fixture from an MVR import: a parsed GDTF plus a world-space
@@ -124,7 +135,13 @@ impl Fixture {
             Some(g) => (g.name.clone(), g.manufacturer.clone()),
             None => (imported.meta.gdtf_spec.clone(), "Unresolved".to_string()),
         };
-        Self {
+        // The patched DMX mode rides in the MVR metadata, by name.
+        let mode_index = imported
+            .gdtf
+            .as_ref()
+            .and_then(|g| g.modes.iter().position(|m| m.name == imported.meta.gdtf_mode))
+            .unwrap_or(0);
+        let mut f = Self {
             name: imported.name,
             profile,
             category,
@@ -134,21 +151,81 @@ impl Fixture {
             orientation,
             pan: 0.0,
             tilt: 0.0,
-            color: imported.color.unwrap_or([1.0, 0.95, 0.85]),
+            color: imported.color.unwrap_or([1.0, 1.0, 1.0]),
             // Imported rigs start blacked out — with no DMX feeding levels, a
             // real rig emits nothing. The user (or, later, live DMX) brings
             // fixtures up; importing 100+ fixtures at full would white out the
             // view. Edit intensity in the Inspector or bulk-select to bring up.
             intensity: 0.0,
             beam_angle,
+            mode_index,
+            cells: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: Some(Box::new(imported.meta)),
-        }
+        };
+        f.sync_mode();
+        f
     }
 
     pub fn is_gdtf(&self) -> bool {
         self.gdtf.is_some()
+    }
+
+    /// The active GDTF mode's emitters (empty for plain fixtures).
+    pub fn emitters(&self) -> &[crate::gdtf::EmitterDef] {
+        self.gdtf
+            .as_ref()
+            .map(|g| g.emitters(self.mode_index))
+            .unwrap_or(&[])
+    }
+
+    /// Re-align the per-mode state (wheel controls, motion phases, cells) with
+    /// the active GDTF mode. Call after construction or a mode change. Cells
+    /// reset to white (manual rest state); live DMX rewrites them per frame.
+    pub fn sync_mode(&mut self) {
+        let Some(gdtf) = &self.gdtf else {
+            return;
+        };
+        if self.mode_index >= gdtf.modes.len() {
+            self.mode_index = 0;
+        }
+        let mode = &gdtf.modes[self.mode_index];
+        self.optics.ensure_wheels(mode.components.len());
+        if self.motion.phases.len() != mode.components.len() {
+            self.motion.phases.resize(mode.components.len(), 0.0);
+        }
+        if self.cells.len() != mode.emitters.len() {
+            self.cells = vec![[1.0, 1.0, 1.0]; mode.emitters.len()];
+        }
+    }
+
+    /// Mutable control for a wheel component by kind+number (UI/preset paths).
+    pub fn wheel_control_mut(
+        &mut self,
+        kind: crate::gdtf::WheelKind,
+        number: u32,
+    ) -> Option<&mut crate::optics::WheelControl> {
+        let gdtf = self.gdtf.as_ref()?;
+        let mode = gdtf.modes.get(self.mode_index)?;
+        let i = mode.component_index(kind, number)?;
+        self.optics.ensure_wheels(mode.components.len());
+        self.optics.wheels.get_mut(i)
+    }
+
+    /// Mutable accumulated motion phase for a component (preset/dev paths).
+    pub fn wheel_phase_mut(
+        &mut self,
+        kind: crate::gdtf::WheelKind,
+        number: u32,
+    ) -> Option<&mut f32> {
+        let gdtf = self.gdtf.as_ref()?;
+        let mode = gdtf.modes.get(self.mode_index)?;
+        let i = mode.component_index(kind, number)?;
+        if self.motion.phases.len() != mode.components.len() {
+            self.motion.phases.resize(mode.components.len(), 0.0);
+        }
+        self.motion.phases.get_mut(i)
     }
 
     /// Model matrix that places and aims the fixture body. Local convention:
