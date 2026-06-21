@@ -547,15 +547,7 @@ impl Ui {
 
     /// Remove every selected fixture and clear the selection.
     fn delete_selected(&mut self, scene: &mut Scene) {
-        let mut ids = self.selection.fixtures.clone();
-        ids.sort_unstable();
-        for &i in ids.iter().rev() {
-            if i < scene.fixtures.len() {
-                scene.fixtures.remove(i);
-            }
-        }
-        self.selection = Selection::default();
-        self.scene_anchor = None; // indices shifted; old anchor is meaningless
+        panels::delete_selected_fixtures(scene, &mut self.selection, &mut self.scene_anchor);
     }
 
     /// Import any `.gdtf` / `.mvr` files dropped onto the window.

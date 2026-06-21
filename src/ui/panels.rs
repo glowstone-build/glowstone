@@ -1425,6 +1425,54 @@ fn decode_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui:
     Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
 }
 
+/// Remove the selected fixtures from the scene and clear the selection. Shared by
+/// the Delete shortcut, the Edit menu, and the viewport context menu so deletion
+/// behaves identically everywhere.
+pub fn delete_selected_fixtures(scene: &mut Scene, selection: &mut Selection, anchor: &mut Option<usize>) {
+    let mut ids = selection.fixtures.clone();
+    ids.sort_unstable();
+    for &i in ids.iter().rev() {
+        if i < scene.fixtures.len() {
+            scene.fixtures.remove(i);
+        }
+    }
+    *selection = Selection::default();
+    *anchor = None; // indices shifted; old anchor is meaningless
+}
+
+/// Extend the selection to every fixture sharing a profile with the current
+/// selection ("Select same type").
+fn select_same_type(scene: &Scene, selection: &mut Selection) {
+    let mut types: Vec<&str> =
+        selection.fixtures.iter().filter_map(|&i| scene.fixtures.get(i)).map(|f| f.profile.as_str()).collect();
+    types.sort_unstable();
+    types.dedup();
+    if types.is_empty() {
+        return;
+    }
+    selection.fixtures = scene
+        .fixtures
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| types.contains(&f.profile.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    selection.environment = None;
+}
+
+/// Frame the camera on the selected fixtures (their AABB). No-op if nothing
+/// selected.
+fn frame_selection(scene: &Scene, selection: &Selection, camera: &mut OrbitCamera) {
+    let mut it = selection.fixtures.iter().filter_map(|&i| scene.fixtures.get(i)).map(|f| f.position);
+    let Some(first) = it.next() else { return };
+    let (mut lo, mut hi) = (first, first);
+    for p in it {
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    camera.frame_aabb(lo - Vec3::splat(0.5), hi + Vec3::splat(0.5));
+}
+
 /// Apply an in-progress modal transform to the scene from the current mouse
 /// position. Reads the snapshot in `op.start`, so it's idempotent — called every
 /// frame the op is live; cancelling restores from the same snapshot.
@@ -1628,6 +1676,66 @@ pub fn viewport(
             None if !(toggle || m.shift) => *selection = Selection::default(),
             None => {}
         }
+    }
+
+    // Right-click: select the fixture under the cursor (if not already selected),
+    // then open a context menu acting on the selection.
+    if !consumed {
+        if response.secondary_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+            let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+            let aspect = rect.width() / rect.height().max(1.0);
+            let (ro, rd) = camera.ray(ndc, aspect);
+            if let Some(Hit::Fixture(i)) = pick(scene, ro, rd)
+                && !selection.contains_fixture(i)
+            {
+                *selection = Selection::fixture(i);
+                *scene_anchor = Some(i);
+            }
+        }
+        response.context_menu(|ui| {
+            ui.set_min_width(170.0);
+            if selection.fixtures.is_empty() {
+                if ui.button(format!("{}  Select all", theme::icon::FIXTURE)).clicked() {
+                    selection.fixtures = (0..scene.fixtures.len()).collect();
+                    selection.environment = None;
+                    ui.close();
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new(format!("{} selected", selection.fixtures.len())).small().weak(),
+                );
+                if ui.button("Select same type").clicked() {
+                    select_same_type(scene, selection);
+                    ui.close();
+                }
+                if ui.button(format!("{}  Frame selection", theme::icon::FRAME)).clicked() {
+                    frame_selection(scene, selection, camera);
+                    ui.close();
+                }
+                if duplicate.is_none() && ui.button(format!("{}  Duplicate / Array…", theme::icon::DUPLICATE)).clicked() {
+                    if let Some(idx) = selection.primary_fixture() {
+                        *duplicate =
+                            Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
+                    }
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Deselect").clicked() {
+                    *selection = Selection::default();
+                    ui.close();
+                }
+                if ui
+                    .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
+                    .clicked()
+                {
+                    delete_selected_fixtures(scene, selection, scene_anchor);
+                    ui.close();
+                }
+            }
+        });
     }
 
     // `d` opens the Duplicate dialog for the selected fixture.
