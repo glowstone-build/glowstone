@@ -353,6 +353,19 @@ pub struct ChannelFunction {
     pub physical_to: f32,
     /// Linked wheel name (color/gobo/prism/animation), if any.
     pub wheel: Option<String>,
+    /// The function's `<ChannelSet>` rows — the profile's exact DMX→wheel-slot
+    /// fixation, so the engine selects the slot the manufacturer intended rather
+    /// than scaling the raw DMX value across the wheel.
+    pub sets: Vec<ChannelSet>,
+}
+
+/// One GDTF `<ChannelSet>`: a DMX point that (optionally) links to a wheel slot.
+#[derive(Clone, Debug)]
+pub struct ChannelSet {
+    /// DMX start normalized to `0..1` over the channel's full range.
+    pub dmx_from: f32,
+    /// GDTF `WheelSlotIndex` (1-based; 0 = no slot link).
+    pub slot: i32,
 }
 
 impl GdtfFixture {
@@ -519,6 +532,14 @@ impl GdtfFixture {
                                         default = parse_dmx_norm(d);
                                     }
                                 }
+                                let cf_sets = cf
+                                    .children()
+                                    .filter(|c| c.has_tag_name("ChannelSet"))
+                                    .map(|c| ChannelSet {
+                                        dmx_from: c.attribute("DMXFrom").map(parse_dmx_norm).unwrap_or(0.0),
+                                        slot: c.attribute("WheelSlotIndex").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+                                    })
+                                    .collect();
                                 functions.push(ChannelFunction {
                                     attribute: cf.attribute("Attribute").unwrap_or(lc_attr).to_string(),
                                     name: cf.attribute("Name").unwrap_or("").to_string(),
@@ -526,6 +547,7 @@ impl GdtfFixture {
                                     physical_from: pf.unwrap_or(0.0),
                                     physical_to: pt.unwrap_or(1.0),
                                     wheel: cf.attribute("Wheel").filter(|w| !w.is_empty()).map(String::from),
+                                    sets: cf_sets,
                                 });
                             }
                         }

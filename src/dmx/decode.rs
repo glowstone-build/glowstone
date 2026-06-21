@@ -130,7 +130,8 @@ fn decode_gdtf(
         // wheels) route by attribute into the mode-aligned control list.
         if let Some((kind, number, role)) = component_attr(&ch.attribute) {
             if let Some(ci) = mode.component_index(kind, number) {
-                apply_wheel(fixture, ci, role, ch, v01);
+                let slots = mode.components.get(ci).map(|c| c.slots).unwrap_or(0);
+                apply_wheel(fixture, ci, role, ch, v01, slots);
                 continue;
             }
         }
@@ -265,7 +266,7 @@ fn decode_gdtf(
 /// Route one wheel-component channel value into the dynamic control list.
 /// `Value` roles get the rotation-subrange treatment: a value landing in a
 /// continuous-rotation channel function drives the spin instead of the select.
-fn apply_wheel(fixture: &mut Fixture, ci: usize, role: WheelRole, ch: &DmxChannel, v01: f32) {
+fn apply_wheel(fixture: &mut Fixture, ci: usize, role: WheelRole, ch: &DmxChannel, v01: f32, slots: u32) {
     let Some(ctl) = fixture.optics.wheels.get_mut(ci) else {
         return;
     };
@@ -284,12 +285,43 @@ fn apply_wheel(fixture: &mut Fixture, ci: usize, role: WheelRole, ch: &DmxChanne
                     ctl.spin = 0.5 + 0.5 * subrange_t(ch, idx, v01);
                     return;
                 }
+                // SLOT SELECT: pick the slot the GDTF profile fixes for this DMX
+                // value (its ChannelSet WheelSlotIndex), not a naive scale across
+                // the whole channel. Stored as slot/(slots-1) so the wheel parks on
+                // the profile slot. Rotation/shake sub-ranges were handled above.
+                if slots >= 1 {
+                    let slot = select_slot(f, ch, idx, v01, slots);
+                    ctl.value = if slots > 1 { slot as f32 / (slots as f32 - 1.0) } else { 0.0 };
+                    return;
+                }
             }
             ctl.value = v01;
         }
         WheelRole::Index => ctl.index = v01,
         WheelRole::Spin => ctl.spin = v01,
     }
+}
+
+/// Map a DMX value within a select channel-function to a wheel slot index, using
+/// the function's `<ChannelSet>` rows (the profile's exact fixation) when present,
+/// else linearly across the function's own sub-range (not the whole channel).
+fn select_slot(f: &ChannelFunction, ch: &DmxChannel, idx: usize, v01: f32, slots: u32) -> u32 {
+    let last = slots - 1;
+    // Profile slot links: the last ChannelSet whose DMXFrom <= v01 with a real
+    // WheelSlotIndex (1-based) wins. (Index 0 = "no link" → skip.)
+    if !f.sets.is_empty() {
+        let mut chosen: Option<i32> = None;
+        for cs in &f.sets {
+            if cs.dmx_from <= v01 + 1e-6 && cs.slot >= 1 {
+                chosen = Some(cs.slot - 1);
+            }
+        }
+        if let Some(s) = chosen {
+            return (s.max(0) as u32).min(last);
+        }
+    }
+    // No slot links: map this function's own sub-range linearly across the slots.
+    (subrange_t(ch, idx, v01) * last as f32).round() as u32
 }
 
 /// Shutter open gate for layer groups: closed sub-ranges → 0, else 1.
@@ -564,6 +596,7 @@ mod tests {
             physical_from: from,
             physical_to: to,
             wheel: None,
+            sets: Vec::new(),
         }
     }
 
@@ -580,6 +613,43 @@ mod tests {
             resolution,
             functions,
         }
+    }
+
+    #[test]
+    fn slot_select_uses_profile_channel_sets() {
+        use crate::gdtf::ChannelSet;
+        // One select function spanning the channel, with the profile's slot links
+        // (WheelSlotIndex is 1-based; 1 = first/open slot).
+        let mut f = cf("Gobo1", "Select", 0.0, 0.0, 1.0);
+        f.sets = vec![
+            ChannelSet { dmx_from: 0.0, slot: 1 },  // → slot 0 (open)
+            ChannelSet { dmx_from: 0.25, slot: 2 }, // → slot 1
+            ChannelSet { dmx_from: 0.5, slot: 3 },  // → slot 2
+            ChannelSet { dmx_from: 0.75, slot: 4 }, // → slot 3
+        ];
+        let ch = chan("Gobo1", 1, 1, vec![f]);
+        assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.10, 4), 0);
+        assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.30, 4), 1);
+        assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.60, 4), 2);
+        assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.90, 4), 3);
+    }
+
+    #[test]
+    fn slot_select_linear_within_subrange_without_sets() {
+        // Gobo select occupies DMX 0..0.5, continuous rotation 0.5..1. With no
+        // ChannelSets the select maps linearly across its OWN sub-range, not the
+        // whole channel.
+        let ch = chan(
+            "Gobo1",
+            1,
+            1,
+            vec![cf("Gobo1", "Select", 0.0, 0.0, 1.0), cf("Gobo1PosRotate", "Rotate CW", 0.5, 0.0, 1.0)],
+        );
+        assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.0, 5), 0); // t=0
+        assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.25, 5), 2); // t=0.5 → round(0.5·4)
+        assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.499, 5), 4); // t≈1 → last slot
+        // A value in the rotation sub-range is a rotation, not a slot.
+        assert!(is_rotation(&ch.functions[1]));
     }
 
     /// A minimal GDTF: Pan(1), Tilt(2), Dimmer(3), Shutter1(4), ColorSub_C(5).

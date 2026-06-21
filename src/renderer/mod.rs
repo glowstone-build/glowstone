@@ -1923,6 +1923,12 @@ fn build_beam_gpus(
     }
     let wheel_off = wheels_out.len() as f32;
     let wheel_count = my_wheels.len() as f32;
+    // A patterned cookie (gobo image or animation glass) makes lateral CA read as
+    // wild colour fringing on every gobo edge; on an open/colour beam it's the
+    // pleasing two-sided rim. So damp CA hard when a pattern is present, keep it
+    // full otherwise. (Colour wheels are solid → no fine detail → not "patterned".)
+    let has_pattern = o.anim.is_some() || o.wheels.iter().any(|w| !w.is_color);
+    let ca_strength = if has_pattern { o.ca_strength * 0.18 } else { o.ca_strength };
     wheels_out.extend(my_wheels);
     let cmyf = [o.cmy[0], o.cmy[1], o.cmy[2], 0.0];
     let (anim_layer, anim_scroll) = match &o.anim {
@@ -1954,7 +1960,7 @@ fn build_beam_gpus(
         cookie_u: [u.x, u.y, u.z, wheel_count],
         extra: [anim_layer, anim_scroll, 0.0, 0.0],
         shape: [n_order, o.focus_dist, o.iris, o.frost],
-        misc: [o.ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
+        misc: [ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
         cmyf,
     };
 

@@ -1451,12 +1451,14 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
                         ui.label(RichText::new(name).strong());
                         ui.add(Slider::new(&mut w.value, 0.0..=1.0).text(value_label));
                         ui.end_row();
-                        if comp.has_index {
+                        // Prism always exposes rotation (index + spin) even when the
+                        // profile didn't flag a dedicated Pos/PosRotate function.
+                        if comp.has_index || comp.kind == WheelKind::Prism {
                             ui.label("  index");
                             ui.add(Slider::new(&mut w.index, 0.0..=1.0));
                             ui.end_row();
                         }
-                        if comp.has_spin || matches!(comp.kind, WheelKind::Color | WheelKind::Animation) {
+                        if comp.has_spin || matches!(comp.kind, WheelKind::Color | WheelKind::Animation | WheelKind::Prism) {
                             ui.label("  spin");
                             ui.add(Slider::new(&mut w.spin, 0.0..=1.0).text("0.5=stop"));
                             ui.end_row();

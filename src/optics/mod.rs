@@ -324,33 +324,73 @@ fn wheel_name(gdtf: &GdtfFixture, comp: &OpticalComponent) -> Option<String> {
 /// beam and overlap on a wide one (exactly like a real fixture). The GDTF facet
 /// offsets (whose scale varies by fixture) are normalised so the largest deflects
 /// by `MAX_DEFLECT`.
-fn prism_beams(gdtf: &GdtfFixture, wheel: &str, rot: f32) -> Vec<PrismBeam> {
+/// The first integer 2..=16 in a name ("4 Prism", "8-Facet Circular Prism") — the
+/// facet count, since most GDTF prism slots encode it in the name and omit the
+/// `<Facet>` geometry.
+fn facet_count_from_name(name: &str) -> Option<usize> {
+    let mut num = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+        } else if !num.is_empty() {
+            break;
+        }
+    }
+    num.parse::<usize>().ok().filter(|n| (2..=16).contains(n))
+}
+
+/// Whether a wheel slot is an engaged prism (has facet geometry or a facet-count
+/// name) rather than the "open" pass-through.
+fn is_prism_slot(slot: &crate::gdtf::WheelSlot, wheel: &str) -> bool {
+    !slot.facets.is_empty()
+        || facet_count_from_name(&slot.name).is_some()
+        || (!slot.name.to_lowercase().contains("open") && facet_count_from_name(wheel).is_some())
+}
+
+fn prism_beams(gdtf: &GdtfFixture, wheel: &str, slot_idx: usize, rot: f32) -> Vec<PrismBeam> {
     /// Largest facet deflection, as tan(angle) in the lens plane (~15°).
     const MAX_DEFLECT: f32 = 0.27;
     let Some(w) = gdtf.wheel(wheel) else {
         return Vec::new();
     };
-    let Some(slot) = w.slots.iter().find(|s| !s.facets.is_empty()) else {
+    // Only the SELECTED slot engages — the "open" slot passes the beam through.
+    let Some(slot) = w.slots.get(slot_idx).filter(|s| is_prism_slot(s, wheel)) else {
         return Vec::new();
     };
-    let n = slot.facets.len();
-    let max_off = slot
-        .facets
-        .iter()
-        .map(|&[x, y]| (x * x + y * y).sqrt())
-        .fold(0.0_f32, f32::max)
-        .max(1e-3);
-    let spread = MAX_DEFLECT / max_off;
+    // Facet count: explicit <Facet> geometry, else the count named on the slot or
+    // the wheel ("4 Prism"), else a sensible default.
+    let n = if !slot.facets.is_empty() {
+        slot.facets.len()
+    } else {
+        facet_count_from_name(&slot.name).or_else(|| facet_count_from_name(wheel)).unwrap_or(3)
+    }
+    .max(2);
+
     let (s, c) = rot.sin_cos();
     // Energy splits across facets, but keep copies punchy (sub-linear falloff).
     let w_each = 1.0 / (n as f32).sqrt();
-    slot.facets
-        .iter()
-        .map(|&[dx, dy]| PrismBeam {
-            offset: [(c * dx - s * dy) * spread, (s * dx + c * dy) * spread],
-            weight: w_each,
-        })
-        .collect()
+    let max_off = slot.facets.iter().map(|&[x, y]| (x * x + y * y).sqrt()).fold(0.0_f32, f32::max);
+    if !slot.facets.is_empty() && max_off > 1e-3 {
+        // Usable GDTF facet offsets: normalise so the largest deflects by MAX_DEFLECT.
+        let spread = MAX_DEFLECT / max_off;
+        slot.facets
+            .iter()
+            .map(|&[dx, dy]| PrismBeam {
+                offset: [(c * dx - s * dy) * spread, (s * dx + c * dy) * spread],
+                weight: w_each,
+            })
+            .collect()
+    } else {
+        // No usable facet geometry (most GDTF prisms): synthesize a regular n-facet
+        // ring — what a circular prism physically does — spaced around a circle of
+        // MAX_DEFLECT and turned by the rotation phase.
+        (0..n)
+            .map(|k| {
+                let a = rot + TAU * (k as f32) / (n as f32);
+                PrismBeam { offset: [MAX_DEFLECT * a.cos(), MAX_DEFLECT * a.sin()], weight: w_each }
+            })
+            .collect()
+    }
 }
 
 /// Stack a second engaged prism onto an existing facet set: deflections add
@@ -486,7 +526,10 @@ pub fn resolve(
                 if ctl.value > 0.01
                     && let Some(w) = comp.wheel.clone().or_else(|| wheel_name(gdtf, comp))
                 {
-                    let set = prism_beams(gdtf, &w, m.phase(i) + ctl.index * TAU);
+                    // Which prism slot the profile selected (3-facet vs 5-facet …).
+                    let slot_idx =
+                        if comp.slots > 1 { (ctl.value * (comp.slots as f32 - 1.0)).round() as usize } else { 0 };
+                    let set = prism_beams(gdtf, &w, slot_idx, m.phase(i) + ctl.index * TAU);
                     prism = compose_prisms(prism, set);
                 }
             }

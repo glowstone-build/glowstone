@@ -108,11 +108,21 @@ fn opt_layer(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, ro
 }
 
 // Animation glass: a scrolling tiled mask (the classic fire/water shimmer).
+// The effect / animation wheel is a WHOLE rotating disc, not a single centred
+// gobo: the beam passes through a narrow window at radius R on it, so as the disc
+// turns the pattern sweeps across the gate as a continuous radial motion. We place
+// the gate window off-centre on the disc and rotate the disc by `scroll` turns.
 fn opt_anim(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, scroll: f32, lod: f32) -> f32 {
     if (layer < 0) {
         return 1.0;
     }
-    let auv = fract(uv * 1.5 + vec2<f32>(scroll, scroll * 0.35));
+    let a = scroll * 6.2831853;            // one full disc revolution per phase wrap
+    let ca = cos(a);
+    let sa = sin(a);
+    let g = uv - vec2<f32>(0.5, 0.5);      // gate-local coords (~[-0.5, 0.5])
+    let disk = vec2<f32>(1.55, 0.0) + g * 1.1; // window sits at radius 1.55 on the disc
+    let rp = vec2<f32>(ca * disk.x - sa * disk.y, sa * disk.x + ca * disk.y);
+    let auv = fract(rp * 0.5 + vec2<f32>(0.5, 0.5)); // tile the disc texture
     return textureSampleLevel(t, s, auv, clamp(layer, 0, ATLAS_MAX_LAYER), lod).a;
 }
 
@@ -165,13 +175,26 @@ fn opt_color_strip(
     let u = position + tcoord * GATE_FRAC;
     let cell = floor(u + 0.5);
     let slot = cell - floor(cell / n) * n;
-    let frac = (u + 0.5) - cell;
-    let d = abs(frac - 0.5);
-    if (gap > 0.001 && d > (0.5 - gap * 0.5)) {
-        return vec3<f32>(0.0, 0.0, 0.0); // dark seam between colour slots
+    let frac = (u + 0.5) - cell;       // 0..1 within the pitch (0.5 = slot centre)
+    let d = abs(frac - 0.5);           // 0 centre … 0.5 boundary
+    // The two slots straddling the gate, and a SOFT cross-fade between them near
+    // the boundary — a real colour-wheel spoke is a thin out-of-focus edge, not a
+    // hard black line. Sharper than the CMY flags (the wheel sits nearer the gate),
+    // but no longer a harsh seam.
+    let dir = select(-1.0, 1.0, frac >= 0.5);
+    let nb = cell + dir;
+    let slotB = nb - floor(nb / n) * n;
+    let colA = textureSampleLevel(tex, samp, vec2<f32>((slot + 0.5) / n, 0.5), i32(base), 0.0).rgb;
+    let colB = textureSampleLevel(tex, samp, vec2<f32>((slotB + 0.5) / n, 0.5), i32(base), 0.0).rgb;
+    const SEAM: f32 = 0.16;            // blend-zone half-width (in pitch units)
+    let t = smoothstep(0.5 - SEAM, 0.5, d) * 0.5; // → 50/50 at the boundary
+    var col = mix(colA, colB, t);
+    if (gap > 0.001) {
+        // Thin, soft, shallow darkening at the divider — never fully black.
+        let spoke = smoothstep(0.5 - gap, 0.5, d);
+        col = col * (1.0 - 0.45 * spoke);
     }
-    let su = (slot + 0.5) / n; // centre of the slot's band
-    return textureSampleLevel(tex, samp, vec2<f32>(su, 0.5), i32(base), 0.0).rgb;
+    return col;
 }
 
 fn opt_cmy_flag(u: f32, c: f32) -> f32 {
