@@ -1990,8 +1990,11 @@ fn build_beam_gpus(
             vec![make(&frame, frame.dir, frame.right, frame.up, base_color, cone.tan_half, cone.n_order, lens_radius)]
         } else {
             // Each facet is a separated aerial beam: deflect the axis, rebuild
-            // its basis, split energy.
-            o.prism
+            // its basis, split energy. While the prism is sliding in (prism_insert
+            // < 1) a straight passthrough of weight 1−insert keeps the main beam —
+            // the bleed during the move.
+            let mut out: Vec<FixtureGpu> = o
+                .prism
                 .iter()
                 .map(|p| {
                     let d = (frame.dir + frame.right * p.offset[0] + frame.up * p.offset[1]).normalize_or_zero();
@@ -1999,7 +2002,13 @@ fn build_beam_gpus(
                     let c = [base_color[0] * p.weight, base_color[1] * p.weight, base_color[2] * p.weight];
                     make(&frame, d, r2, u2, c, cone.tan_half, cone.n_order, lens_radius)
                 })
-                .collect()
+                .collect();
+            let straight = (1.0 - o.prism_insert).clamp(0.0, 1.0);
+            if straight > 0.01 {
+                let c = [base_color[0] * straight, base_color[1] * straight, base_color[2] * straight];
+                out.push(make(&frame, frame.dir, frame.right, frame.up, c, cone.tan_half, cone.n_order, lens_radius));
+            }
+            out
         };
 
         // Physical front lens at the beam exit, tinted by the colour chain.

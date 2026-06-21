@@ -29,6 +29,9 @@ pub struct WheelMotion {
     pub shake_phases: Vec<f32>,
     /// Physical wheel position in slot units (slewed; wraps at the slot count).
     pub positions: Vec<f32>,
+    /// Per-component INSERTION amount `0..1` (prism / frost sliding into the shaft),
+    /// slewed so an element travels in/out over time instead of popping in.
+    pub inserts: Vec<f32>,
     /// Slewed CMY flag insertions (cyan/magenta/yellow), each `0..1`.
     pub cmy: [f32; 3],
 }
@@ -57,6 +60,27 @@ impl WheelMotion {
         self.positions.get(i).copied().unwrap_or(0.0)
     }
 
+    /// The slewed insertion amount (0..1) for component `i` (prism/frost travel).
+    pub fn insert(&self, i: usize) -> f32 {
+        self.inserts.get(i).copied().unwrap_or(0.0)
+    }
+
+    /// Target insertion for a component: frost tracks its amount; prism is binary
+    /// (in past half-travel). Others don't insert.
+    fn insert_target(kind: WheelKind, value: f32) -> f32 {
+        match kind {
+            WheelKind::Frost => value.clamp(0.0, 1.0),
+            WheelKind::Prism => {
+                if value > 0.5 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        }
+    }
+
     /// The shake oscillation offset (radians) for component `i` at amplitude
     /// scaled by its `shake` control — a sine sway of the indexed element.
     pub fn shake_offset(&self, i: usize, shake: f32) -> f32 {
@@ -76,6 +100,7 @@ impl WheelMotion {
     pub fn settle(&mut self, c: &OpticalControls, components: &[OpticalComponent]) {
         let n = components.len();
         self.positions.resize(n, 0.0);
+        self.inserts.resize(n, 0.0);
         if self.phases.len() != n {
             self.phases.resize(n, 0.0);
         }
@@ -89,6 +114,7 @@ impl WheelMotion {
             if matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) && !spinning {
                 self.positions[i] = slot_target(ctl.value, slots);
             }
+            self.inserts[i] = Self::insert_target(comp.kind, ctl.value);
         }
         self.cmy = [c.cmy[0].clamp(0.0, 1.0), c.cmy[1].clamp(0.0, 1.0), c.cmy[2].clamp(0.0, 1.0)];
     }
@@ -106,15 +132,21 @@ impl WheelMotion {
         if self.positions.len() != n {
             self.positions.resize(n, 0.0);
         }
+        if self.inserts.len() != n {
+            self.inserts.resize(n, 0.0);
+        }
 
         // A real wheel indexes a slot fast (~0.1 s) — snappier than before so the
         // disc visibly spins through the change rather than crawling.
         const WHEEL_SLOT_RATE: f32 = 8.0; // slots/s for a select move
         const SCROLL_MAX: f32 = 10.0; // slots/s at full continuous scroll
+        const INSERT_RATE: f32 = 2.6; // prism/frost full travel in/out (~0.4 s)
 
         for (i, comp) in components.iter().enumerate() {
             let ctl = c.wheel(i);
             let slots = (comp.slots.max(1)) as f32;
+            // Prism/frost slide in/out of the shaft over time (no instant pop-in).
+            slew_toward(&mut self.inserts[i], Self::insert_target(comp.kind, ctl.value), INSERT_RATE, dt);
             // Shake oscillation: 1..9 Hz, wrapping 0..1.
             if ctl.shake > 0.01 && matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) {
                 let hz = 1.0 + 8.0 * ctl.shake;

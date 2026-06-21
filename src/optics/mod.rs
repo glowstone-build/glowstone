@@ -283,6 +283,9 @@ pub struct BeamOptics {
     pub anim: Option<(String, f32)>,
     /// Prism facet copies (empty = no prism; stacked prisms compose).
     pub prism: Vec<PrismBeam>,
+    /// How far the prism has slid into the shaft (0..1). Mid-travel the renderer
+    /// keeps a straight passthrough of weight `1 − prism_insert` (the bleed).
+    pub prism_insert: f32,
     /// A real (non-open) gobo is in the beam. The gobo disc is ALWAYS emitted (it
     /// physically lives in the shaft), so this — not "any gobo wheel present" — is
     /// what gates gobo-only effects like CA damping.
@@ -486,6 +489,7 @@ pub fn resolve(
     let mut color_fold = [1.0_f32, 1.0, 1.0];
     let mut anim: Option<(String, f32)> = None;
     let mut prism: Vec<PrismBeam> = Vec::new();
+    let mut prism_insert = 0.0_f32; // how far the prism has slid in (0..1)
     let mut frost = 0.0_f32;
     let mut gobo_engaged = false;
     /// Holder-gap fractions from `research-wheel-optics.md`.
@@ -555,20 +559,28 @@ pub fn resolve(
                 }
             }
             WheelKind::Prism => {
-                // `value` is the selected slot (like gobo/colour): DMX maps it to the
-                // profile slot, the inspector slider selects it. Engagement is decided
-                // entirely by whether that slot is a prism slot (prism_beams returns
-                // empty on the "open" slot), so there's no separate insertion gate to
-                // fight the slot-fraction semantics.
-                if let Some(w) = comp.wheel.clone().or_else(|| wheel_name(gdtf, comp)) {
+                // `value` selects the slot; the prism then SLIDES into the shaft over
+                // its travel time (m.insert). Mid-travel the facet copies are weak and
+                // a straight passthrough (weight 1−t, added in the renderer) keeps the
+                // main beam — the "bleed" while the prism moves in/out.
+                let t = m.insert(i).clamp(0.0, 1.0);
+                if t > 0.005
+                    && let Some(w) = comp.wheel.clone().or_else(|| wheel_name(gdtf, comp))
+                {
                     let slot_idx =
                         if comp.slots > 1 { (ctl.value.clamp(0.0, 1.0) * (comp.slots as f32 - 1.0)).round() as usize } else { 0 };
                     let set = prism_beams(gdtf, &w, slot_idx, m.phase(i) + ctl.index * TAU);
-                    prism = compose_prisms(prism, set);
+                    if !set.is_empty() {
+                        let scaled: Vec<PrismBeam> =
+                            set.iter().map(|p| PrismBeam { offset: p.offset, weight: p.weight * t }).collect();
+                        prism = compose_prisms(prism, scaled);
+                        prism_insert = prism_insert.max(t);
+                    }
                 }
             }
             WheelKind::Frost => {
-                frost = frost.max(ctl.value.clamp(0.0, 1.0));
+                // Frost slides in over its travel time too (slewed insertion).
+                frost = frost.max(m.insert(i).clamp(0.0, 1.0));
             }
         }
     }
@@ -646,6 +658,7 @@ pub fn resolve(
         cmy: cmy_spatial,
         anim,
         prism,
+        prism_insert,
         gobo_engaged,
     }
 }
