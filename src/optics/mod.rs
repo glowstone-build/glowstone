@@ -23,6 +23,43 @@ use std::f32::consts::TAU;
 
 use crate::gdtf::{GdtfFixture, OpticalComponent, WheelKind};
 
+/// The fixture's mechanical shutter style — part of OUR editable fixture model,
+/// not GDTF (GDTF doesn't describe blade geometry). Defaulted on import (a fixture
+/// with a Shutter1 channel gets `Blade`) and editable in the inspector. Drives the
+/// physical blade simulated on the lens + projected beam.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ShutterKind {
+    /// No mechanical blade (electronic dimming only) — uniform gate.
+    #[default]
+    None,
+    /// Two straight blades closing from top + bottom (typical strobe shutter).
+    Blade,
+    /// Blades with a sawtooth edge (softer strobe transition).
+    Sawtooth,
+}
+
+impl ShutterKind {
+    /// All variants, for the inspector dropdown.
+    pub const ALL: [ShutterKind; 3] = [ShutterKind::None, ShutterKind::Blade, ShutterKind::Sawtooth];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShutterKind::None => "None (electronic)",
+            ShutterKind::Blade => "Blade",
+            ShutterKind::Sawtooth => "Sawtooth",
+        }
+    }
+
+    /// Shader code: 0 = none, 1 = blade, 2 = sawtooth.
+    pub fn code(self) -> f32 {
+        match self {
+            ShutterKind::None => 0.0,
+            ShutterKind::Blade => 1.0,
+            ShutterKind::Sawtooth => 2.0,
+        }
+    }
+}
+
 /// Controls for one wheel component, aligned with the GDTF mode's
 /// [`components`](crate::gdtf::DmxMode::components) list.
 #[derive(Clone, Copy, Debug)]

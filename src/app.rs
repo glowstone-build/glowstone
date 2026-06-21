@@ -610,8 +610,18 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
             *p = phase;
         }
     }
-    let presets: [(&str, fn(&mut crate::scene::Fixture)); 15] = [
+    let presets: [(&str, fn(&mut crate::scene::Fixture)); 17] = [
         ("01_neutral", |_f| {}),
+        ("18_shutter_blade", |f| {
+            f.shutter = crate::optics::ShutterKind::Blade;
+            f.optics.shutter = 0.5; // half closed — blades cut in from top + bottom
+            f.optics.zoom = 0.0; // narrow beam → the blade outline images sharply
+        }),
+        ("19_shutter_sawtooth", |f| {
+            f.shutter = crate::optics::ShutterKind::Sawtooth;
+            f.optics.shutter = 0.5;
+            f.optics.zoom = 0.0;
+        }),
         ("02_gobo_target", |f| { wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0); f.optics.zoom = 0.25; }),
         ("03_gobo_vortex_spin", |f| {
             wheel(f, K::Gobo, 1, 4.0 / 6.0, 0.85, 0.8);

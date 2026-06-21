@@ -11,7 +11,7 @@ use glam::{Mat4, Quat, Vec3};
 use super::library::{FixtureGeometry, FixtureProfile};
 use crate::gdtf::GdtfFixture;
 use crate::mvr::MvrFixtureMeta;
-use crate::optics::{OpticalControls, WheelMotion};
+use crate::optics::{OpticalControls, ShutterKind, WheelMotion};
 
 /// One controllable fixture.
 #[derive(Clone)]
@@ -64,6 +64,9 @@ pub struct Fixture {
     /// A laser engine — rendered as a thin haze-only streak (no inverse-square
     /// cone falloff, razor edge), not a lamp cone.
     pub is_laser: bool,
+    /// Mechanical shutter blade style (our editable model; defaulted on import) —
+    /// simulated on the lens face + the projected beam.
+    pub shutter: ShutterKind,
 
     /// Active GDTF DMX mode — selects the geometry root (emitter layout), the
     /// component chain and the channel map. Synced from the patch table.
@@ -118,6 +121,7 @@ impl Fixture {
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: None,
+            shutter: ShutterKind::None,
         }
     }
 
@@ -125,6 +129,7 @@ impl Fixture {
     pub fn from_gdtf(gdtf: Arc<GdtfFixture>, name: impl Into<String>, position: Vec3) -> Self {
         let beam_angle = gdtf.beam_angle.max(1.0);
         let is_laser = gdtf.beam.lamp_type.to_lowercase().contains("laser");
+        let shutter = default_shutter(&gdtf);
         let mut f = Self {
             name: name.into(),
             profile: gdtf.name.clone(),
@@ -149,6 +154,7 @@ impl Fixture {
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: None,
+            shutter,
         };
         f.sync_mode();
         f
@@ -176,6 +182,7 @@ impl Fixture {
             .as_ref()
             .map(|g| g.beam.lamp_type.to_lowercase().contains("laser"))
             .unwrap_or(false);
+        let shutter = imported.gdtf.as_ref().map(|g| default_shutter(g)).unwrap_or(ShutterKind::None);
         let mut f = Self {
             name: imported.name,
             profile,
@@ -204,6 +211,7 @@ impl Fixture {
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: Some(Box::new(imported.meta)),
+            shutter,
         };
         f.sync_mode();
         f
@@ -393,6 +401,20 @@ fn slew_axis(cur: f32, vel: &mut f32, target: f32, max_v: f32, max_a: f32, dt: f
         return target;
     }
     next
+}
+
+/// Default mechanical-shutter style for an imported GDTF: a fixture with any
+/// Shutter channel gets a `Blade` (most strobe shutters are blades); the user can
+/// switch it to Sawtooth or None in the inspector. GDTF doesn't describe blade
+/// geometry, so this is our model filling the gap.
+fn default_shutter(gdtf: &GdtfFixture) -> ShutterKind {
+    let has_shutter = gdtf.modes.iter().any(|m| {
+        m.channels.iter().any(|c| {
+            c.attribute.starts_with("Shutter")
+                || c.functions.iter().any(|f| f.attribute.starts_with("Shutter"))
+        })
+    });
+    if has_shutter { ShutterKind::Blade } else { ShutterKind::None }
 }
 
 #[cfg(test)]

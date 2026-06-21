@@ -285,6 +285,28 @@ fn opt_wheels(
 
 // The full per-fragment optical cookie: the fixture's wheel chain × CMY ×
 // animation, each evaluated spatially (physical wheels + sliding flags). Returns
+// Mechanical SHUTTER blades closing across the aperture. Two blades close from the
+// top and bottom; `close` 0 = open … 1 = shut, `kind` 1 = straight blade / 2 =
+// sawtooth edge, `soft` = edge softness (small = crisp blade, used for narrow beam
+// fixtures whose gate images sharply; large = blurred away on wide washes). The lit
+// centre stays full; the band under a blade darkens with a visible edge — so a
+// partly-closed shutter shows the blade outline on the beam + floor pool.
+// `p` = beam cross-section in the unit disc = (guv-0.5)*2.
+fn opt_shutter(p: vec2<f32>, close: f32, kind: f32, soft: f32) -> f32 {
+    if (kind < 0.5 || close < 0.02) {
+        return 1.0;
+    }
+    let half = 1.0 - close;            // lit half-height (p.y in [-1, 1])
+    var edge = half;
+    if (kind > 1.5) {                  // sawtooth edge
+        let tri = abs(fract(p.x * 3.0) * 2.0 - 1.0); // 0..1 zigzag
+        edge = half + (tri - 0.5) * 0.16;
+    }
+    let s = clamp(soft, 0.02, 0.6);
+    let under = smoothstep(edge - s, edge + s, abs(p.y)); // 0 lit … 1 under blade
+    return 1.0 - 0.82 * under;
+}
+
 // the per-channel transmittance multiplying the beam colour. `sharpen` > 0 (floor
 // pool only) applies LOD-faded contour steepening to the gobo edge.
 fn opt_cookie(

@@ -246,7 +246,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
                 gobo_tex, gobo_samp, guv,
                 fx.cookie_r.w, fx.cookie_u.w,
                 fx.extra.x, fx.extra.y, fx.cmyf.xyz, lod, 0.0,
-            );
+            ) * opt_shutter((guv - vec2<f32>(0.5)) * 2.0, fx.extra.z, fx.extra.w, fx.cmyf.w);
             if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
                 continue;
             }

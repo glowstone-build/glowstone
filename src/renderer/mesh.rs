@@ -99,16 +99,20 @@ pub struct LensInstance {
     /// x = tan(half beam angle), y = super-Gaussian edge order, z = candela
     /// gain (zoom concentration → face luminance), w = lens radius (m).
     pub params: [f32; 4],
+    /// Mechanical shutter on the lens face: x = close 0..1, y = kind (0 none /
+    /// 1 blade / 2 sawtooth), z = edge softness, w = unused.
+    pub shutter: [f32; 4],
 }
 
 impl LensInstance {
-    const ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    const ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
         5 => Float32x4,
         6 => Float32x4,
         7 => Float32x4,
         8 => Float32x4,
         9 => Float32x4,
         10 => Float32x4,
+        11 => Float32x4,
     ];
 
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {

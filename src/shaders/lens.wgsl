@@ -34,6 +34,7 @@ struct VsIn {
     @location(8) m3: vec4<f32>,
     @location(9) color: vec4<f32>,  // rgb = cell color, w = level (0 = off)
     @location(10) params: vec4<f32>, // x = tan_half, y = n_order, z = candela, w = lens radius
+    @location(11) shutter: vec4<f32>, // x = close, y = kind, z = soft, w = unused
 };
 
 struct VsOut {
@@ -45,6 +46,7 @@ struct VsOut {
     @location(4) up: vec3<f32>,
     @location(5) color: vec4<f32>,
     @location(6) params: vec4<f32>,
+    @location(7) shutter: vec4<f32>,
 };
 
 @vertex
@@ -60,6 +62,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.up = normalize(in.m1.xyz);
     out.color = in.color;
     out.params = in.params;
+    out.shutter = in.shutter;
     return out;
 }
 
@@ -125,6 +128,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     } else if (level > 1e-4) {
         // Back side of a lit cell: the lens body still glows faintly.
         rgb += in.color.rgb * (level * 0.4);
+    }
+
+    // Mechanical shutter blade(s) across the lens face — the mechanism lives at
+    // the gate, so it's visible on the glass (a thin parked sliver even when open,
+    // more as it closes). Two blades from top + bottom; sawtooth edge if kind 2.
+    let sk = in.shutter.y;
+    if (sk > 0.5) {
+        var bedge = 1.0 - in.shutter.x;
+        if (sk > 1.5) {
+            let tri = abs(fract(in.local.x * 3.0) * 2.0 - 1.0);
+            bedge = bedge + (tri - 0.5) * 0.16;
+        }
+        let bsoft = max(in.shutter.z, 0.02);
+        let under = smoothstep(bedge - bsoft, bedge + bsoft, abs(in.local.y));
+        rgb = rgb * (1.0 - 0.92 * under);
     }
 
     return vec4<f32>(rgb * edge, 1.0);

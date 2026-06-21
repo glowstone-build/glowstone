@@ -188,7 +188,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
             gobo_tex, gobo_samp, guv,
             lt.cookie_r.w, lt.cookie_u.w,
             lt.extra.x, lt.extra.y, lt.cmyf.xyz, lod, camera.render_mode.y,
-        );
+        ) * opt_shutter((guv - vec2<f32>(0.5)) * 2.0, lt.extra.z, lt.extra.w, lt.cmyf.w);
         if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
             continue;
         }

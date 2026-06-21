@@ -1758,6 +1758,7 @@ struct BeamBuild {
 }
 
 /// Build a lens-disc instance facing `dir` at `origin`, radius `r`.
+#[allow(clippy::too_many_arguments)]
 fn lens_instance(
     origin: Vec3,
     dir: Vec3,
@@ -1769,6 +1770,7 @@ fn lens_instance(
     tan_half: f32,
     n_order: f32,
     candela: f32,
+    shutter: [f32; 4],
 ) -> LensInstance {
     let model = Mat4::from_cols(
         (right * r).extend(0.0),
@@ -1780,6 +1782,7 @@ fn lens_instance(
         model: model.to_cols_array_2d(),
         color: [color[0], color[1], color[2], level],
         params: [tan_half, n_order, candela, r],
+        shutter,
     }
 }
 
@@ -1826,6 +1829,7 @@ fn build_laser(
             tan_half,
             6.0,
             8.0,
+            [0.0; 4], // lasers have no mechanical shutter blade
         )],
     }
 }
@@ -1901,6 +1905,7 @@ fn build_beam_gpus(
                 tan_half,
                 6.0,
                 1.0,
+                [0.0; 4],
             )],
         };
     };
@@ -1946,6 +1951,11 @@ fn build_beam_gpus(
     // emit no beams so the raymarch / floor loop skips the fixture entirely.
     let level = fixture.intensity.max(0.0) * fixture.optics.dimmer.max(0.0) * o.shutter_gain;
     let lens_level = (fixture.intensity * fixture.optics.dimmer).max(0.0) * o.shutter_gain;
+    // Mechanical shutter blade: how far closed (tracks the shutter, not the dimmer)
+    // + the blade style. The blade's edge softness (cmyf.w, set per-beam from the
+    // beam's half-angle) makes it crisp on a narrow beam and soft on a wide one.
+    let shutter_close = (1.0 - o.shutter_gain).clamp(0.0, 1.0);
+    let shutter_kind = fixture.shutter.code();
 
     let make = |frame: &fixture_model::BeamFrame,
                 bdir: Vec3,
@@ -1960,10 +1970,12 @@ fn build_beam_gpus(
         color: [col[0], col[1], col[2], lens_r],
         cookie_r: [r.x, r.y, r.z, wheel_off],
         cookie_u: [u.x, u.y, u.z, wheel_count],
-        extra: [anim_layer, anim_scroll, 0.0, 0.0],
+        extra: [anim_layer, anim_scroll, shutter_close, shutter_kind],
         shape: [n_order, o.focus_dist, o.iris, o.frost],
         misc: [ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
-        cmyf,
+        // cmyf.w = shutter-blade edge softness: crisp on a narrow beam (the gate
+        // images sharply on a beam fixture), blurred out on a wide wash.
+        cmyf: [cmyf[0], cmyf[1], cmyf[2], (tan_half * 1.1).clamp(0.03, 0.6)],
     };
 
     // ----- single-emitter path (classic moving head; prism expansion) -----
@@ -2011,7 +2023,11 @@ fn build_beam_gpus(
             out
         };
 
-        // Physical front lens at the beam exit, tinted by the colour chain.
+        // Physical front lens at the beam exit, tinted by the colour chain. The
+        // shutter blade shows on the lens even when open (a thin parked sliver) —
+        // the mechanism lives at the gate; crisp here (it's right at the glass).
+        let lens_shutter =
+            if shutter_kind > 0.5 { [shutter_close.max(0.08), shutter_kind, 0.05, 0.0] } else { [0.0; 4] };
         let lenses = vec![lens_instance(
             frame.origin + frame.dir * 0.04,
             frame.dir,
@@ -2023,6 +2039,7 @@ fn build_beam_gpus(
             cone.tan_half,
             cone.n_order,
             cone.face_gain,
+            lens_shutter,
         )];
         return BeamBuild { beams, lenses };
     }
@@ -2094,6 +2111,7 @@ fn build_beam_gpus(
             c.cone.tan_half,
             c.cone.n_order,
             c.cone.face_gain,
+            [0.0; 4], // multi-emitter washes: no framing blade on each cell
         ));
     }
 
