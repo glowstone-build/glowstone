@@ -841,6 +841,10 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     if std::env::var("PREVIZ_UI_PROFILE").is_ok() {
         state.ui.debug_open_profile(&state.scene);
     }
+    // PREVIZ_UI_SHARE opens the online Fixture Library window; =demo injects rows.
+    if let Ok(v) = std::env::var("PREVIZ_UI_SHARE") {
+        state.ui.debug_open_share(v == "demo");
+    }
     if std::env::var("PREVIZ_UI_SELECT").is_ok() {
         state.ui.debug_select_first_gdtf(&state.scene);
     }

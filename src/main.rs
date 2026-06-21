@@ -10,6 +10,7 @@ mod mvr;
 mod optics;
 mod renderer;
 mod scene;
+mod share;
 mod ui;
 
 use winit::event_loop::EventLoop;

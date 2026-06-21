@@ -498,6 +498,7 @@ fn add_library_row(row: &LibRow, library: &Library, scene: &mut Scene) -> Select
 
 /// Left tab: the content library — a searchable, sortable list of fixture and
 /// environment templates with multi-select (shift = range) and batch add.
+#[allow(clippy::too_many_arguments)]
 pub fn library_browser(
     ui: &mut egui::Ui,
     library: &mut Library,
@@ -505,6 +506,7 @@ pub fn library_browser(
     selection: &mut Selection,
     camera: &mut OrbitCamera,
     lib: &mut LibState,
+    open_share: &mut bool,
 ) {
     use theme::icon;
 
@@ -512,6 +514,14 @@ pub fn library_browser(
     ui.horizontal(|ui| {
         ui.heading("Library");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button(format!("{}  Online", icon::ONLINE))
+                .on_hover_text("Browse and download fixtures from the online GDTF Share library")
+                .clicked()
+            {
+                *open_share = true;
+            }
+            ui.separator();
             let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
             if ui.add_enabled(can_export, egui::Button::new(theme::ico(icon::EXPORT)))
                 .on_hover_text("Export the scene to MVR")

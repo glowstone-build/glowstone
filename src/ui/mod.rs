@@ -3,6 +3,7 @@
 
 mod cues;
 mod panels;
+mod share_window;
 pub mod theme;
 mod windows;
 
@@ -242,6 +243,9 @@ pub struct Ui {
     group_name: String,
     /// The cue list + crossfade engine.
     cues: cues::CueEngine,
+    /// The online GDTF Share fixture library + its window toggle.
+    share: crate::share::Share,
+    show_share: bool,
     /// A delete was requested (from a shortcut / menu / context menu) — committed
     /// once after the dock, where the patch is reachable, so the patch / groups /
     /// cues all get remapped in lock-step with the fixture removal.
@@ -274,6 +278,8 @@ impl Ui {
             group_name: String::new(),
             cues: cues::CueEngine::default(),
             pending_delete: false,
+            share: crate::share::Share::new(),
+            show_share: false,
         }
     }
 
@@ -375,6 +381,7 @@ impl Ui {
             group_name: &mut self.group_name,
             cues: &mut self.cues,
             delete_requested: &mut self.pending_delete,
+            open_share: &mut self.show_share,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
             dmx_status: dmxv.status,
@@ -416,11 +423,28 @@ impl Ui {
         windows::about_window(ctx, &mut self.show_about);
         windows::shortcuts_window(ctx, &mut self.show_shortcuts);
         windows::quick_select_window(ctx, scene, &mut self.selection, &mut self.quick_select);
+        share_window::fixture_library_window(
+            ctx,
+            &mut self.show_share,
+            &mut self.share,
+            &mut self.library,
+            scene,
+            &mut self.selection,
+        );
     }
 
     /// Force the quick-select palette open (headless screenshot hook).
     pub fn debug_open_quick_select(&mut self) {
         self.quick_select = true;
+    }
+
+    /// Open the online Fixture Library window (headless hook). `demo` injects fake
+    /// catalogue rows so the browse view renders without real credentials.
+    pub fn debug_open_share(&mut self, demo: bool) {
+        self.show_share = true;
+        if demo {
+            self.share.debug_demo();
+        }
     }
 
     /// Open the profile editor for the first GDTF fixture (headless hook).
@@ -769,6 +793,11 @@ impl Ui {
                     ui.checkbox(&mut self.settings.show_beam_wireframes, "Beam gizmos");
                 });
                 ui.menu_button("Fixture", |ui| {
+                    if ui.button(format!("{}  Online Library…", icon::ONLINE)).clicked() {
+                        self.show_share = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     let has = self.selection.primary_fixture().map(|i| i < scene.fixtures.len() && scene.fixtures[i].is_gdtf()).unwrap_or(false);
                     if ui.add_enabled(has, egui::Button::new(format!("{}  Edit Profile…", icon::PROFILE))).clicked() {
                         if let Some(i) = self.selection.primary_fixture() {
@@ -953,6 +982,7 @@ struct PanelViewer<'a> {
     group_name: &'a mut String,
     cues: &'a mut cues::CueEngine,
     delete_requested: &'a mut bool,
+    open_share: &'a mut bool,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
     dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
@@ -1010,6 +1040,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.selection,
                 self.camera,
                 self.lib,
+                self.open_share,
             ),
             Tab::Inspector => {
                 panels::inspector(ui, self.scene, self.selection, self.gdtf_textures, self.profile)

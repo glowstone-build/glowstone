@@ -61,6 +61,16 @@ pub mod icon {
     // Status glyphs
     pub const LIVE: &str = p::CIRCLE; // filled-via-color
     pub const WARNING: &str = p::WARNING;
+    // Online fixture library (GDTF Share)
+    pub const ONLINE: &str = p::GLOBE_SIMPLE;
+    pub const DOWNLOAD: &str = p::DOWNLOAD_SIMPLE;
+    pub const CLOUD: &str = p::CLOUD_ARROW_DOWN;
+    pub const CACHED: &str = p::CLOUD_CHECK;
+    pub const CHECK: &str = p::CHECK;
+    pub const STAR: &str = p::STAR;
+    pub const SIGN_IN: &str = p::SIGN_IN;
+    pub const SIGN_OUT: &str = p::SIGN_OUT;
+    pub const USER: &str = p::USER_CIRCLE;
 }
 
 // --- semantic status colours (consistent across every panel) ---
