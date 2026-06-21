@@ -27,6 +27,7 @@ pub enum PatchSource {
 }
 
 impl PatchSource {
+    #[allow(dead_code)] // shown in the fixture sheet on demand / round-trip metadata
     pub fn label(self) -> &'static str {
         match self {
             PatchSource::Mvr => "MVR",
