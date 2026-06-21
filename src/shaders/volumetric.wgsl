@@ -23,14 +23,11 @@ struct Fixture {
     pos_range: vec4<f32>, // xyz = lens position, w = range (m)
     dir_cos: vec4<f32>,   // xyz = beam dir (unit), w = tan(half zoom angle)
     color: vec4<f32>,     // rgb = tint*intensity*candela*shutter, w = lens radius (m)
-    cookie_r: vec4<f32>,  // xyz = lens-plane right, w = gobo1 image rotation (rad)
-    cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = gobo2 image rotation (rad)
+    cookie_r: vec4<f32>,  // xyz = lens-plane right, w = wheel buffer offset
+    cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = wheel count (dynamic chain)
     extra: vec4<f32>,     // x = anim layer (<0 none), y = anim scroll, z/w = unused
     shape: vec4<f32>,     // x = super-Gaussian order, y = focus dist, z = iris frac, w = frost
     misc: vec4<f32>,      // x = CA strength, y = laser flag, z = atlas count, w = shadow layer
-    gw1: vec4<f32>,       // gobo1 wheel: base_layer, position(slot), n_slots, gap (<0 base = none)
-    gw2: vec4<f32>,       // gobo2 wheel
-    cw: vec4<f32>,        // colour wheel: base_layer, position, n_slots, unused
     cmyf: vec4<f32>,      // CMY flag insertions c,m,y, unused
 };
 
@@ -46,6 +43,9 @@ struct Fixture {
 @group(0) @binding(7) var shadow_atlas: texture_depth_2d_array;
 @group(0) @binding(8) var shadow_samp: sampler_comparison;
 @group(0) @binding(9) var<storage, read> shadow_mats: array<mat4x4<f32>>;
+// Per-fixture wheel chain (dynamic count); each fixture indexes a [offset,count)
+// slice via cookie_r.w / cookie_u.w.
+@group(0) @binding(10) var<storage, read> wheels: array<WheelGpu>;
 
 const PI: f32 = 3.14159265359;
 
@@ -244,7 +244,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             let lod = opt_lod(depth, fx.shape.y, frost, tan_half, iris, lens_r);
             let trans = opt_cookie(
                 gobo_tex, gobo_samp, guv,
-                fx.gw1, fx.cookie_r.w, fx.gw2, fx.cookie_u.w, fx.cw,
+                fx.cookie_r.w, fx.cookie_u.w,
                 fx.extra.x, fx.extra.y, fx.cmyf.xyz, lod, 0.0,
             );
             if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {

@@ -229,8 +229,24 @@ pub fn volumetric_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
             shadow_atlas_entry(7),
             shadow_sampler_entry(8),
             shadow_matrices_entry(9),
+            // 10: per-fixture wheel chain (dynamic count).
+            storage_entry(10),
         ],
     })
+}
+
+/// Read-only storage buffer bind-group-layout entry (fragment-visible).
+fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 /// Fixtures-as-spotlights storage buffer + the gobo atlas for surface lighting
@@ -269,6 +285,8 @@ pub fn light_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             shadow_atlas_entry(3),
             shadow_sampler_entry(4),
             shadow_matrices_entry(5),
+            // 6: per-fixture wheel chain (dynamic count).
+            storage_entry(6),
         ],
     })
 }

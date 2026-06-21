@@ -18,14 +18,11 @@ struct Light {
     pos_range: vec4<f32>, // xyz = lens, w = range
     dir_cos: vec4<f32>,   // xyz = beam dir, w = tan(half zoom angle)
     color: vec4<f32>,     // rgb = tint*intensity*candela*shutter, w = lens radius
-    cookie_r: vec4<f32>,  // xyz = lens-plane right, w = gobo1 image rotation (rad)
-    cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = gobo2 image rotation (rad)
+    cookie_r: vec4<f32>,  // xyz = lens-plane right, w = wheel buffer offset
+    cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = wheel count (dynamic chain)
     extra: vec4<f32>,     // x = anim layer (<0 none), y = anim scroll, z/w = unused
     shape: vec4<f32>,     // x = super-Gaussian order, y = focus dist, z = iris frac, w = frost
     misc: vec4<f32>,      // x = CA strength, y = laser flag, z = atlas count, w = shadow layer
-    gw1: vec4<f32>,       // gobo1 wheel: base_layer, position(slot), n_slots, gap (<0 base = none)
-    gw2: vec4<f32>,       // gobo2 wheel
-    cw: vec4<f32>,        // colour wheel: base_layer, position, n_slots, unused
     cmyf: vec4<f32>,      // CMY flag insertions c,m,y, unused
 };
 
@@ -37,6 +34,8 @@ var<storage, read> lights: array<Light>;
 @group(1) @binding(3) var shadow_atlas: texture_depth_2d_array;
 @group(1) @binding(4) var shadow_samp: sampler_comparison;
 @group(1) @binding(5) var<storage, read> shadow_mats: array<mat4x4<f32>>;
+// Per-fixture wheel chain (dynamic count); shared with the volumetric pass.
+@group(1) @binding(6) var<storage, read> wheels: array<WheelGpu>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -147,7 +146,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         let lod = opt_lod(depth, lt.shape.y, lt.shape.w, lt.dir_cos.w, lt.shape.z, lt.color.w);
         let trans = opt_cookie(
             gobo_tex, gobo_samp, guv,
-            lt.gw1, lt.cookie_r.w, lt.gw2, lt.cookie_u.w, lt.cw,
+            lt.cookie_r.w, lt.cookie_u.w,
             lt.extra.x, lt.extra.y, lt.cmyf.xyz, lod, camera.render_mode.y,
         );
         if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {

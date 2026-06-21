@@ -240,6 +240,9 @@ pub struct WheelSel {
     pub n_slots: f32,
     pub gap: f32,
     pub rot: f32,
+    /// True = a colour wheel (sampled from the packed colour strip); false = a
+    /// gobo wheel (sampled from the atlas image block, with holder gap + image rot).
+    pub is_color: bool,
 }
 
 /// One prism facet copy: an angular deflection of the beam axis (in the lens
@@ -268,12 +271,11 @@ pub struct BeamOptics {
     pub shutter_gain: f32,
     /// Chromatic-aberration strength (beam-edge per-channel offset).
     pub ca_strength: f32,
-    /// Up to two engaged gobo wheels (the GPU's projected-cookie lanes).
-    pub gobo1: Option<WheelSel>,
-    pub gobo2: Option<WheelSel>,
-    /// Engaged colour wheel — solid-colour dichroic slots, physically split
-    /// across the beam (sampled from the atlas like a gobo, with no gap).
-    pub color_wheel: Option<WheelSel>,
+    /// Every engaged wheel this frame (gobo + colour), in chain order — a DYNAMIC
+    /// count. The renderer flattens these into the per-fixture GPU wheel buffer;
+    /// the shader folds them in any number. Parked wheels are excluded (their
+    /// colour is already folded into `tint`).
+    pub wheels: Vec<WheelSel>,
     /// Slewed CMY flag insertions (cyan/magenta/yellow, each 0..1) — the shader
     /// renders them as sliding graduated dichroic flags per fragment.
     pub cmy: [f32; 3],
@@ -410,8 +412,8 @@ pub fn resolve(
     // Gobo/colour wheels become a continuous slewed `position` (slot units) the
     // shader samples per-fragment, producing the split + holder gap; we no longer
     // fold colour into the tint. CMY likewise becomes per-fragment (sliding flags).
-    let mut gobos: Vec<WheelSel> = Vec::new();
-    let mut color_wheel: Option<WheelSel> = None;
+    // Every engaged wheel (gobo + colour), in chain order — a dynamic count.
+    let mut wheels: Vec<WheelSel> = Vec::new();
     // A colour wheel parked on a slot is spatially uniform → folded into the
     // tint here (free per fragment); it only goes spatial (split) while moving.
     let mut color_fold = [1.0_f32, 1.0, 1.0];
@@ -427,7 +429,9 @@ pub fn resolve(
         let position = m.position(i); // slewed continuous slot position
         match comp.kind {
             WheelKind::Color => {
-                if color_wheel.is_none() && comp.slots >= 1 && comp.wheel.is_some() {
+                // Every colour wheel (not just the first); parked ones fold to
+                // tint, moving ones split spatially.
+                if comp.slots >= 1 && comp.wheel.is_some() {
                     let wname = comp.wheel.clone().unwrap();
                     let scrolling = (ctl.spin - 0.5).abs() > 0.02;
                     let settled = !scrolling && (position - position.round()).abs() < 0.02;
@@ -439,12 +443,13 @@ pub fn resolve(
                         color_fold = [color_fold[0] * t[0], color_fold[1] * t[1], color_fold[2] * t[2]];
                     } else {
                         // Moving / scrolling: spatial split across the beam.
-                        color_wheel = Some(WheelSel {
+                        wheels.push(WheelSel {
                             wheel: wname,
                             position,
                             n_slots: n.max(1.0),
                             gap: COLOR_GAP,
                             rot: 0.0,
+                            is_color: true,
                         });
                     }
                 }
@@ -457,7 +462,7 @@ pub fn resolve(
                     && comp.slots >= 1
                     && let Some(w) = comp.wheel.clone()
                 {
-                    gobos.push(WheelSel {
+                    wheels.push(WheelSel {
                         wheel: w,
                         position,
                         n_slots: n.max(1.0),
@@ -465,6 +470,7 @@ pub fn resolve(
                         // Gobo IMAGE rotation (separate from the wheel position):
                         // indexed turn + continuous spin phase + shake sway.
                         rot: m.phase(i) + ctl.index * TAU + m.shake_offset(i, ctl.shake),
+                        is_color: false,
                     });
                 }
             }
@@ -489,10 +495,6 @@ pub fn resolve(
             }
         }
     }
-    let mut gobo_it = gobos.into_iter();
-    let gobo1 = gobo_it.next();
-    let gobo2 = gobo_it.next();
-
     // --- focus / dispersion ---
     // GDTF Focus1 is normalised 0..1 (no metres); map it in reciprocal distance
     // so equal knob steps give equal *perceived* focus change and focus≈0 reaches
@@ -563,9 +565,7 @@ pub fn resolve(
         focus_dist,
         shutter_gain,
         ca_strength,
-        gobo1,
-        gobo2,
-        color_wheel,
+        wheels,
         cmy: cmy_spatial,
         anim,
         prism,

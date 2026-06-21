@@ -195,22 +195,48 @@ fn opt_cmy(p: vec2<f32>, cmy: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(pow(10.0, -dR), pow(10.0, -dG), pow(10.0, -dB));
 }
 
-// The full per-fragment optical cookie: gobo1 × gobo2 × colour wheel × CMY ×
+// One physical wheel in the per-fixture chain (a DYNAMIC count, not a fixed
+// gobo1/gobo2/colour triple). `d` = base atlas layer / position(slot) / n_slots /
+// gap; `m.x` = kind (0 = gobo image block, 1 = colour strip), `m.y` = gobo image
+// rotation. Read from the global `wheels` storage buffer (declared per-shader).
+struct WheelGpu {
+    d: vec4<f32>,
+    m: vec4<f32>,
+};
+
+// Fold a fixture's `count` wheels (starting at `offset` in `wheels`) into one
+// transmittance triple — gobo wheels sample the atlas image block (with holder
+// gap + image rotation), colour wheels sample the packed colour strip. Any
+// number of wheels of any mix; the renderer only emits the wheels actually
+// engaged this frame (parked ones are folded to a uniform CPU tint upstream).
+fn opt_wheels(
+    tex: texture_2d_array<f32>, samp: sampler, guv: vec2<f32>,
+    offset: u32, count: u32, lod: f32,
+) -> vec3<f32> {
+    var cook = vec3<f32>(1.0, 1.0, 1.0);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let w = wheels[offset + i];
+        if (w.m.x < 0.5) {
+            let g = opt_wheel(tex, samp, guv, w.d.x, w.d.y, w.d.z, w.d.w, w.m.y, lod);
+            cook = cook * vec3<f32>(g.r * g.a, g.g * g.a, g.b * g.a);
+        } else {
+            cook = cook * opt_color_strip(tex, samp, guv, w.d.x, w.d.y, w.d.z, w.d.w);
+        }
+    }
+    return cook;
+}
+
+// The full per-fragment optical cookie: the fixture's wheel chain × CMY ×
 // animation, each evaluated spatially (physical wheels + sliding flags). Returns
 // the per-channel transmittance multiplying the beam colour. `sharpen` > 0 (floor
 // pool only) applies LOD-faded contour steepening to the gobo edge.
 fn opt_cookie(
     tex: texture_2d_array<f32>, samp: sampler, guv: vec2<f32>,
-    gw1: vec4<f32>, g1rot: f32, gw2: vec4<f32>, g2rot: f32, cw: vec4<f32>,
+    wheel_off: f32, wheel_count: f32,
     anim_layer: f32, anim_scroll: f32, cmy: vec3<f32>, lod: f32, sharpen: f32,
 ) -> vec3<f32> {
-    let g1 = opt_wheel(tex, samp, guv, gw1.x, gw1.y, gw1.z, gw1.w, g1rot, lod);
-    let g2 = opt_wheel(tex, samp, guv, gw2.x, gw2.y, gw2.z, gw2.w, g2rot, lod);
-    let col = opt_color_strip(tex, samp, guv, cw.x, cw.y, cw.z, cw.w);
     let anim = opt_anim(tex, samp, guv, i32(anim_layer), anim_scroll, lod);
-    var out = vec3<f32>(g1.r * g1.a, g1.g * g1.a, g1.b * g1.a)
-            * vec3<f32>(g2.r * g2.a, g2.g * g2.a, g2.b * g2.a)
-            * col
+    var out = opt_wheels(tex, samp, guv, u32(max(wheel_off, 0.0)), u32(max(wheel_count, 0.0)), lod)
             * anim;
     if (cmy.x + cmy.y + cmy.z > 0.001) {
         out = out * opt_cmy((guv - vec2<f32>(0.5)) * 2.0, cmy);

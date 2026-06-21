@@ -55,19 +55,22 @@ struct FixtureGpu {
     pos_range: [f32; 4],   // xyz = lens pos, w = range (m)
     dir_cos: [f32; 4],     // xyz = beam dir (unit), w = tan(half zoom angle)
     color: [f32; 4],       // rgb = tint*intensity*candela*shutter, w = lens radius (m)
-    cookie_r: [f32; 4],    // xyz = lens-plane right basis, w = gobo1 atlas layer (frac; <0 none)
-    cookie_u: [f32; 4],    // xyz = lens-plane up basis,    w = gobo1 rotation (rad)
-    extra: [f32; 4],       // x = gobo2 layer (<0 none), y = gobo2 rot, z = anim layer (<0 none), w = anim scroll
+    cookie_r: [f32; 4],    // xyz = lens-plane right basis, w = wheel-buffer offset
+    cookie_u: [f32; 4],    // xyz = lens-plane up basis,    w = wheel count (dynamic chain)
+    extra: [f32; 4],       // x = anim layer (<0 none), y = anim scroll, z/w = unused
     shape: [f32; 4],       // x = super-Gaussian order, y = focus dist (m), z = iris frac, w = frost 0..1
     misc: [f32; 4],        // x = CA strength, y = laser flag, z = atlas layer count, w = shadow layer
-    // Physical wheels (per-fragment spatial sampling): a wheel of N slots whose
-    // continuous slewed position passes across the beam gate, splitting it
-    // between adjacent slots (gobos show the holder gap, colours abut). Filled by
-    // the spatial-wheel rework; neutral (base = -1) until then.
-    gw1: [f32; 4],         // gobo1 wheel: base_layer, position (slot units), n_slots, gap_half (<0 base = none)
-    gw2: [f32; 4],         // gobo2 wheel
-    cw: [f32; 4],          // colour wheel (solid-colour slots): base_layer, position, n_slots, unused
     cmyf: [f32; 4],        // CMY flag insertions: c, m, y, unused (spatial sliding dichroic flags)
+}
+
+/// One physical wheel in a fixture's chain (a DYNAMIC count per fixture, indexed
+/// by `FixtureGpu.cookie_r.w` offset + `cookie_u.w` count). Mirrors `WheelGpu`
+/// in `optics.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct WheelGpu {
+    d: [f32; 4], // base atlas layer (<0 none), position (slot units), n_slots, gap
+    m: [f32; 4], // x = kind (0 = gobo image, 1 = colour strip), y = gobo image rotation (rad), z/w unused
 }
 
 impl FixtureGpu {
@@ -77,9 +80,7 @@ impl FixtureGpu {
         let mut f = Self::zeroed();
         f.extra[0] = -1.0; // no anim
         f.misc[3] = -1.0; // no shadow
-        f.gw1[0] = -1.0;
-        f.gw2[0] = -1.0;
-        f.cw[0] = -1.0;
+        f.cookie_u[3] = 0.0; // no wheels
         f
     }
 }
@@ -156,6 +157,8 @@ pub struct Renderer {
     volumetric_layout: wgpu::BindGroupLayout,
     volumetric_uniform: wgpu::Buffer,
     fixtures_storage: GrowBuffer,
+    /// Flattened per-fixture wheel chains (shared by the volumetric + mesh passes).
+    wheels_storage: GrowBuffer,
     composite_pipeline: wgpu::RenderPipeline,
     #[allow(dead_code)]
     noise_texture: wgpu::Texture,
@@ -336,6 +339,12 @@ impl Renderer {
             wgpu::BufferUsages::STORAGE,
             std::mem::size_of::<FixtureGpu>() as u64 * 16,
         );
+        let wheels_storage = GrowBuffer::new(
+            &device,
+            "wheels-gpu",
+            wgpu::BufferUsages::STORAGE,
+            std::mem::size_of::<WheelGpu>() as u64 * 32,
+        );
 
         // Precomputed tiling 3D haze noise (sampled by the volumetric shader
         // instead of recomputing FBM per raymarch sample).
@@ -470,6 +479,7 @@ impl Renderer {
             volumetric_layout,
             volumetric_uniform,
             fixtures_storage,
+            wheels_storage,
             composite_pipeline,
             ssao_pipeline,
             ssao_layout,
@@ -1055,10 +1065,13 @@ impl Renderer {
         // Which scene fixture each GPU beam came from (shadow dedupe).
         let mut beam_fixture: Vec<usize> = Vec::with_capacity(scene.fixtures.len());
         let mut lens_instances: Vec<LensInstance> = Vec::with_capacity(scene.fixtures.len());
+        // Per-fixture wheel chains, flattened into one buffer; each FixtureGpu
+        // indexes its slice via cookie_r.w (offset) + cookie_u.w (count).
+        let mut gpu_wheels: Vec<WheelGpu> = Vec::new();
         let beam_dump = std::env::var("PREVIZ_BEAM_DUMP").is_ok();
         for (i, f) in scene.fixtures.iter().enumerate() {
             let key = f.gdtf.as_ref().map(|g| Arc::as_ptr(g) as usize).unwrap_or(0);
-            let built = build_beam_gpus(f, &beam_frames[i], key, &self.gobo_atlas, time);
+            let built = build_beam_gpus(f, &beam_frames[i], key, &self.gobo_atlas, time, &mut gpu_wheels);
             if beam_dump && !built.beams.is_empty() {
                 let cmax = built
                     .beams
@@ -1142,6 +1155,12 @@ impl Renderer {
 
         self.fixtures_storage
             .upload(&self.device, &self.queue, &gpu_fixtures);
+        // Keep the storage binding non-empty (≥1 element) even with no wheels.
+        if gpu_wheels.is_empty() {
+            gpu_wheels.push(WheelGpu::zeroed());
+        }
+        self.wheels_storage
+            .upload(&self.device, &self.queue, &gpu_wheels);
         let lens_count = self
             .lens_instances
             .upload(&self.device, &self.queue, &lens_instances);
@@ -1191,6 +1210,14 @@ impl Renderer {
                 size: std::num::NonZeroU64::new(used_fixtures),
             })
         };
+        let used_wheels = (gpu_wheels.len() * std::mem::size_of::<WheelGpu>()) as u64;
+        let wheels_binding = || {
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &self.wheels_storage.buffer,
+                offset: 0,
+                size: std::num::NonZeroU64::new(used_wheels),
+            })
+        };
 
         let light_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("light-bg"),
@@ -1219,6 +1246,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.shadow.sample_matrices.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wheels_binding(),
                 },
             ],
         });
@@ -1266,6 +1297,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: self.shadow.sample_matrices.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wheels_binding(),
                 },
             ],
         });
@@ -1677,14 +1712,11 @@ fn build_laser(
                 pos_range: [f.origin.x, f.origin.y, f.origin.z, LASER_RANGE],
                 dir_cos: [f.dir.x, f.dir.y, f.dir.z, tan_half],
                 color: [fixture.color[0] * g, fixture.color[1] * g, fixture.color[2] * g, LASER_CORE],
-                cookie_r: [f.right.x, f.right.y, f.right.z, 0.0],
-                cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],
+                cookie_r: [f.right.x, f.right.y, f.right.z, 0.0], // wheel offset 0
+                cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],          // wheel count 0 (no wheels)
                 extra: [-1.0, 0.0, 0.0, 0.0], // anim layer = none
                 shape: [4.0, 8.0, 1.0, 0.0], // soft-ish edge → survives downsampling
                 misc: [0.0, 1.0, atlas_layers, -1.0], // misc.y = laser flag
-                gw1: [-1.0, 0.0, 0.0, 0.0],
-                gw2: [-1.0, 0.0, 0.0, 0.0],
-                cw: [-1.0, 0.0, 0.0, 0.0],
                 cmyf: [0.0, 0.0, 0.0, 0.0],
             }]
         },
@@ -1715,6 +1747,7 @@ fn build_beam_gpus(
     key: usize,
     atlas: &atlas::GoboAtlas,
     time: f32,
+    wheels_out: &mut Vec<WheelGpu>,
 ) -> BeamBuild {
     let atlas_layers = atlas.layer_count() as f32;
     const RANGE: f32 = 40.0;
@@ -1754,14 +1787,11 @@ fn build_beam_gpus(
                     pos_range: [f.origin.x, f.origin.y, f.origin.z, RANGE],
                     dir_cos: [f.dir.x, f.dir.y, f.dir.z, tan_half],
                     color: [fixture.color[0] * i, fixture.color[1] * i, fixture.color[2] * i, Fixture::BODY_RADIUS],
-                    cookie_r: [f.right.x, f.right.y, f.right.z, 0.0],
-                    cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],
+                    cookie_r: [f.right.x, f.right.y, f.right.z, 0.0], // wheel offset 0
+                    cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],          // wheel count 0 (no wheels)
                     extra: [-1.0, 0.0, 0.0, 0.0], // anim layer = none
                     shape: [6.0, 8.0, 1.0, 0.0],
                     misc: [0.0, 0.0, atlas_layers, -1.0],
-                    gw1: [-1.0, 0.0, 0.0, 0.0],
-                    gw2: [-1.0, 0.0, 0.0, 0.0],
-                    cw: [-1.0, 0.0, 0.0, 0.0],
                     cmyf: [0.0, 0.0, 0.0, 0.0],
                 }]
             },
@@ -1783,20 +1813,22 @@ fn build_beam_gpus(
     let o = optics::resolve(gdtf, fixture.mode_index, &fixture.optics, &fixture.motion, time);
     let emitters = fixture.emitters();
 
-    // Physical wheel selection → GPU lane [base_layer, position(slot), n_slots,
-    // gap] + the gobo image rotation. base < 0 = no wheel.
-    let wheel_lanes = |sel: &Option<optics::WheelSel>| -> ([f32; 4], f32) {
-        match sel {
-            Some(s) => match atlas.base_layer(key, &s.wheel) {
-                Some(base) => ([base as f32, s.position, s.n_slots, s.gap], s.rot),
-                None => ([-1.0, 0.0, 0.0, 0.0], 0.0),
-            },
-            None => ([-1.0, 0.0, 0.0, 0.0], 0.0),
+    // Dynamic wheel chain: every engaged gobo/colour wheel becomes a WheelGpu in
+    // the global buffer; this fixture's beams reference the contiguous slice
+    // [wheel_off, wheel_off + wheel_count). Wheels not present in the atlas (e.g.
+    // a prism, or one that didn't bake) are simply dropped.
+    let mut my_wheels: Vec<WheelGpu> = Vec::with_capacity(o.wheels.len());
+    for s in &o.wheels {
+        if let Some(base) = atlas.base_layer(key, &s.wheel) {
+            my_wheels.push(WheelGpu {
+                d: [base as f32, s.position, s.n_slots, s.gap],
+                m: [if s.is_color { 1.0 } else { 0.0 }, s.rot, 0.0, 0.0],
+            });
         }
-    };
-    let (gw1, g1_rot) = wheel_lanes(&o.gobo1);
-    let (gw2, g2_rot) = wheel_lanes(&o.gobo2);
-    let (cw, _) = wheel_lanes(&o.color_wheel);
+    }
+    let wheel_off = wheels_out.len() as f32;
+    let wheel_count = my_wheels.len() as f32;
+    wheels_out.extend(my_wheels);
     let cmyf = [o.cmy[0], o.cmy[1], o.cmy[2], 0.0];
     let (anim_layer, anim_scroll) = match &o.anim {
         // Slot 0 = open (white), slot 1 = the animation glass.
@@ -1823,14 +1855,11 @@ fn build_beam_gpus(
         pos_range: [frame.origin.x, frame.origin.y, frame.origin.z, RANGE],
         dir_cos: [bdir.x, bdir.y, bdir.z, tan_half],
         color: [col[0], col[1], col[2], lens_r],
-        cookie_r: [r.x, r.y, r.z, g1_rot],
-        cookie_u: [u.x, u.y, u.z, g2_rot],
+        cookie_r: [r.x, r.y, r.z, wheel_off],
+        cookie_u: [u.x, u.y, u.z, wheel_count],
         extra: [anim_layer, anim_scroll, 0.0, 0.0],
         shape: [n_order, o.focus_dist, o.iris, o.frost],
         misc: [o.ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
-        gw1,
-        gw2,
-        cw,
         cmyf,
     };
 
@@ -1968,9 +1997,7 @@ fn build_beam_gpus(
     if lit.is_empty() {
         return BeamBuild { beams, lenses };
     }
-    let no_cookie = gw1[0] < 0.0
-        && gw2[0] < 0.0
-        && cw[0] < 0.0
+    let no_cookie = wheel_count < 0.5
         && anim_layer < 0.0
         && o.cmy.iter().all(|&v| v < 0.005)
         && o.prism.is_empty();
