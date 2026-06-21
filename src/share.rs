@@ -34,39 +34,39 @@ const BASE: &str = "https://gdtf-share.com/apis/public";
 // ---------------------------------------------------------------------------
 
 /// One DMX mode of a fixture revision (from `getList`).
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Mode {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub name: String,
     #[serde(default, deserialize_with = "de_i64")]
     pub dmxfootprint: i64,
 }
 
 /// One fixture revision in the GDTF Share list.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListEntry {
     #[serde(default, deserialize_with = "de_i64")]
     pub rid: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub fixture: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub manufacturer: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub revision: String,
     #[serde(default, deserialize_with = "de_i64")]
     pub creation_date: i64,
     #[serde(default, deserialize_with = "de_i64")]
     pub last_modified: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub uploader: String,
     #[serde(default, deserialize_with = "de_f64")]
     pub rating: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub version: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub creator: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string")]
     pub uuid: String,
     #[serde(default, deserialize_with = "de_i64")]
     pub filesize: i64,
@@ -139,6 +139,28 @@ fn de_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
         Loose::F(f) => f,
         Loose::S(s) => s.trim().parse().unwrap_or(0.0),
         Loose::None => 0.0,
+    })
+}
+
+// String fields on GDTF Share come back as `null` for unset values (uuid,
+// revision, …) and occasionally as numbers — coerce all of them to a String so a
+// single null doesn't fail the whole 6 MB list parse.
+fn de_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Loose {
+        S(String),
+        I(i64),
+        F(f64),
+        B(bool),
+        None,
+    }
+    Ok(match Loose::deserialize(d)? {
+        Loose::S(s) => s,
+        Loose::I(i) => i.to_string(),
+        Loose::F(f) => f.to_string(),
+        Loose::B(b) => b.to_string(),
+        Loose::None => String::new(),
     })
 }
 
@@ -325,19 +347,28 @@ fn with_cookie(req: ureq::Request, cookie: &Option<String>) -> ureq::Request {
     }
 }
 
+/// Parse a getList response body into entries + timestamp.
+fn parse_list(body: &str) -> Result<(Vec<ListEntry>, i64), String> {
+    let r: ListResp = serde_json::from_str(body).map_err(|e| format!("list parse: {e}"))?;
+    if !r.result {
+        return Err(if r.error.is_empty() { "could not load the list".into() } else { r.error });
+    }
+    Ok((r.list, r.timestamp))
+}
+
+/// Fetch + parse the catalogue (no UI side effects — used by the worker and tests).
+fn fetch_list(agent: &ureq::Agent, cookie: &Option<String>) -> Result<(Vec<ListEntry>, i64, String), String> {
+    let body = body_text(with_cookie(agent.get(&format!("{BASE}/getList.php")), cookie).call())?;
+    let (list, ts) = parse_list(&body)?;
+    Ok((list, ts, body))
+}
+
 fn do_fetch(agent: &ureq::Agent, shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, cookie: &Option<String>) {
     update(shared, ctx, |s| {
         s.busy = Some("Loading library…".into());
         s.error = None;
     });
-    let result = (|| -> Result<(Vec<ListEntry>, i64, String), String> {
-        let body = body_text(with_cookie(agent.get(&format!("{BASE}/getList.php")), cookie).call())?;
-        let r: ListResp = serde_json::from_str(&body).map_err(|e| format!("list parse: {e}"))?;
-        if !r.result {
-            return Err(if r.error.is_empty() { "could not load the list".into() } else { r.error });
-        }
-        Ok((r.list, r.timestamp, body))
-    })();
+    let result = fetch_list(agent, cookie);
     match result {
         Ok((list, ts, raw)) => {
             save_cached_list(&raw);
@@ -786,5 +817,63 @@ impl Share {
 impl Default for Share {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_null_string_and_loose_number_fields() {
+        // Mirrors the real GDTF Share payload: null uuid/revision/manufacturer,
+        // a "N/A" rating string, a string rid, a string dmxfootprint, an unknown
+        // `description` field, and a missing top-level `timestamp`.
+        let body = r#"{"result":true,"list":[
+            {"rid":1,"fixture":"EVA281H","manufacturer":"M","revision":null,"uuid":null,
+             "rating":"N\/A","description":null,"version":"1.2","creator":null,
+             "modes":[{"name":"Standard mode","dmxfootprint":"49"}]},
+            {"rid":"2","fixture":"B","manufacturer":null,"rating":4.5,"modes":[]}
+        ]}"#;
+        let (list, ts) = parse_list(body).expect("should parse");
+        assert_eq!(ts, 0); // timestamp absent → default
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].rid, 1);
+        assert_eq!(list[0].uuid, ""); // null → ""
+        assert_eq!(list[0].revision, ""); // null → ""
+        assert_eq!(list[0].creator, ""); // null → ""
+        assert_eq!(list[0].rating, 0.0); // "N/A" → 0
+        assert_eq!(list[0].modes[0].dmxfootprint, 49); // "49" → 49
+        assert_eq!(list[1].rid, 2); // "2" → 2
+        assert_eq!(list[1].manufacturer, ""); // null → ""
+        assert_eq!(list[1].rating, 4.5);
+    }
+
+    #[test]
+    fn server_error_is_reported() {
+        let body = r#"{"result":false,"error":"Unauthorized."}"#;
+        assert_eq!(parse_list(body).unwrap_err(), "Unauthorized.");
+    }
+
+    /// Live end-to-end check against the real GDTF Share API. No-op unless saved
+    /// credentials exist (so CI / other machines skip it); set
+    /// PREVIZ_SHARE_SKIP_LIVE=1 to force-skip even with credentials.
+    #[test]
+    fn live_login_and_list() {
+        if std::env::var("PREVIZ_SHARE_SKIP_LIVE").is_ok() {
+            return;
+        }
+        let Some(creds) = load_credentials() else {
+            eprintln!("live_login_and_list: skipped (no saved credentials)");
+            return;
+        };
+        let agent = build_agent();
+        let (notice, cookie) = do_login(&agent, &creds.user, &creds.password).expect("login should succeed");
+        eprintln!("live_login_and_list: {notice}");
+        assert!(cookie.is_some(), "login returned no session cookie");
+        let (list, _ts, raw) = fetch_list(&agent, &cookie).expect("getList should succeed and parse");
+        eprintln!("live_login_and_list: parsed {} fixtures from {} bytes", list.len(), raw.len());
+        assert!(list.len() > 50, "expected a large catalogue, got {}", list.len());
+        assert!(list.iter().any(|e| !e.fixture.is_empty()), "fixtures should have names");
     }
 }
