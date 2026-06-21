@@ -23,6 +23,7 @@ const RES: u32 = 512;
 /// per colour wheel, across all loaded fixture types). Colour wheels now cost a
 /// single layer each (see `color_strip`), so gobos dominate; 128 covers large
 /// multi-type rigs without exceeding the GPU's per-texture budget.
+/// MUST stay in sync with `ATLAS_MAX_LAYER` (= LAYERS - 1) in `optics.wgsl`.
 const LAYERS: u32 = 128;
 
 pub struct GoboAtlas {
@@ -92,9 +93,15 @@ impl GoboAtlas {
         self.base_of.get(&(key, wheel.to_string())).copied()
     }
 
-    /// Allocate + upload the projectable wheels (gobo / animation) of a fixture
-    /// the first time it is seen. Idempotent per `(key, wheel)`.
+    /// Allocate + upload the projectable wheels (gobo / animation / colour) of a
+    /// fixture the first time it is seen. Idempotent per `(key, wheel)`.
+    ///
+    /// Two passes: COLOUR wheels first (one cheap layer each), then gobo/animation
+    /// wheels (one image layer per slot). So if the atlas fills, only the
+    /// expensive image wheels are skipped — a colour wheel (which would otherwise
+    /// lose its colour entirely while moving) always fits.
     pub fn ensure(&mut self, queue: &wgpu::Queue, key: usize, gdtf: &Arc<GdtfFixture>) {
+        for colour_pass in [true, false] {
         for wheel in &gdtf.wheels {
             let has_media = wheel.slots.iter().any(|s| s.media.is_some());
             let is_prism = wheel.slots.iter().any(|s| !s.facets.is_empty());
@@ -106,16 +113,19 @@ impl GoboAtlas {
             if !bake {
                 continue;
             }
-            let k = (key, wheel.name.clone());
-            if self.base_of.contains_key(&k) {
-                continue;
-            }
             // A pure colour wheel (solid dichroic slots, no imagery) is packed
             // into ONE layer as vertical colour bands — sampled horizontally by
             // slot in the shader (`opt_color_strip`). A gobo/animation wheel still
             // gets one image layer per slot. This keeps virtual colour wheels
             // (often 60+ slots) from each eating 60+ of the 512² atlas layers.
             let is_color_wheel = !has_media;
+            if is_color_wheel != colour_pass {
+                continue; // colour wheels in pass 1, gobo/anim in pass 2
+            }
+            let k = (key, wheel.name.clone());
+            if self.base_of.contains_key(&k) {
+                continue;
+            }
             let count = wheel.slots.len() as u32;
             let layers_needed = if is_color_wheel { 1 } else { count };
             if self.next_layer + layers_needed > LAYERS {
@@ -140,6 +150,7 @@ impl GoboAtlas {
             }
             self.base_of.insert(k, base);
             log::info!("atlas: wheel '{}' -> base {base} (+{layers_needed})", wheel.name);
+        }
         }
     }
 

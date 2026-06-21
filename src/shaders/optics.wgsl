@@ -96,12 +96,15 @@ fn opt_sharpen_iso(a: f32, k: f32) -> f32 {
 // ClampToEdge), so outside the image we read the border texel — white for the
 // "open" slot (→ the beam stays a clean round disc shaped only by the radial
 // falloff, no square cutoff) and black for a gobo's holder (→ round gobo).
+// Highest valid gobo-atlas layer index — MUST track `atlas::LAYERS - 1`.
+const ATLAS_MAX_LAYER: i32 = 127;
+
 fn opt_layer(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, rot: f32, lod: f32) -> vec4<f32> {
     if (layer < 0) {
         return vec4<f32>(1.0, 1.0, 1.0, 1.0);
     }
     let r = clamp(opt_rot(uv, rot), vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
-    return textureSampleLevel(t, s, r, clamp(layer, 0, 63), lod);
+    return textureSampleLevel(t, s, r, clamp(layer, 0, ATLAS_MAX_LAYER), lod);
 }
 
 // Animation glass: a scrolling tiled mask (the classic fire/water shimmer).
@@ -110,7 +113,7 @@ fn opt_anim(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, scr
         return 1.0;
     }
     let auv = fract(uv * 1.5 + vec2<f32>(scroll, scroll * 0.35));
-    return textureSampleLevel(t, s, auv, clamp(layer, 0, 63), lod).a;
+    return textureSampleLevel(t, s, auv, clamp(layer, 0, ATLAS_MAX_LAYER), lod).a;
 }
 
 // PHYSICAL WHEEL: a disc of N slots whose continuous slewed `position` (slot
