@@ -94,10 +94,14 @@ impl GoboAtlas {
     /// the first time it is seen. Idempotent per `(key, wheel)`.
     pub fn ensure(&mut self, queue: &wgpu::Queue, key: usize, gdtf: &Arc<GdtfFixture>) {
         for wheel in &gdtf.wheels {
-            // Projectable = has imagery, but is not a prism (facets) wheel.
             let has_media = wheel.slots.iter().any(|s| s.media.is_some());
             let is_prism = wheel.slots.iter().any(|s| !s.facets.is_empty());
-            if !has_media || is_prism {
+            let has_color = wheel.slots.iter().any(|s| s.color.is_some());
+            // Bake: gobo/animation wheels (imagery) AND colour wheels (solid
+            // dichroic-colour slots) — both are sampled as the physical wheel.
+            // Prisms (facets) are CPU beam-expansion, not atlas slots.
+            let bake = (has_media || has_color) && !is_prism;
+            if !bake {
                 continue;
             }
             let k = (key, wheel.name.clone());
@@ -112,16 +116,20 @@ impl GoboAtlas {
             let base = self.next_layer;
             for (i, slot) in wheel.slots.iter().enumerate() {
                 let layer = base + i as u32;
-                let rgba = slot
-                    .media
-                    .as_ref()
-                    .and_then(|bytes| decode_gobo(bytes))
-                    .unwrap_or_else(|| vec![255u8; (RES * RES * 4) as usize]);
+                let rgba = if let Some(bytes) = &slot.media {
+                    decode_gobo(bytes).unwrap_or_else(|| vec![255u8; (RES * RES * 4) as usize])
+                } else if has_media {
+                    // A media wheel's slot with no image = open (white).
+                    vec![255u8; (RES * RES * 4) as usize]
+                } else {
+                    // Colour wheel: a solid dichroic-transmittance slot.
+                    color_slot(slot.color)
+                };
                 self.write_with_mips(queue, layer, rgba);
             }
             self.next_layer += count;
             self.base_of.insert(k, base);
-            log::info!("gobo atlas: wheel '{}' -> layers {base}..{}", wheel.name, base + count);
+            log::info!("atlas: wheel '{}' -> layers {base}..{}", wheel.name, base + count);
         }
     }
 
@@ -160,6 +168,26 @@ impl GoboAtlas {
             self.write_mip(queue, layer, mip, dim, &cur);
         }
     }
+}
+
+/// A solid colour-wheel slot, filled with the dichroic **transmittance** triple
+/// (linear, stored raw in the Unorm atlas so the shader multiplies it into the
+/// beam). `None` = open / no filter (white, full transmittance). Saturated
+/// dichroics pass less light, so brightness is scaled down with saturation
+/// (deep blue ≈ 9 %, amber ≈ 60 %, pale ≈ 100 %) per research-dichroic.md.
+fn color_slot(color: Option<[f32; 3]>) -> Vec<u8> {
+    let t = crate::optics::color::dichroic_transmittance(color);
+    let px = [
+        (t[0] * 255.0).round() as u8,
+        (t[1] * 255.0).round() as u8,
+        (t[2] * 255.0).round() as u8,
+        255u8,
+    ];
+    let mut out = vec![0u8; (RES * RES * 4) as usize];
+    for chunk in out.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&px);
+    }
+    out
 }
 
 /// Decode a gobo PNG to RES×RES RGBA8: keep its color, set alpha to the

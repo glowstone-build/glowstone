@@ -62,8 +62,11 @@ pub struct OpticalControls {
     /// Plus/minus-green tint (the CC axis orthogonal to CCT): -1 = magenta,
     /// 0 = neutral, +1 = green.
     pub green: f32,
-    /// Subtractive cyan / magenta / yellow flags, each `0..1`.
+    /// Subtractive cyan / magenta / yellow flag insertion targets, each `0..1`
+    /// (the rendered insertions slew toward these — see [`WheelMotion::cmy`]).
     pub cmy: [f32; 3],
+    /// CMY flag motor speed `0..1` from GDTF `ColorMixMSpeed` (0 = fastest).
+    pub color_mix_speed: f32,
     /// Shutter open amount (1 = open) and strobe rate (0 = off).
     pub shutter: f32,
     pub strobe: f32,
@@ -84,6 +87,7 @@ impl Default for OpticalControls {
             cto: 0.0,
             green: 0.0,
             cmy: [0.0, 0.0, 0.0],
+            color_mix_speed: 0.0,
             shutter: 1.0,
             strobe: 0.0,
             ca: 0.25,
@@ -106,12 +110,17 @@ impl OpticalControls {
     }
 }
 
-/// A gobo/animation wheel selection: which wheel, the fractional slot (for
-/// crossfading during a wheel move), and the projected-image rotation (radians).
+/// A physically-simulated wheel selection: which wheel, the continuous slewed
+/// **position** in slot units (the stepper's actual angle — wraps at `n_slots`),
+/// the slot count, the holder-gap fraction (gobo ≈ 0.18, colour ≈ 0.02), and the
+/// projected-image rotation (radians, gobos only). The shader maps each beam
+/// fragment to a wheel slot from `position`, producing the split + gap.
 #[derive(Clone, Debug)]
 pub struct WheelSel {
     pub wheel: String,
-    pub slot_frac: f32,
+    pub position: f32,
+    pub n_slots: f32,
+    pub gap: f32,
     pub rot: f32,
 }
 
@@ -144,6 +153,12 @@ pub struct BeamOptics {
     /// Up to two engaged gobo wheels (the GPU's projected-cookie lanes).
     pub gobo1: Option<WheelSel>,
     pub gobo2: Option<WheelSel>,
+    /// Engaged colour wheel — solid-colour dichroic slots, physically split
+    /// across the beam (sampled from the atlas like a gobo, with no gap).
+    pub color_wheel: Option<WheelSel>,
+    /// Slewed CMY flag insertions (cyan/magenta/yellow, each 0..1) — the shader
+    /// renders them as sliding graduated dichroic flags per fragment.
+    pub cmy: [f32; 3],
     /// Animation wheel: (wheel name, scroll 0..1).
     pub anim: Option<(String, f32)>,
     /// Prism facet copies (empty = no prism; stacked prisms compose).
@@ -181,30 +196,6 @@ fn wheel_name(gdtf: &GdtfFixture, comp: &OpticalComponent) -> Option<String> {
         .filter(|w| w.name.to_lowercase().contains(hint));
     let first = hits.nth((comp.number.max(1) - 1) as usize);
     first.map(|w| w.name.clone())
-}
-
-/// Crossfaded color-wheel tint (linear RGB): `control` (0..1) selects across the
-/// slots, `phase` (0..1, from a continuous spin) scrolls the whole wheel.
-fn color_wheel_tint(gdtf: &GdtfFixture, wheel: &str, control: f32, phase: f32) -> [f32; 3] {
-    let Some(w) = gdtf.wheel(wheel) else {
-        return [1.0, 1.0, 1.0];
-    };
-    if w.slots.is_empty() {
-        return [1.0, 1.0, 1.0];
-    }
-    let n = w.slots.len();
-    let pos = control.clamp(0.0, 1.0) * (n as f32 - 1.0) + phase * n as f32;
-    let f = pos.rem_euclid(n as f32); // wrap so a spin loops the wheel
-    let i0 = (f.floor() as usize) % n;
-    let i1 = (i0 + 1) % n;
-    let frac = f.fract();
-    let col = |i: usize| w.slots[i].color.unwrap_or([1.0, 1.0, 1.0]);
-    let (a, b) = (col(i0), col(i1));
-    [
-        a[0] + (b[0] - a[0]) * frac,
-        a[1] + (b[1] - a[1]) * frac,
-        a[2] + (b[2] - a[2]) * frac,
-    ]
 }
 
 /// Facet copies for an engaged prism: rotated lens-plane deflections + weight.
@@ -271,11 +262,6 @@ fn compose_prisms(a: Vec<PrismBeam>, b: Vec<PrismBeam>) -> Vec<PrismBeam> {
     out
 }
 
-/// Whether a wheel component is engaged enough to light up its GPU lane.
-fn engaged(ctl: &WheelControl) -> bool {
-    ctl.value > 0.005 || (ctl.spin - 0.5).abs() > 0.02
-}
-
 /// Resolve a fixture's shared controls + motion into [`BeamOptics`] for this
 /// frame. `mode_index` selects the GDTF mode whose component chain the
 /// controls align with; `time` drives the strobe. Per-emitter cone shape and
@@ -302,54 +288,81 @@ pub fn resolve(
         })
         .unwrap_or(1.0);
 
-    // --- walk the dynamic wheel chain ---
-    let mut tint_wheels = [1.0_f32, 1.0, 1.0];
+    // --- walk the dynamic wheel chain → PHYSICAL wheel descriptors ---
+    // Gobo/colour wheels become a continuous slewed `position` (slot units) the
+    // shader samples per-fragment, producing the split + holder gap; we no longer
+    // fold colour into the tint. CMY likewise becomes per-fragment (sliding flags).
     let mut gobos: Vec<WheelSel> = Vec::new();
+    let mut color_wheel: Option<WheelSel> = None;
+    // A colour wheel parked on a slot is spatially uniform → folded into the
+    // tint here (free per fragment); it only goes spatial (split) while moving.
+    let mut color_fold = [1.0_f32, 1.0, 1.0];
     let mut anim: Option<(String, f32)> = None;
     let mut prism: Vec<PrismBeam> = Vec::new();
     let mut frost = 0.0_f32;
+    /// Holder-gap fractions from `research-wheel-optics.md`.
+    const GOBO_GAP: f32 = 0.18;
+    const COLOR_GAP: f32 = 0.02;
     for (i, comp) in components.iter().enumerate() {
         let ctl = c.wheel(i);
-        let phase = m.phase(i);
+        let n = comp.slots as f32;
+        let position = m.position(i); // slewed continuous slot position
         match comp.kind {
             WheelKind::Color => {
-                if let Some(w) = wheel_name(gdtf, comp) {
-                    // Shake sways the slot position back and forth across the wheel.
-                    let shake = m.shake_offset(i, ctl.shake) / TAU; // turns → slot fraction
-                    let sel = (ctl.value + shake).clamp(0.0, 1.0);
-                    let t = color_wheel_tint(gdtf, &w, sel, phase);
-                    tint_wheels = [tint_wheels[0] * t[0], tint_wheels[1] * t[1], tint_wheels[2] * t[2]];
+                if color_wheel.is_none() && comp.slots >= 1 && comp.wheel.is_some() {
+                    let wname = comp.wheel.clone().unwrap();
+                    let scrolling = (ctl.spin - 0.5).abs() > 0.02;
+                    let settled = !scrolling && (position - position.round()).abs() < 0.02;
+                    if settled {
+                        // Parked on a slot: uniform → fold the dichroic colour in.
+                        let slot = (position.round() as i32).rem_euclid(comp.slots as i32) as usize;
+                        let col = gdtf.wheel(&wname).and_then(|w| w.slots.get(slot)).and_then(|s| s.color);
+                        let t = color::dichroic_transmittance(col);
+                        color_fold = [color_fold[0] * t[0], color_fold[1] * t[1], color_fold[2] * t[2]];
+                    } else {
+                        // Moving / scrolling: spatial split across the beam.
+                        color_wheel = Some(WheelSel {
+                            wheel: wname,
+                            position,
+                            n_slots: n.max(1.0),
+                            gap: COLOR_GAP,
+                            rot: 0.0,
+                        });
+                    }
                 }
             }
             WheelKind::Gobo => {
-                if engaged(&ctl)
-                    && let Some(w) = wheel_name(gdtf, comp)
+                // Emit while engaged OR still slewing back toward open, so the
+                // physical move (incl. return-to-open) is always visible.
+                let active = ctl.value > 0.005 || position.abs() > 0.02 || (ctl.spin - 0.5).abs() > 0.02;
+                if active
+                    && comp.slots >= 1
+                    && let Some(w) = comp.wheel.clone()
                 {
-                    let n = gdtf.wheel(&w).map(|x| x.slots.len()).unwrap_or(0);
-                    if n > 0 {
-                        gobos.push(WheelSel {
-                            wheel: w,
-                            slot_frac: ctl.value.clamp(0.0, 1.0) * (n as f32 - 1.0),
-                            // Image rotation: spin phase + indexed turn + shake sway.
-                            rot: phase + ctl.index * TAU + m.shake_offset(i, ctl.shake),
-                        });
-                    }
+                    gobos.push(WheelSel {
+                        wheel: w,
+                        position,
+                        n_slots: n.max(1.0),
+                        gap: GOBO_GAP,
+                        // Gobo IMAGE rotation (separate from the wheel position):
+                        // indexed turn + continuous spin phase + shake sway.
+                        rot: m.phase(i) + ctl.index * TAU + m.shake_offset(i, ctl.shake),
+                    });
                 }
             }
             WheelKind::Animation => {
                 if ctl.value > 0.01
                     && anim.is_none()
-                    && let Some(w) = wheel_name(gdtf, comp)
+                    && let Some(w) = comp.wheel.clone().or_else(|| wheel_name(gdtf, comp))
                 {
-                    // Phase wraps 0..1 for scrolls (see WheelMotion::advance).
-                    anim = Some((w, phase));
+                    anim = Some((w, m.phase(i)));
                 }
             }
             WheelKind::Prism => {
                 if ctl.value > 0.01
-                    && let Some(w) = wheel_name(gdtf, comp)
+                    && let Some(w) = comp.wheel.clone().or_else(|| wheel_name(gdtf, comp))
                 {
-                    let set = prism_beams(gdtf, &w, phase + ctl.index * TAU);
+                    let set = prism_beams(gdtf, &w, m.phase(i) + ctl.index * TAU);
                     prism = compose_prisms(prism, set);
                 }
             }
@@ -392,7 +405,8 @@ pub fn resolve(
         c.shutter.clamp(0.0, 1.0)
     };
 
-    // --- color: source white × CTO × CMY × color wheels (all linear) ---
+    // --- color: source white × CTO (linear). CMY + colour wheel are now
+    // per-fragment in the shader, so they're NOT folded into the tint here. ---
     let source = color::cct_to_linear_rgb(gdtf.beam.color_temp);
     let t_cto = if c.cto > 0.01 {
         let target_k = 6800.0 + (2800.0 - 6800.0) * c.cto.clamp(0.0, 1.0);
@@ -400,12 +414,25 @@ pub fn resolve(
     } else {
         [1.0, 1.0, 1.0]
     };
-    let t_cmy = color::cmy_transmittance(c.cmy);
     let mut tint = [
-        source[0] * t_cto[0] * t_cmy[0] * tint_wheels[0],
-        source[1] * t_cto[1] * t_cmy[1] * tint_wheels[1],
-        source[2] * t_cto[2] * t_cmy[2] * tint_wheels[2],
+        source[0] * t_cto[0] * color_fold[0],
+        source[1] * t_cto[1] * color_fold[1],
+        source[2] * t_cto[2] * color_fold[2],
     ];
+
+    // CMY: render the sliding flags PER-FRAGMENT only while they're actually
+    // moving (the visible sweep); once settled they're spatially uniform, so
+    // fold them into the tint on the CPU — free per fragment, and the common
+    // case (held colour). `m.cmy` is the slewed insertion; `c.cmy` the target.
+    let cmy_sliding = (0..3).any(|k| (m.cmy[k] - c.cmy[k]).abs() > 0.01);
+    let cmy_spatial = if cmy_sliding {
+        [m.cmy[0], m.cmy[1], m.cmy[2]]
+    } else {
+        let t = color::cmy_transmittance(m.cmy);
+        tint = [tint[0] * t[0], tint[1] * t[1], tint[2] * t[2]];
+        [0.0, 0.0, 0.0]
+    };
+
     // Plus/minus-green correction (orthogonal CC axis).
     if c.green.abs() > 1e-3 {
         tint = color::green_tint(tint, c.green);
@@ -420,6 +447,8 @@ pub fn resolve(
         ca_strength,
         gobo1,
         gobo2,
+        color_wheel,
+        cmy: cmy_spatial,
         anim,
         prism,
     }

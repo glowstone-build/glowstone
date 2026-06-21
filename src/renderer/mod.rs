@@ -59,7 +59,15 @@ struct FixtureGpu {
     cookie_u: [f32; 4],    // xyz = lens-plane up basis,    w = gobo1 rotation (rad)
     extra: [f32; 4],       // x = gobo2 layer (<0 none), y = gobo2 rot, z = anim layer (<0 none), w = anim scroll
     shape: [f32; 4],       // x = super-Gaussian order, y = focus dist (m), z = iris frac, w = frost 0..1
-    misc: [f32; 4],        // x = CA strength, y = unused, z = atlas layer count, w = unused
+    misc: [f32; 4],        // x = CA strength, y = laser flag, z = atlas layer count, w = shadow layer
+    // Physical wheels (per-fragment spatial sampling): a wheel of N slots whose
+    // continuous slewed position passes across the beam gate, splitting it
+    // between adjacent slots (gobos show the holder gap, colours abut). Filled by
+    // the spatial-wheel rework; neutral (base = -1) until then.
+    gw1: [f32; 4],         // gobo1 wheel: base_layer, position (slot units), n_slots, gap_half (<0 base = none)
+    gw2: [f32; 4],         // gobo2 wheel
+    cw: [f32; 4],          // colour wheel (solid-colour slots): base_layer, position, n_slots, unused
+    cmyf: [f32; 4],        // CMY flag insertions: c, m, y, unused (spatial sliding dichroic flags)
 }
 
 impl FixtureGpu {
@@ -67,10 +75,11 @@ impl FixtureGpu {
     /// length ≥ 1 when the scene has no fixtures.
     fn disabled() -> Self {
         let mut f = Self::zeroed();
-        f.cookie_r[3] = -1.0;
-        f.extra[0] = -1.0;
-        f.extra[2] = -1.0;
-        f.misc[3] = -1.0;
+        f.extra[0] = -1.0; // no anim
+        f.misc[3] = -1.0; // no shadow
+        f.gw1[0] = -1.0;
+        f.gw2[0] = -1.0;
+        f.cw[0] = -1.0;
         f
     }
 }
@@ -1514,11 +1523,15 @@ fn build_laser(
                 pos_range: [f.origin.x, f.origin.y, f.origin.z, LASER_RANGE],
                 dir_cos: [f.dir.x, f.dir.y, f.dir.z, tan_half],
                 color: [fixture.color[0] * g, fixture.color[1] * g, fixture.color[2] * g, LASER_CORE],
-                cookie_r: [f.right.x, f.right.y, f.right.z, -1.0],
+                cookie_r: [f.right.x, f.right.y, f.right.z, 0.0],
                 cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],
-                extra: [-1.0, 0.0, -1.0, 0.0],
+                extra: [-1.0, 0.0, 0.0, 0.0], // anim layer = none
                 shape: [4.0, 8.0, 1.0, 0.0], // soft-ish edge → survives downsampling
                 misc: [0.0, 1.0, atlas_layers, -1.0], // misc.y = laser flag
+                gw1: [-1.0, 0.0, 0.0, 0.0],
+                gw2: [-1.0, 0.0, 0.0, 0.0],
+                cw: [-1.0, 0.0, 0.0, 0.0],
+                cmyf: [0.0, 0.0, 0.0, 0.0],
             }]
         },
         lenses: vec![lens_instance(
@@ -1587,11 +1600,15 @@ fn build_beam_gpus(
                     pos_range: [f.origin.x, f.origin.y, f.origin.z, RANGE],
                     dir_cos: [f.dir.x, f.dir.y, f.dir.z, tan_half],
                     color: [fixture.color[0] * i, fixture.color[1] * i, fixture.color[2] * i, Fixture::BODY_RADIUS],
-                    cookie_r: [f.right.x, f.right.y, f.right.z, -1.0],
+                    cookie_r: [f.right.x, f.right.y, f.right.z, 0.0],
                     cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],
-                    extra: [-1.0, 0.0, -1.0, 0.0],
+                    extra: [-1.0, 0.0, 0.0, 0.0], // anim layer = none
                     shape: [6.0, 8.0, 1.0, 0.0],
                     misc: [0.0, 0.0, atlas_layers, -1.0],
+                    gw1: [-1.0, 0.0, 0.0, 0.0],
+                    gw2: [-1.0, 0.0, 0.0, 0.0],
+                    cw: [-1.0, 0.0, 0.0, 0.0],
+                    cmyf: [0.0, 0.0, 0.0, 0.0],
                 }]
             },
             lenses: vec![lens_instance(
@@ -1612,18 +1629,21 @@ fn build_beam_gpus(
     let o = optics::resolve(gdtf, fixture.mode_index, &fixture.optics, &fixture.motion, time);
     let emitters = fixture.emitters();
 
-    // Gobo/animation wheel selections → absolute fractional atlas layers.
-    let layer_of = |sel: &Option<optics::WheelSel>| -> (f32, f32) {
+    // Physical wheel selection → GPU lane [base_layer, position(slot), n_slots,
+    // gap] + the gobo image rotation. base < 0 = no wheel.
+    let wheel_lanes = |sel: &Option<optics::WheelSel>| -> ([f32; 4], f32) {
         match sel {
             Some(s) => match atlas.base_layer(key, &s.wheel) {
-                Some(base) => (base as f32 + s.slot_frac, s.rot),
-                None => (-1.0, 0.0),
+                Some(base) => ([base as f32, s.position, s.n_slots, s.gap], s.rot),
+                None => ([-1.0, 0.0, 0.0, 0.0], 0.0),
             },
-            None => (-1.0, 0.0),
+            None => ([-1.0, 0.0, 0.0, 0.0], 0.0),
         }
     };
-    let (g1_layer, g1_rot) = layer_of(&o.gobo1);
-    let (g2_layer, g2_rot) = layer_of(&o.gobo2);
+    let (gw1, g1_rot) = wheel_lanes(&o.gobo1);
+    let (gw2, g2_rot) = wheel_lanes(&o.gobo2);
+    let (cw, _) = wheel_lanes(&o.color_wheel);
+    let cmyf = [o.cmy[0], o.cmy[1], o.cmy[2], 0.0];
     let (anim_layer, anim_scroll) = match &o.anim {
         // Slot 0 = open (white), slot 1 = the animation glass.
         Some((wheel, scroll)) => match atlas.base_layer(key, wheel) {
@@ -1649,11 +1669,15 @@ fn build_beam_gpus(
         pos_range: [frame.origin.x, frame.origin.y, frame.origin.z, RANGE],
         dir_cos: [bdir.x, bdir.y, bdir.z, tan_half],
         color: [col[0], col[1], col[2], lens_r],
-        cookie_r: [r.x, r.y, r.z, g1_layer],
-        cookie_u: [u.x, u.y, u.z, g1_rot],
-        extra: [g2_layer, g2_rot, anim_layer, anim_scroll],
+        cookie_r: [r.x, r.y, r.z, g1_rot],
+        cookie_u: [u.x, u.y, u.z, g2_rot],
+        extra: [anim_layer, anim_scroll, 0.0, 0.0],
         shape: [n_order, o.focus_dist, o.iris, o.frost],
         misc: [o.ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
+        gw1,
+        gw2,
+        cw,
+        cmyf,
     };
 
     // ----- single-emitter path (classic moving head; prism expansion) -----
@@ -1790,7 +1814,12 @@ fn build_beam_gpus(
     if lit.is_empty() {
         return BeamBuild { beams, lenses };
     }
-    let no_cookie = g1_layer < 0.0 && g2_layer < 0.0 && anim_layer < 0.0 && o.prism.is_empty();
+    let no_cookie = gw1[0] < 0.0
+        && gw2[0] < 0.0
+        && cw[0] < 0.0
+        && anim_layer < 0.0
+        && o.cmy.iter().all(|&v| v < 0.005)
+        && o.prism.is_empty();
     let cluster_by = |lit: &[&'_ Cell], min_dot: f32| -> Vec<Vec<usize>> {
         let mut out: Vec<(Vec3, Vec<usize>)> = Vec::new();
         for (i, c) in lit.iter().enumerate() {

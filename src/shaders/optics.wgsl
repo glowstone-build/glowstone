@@ -69,13 +69,16 @@ fn opt_lod(
     tan_half: f32, iris: f32, lens_r: f32,
 ) -> f32 {
     // Aperture / DoF gain ∝ (lens radius + floor) · iris · beam half-angle.
-    // Narrow beam or stopped iris → small k_ap → wide DoF.
-    let k_ap = 0.45 * (0.04 + lens_r) * clamp(iris, 0.02, 1.0) * max(tan_half, 1e-3);
-    // Diopter defocus with a hyperfocal deadband (at/after focus → mip0).
+    // Narrow beam or stopped iris → small k_ap → wide DoF. (Tuned stronger than
+    // the textbook value so a normal spot still visibly softens away from its
+    // focus plane — a knife-sharp-everywhere beam reads as fake.)
+    let k_ap = 1.1 * (0.04 + lens_r) * clamp(iris, 0.02, 1.0) * max(tan_half, 1e-3);
+    // Diopter defocus with a small hyperfocal deadband (at focus → mip0 so the
+    // gobo sharpening sees full-res; just outside, blur ramps up immediately).
     let diopter = abs(1.0 / max(focus_dist, 0.25) - 1.0 / max(depth, 0.25));
-    let defocus = max(diopter - 0.006, 0.0);
+    let defocus = max(diopter - 0.003, 0.0);
     // Blur as a fraction of the cone radius (×~half the atlas width) + frost.
-    let sigma = k_ap * defocus * 200.0 + 1.2 * frost01;
+    let sigma = k_ap * defocus * 230.0 + 1.2 * frost01;
     return clamp(log2(1.0 + sigma * 64.0), 0.0, 8.0);
 }
 
@@ -101,21 +104,6 @@ fn opt_layer(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, ro
     return textureSampleLevel(t, s, r, clamp(layer, 0, 63), lod);
 }
 
-// Gobo with slot cross-fade: `layer_f` is an absolute fractional atlas layer
-// (<0 = none/open). During a wheel move it blends consecutive slots.
-fn opt_gobo(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer_f: f32, rot: f32, lod: f32) -> vec4<f32> {
-    if (layer_f < 0.0) {
-        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
-    }
-    let a = floor(layer_f);
-    let frac = layer_f - a;
-    var c = opt_layer(t, s, uv, i32(a), rot, lod);
-    if (frac > 0.001) {
-        c = mix(c, opt_layer(t, s, uv, i32(a) + 1, rot, lod), frac);
-    }
-    return c;
-}
-
 // Animation glass: a scrolling tiled mask (the classic fire/water shimmer).
 fn opt_anim(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, scroll: f32, lod: f32) -> f32 {
     if (layer < 0) {
@@ -125,42 +113,84 @@ fn opt_anim(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, scr
     return textureSampleLevel(t, s, auv, clamp(layer, 0, 63), lod).a;
 }
 
-// The combined gobo stack (wheel 1 × wheel 2) sampled at one lens-frame uv.
-fn opt_cookie_at(
-    t: texture_2d_array<f32>, s: sampler, guv: vec2<f32>,
-    g1: f32, r1: f32, g2: f32, r2: f32, lod: f32,
+// PHYSICAL WHEEL: a disc of N slots whose continuous slewed `position` (slot
+// units) passes across the beam gate. The fragment's tangential beam coordinate
+// `t = guv.x - 0.5` maps to a wheel position, so a move SPLITS the beam between
+// adjacent slots (and, with a `gap`, shows the dark metal holder between gobos —
+// colour wheels pass gap≈0 so slots abut). `base < 0` = no wheel (clear).
+// See .context/research-wheel-optics.md.
+fn opt_wheel(
+    tex: texture_2d_array<f32>, samp: sampler, guv: vec2<f32>,
+    base: f32, position: f32, n: f32, gap: f32, rot: f32, lod: f32,
 ) -> vec4<f32> {
-    return opt_gobo(t, s, guv, g1, r1, lod) * opt_gobo(t, s, guv, g2, r2, lod);
+    if (base < 0.0 || n < 1.0) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
+    const GATE_FRAC: f32 = 0.7;        // gate width in slot units (gate < 1 slot)
+    let tcoord = guv.x - 0.5;          // tangential position across the beam
+    let u = position + tcoord * GATE_FRAC;
+    let cell = floor(u + 0.5);
+    // wrapped slot index in [0, n)
+    let slot = cell - floor(cell / n) * n;
+    let frac = (u + 0.5) - cell;       // 0..1 within the pitch
+    let d = abs(frac - 0.5);           // 0 centre … 0.5 boundary
+    if (gap > 0.001 && d > (0.5 - gap * 0.5)) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // opaque holder gap (gobo) / seam
+    }
+    return opt_layer(tex, samp, guv, i32(base + slot), rot, lod);
 }
 
-// Per-channel transmitted colour of the whole cookie (gobo 1 × gobo 2 ×
-// animation) WITH chromatic aberration: red/green/blue are sampled at lens-frame
-// uv offset ±(ca·0.5) along the dispersion axis (uv.x = lens "right"), so the
-// projected gobo's pattern edges fringe red/blue exactly like the beam edge —
-// not just the open cone. Degrades to a plain cookie when ca = 0, and costs
-// nothing extra for an open beam (the gobo samples early-out to white).
-fn opt_cookie_ca(
-    t: texture_2d_array<f32>, s: sampler, guv: vec2<f32>,
-    g1: f32, r1: f32, g2: f32, r2: f32,
-    anim_layer: i32, anim_scroll: f32, lod: f32, ca: f32, sharpen: f32,
+// CMY: three graduated dichroic FLAGS sliding across the aperture on distinct
+// axes (≈120° apart), each producing a coloured gradient/edge that sweeps in as
+// it inserts. Per-fragment optical density (densities add → 10^-D), mirroring
+// the CPU density model. `p` = beam cross-section in the unit disc = (guv-0.5)*2;
+// `cmy` = the three slewed insertions (0 = clear … 1 = full). Returns the
+// transmittance triple to multiply into the beam. (research-cmy.md)
+fn opt_cmy_flag(u: f32, c: f32) -> f32 {
+    const EDGE_SOFT: f32 = 0.22;       // soft sawtooth/halftone edge width
+    let edge = 2.0 * c - 1.0;          // inserts from -axis (c=0) to +axis (c=1)
+    let depth = (edge - u) * 0.5;      // >0 ⇒ covered; magnitude ⇒ how deep
+    let cover = smoothstep(-EDGE_SOFT, EDGE_SOFT, depth);
+    let ramp = clamp(depth + 0.5, 0.0, 1.0); // graduated: denser deeper under the flag
+    return cover * ramp;
+}
+fn opt_cmy(p: vec2<f32>, cmy: vec3<f32>) -> vec3<f32> {
+    const D_PEAK: f32 = 1.8;
+    const D_SHOULDER: f32 = 0.10;
+    const GAMMA_INS: f32 = 1.6;
+    let aC = vec2<f32>(1.0, 0.0);
+    let aM = vec2<f32>(-0.5, 0.8660254);
+    let aY = vec2<f32>(-0.5, -0.8660254);
+    let rc = pow(opt_cmy_flag(dot(p, aC), cmy.x), GAMMA_INS);
+    let rm = pow(opt_cmy_flag(dot(p, aM), cmy.y), GAMMA_INS);
+    let ry = pow(opt_cmy_flag(dot(p, aY), cmy.z), GAMMA_INS);
+    let dR = D_PEAK * rc + D_SHOULDER * rm + D_SHOULDER * ry; // cyan ↘ R
+    let dG = D_SHOULDER * rc + D_PEAK * rm + D_SHOULDER * ry; // magenta ↘ G
+    let dB = D_SHOULDER * rc + D_SHOULDER * rm + D_PEAK * ry; // yellow ↘ B
+    return vec3<f32>(pow(10.0, -dR), pow(10.0, -dG), pow(10.0, -dB));
+}
+
+// The full per-fragment optical cookie: gobo1 × gobo2 × colour wheel × CMY ×
+// animation, each evaluated spatially (physical wheels + sliding flags). Returns
+// the per-channel transmittance multiplying the beam colour. `sharpen` > 0 (floor
+// pool only) applies LOD-faded contour steepening to the gobo edge.
+fn opt_cookie(
+    tex: texture_2d_array<f32>, samp: sampler, guv: vec2<f32>,
+    gw1: vec4<f32>, g1rot: f32, gw2: vec4<f32>, g2rot: f32, cw: vec4<f32>,
+    anim_layer: f32, anim_scroll: f32, cmy: vec3<f32>, lod: f32, sharpen: f32,
 ) -> vec3<f32> {
-    // Green/centre cookie + animation are always needed; sample once. With no
-    // chromatic aberration the red/blue offset samples coincide with green, so
-    // skip them — byte-for-byte identical, up to 2 fewer cookie evaluations.
-    let cg = opt_cookie_at(t, s, guv, g1, r1, g2, r2, lod);
-    let anim = opt_anim(t, s, guv, anim_layer, anim_scroll, lod);
-    var out: vec3<f32>;
-    if (abs(ca) <= 0.001) {
-        out = vec3<f32>(cg.r * cg.a, cg.g * cg.a, cg.b * cg.a) * anim;
-    } else {
-        let off = vec2<f32>(ca * 0.5, 0.0);
-        let cr = opt_cookie_at(t, s, guv + off, g1, r1, g2, r2, lod);
-        let cb = opt_cookie_at(t, s, guv - off, g1, r1, g2, r2, lod);
-        out = vec3<f32>(cr.r * cr.a, cg.g * cg.a, cb.b * cb.a) * anim;
+    let g1 = opt_wheel(tex, samp, guv, gw1.x, gw1.y, gw1.z, gw1.w, g1rot, lod);
+    let g2 = opt_wheel(tex, samp, guv, gw2.x, gw2.y, gw2.z, gw2.w, g2rot, lod);
+    let col = opt_wheel(tex, samp, guv, cw.x, cw.y, cw.z, cw.w, 0.0, lod);
+    let anim = opt_anim(tex, samp, guv, i32(anim_layer), anim_scroll, lod);
+    var out = vec3<f32>(g1.r * g1.a, g1.g * g1.a, g1.b * g1.a)
+            * vec3<f32>(g2.r * g2.a, g2.g * g2.a, g2.b * g2.a)
+            * col.rgb
+            * anim;
+    if (cmy.x + cmy.y + cmy.z > 0.001) {
+        out = out * opt_cmy((guv - vec2<f32>(0.5)) * 2.0, cmy);
     }
-    // Edge sharpening, faded out with defocus (exp2(-lod) = fraction of mip0
-    // detail still present) so blurred mips are never re-sharpened. Zero-tap
-    // contour steepening; callers pass sharpen=0 to disable (aerial shaft).
+    // Contour edge sharpening, faded out with defocus (exp2(-lod)); floor only.
     if (sharpen > 0.001) {
         let gain = sharpen * max(exp2(-lod) - 0.03, 0.0);
         if (gain > 0.0) {

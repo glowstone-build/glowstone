@@ -83,6 +83,11 @@ pub fn filter_from_to(source: [f32; 3], target: [f32; 3]) -> [f32; 3] {
 /// keeping mid-insertion hue on a realistic curved path; densities add, so
 /// stacked flags / CTO compose by summing `D`. `cmy` = cyan/magenta/yellow
 /// insertion, each `0..1`. (Burns subtractive mixture ≈ geometric mean ≡ log-add.)
+///
+/// This is the CPU reference for the **uniform** case; the live renderer now
+/// evaluates CMY per-fragment (sliding flags) in `optics.wgsl::opt_cmy` using the
+/// same `D_PEAK`/`D_SHOULDER`/`GAMMA_INS` constants. Kept for the colour tests.
+#[allow(dead_code)]
 pub fn cmy_transmittance(cmy: [f32; 3]) -> [f32; 3] {
     const D_PEAK: f32 = 1.8; // full-flag peak density: 10^-1.8 ≈ 1.6% leak
     const D_SHOULDER: f32 = 0.10; // neighbour bleed at full insertion
@@ -143,6 +148,27 @@ pub fn fold_rgbwal(levels: [f32; 6], e: &Emitters) -> [f32; 3] {
     add(&mut o, e.amber, a * e.a_share);
     add(&mut o, e.lime, l * e.l_share);
     o
+}
+
+/// Dichroic colour-wheel slot transmittance (linear RGB). `None` = open / no
+/// filter (white). A dichroic passes its hue and *dims* with saturation (deep
+/// blue ≈ 9 %, amber ≈ 60 %, pale ≈ 100 % luminous transmittance), so a colour
+/// change also dims realistically. Shared by the atlas slot bake and the CPU
+/// fold for a settled colour wheel. (research-dichroic.md)
+pub fn dichroic_transmittance(color: Option<[f32; 3]>) -> [f32; 3] {
+    let c = color.unwrap_or([1.0, 1.0, 1.0]);
+    let max = c[0].max(c[1]).max(c[2]).max(1e-3);
+    let min = c[0].min(c[1]).min(c[2]);
+    let sat = 1.0 - (min / max); // 0 = white … 1 = fully saturated
+    let lum_t = 0.10 + 0.90 * (1.0 - sat).powf(1.5);
+    let hue = [c[0] / max, c[1] / max, c[2] / max];
+    let l = luminance(hue).max(1e-3);
+    let s = lum_t / l;
+    [
+        (hue[0] * s).clamp(0.0, 1.0),
+        (hue[1] * s).clamp(0.0, 1.0),
+        (hue[2] * s).clamp(0.0, 1.0),
+    ]
 }
 
 /// Plus/minus-green correction (the CC / "tint" axis orthogonal to CCT): `t > 0`

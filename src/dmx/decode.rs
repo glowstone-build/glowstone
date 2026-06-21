@@ -339,6 +339,8 @@ fn apply_gdtf_channel(
         "Tilt" => fixture.tilt = tilt_deg(gdtf, mode_index, v01),
         // Motor speed: 0 = fastest ("tracking"), up = slower. Drives the slew.
         "PositionMSpeed" => fixture.move_speed = v01,
+        // CMY flag motor speed (0 = fastest); drives the colour-flag slide.
+        "ColorMixMSpeed" => fixture.optics.color_mix_speed = v01,
         "Dimmer" => fixture.intensity = v01,
         // Subtractive colour mixing drives the beam tint directly.
         "ColorSub_C" => fixture.optics.cmy[0] = v01,

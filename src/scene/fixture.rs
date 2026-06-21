@@ -300,6 +300,13 @@ impl Fixture {
         self.tilt_actual = self.tilt;
         self.pan_vel = 0.0;
         self.tilt_vel = 0.0;
+        // Also settle the physical wheels (gobo/colour position + CMY flags) to
+        // their targets so headless captures show the selected slot, not "open".
+        if let Some(gdtf) = &self.gdtf
+            && let Some(mode) = gdtf.modes.get(self.mode_index)
+        {
+            self.motion.settle(&self.optics, &mode.components);
+        }
     }
 
     /// Max pan / tilt slew rate (deg/s) at this fixture's current motor speed.

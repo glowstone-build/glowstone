@@ -18,11 +18,15 @@ struct Light {
     pos_range: vec4<f32>, // xyz = lens, w = range
     dir_cos: vec4<f32>,   // xyz = beam dir, w = tan(half zoom angle)
     color: vec4<f32>,     // rgb = tint*intensity*candela*shutter, w = lens radius
-    cookie_r: vec4<f32>,  // xyz = lens-plane right, w = gobo1 layer (frac; <0 none)
-    cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = gobo1 rotation (rad)
-    extra: vec4<f32>,     // x = gobo2 layer, y = gobo2 rot, z = anim layer, w = anim scroll
+    cookie_r: vec4<f32>,  // xyz = lens-plane right, w = gobo1 image rotation (rad)
+    cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = gobo2 image rotation (rad)
+    extra: vec4<f32>,     // x = anim layer (<0 none), y = anim scroll, z/w = unused
     shape: vec4<f32>,     // x = super-Gaussian order, y = focus dist, z = iris frac, w = frost
-    misc: vec4<f32>,      // x = CA strength, y/z/w = reserved
+    misc: vec4<f32>,      // x = CA strength, y = laser flag, z = atlas count, w = shadow layer
+    gw1: vec4<f32>,       // gobo1 wheel: base_layer, position(slot), n_slots, gap (<0 base = none)
+    gw2: vec4<f32>,       // gobo2 wheel
+    cw: vec4<f32>,        // colour wheel: base_layer, position, n_slots, unused
+    cmyf: vec4<f32>,      // CMY flag insertions c,m,y, unused
 };
 
 @group(1) @binding(0)
@@ -135,10 +139,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // Aperture-dependent DoF LOD (tan_half, iris, lens_r). The floor pool is
         // a stable surface projection, so sharpen the in-focus cookie fully.
         let lod = opt_lod(depth, lt.shape.y, lt.shape.w, lt.dir_cos.w, lt.shape.z, lt.color.w);
-        let trans = opt_cookie_ca(
+        let trans = opt_cookie(
             gobo_tex, gobo_samp, guv,
-            lt.cookie_r.w, lt.cookie_u.w, lt.extra.x, lt.extra.y,
-            i32(lt.extra.z), lt.extra.w, lod, lt.misc.x, camera.render_mode.y,
+            lt.gw1, lt.cookie_r.w, lt.gw2, lt.cookie_u.w, lt.cw,
+            lt.extra.x, lt.extra.y, lt.cmyf.xyz, lod, camera.render_mode.y,
         );
         if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
             continue;

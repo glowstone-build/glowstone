@@ -246,6 +246,9 @@ pub struct OpticalComponent {
     pub attribute: String,
     /// Linked wheel (slot media/colors/facets), from the channel functions.
     pub wheel: Option<String>,
+    /// Number of slots on the linked wheel (≥1) — drives the physical-wheel
+    /// split/gap simulation; 0 if no wheel resolved.
+    pub slots: u32,
     /// Whether the mode exposes indexed-rotation / continuous-spin controls.
     pub has_index: bool,
     pub has_spin: bool,
@@ -565,7 +568,7 @@ impl GdtfFixture {
                     .unwrap_or(&roots[0]);
                 let emitters = collect_emitters(root);
                 let resolved = resolve_channels(&channels, root, &emitters);
-                let components = collect_components(&channels);
+                let components = collect_components(&channels, &wheels);
                 let footprint = resolved
                     .iter()
                     .flat_map(|rc| rc.offsets.iter().copied())
@@ -766,7 +769,7 @@ fn expand_references(node: &Geometry, roots: &[Geometry], indirections: u32) -> 
 /// Derive a mode's optical wheel chain from its channels: every distinct
 /// `(kind, number)` seen across channel/function attributes becomes one
 /// component, with the wheel link and index/spin capabilities folded in.
-fn collect_components(channels: &[DmxChannel]) -> Vec<OpticalComponent> {
+fn collect_components(channels: &[DmxChannel], wheels: &[Wheel]) -> Vec<OpticalComponent> {
     let mut out: Vec<OpticalComponent> = Vec::new();
     let mut note = |attr: &str, wheel: &Option<String>| {
         let Some((kind, number, role)) = component_attr(attr) else {
@@ -790,6 +793,7 @@ fn collect_components(channels: &[DmxChannel]) -> Vec<OpticalComponent> {
                         number
                     ),
                     wheel: None,
+                    slots: 0,
                     has_index: false,
                     has_spin: false,
                 });
@@ -809,6 +813,38 @@ fn collect_components(channels: &[DmxChannel]) -> Vec<OpticalComponent> {
         note(&ch.attribute, &None);
         for f in &ch.functions {
             note(&f.attribute, &f.wheel);
+        }
+    }
+    // Resolve each component's slot count from its linked wheel (explicit link,
+    // else a name-substring hint) — drives the physical split/gap simulation.
+    for c in &mut out {
+        let hint = match c.kind {
+            WheelKind::Color => "color",
+            WheelKind::Gobo => "gobo",
+            WheelKind::Prism => "prism",
+            WheelKind::Animation => "anim",
+            WheelKind::Frost => "",
+        };
+        let w = c
+            .wheel
+            .as_deref()
+            .and_then(|n| wheels.iter().find(|w| w.name == n))
+            .or_else(|| {
+                if hint.is_empty() {
+                    None
+                } else {
+                    // Nth wheel matching the kind hint (Gobo2 → 2nd gobo wheel).
+                    wheels
+                        .iter()
+                        .filter(|w| w.name.to_lowercase().contains(hint))
+                        .nth((c.number.max(1) - 1) as usize)
+                }
+            });
+        if let Some(w) = w {
+            c.slots = w.slots.len() as u32;
+            if c.wheel.is_none() {
+                c.wheel = Some(w.name.clone());
+            }
         }
     }
     out.sort_by(|a, b| (a.kind, a.number).cmp(&(b.kind, b.number)));

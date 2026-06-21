@@ -286,6 +286,16 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // Headless wheel-transition check: PREVIZ_WHEEL=dir (with PREVIZ_GDTF)
+        // steps a gobo/colour wheel between slots and scrolls CMY in, advancing
+        // the scene between frames — to verify the physical split + gap + flag
+        // slide (not a crossfade).
+        if let Ok(dir) = std::env::var("PREVIZ_WHEEL") {
+            render_wheel_sequence(self.state.as_mut().unwrap(), &dir);
+            event_loop.exit();
+            return;
+        }
+
         // Headless screenshot path: PREVIZ_SCREENSHOT=path.png renders the
         // offscreen 3D view to a PNG and exits (no window needed). Handy for
         // verifying the renderer without a visible window / CI.
@@ -732,6 +742,52 @@ fn render_anim_sequence(state: &mut State, dir: &str) {
         }
     }
     log::info!("anim: wrote 6 frames to {dir}");
+}
+
+/// Render a wheel-transition sequence: a gobo wheel stepping between slots
+/// (showing the split + dark holder gap sweep), plus CMY flags sliding in — to
+/// verify the physical wheel/flag simulation animates instead of crossfading.
+fn render_wheel_sequence(state: &mut State, dir: &str) {
+    use crate::gdtf::WheelKind as K;
+    let _ = std::fs::create_dir_all(dir);
+    let Some(idx) = state.scene.fixtures.iter().position(|f| f.is_gdtf()) else {
+        log::error!("PREVIZ_WHEEL needs a GDTF fixture (set PREVIZ_GDTF)");
+        return;
+    };
+    if let Some(env) = state.scene.environments.first_mut() {
+        env.density = 0.13;
+    }
+    {
+        let f = &mut state.scene.fixtures[idx];
+        f.tilt = 38.0;
+        f.optics = Default::default();
+        f.sync_mode();
+        f.optics.zoom = 0.32;
+        // Start at open; target a gobo slot so the wheel slews through the gap.
+        if let Some(w) = f.wheel_control_mut(K::Gobo, 1) {
+            w.value = 5.0 / 6.0;
+        }
+        f.snap_movement(); // settle pan/tilt; wheel positions start at 0 (open)
+        f.motion.positions.iter_mut().for_each(|p| *p = 0.0);
+    }
+    // Look down the beam onto the floor pool, where the gobo split + holder gap
+    // read clearly during the wheel's travel.
+    // Close 3/4 view of the beam shaft; the gobo split + dark holder gap sweep
+    // across the cone as the wheel travels.
+    let mut cam = state.camera.clone();
+    cam.target = glam::Vec3::new(0.0, 2.4, 0.9);
+    cam.pitch = 0.12;
+    cam.distance = 4.2;
+    cam.yaw = 0.7;
+    for frame in 0..10 {
+        let (w, h, px) = state.renderer.capture(&state.scene, &cam, &state.ui.settings);
+        if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
+            let _ = img.save(format!("{dir}/wheel_{frame:02}.png"));
+        }
+        // ~0.05 s between frames → catch the wheel mid-travel (split + gap sweep).
+        state.scene.advance(0.05);
+    }
+    log::info!("wheel: wrote 10 frames to {dir}");
 }
 
 impl State {
