@@ -32,6 +32,8 @@ pub mod icon {
     // Entities
     pub const FIXTURE: &str = p::LIGHTBULB_FILAMENT;
     pub const ENVIRONMENT: &str = p::SPHERE;
+    pub const WORLD: &str = p::SUN_HORIZON;
+    pub const IMAGE: &str = p::IMAGE;
     pub const GEOMETRY: &str = p::CUBE;
     pub const CATEGORY: &str = p::TAG;
     // Actions

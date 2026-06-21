@@ -7,10 +7,45 @@ struct Camera {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     render_mode: vec4<f32>, // x: 0 = beauty (lit), 1 = unlit/flat, 2 = wireframe
+    world: vec4<f32>,       // x = brightness, y = rotation, z = ambient, w = has-HDRI
+    inv_view_proj: mat4x4<f32>,
 };
 
 @group(0) @binding(0)
 var<uniform> camera: Camera;
+
+// World/HDRI environment map (equirectangular, with mips for blurred IBL ambient).
+@group(2) @binding(0) var world_tex: texture_2d<f32>;
+@group(2) @binding(1) var world_samp: sampler;
+
+const PI: f32 = 3.14159265;
+const TAU: f32 = 6.28318531;
+
+// Rotate a direction about +Y (world environment yaw).
+fn world_rotate_y(d: vec3<f32>, a: f32) -> vec3<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    return vec3<f32>(c * d.x + s * d.z, d.y, -s * d.x + c * d.z);
+}
+
+// World direction → equirectangular UV. v=0 at +Y (zenith), v=1 at -Y.
+fn world_equirect_uv(d: vec3<f32>) -> vec2<f32> {
+    let u = atan2(d.x, -d.z) / TAU + 0.5;
+    let v = acos(clamp(d.y, -1.0, 1.0)) / PI;
+    return vec2<f32>(u, v);
+}
+
+// Image-based ambient irradiance in direction `n` (sampled from a blurred high
+// mip of the env map), pre-scaled by brightness × ambient.
+fn world_ambient(n: vec3<f32>) -> vec3<f32> {
+    let d = world_rotate_y(normalize(n), camera.world.y);
+    let uv = world_equirect_uv(d);
+    let dims = textureDimensions(world_tex, 0);
+    let max_lod = log2(f32(max(dims.x, dims.y)));
+    // Sample a heavily-blurred mip → approximate diffuse irradiance.
+    let irr = textureSampleLevel(world_tex, world_samp, uv, max_lod - 2.0).rgb;
+    return irr * camera.world.x * camera.world.z;
+}
 
 // Fixtures as disc spotlights (mirrors FixtureGpu / the volumetric `Fixture`).
 // The array length comes from the sized buffer binding.
@@ -100,11 +135,16 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         return vec4<f32>(mix(flat, emit, clamp(in.emissive, 0.0, 1.0)), 1.0);
     }
 
-    // Low ambient/fill — the venue still reads dark and beams do the real lighting,
-    // but set geometry stays faintly readable where no beam reaches it (previz wants
-    // to see the rig, not a pure blackout).
-    let key_dir = normalize(vec3<f32>(0.4, 1.0, 0.6));
-    let key = 0.03 + max(dot(normal, key_dir), 0.0) * 0.05;
+    // Ambient fill: an HDRI world lights the geometry (image-based ambient), else
+    // a faint flat key so set geometry stays readable in the dark void where no
+    // beam reaches (previz wants to see the rig, not a pure blackout).
+    var ambient: vec3<f32>;
+    if (camera.world.w > 0.5) {
+        ambient = world_ambient(normal);
+    } else {
+        let key_dir = normalize(vec3<f32>(0.4, 1.0, 0.6));
+        ambient = vec3<f32>(0.03 + max(dot(normal, key_dir), 0.0) * 0.05);
+    }
 
     // Illumination from every fixture spotlight reaching this surface point.
     var fixture_light = vec3<f32>(0.0);
@@ -170,7 +210,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     }
 
     let albedo = in.color;
-    var lit = albedo * key * max(in.intensity, 0.08);
+    var lit = albedo * ambient * max(in.intensity, 0.08);
     lit += albedo * fixture_light;
 
     // Self-illuminated surface (a fixture lens): a bright bloomy disc (HDR,

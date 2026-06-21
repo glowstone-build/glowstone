@@ -15,6 +15,12 @@ pub struct CameraUniform {
     /// x = viewport mode (see `ViewportMode::shader_code`); yzw reserved. Only the
     /// mesh shader reads it; grid/lens shaders bind a prefix of this buffer.
     pub render_mode: [f32; 4],
+    /// World/HDRI: x = brightness, y = rotation (rad), z = ambient strength,
+    /// w = has-HDRI flag (0/1). Read by the mesh IBL ambient + the sky pass.
+    pub world: [f32; 4],
+    /// Inverse view-projection — the sky pass reconstructs the per-pixel world
+    /// ray from NDC. Appended last so grid/lens keep reading a valid prefix.
+    pub inv_view_proj: [[f32; 4]; 4],
 }
 
 /// A camera that orbits a target point: drag to rotate, scroll to dolly.
@@ -176,10 +182,13 @@ impl OrbitCamera {
 
     pub fn uniform(&self, aspect: f32) -> CameraUniform {
         let eye = self.eye();
+        let vp = self.view_proj(aspect);
         CameraUniform {
-            view_proj: self.view_proj(aspect).to_cols_array_2d(),
+            view_proj: vp.to_cols_array_2d(),
             eye: Vec4::new(eye.x, eye.y, eye.z, 1.0).to_array(),
             render_mode: [0.0; 4],
+            world: [0.0; 4],
+            inv_view_proj: vp.inverse().to_cols_array_2d(),
         }
     }
 }

@@ -199,6 +199,24 @@ impl ApplicationHandler for App {
         {
             self.state.as_mut().unwrap().ui.settings.exposure = v;
         }
+        // PREVIZ_HDRI=path loads an equirectangular environment map into the world
+        // (sky background + image-based ambient). PREVIZ_HDRI_BRIGHT scales it.
+        if let Ok(path) = std::env::var("PREVIZ_HDRI") {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let w = &mut self.state.as_mut().unwrap().scene.world;
+                    w.hdri = Some(std::sync::Arc::new(bytes));
+                    w.hdri_name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or(path);
+                    if let Ok(b) = std::env::var("PREVIZ_HDRI_BRIGHT").unwrap_or_default().parse::<f32>() {
+                        w.brightness = b;
+                    }
+                }
+                Err(e) => log::error!("PREVIZ_HDRI read {path}: {e}"),
+            }
+        }
         if let Ok(v) = std::env::var("PREVIZ_LEVELS")
             && let Ok(v) = v.parse::<f32>()
         {

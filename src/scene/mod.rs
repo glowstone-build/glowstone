@@ -190,9 +190,44 @@ pub fn apply_fixture_click(
 }
 
 /// Everything the renderer draws and the UI edits.
+/// The world environment: an equirectangular HDRI that both renders behind the
+/// scene (a sky) and lights the geometry (image-based ambient), with overall
+/// brightness, a yaw rotation, and an ambient-fill strength. When no map is
+/// loaded the renderer keeps the dark void + a faint flat fill.
+#[derive(Clone)]
+pub struct World {
+    /// Equirectangular map file bytes (`.hdr` / `.png` / `.jpg`), if loaded.
+    pub hdri: Option<std::sync::Arc<Vec<u8>>>,
+    /// Display name of the loaded map (for the UI / round-trip).
+    pub hdri_name: String,
+    /// Overall world brightness multiplier (drives both sky + ambient).
+    pub brightness: f32,
+    /// Environment yaw about +Y, radians (turns sky + ambient together).
+    pub rotation: f32,
+    /// Image-based ambient fill strength on geometry (0 = none).
+    pub ambient: f32,
+    /// Draw the map as the viewport background (off = keep the dark void).
+    pub show_background: bool,
+}
+
+impl Default for World {
+    fn default() -> Self {
+        Self {
+            hdri: None,
+            hdri_name: String::new(),
+            brightness: 1.0,
+            rotation: 0.0,
+            ambient: 1.0,
+            show_background: true,
+        }
+    }
+}
+
 pub struct Scene {
     pub fixtures: Vec<Fixture>,
     pub environments: Vec<Environment>,
+    /// The world / environment (HDRI sky + ambient lighting).
+    pub world: World,
     /// Static imported geometry (stage, truss, set) — drawn but not a light.
     pub geometry: Vec<SceneGeometry>,
     /// Retained MVR document data, present when the scene came from an MVR
@@ -222,6 +257,7 @@ impl Scene {
         Self {
             fixtures: vec![fixture],
             environments: vec![environment],
+            world: World::default(),
             geometry: Vec::new(),
             mvr: None,
         }

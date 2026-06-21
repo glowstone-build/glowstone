@@ -238,6 +238,11 @@ pub fn scene_outliner(
         }
     });
 
+    // ---- WORLD: HDRI environment (sky background + image-based ambient) ----
+    folder_header(icon::WORLD, "World", 0, true, &ink).show(ui, |ui| {
+        world_controls(ui, &mut scene.world, &ink);
+    });
+
     ui.add_space(6.0);
     ui.separator();
     folder_header(icon::SETTINGS, "View", 0, true, &ink).show(ui, |ui| {
@@ -285,6 +290,63 @@ pub fn scene_outliner(
                 .small(),
         );
     });
+}
+
+/// The World / environment controls: load an equirectangular HDRI (sky +
+/// image-based ambient), set its brightness, ambient fill, yaw and whether it
+/// shows as the viewport background.
+fn world_controls(ui: &mut egui::Ui, world: &mut crate::scene::World, ink: &theme::Ink) {
+    use theme::icon;
+    ui.horizontal(|ui| {
+        if ui
+            .button(format!("{}  Load HDRI…", icon::IMAGE))
+            .on_hover_text("Load an equirectangular environment map (.hdr / .png / .jpg)")
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Environment map", &["hdr", "exr", "png", "jpg", "jpeg"])
+                .pick_file()
+        {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    world.hdri = Some(std::sync::Arc::new(bytes));
+                    world.hdri_name = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                }
+                Err(e) => log::error!("load HDRI {}: {e}", path.display()),
+            }
+        }
+        if world.hdri.is_some() && ui.button(theme::ico(icon::CLOSE)).on_hover_text("Remove the environment map").clicked() {
+            world.hdri = None;
+            world.hdri_name.clear();
+        }
+    });
+    let name = if world.hdri.is_some() {
+        if world.hdri_name.is_empty() { "loaded".to_string() } else { world.hdri_name.clone() }
+    } else {
+        "none (dark void)".to_string()
+    };
+    ui.label(RichText::new(name).weak().small());
+
+    let enabled = world.hdri.is_some();
+    Grid::new("world-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Brightness").on_hover_text("Overall world exposure (sky + ambient)");
+        ui.add_enabled(enabled, Slider::new(&mut world.brightness, 0.0..=4.0));
+        ui.end_row();
+        ui.label("Ambient").on_hover_text("How strongly the environment lights the geometry");
+        ui.add_enabled(enabled, Slider::new(&mut world.ambient, 0.0..=2.0));
+        ui.end_row();
+        ui.label("Rotation").on_hover_text("Turn the environment around the vertical axis");
+        ui.add_enabled(enabled, Slider::new(&mut world.rotation, 0.0..=std::f32::consts::TAU).suffix(" rad"));
+        ui.end_row();
+        ui.label("Background");
+        ui.add_enabled(enabled, egui::Checkbox::new(&mut world.show_background, "show sky"));
+        ui.end_row();
+    });
+    if !enabled {
+        ui.label(RichText::new("Load a map to light the scene from the environment.").weak().small().color(ink.muted));
+    }
 }
 
 /// A collapsible top-level Scene folder header: icon + title + count, styled as a

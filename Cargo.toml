@@ -20,10 +20,14 @@ egui_dock = "0.19"
 glam = { version = "0.33", features = ["bytemuck"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
+# f16 conversion for the HDR world/environment map (Rgba16Float is filterable;
+# Rgba32Float is not without an optional device feature).
+half = { version = "2", features = ["bytemuck"] }
 env_logger = "0.11"
 log = "0.4"
-# Image decode/encode: headless screenshot PNG + GDTF wheel/thumbnail images.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Image decode/encode: headless screenshot PNG + GDTF wheel/thumbnail images +
+# HDR (Radiance .hdr) + JPEG for world/environment HDRI maps.
+image = { version = "0.25", default-features = false, features = ["png", "hdr", "jpeg"] }
 
 # GDTF import (fixture library): GDTF is a ZIP of an XML description + glTF
 # models + wheel images.

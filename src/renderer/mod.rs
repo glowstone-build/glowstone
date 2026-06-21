@@ -16,6 +16,7 @@ mod noise;
 mod pipeline;
 mod shadow;
 pub mod viewport;
+mod world;
 
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
@@ -145,6 +146,14 @@ pub struct Renderer {
     // Placeholder cone bodies for GDTF fixtures whose 3D models didn't bake
     // (absent / unsupported model format) — so the fixture is still visible.
     gdtf_placeholder_instances: GrowBuffer,
+
+    // World/HDRI environment: the equirect map + the sky background pipeline.
+    // `world_key` caches the loaded map's Arc pointer (0 = placeholder).
+    sky_pipeline: wgpu::RenderPipeline,
+    world_bgl: wgpu::BindGroupLayout,
+    world_tex: world::WorldTexture,
+    world_bind_group: wgpu::BindGroup,
+    world_key: usize,
 
     // Gobo/animation texture atlas (built from GDTF wheel media on first load).
     gobo_atlas: atlas::GoboAtlas,
@@ -285,9 +294,15 @@ impl Renderer {
             bind_group_layouts: &[Some(&camera_bgl)],
             immediate_size: 0,
         });
+        let world_bgl = pipeline::world_bind_group_layout(&device);
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-pipeline-layout"),
-            bind_group_layouts: &[Some(&camera_bgl), Some(&light_layout)],
+            bind_group_layouts: &[Some(&camera_bgl), Some(&light_layout), Some(&world_bgl)],
+            immediate_size: 0,
+        });
+        let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky-pipeline-layout"),
+            bind_group_layouts: &[Some(&camera_bgl), Some(&world_bgl)],
             immediate_size: 0,
         });
 
@@ -296,6 +311,17 @@ impl Renderer {
         let mesh_wire_pipeline =
             wireframe_supported.then(|| pipeline::mesh_wire_pipeline(&device, &mesh_layout));
         let lens_pipeline = pipeline::lens_pipeline(&device, &line_layout);
+        let sky_pipeline = pipeline::sky_pipeline(&device, &sky_layout);
+
+        let world_tex = world::WorldTexture::placeholder(&device, &queue);
+        let world_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("world-bg"),
+            layout: &world_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&world_tex.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&world_tex.sampler) },
+            ],
+        });
 
         // --- meshes ---
         let grid_mesh = GpuMesh::new(&device, "grid", &mesh::grid_and_axes(20.0, 1.0));
@@ -473,6 +499,11 @@ impl Renderer {
             scene_geom_cache: HashMap::new(),
             scene_geom_instances,
             gdtf_placeholder_instances,
+            sky_pipeline,
+            world_bgl,
+            world_tex,
+            world_bind_group,
+            world_key: 0,
             gobo_atlas,
             shadow,
             volumetric_pipeline,
@@ -542,6 +573,34 @@ impl Renderer {
         }
         log::info!("loaded GDTF '{}' — {} mesh parts", gdtf.name, meshes.len());
         self.gdtf_cache.insert(key, meshes);
+    }
+
+    /// (Re)load the world HDRI texture when the scene's map changes (keyed by the
+    /// bytes' `Arc` pointer), rebuilding the world bind group. Cheap no-op when
+    /// the map is unchanged.
+    fn ensure_world(&mut self, world: &crate::scene::World) {
+        let key = world.hdri.as_ref().map(|a| Arc::as_ptr(a) as usize).unwrap_or(0);
+        if key == self.world_key {
+            return;
+        }
+        let tex = match &world.hdri {
+            Some(bytes) => world::WorldTexture::from_bytes(&self.device, &self.queue, bytes)
+                .unwrap_or_else(|| {
+                    log::warn!("world: could not decode environment map '{}'", world.hdri_name);
+                    world::WorldTexture::placeholder(&self.device, &self.queue)
+                }),
+            None => world::WorldTexture::placeholder(&self.device, &self.queue),
+        };
+        self.world_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("world-bg"),
+            layout: &self.world_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&tex.sampler) },
+            ],
+        });
+        self.world_tex = tex;
+        self.world_key = key;
     }
 
     /// Bake an imported MVR static-geometry model (GLB or 3DS blob) into a cached
@@ -885,10 +944,18 @@ impl Renderer {
         let time = self.start_time.elapsed().as_secs_f32();
         let aspect = self.viewport.aspect();
 
+        // --- world / HDRI environment (reloads the GPU map only when it changes) ---
+        self.ensure_world(&scene.world);
+
         // --- camera uniform ---
         let mut camera_uniform = camera.uniform(aspect);
         camera_uniform.render_mode[0] = settings.mode.shader_code();
         camera_uniform.render_mode[1] = settings.gobo_sharpness.max(0.0); // floor-pool gobo sharpen
+        {
+            let w = &scene.world;
+            let has = if w.hdri.is_some() { 1.0 } else { 0.0 };
+            camera_uniform.world = [w.brightness, w.rotation, w.ambient, has];
+        }
 
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
@@ -1403,7 +1470,21 @@ impl Renderer {
             });
 
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
+
+            // World HDRI background: a fullscreen sky behind everything (depth
+            // Always, no write) — opaque geometry below overdraws it. Only in
+            // Beauty mode, when a map is loaded and the background is enabled.
+            if scene.world.hdri.is_some()
+                && scene.world.show_background
+                && settings.mode == ViewportMode::Beauty
+            {
+                pass.set_pipeline(&self.sky_pipeline);
+                pass.set_bind_group(1, &self.world_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
             pass.set_bind_group(1, &light_bg, &[]);
+            pass.set_bind_group(2, &self.world_bind_group, &[]); // mesh IBL ambient
 
             let mesh_pipe = match (settings.mode, self.mesh_wire_pipeline.as_ref()) {
                 (ViewportMode::Wireframe, Some(wire)) => wire,
