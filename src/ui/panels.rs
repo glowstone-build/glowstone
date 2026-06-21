@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
-use glam::{Vec2, Vec3};
+use glam::{Quat, Vec2, Vec3};
 
 use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
-use super::{DuplicateDialog, GdtfTextures};
+use super::{Axis, DuplicateDialog, GdtfTextures, TransformKind, TransformOp};
 use crate::dmx::patch::channel_map;
 use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
 use crate::gdtf::{GdtfFixture, WheelKind};
@@ -1425,15 +1425,67 @@ fn decode_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui:
     Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
 }
 
+/// Apply an in-progress modal transform to the scene from the current mouse
+/// position. Reads the snapshot in `op.start`, so it's idempotent — called every
+/// frame the op is live; cancelling restores from the same snapshot.
+fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cur: egui::Pos2) {
+    let d = cur - op.start_screen; // pixel delta
+    let (right, up, _fwd) = camera.view_basis();
+    match op.kind {
+        TransformKind::Move => {
+            let speed = camera.distance * 0.0015;
+            let mut world = right * (d.x * speed) + up * (-d.y * speed);
+            if let Some(ax) = op.axis {
+                let a = ax.vec();
+                world = a * world.dot(a); // lock to one axis
+            }
+            for (i, p0, _q) in &op.start {
+                if let Some(f) = scene.fixtures.get_mut(*i) {
+                    f.position = *p0 + world;
+                    f.snap_movement();
+                }
+            }
+        }
+        TransformKind::Rotate => {
+            let angle = d.x * 0.01;
+            let axis = op.axis.map(|a| a.vec()).unwrap_or(Vec3::Y);
+            let rot = Quat::from_axis_angle(axis, angle);
+            for (i, p0, q0) in &op.start {
+                if let Some(f) = scene.fixtures.get_mut(*i) {
+                    f.position = op.pivot + rot * (*p0 - op.pivot);
+                    f.orientation = rot * *q0;
+                    f.snap_movement();
+                }
+            }
+        }
+        TransformKind::Scale => {
+            let factor = (1.0 + d.x * 0.005).max(0.01);
+            for (i, p0, _q) in &op.start {
+                if let Some(f) = scene.fixtures.get_mut(*i) {
+                    let off = *p0 - op.pivot;
+                    let new = if let Some(ax) = op.axis {
+                        let a = ax.vec();
+                        let comp = a * off.dot(a);
+                        (off - comp) + comp * factor // scale only the locked axis
+                    } else {
+                        off * factor
+                    };
+                    f.position = op.pivot + new;
+                    f.snap_movement();
+                }
+            }
+        }
+    }
+}
+
 /// Central tab: the 3D scene, rendered offscreen and shown as a texture.
 /// Drag to orbit, shift+drag to pan, scroll to zoom, click to select, `d` to
-/// duplicate the selected fixture.
-#[allow(clippy::too_many_arguments)]
+/// duplicate the selected fixture; G/R/S to move/rotate/scale the selection.
 #[allow(clippy::too_many_arguments)]
 pub fn viewport(
     ui: &mut egui::Ui,
     camera: &mut OrbitCamera,
-    scene: &Scene,
+    scene: &mut Scene,
     selection: &mut Selection,
     scene_anchor: &mut Option<usize>,
     viewport_focused: &mut bool,
@@ -1443,6 +1495,7 @@ pub fn viewport(
     fps: f32,
     prefs: &Preferences,
     settings: &mut RenderSettings,
+    transform: &mut Option<TransformOp>,
 ) {
     let available = ui.available_size();
     let ppp = ui.pixels_per_point();
@@ -1468,7 +1521,79 @@ pub fn viewport(
         *viewport_focused = rect.contains(p);
     }
 
-    if response.dragged() {
+    // --- Modal transform (Blender G/R/S): when active it OWNS the viewport
+    // (mouse drives the transform; orbit/select/zoom are suspended). ---
+    let mut consumed = transform.is_some();
+    if let Some(op) = transform.as_mut() {
+        // Axis constraint: X/Y/Z toggles a single-axis lock.
+        ui.input(|i| {
+            use egui::Key;
+            for (k, ax) in [(Key::X, Axis::X), (Key::Y, Axis::Y), (Key::Z, Axis::Z)] {
+                if i.key_pressed(k) {
+                    op.axis = if op.axis == Some(ax) { None } else { Some(ax) };
+                }
+            }
+        });
+        let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape)) || response.secondary_clicked();
+        let confirm = ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))
+            || response.clicked();
+        if cancel {
+            for (i, p0, q0) in &op.start {
+                if let Some(f) = scene.fixtures.get_mut(*i) {
+                    f.position = *p0;
+                    f.orientation = *q0;
+                    f.snap_movement();
+                }
+            }
+            *transform = None;
+        } else {
+            if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
+                apply_transform(op, scene, camera, cur);
+            }
+            let hint = op.hint();
+            ui.painter().text(
+                rect.center_top() + egui::vec2(0.0, 10.0),
+                egui::Align2::CENTER_TOP,
+                hint,
+                egui::FontId::monospace(13.0),
+                egui::Color32::from_rgb(255, 220, 120),
+            );
+            if confirm {
+                *transform = None;
+            }
+        }
+    } else if *viewport_focused && !selection.fixtures.is_empty() {
+        // Start a transform on G / R / S.
+        let kind = ui.input(|i| {
+            use egui::Key;
+            if i.key_pressed(Key::G) {
+                Some(TransformKind::Move)
+            } else if i.key_pressed(Key::R) {
+                Some(TransformKind::Rotate)
+            } else if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl {
+                Some(TransformKind::Scale)
+            } else {
+                None
+            }
+        });
+        if let Some(kind) = kind
+            && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
+        {
+            let ids: Vec<usize> =
+                selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+            if !ids.is_empty() {
+                let pivot = ids.iter().map(|&i| scene.fixtures[i].position).sum::<Vec3>() / ids.len() as f32;
+                let start = ids
+                    .iter()
+                    .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
+                    .collect();
+                *transform = Some(TransformOp { kind, axis: None, start_screen: cur, pivot, start });
+                consumed = true;
+            }
+        }
+    }
+
+    if !consumed && response.dragged() {
         let delta = response.drag_delta();
         if ui.input(|i| i.modifiers.shift) {
             camera.pan(delta.x, delta.y);
@@ -1476,7 +1601,7 @@ pub fn viewport(
             camera.orbit(delta.x, delta.y);
         }
     }
-    if response.contains_pointer() {
+    if !consumed && response.contains_pointer() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
             camera.zoom(scroll * 0.01);
@@ -1487,7 +1612,8 @@ pub fn viewport(
     // ⌘/Ctrl-click toggles into a multi-selection; Shift-click range-selects from
     // the anchor (same as the outliner). A drag with Shift pans, so a stationary
     // Shift-click still range-selects.
-    if response.clicked()
+    if !consumed
+        && response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
     {
         let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
@@ -1505,7 +1631,8 @@ pub fn viewport(
     }
 
     // `d` opens the Duplicate dialog for the selected fixture.
-    if *viewport_focused
+    if !consumed
+        && *viewport_focused
         && duplicate.is_none()
         && ui.input(|i| i.key_pressed(egui::Key::D))
         && let Some(idx) = selection.primary_fixture()
@@ -1533,7 +1660,7 @@ pub fn viewport(
     ui.painter().text(
         rect.left_bottom() + egui::vec2(8.0, -6.0),
         egui::Align2::LEFT_BOTTOM,
-        "drag: orbit · shift+drag: pan · scroll: zoom · click: select · d: duplicate",
+        "drag: orbit · shift+drag: pan · scroll: zoom · click: select · g/r/s: move/rotate/scale · d: duplicate",
         egui::FontId::proportional(11.0),
         egui::Color32::from_white_alpha(110),
     );
@@ -2388,5 +2515,62 @@ mod pick_tests {
         let ro = f + Vec3::new(0.0, 0.0, 6.0);
         let rd = (f - ro).normalize();
         assert_eq!(pick(&scene, ro, rd), Some(Hit::Fixture(0)));
+    }
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+
+    fn make_op(kind: TransformKind, axis: Option<Axis>, pivot: Vec3, idx: usize, p0: Vec3) -> TransformOp {
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)] }
+    }
+
+    #[test]
+    fn move_axis_lock_keeps_other_axes() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let cam = OrbitCamera::default();
+        let o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
+        apply_transform(&o, &mut scene, &cam, egui::pos2(120.0, 40.0));
+        let d = scene.fixtures[0].position - p0;
+        assert!(d.y.abs() < 1e-4, "y leaked: {}", d.y);
+        assert!(d.z.abs() < 1e-4, "z leaked: {}", d.z);
+    }
+
+    #[test]
+    fn rotate_y_preserves_distance_and_height() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let pivot = p0 + Vec3::new(2.0, 0.0, 0.0);
+        let o = make_op(TransformKind::Rotate, Some(Axis::Y), pivot, 0, p0);
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(80.0, 0.0));
+        let before = (p0 - pivot).length();
+        let after = (scene.fixtures[0].position - pivot).length();
+        assert!((before - after).abs() < 1e-3, "radius changed {before} -> {after}");
+        assert!((scene.fixtures[0].position.y - p0.y).abs() < 1e-4, "Y rotation changed height");
+    }
+
+    #[test]
+    fn scale_expands_from_pivot() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
+        let o = make_op(TransformKind::Scale, None, pivot, 0, p0);
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(200.0, 0.0));
+        let before = (p0 - pivot).length();
+        let after = (scene.fixtures[0].position - pivot).length();
+        assert!(after > before, "expected expansion {before} -> {after}");
+    }
+
+    #[test]
+    fn scale_factor_floor_keeps_geometry_nonzero() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
+        let o = make_op(TransformKind::Scale, None, pivot, 0, p0);
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(-100000.0, 0.0));
+        let after = (scene.fixtures[0].position - pivot).length();
+        assert!(after > 0.0, "geometry collapsed to the pivot");
     }
 }

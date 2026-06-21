@@ -155,6 +155,15 @@ impl OrbitCamera {
         self.target += (-right * delta_x + up * delta_y) * speed;
     }
 
+    /// The camera's world-space basis: (right, up, forward). Used to map a
+    /// screen-space drag onto the view plane (modal transforms).
+    pub fn view_basis(&self) -> (Vec3, Vec3, Vec3) {
+        let forward = (self.target - self.eye()).normalize_or_zero();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        (right, up, forward)
+    }
+
     pub fn view_matrix(&self) -> Mat4 {
         Mat4::look_at_rh(self.eye(), self.target, Vec3::Y)
     }

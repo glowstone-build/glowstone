@@ -52,6 +52,77 @@ pub enum Tab {
     Patch,
 }
 
+/// An in-progress modal transform of the selected fixtures (Blender's G/R/S):
+/// grab / rotate / scale driven by mouse motion, optionally axis-constrained,
+/// confirmed by click/Enter or cancelled by Esc/right-click.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TransformKind {
+    Move,
+    Rotate,
+    Scale,
+}
+
+impl TransformKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Move => "Move",
+            Self::Rotate => "Rotate",
+            Self::Scale => "Scale",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    pub fn vec(self) -> Vec3 {
+        match self {
+            Self::X => Vec3::X,
+            Self::Y => Vec3::Y,
+            Self::Z => Vec3::Z,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::Z => "Z",
+        }
+    }
+}
+
+pub struct TransformOp {
+    pub kind: TransformKind,
+    pub axis: Option<Axis>,
+    /// Mouse position (screen) when the op started.
+    pub start_screen: egui::Pos2,
+    /// Selection centroid (pivot for rotate/scale).
+    pub pivot: Vec3,
+    /// Original (fixture index, position, orientation) snapshot, for live re-apply
+    /// each frame and for cancel/restore.
+    pub start: Vec<(usize, Vec3, glam::Quat)>,
+}
+
+impl TransformOp {
+    /// The on-viewport status line shown while the op is in progress.
+    pub fn hint(&self) -> String {
+        let ax = match self.axis {
+            Some(a) => format!(" · axis {}", a.label()),
+            None => String::new(),
+        };
+        format!(
+            "{}{}   X/Y/Z lock · click/Enter confirm · Esc cancel",
+            self.kind.label(),
+            ax
+        )
+    }
+}
+
 /// A workspace layout preset, switchable from the Window menu.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Workspace {
@@ -138,6 +209,8 @@ pub struct Ui {
     fm: panels::FmState,
     /// The `s` quick-select palette is open.
     quick_select: bool,
+    /// In-progress modal transform (G/R/S), if any.
+    transform: Option<TransformOp>,
 }
 
 impl Ui {
@@ -161,6 +234,7 @@ impl Ui {
             scene_sort: panels::SceneSort::Patch,
             fm: panels::FmState::default(),
             quick_select: false,
+            transform: None,
         }
     }
 
@@ -251,6 +325,7 @@ impl Ui {
             scene_anchor: &mut self.scene_anchor,
             scene_sort: &mut self.scene_sort,
             fm: &mut self.fm,
+            transform: &mut self.transform,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
             dmx_status: dmxv.status,
@@ -412,8 +487,12 @@ impl Ui {
             if i.modifiers.command && i.key_pressed(Key::Comma) {
                 self.show_prefs = true;
             }
-            // `s` opens the quick-select palette (keyboard-driven thereafter).
-            if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl {
+            // `s` opens the quick-select palette — UNLESS the viewport is focused
+            // with a selection, where `s` means Scale (Blender modal transform,
+            // handled in panels::viewport). So: something to scale → scale; nothing
+            // to scale → open the select palette.
+            let s_is_scale = self.viewport_focused && !self.selection.fixtures.is_empty();
+            if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl && !s_is_scale {
                 self.quick_select = true;
             }
             // `a` = select all fixtures; `l` = toggle fixture labels.
@@ -442,7 +521,7 @@ impl Ui {
         // Arrow keys nudge the selected fixtures on the floor plane (Shift = 1 m,
         // else 0.1 m), but only when the viewport has focus so they don't fight
         // panel scrolling. PageUp/Down nudge height.
-        if self.viewport_focused && !self.selection.fixtures.is_empty() {
+        if self.viewport_focused && self.transform.is_none() && !self.selection.fixtures.is_empty() {
             let (mut dx, mut dz, mut dy) = (0.0f32, 0.0f32, 0.0f32);
             let step = ctx.input(|i| {
                 use egui::Key;
@@ -796,6 +875,7 @@ struct PanelViewer<'a> {
     scene_anchor: &'a mut Option<usize>,
     scene_sort: &'a mut panels::SceneSort,
     fm: &'a mut panels::FmState,
+    transform: &'a mut Option<TransformOp>,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
     dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
@@ -832,6 +912,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.fps,
                 self.prefs,
                 self.settings,
+                self.transform,
             ),
             Tab::Scene => panels::scene_outliner(
                 ui,
