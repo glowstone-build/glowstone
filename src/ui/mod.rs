@@ -237,6 +237,14 @@ impl Ui {
         self.quick_select = true;
     }
 
+    /// Open the profile editor for the first GDTF fixture (headless hook).
+    pub fn debug_open_profile(&mut self, scene: &Scene) {
+        if let Some(i) = scene.fixtures.iter().position(|f| f.is_gdtf()) {
+            self.selection = Selection::fixture(i);
+            self.profile = Some(ProfileEditor::new(i));
+        }
+    }
+
     /// Make the named tab the active one in its leaf (used by the headless UI
     /// screenshot path to capture a specific panel).
     pub fn focus_tab_by_title(&mut self, title: &str) {

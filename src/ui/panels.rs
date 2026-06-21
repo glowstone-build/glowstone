@@ -1651,39 +1651,49 @@ pub fn dmx_universe_grid(
         *selected_universe = universes[0];
     }
 
+    let ink = theme::ink(!ui.visuals().dark_mode);
+    let accent = ui.visuals().selection.stroke.color;
+    let u = *selected_universe;
+    let live = snapshot.is_live(u, DMX_STALE);
+    let nconf = patch.conflicts().len();
+
+    // --- header: title · universe nav · live / conflict status ---
     ui.horizontal(|ui| {
+        ui.label(RichText::new(theme::icon::DMX).size(16.0).color(ink.secondary));
         ui.heading("DMX Universe");
-        if ui.button("◀").clicked()
-            && let Some(pos) = universes.iter().position(|u| u == selected_universe)
+        ui.add_space(6.0);
+        if ui.button(theme::ico(theme::icon::PREV)).clicked()
+            && let Some(pos) = universes.iter().position(|x| x == selected_universe)
         {
             *selected_universe = universes[pos.saturating_sub(1)];
         }
         egui::ComboBox::from_id_salt("dmx-universe-select")
             .selected_text(format!("Universe {selected_universe}"))
             .show_ui(ui, |ui| {
-                for &u in &universes {
-                    ui.selectable_value(selected_universe, u, format!("Universe {u}"));
+                for &x in &universes {
+                    ui.selectable_value(selected_universe, x, format!("Universe {x}"));
                 }
             });
-        if ui.button("▶").clicked()
-            && let Some(pos) = universes.iter().position(|u| u == selected_universe)
+        if ui.button(theme::ico(theme::icon::NEXT)).clicked()
+            && let Some(pos) = universes.iter().position(|x| x == selected_universe)
         {
             *selected_universe = universes[(pos + 1).min(universes.len() - 1)];
         }
-        if snapshot.is_live(*selected_universe, DMX_STALE) {
-            let n = snapshot.frames.get(selected_universe).map(|f| f.sources).unwrap_or(0);
-            ui.colored_label(Color32::from_rgb(120, 210, 120), format!("● LIVE · {n} src"));
-        } else {
-            ui.colored_label(Color32::from_gray(130), "○ idle");
-        }
-        let nconf = patch.conflicts().len();
-        if nconf > 0 {
-            ui.colored_label(Color32::from_rgb(230, 90, 90), format!("⚠ {nconf} conflict(s)"));
-        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if nconf > 0 {
+                ui.colored_label(
+                    theme::CONFLICT,
+                    RichText::new(format!("{} {nconf} conflict{}", theme::icon::WARNING, if nconf == 1 { "" } else { "s" })),
+                );
+            }
+            if live {
+                let n = snapshot.frames.get(&u).map(|f| f.sources).unwrap_or(0);
+                ui.colored_label(theme::LIVE, format!("● LIVE · {n} src"));
+            } else {
+                ui.colored_label(ink.muted, "○ idle");
+            }
+        });
     });
-    ui.separator();
-
-    let u = *selected_universe;
 
     // Per-channel occupant (fixture index + attribute) for the selected universe,
     // computed once so each of the 512 cells is a cheap lookup.
@@ -1707,13 +1717,29 @@ pub fn dmx_universe_grid(
             }
         }
     }
+    let active = (1..=512u16).filter(|&c| snapshot.level(u, c).unwrap_or(0) > 0).count();
+    let patched = occ.iter().filter(|o| o.is_some()).count();
+
+    // --- summary strip ---
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{active}")).monospace().strong().color(if active > 0 { accent } else { ink.muted }));
+        ui.label(RichText::new("active").small().color(ink.tertiary));
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!("{patched}")).monospace().strong().color(ink.secondary));
+        ui.label(RichText::new("patched / 512").small().color(ink.tertiary));
+    });
+    ui.separator();
+
+    let base_patched = ui.visuals().widgets.inactive.bg_fill;
+    let base_empty = ui.visuals().extreme_bg_color;
+    let border = ui.visuals().widgets.noninteractive.bg_stroke.color;
 
     const COLS: usize = 16;
     const ROWS: usize = 32;
-    egui::ScrollArea::both().show(ui, |ui| {
+    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         let avail = ui.available_width().max(360.0);
-        let cell_w = (avail / COLS as f32).clamp(42.0, 92.0);
-        let cell_h = 34.0;
+        let cell_w = (avail / COLS as f32).clamp(40.0, 96.0);
+        let cell_h = 30.0;
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(cell_w * COLS as f32, cell_h * ROWS as f32),
             Sense::click(),
@@ -1727,65 +1753,73 @@ pub fn dmx_universe_grid(
                     egui::vec2(cell_w - 1.0, cell_h - 1.0),
                 );
                 let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
-                let bg = cell_bg(level, occ[ch].is_some());
-                let ink = cell_ink(bg);
-                painter.rect_filled(cell, 2.0, bg);
-                // Thin separator between cells; a red outline for conflicts.
-                painter.rect_stroke(
-                    cell,
-                    2.0,
-                    egui::Stroke::new(1.0, Color32::from_gray(70)),
-                    egui::StrokeKind::Inside,
-                );
-                if conflict_cells[ch] {
-                    painter.rect_stroke(
-                        cell,
-                        2.0,
-                        egui::Stroke::new(1.6, Color32::from_rgb(214, 64, 64)),
-                        egui::StrokeKind::Inside,
+                let occupied = occ[ch].as_ref();
+                let selected = occupied.is_some_and(|(fi, _)| selection.contains_fixture(*fi));
+                let tint = occupied.map(|(fi, _)| fixture_tint(*fi)).unwrap_or(accent);
+
+                // Base + a value-fill bar rising from the bottom (∝ level).
+                painter.rect_filled(cell, 3.0, if occupied.is_some() { base_patched } else { base_empty });
+                if level > 0 {
+                    let frac = level as f32 / 255.0;
+                    let fill = egui::Rect::from_min_max(
+                        egui::pos2(cell.left(), cell.bottom() - cell.height() * frac),
+                        cell.right_bottom(),
+                    );
+                    painter.rect_filled(fill, 0.0, tint.gamma_multiply(0.22 + 0.55 * frac));
+                }
+                // Fixture-identity stripe down the left edge.
+                if occupied.is_some() {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(cell.left_top(), egui::pos2(cell.left() + 2.5, cell.bottom())),
+                        0.0,
+                        tint,
                     );
                 }
-                // Channel number (top-left), level % (top-right).
+                // Border / conflict / selection ring.
+                painter.rect_stroke(cell, 3.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                if conflict_cells[ch] {
+                    painter.rect_stroke(cell, 3.0, egui::Stroke::new(1.5, theme::CONFLICT), egui::StrokeKind::Inside);
+                } else if selected {
+                    painter.rect_stroke(cell, 3.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+                }
+                // Channel number (top-left) + value % (bottom-right), tabular.
                 painter.text(
-                    cell.left_top() + egui::vec2(3.0, 1.0),
+                    cell.left_top() + egui::vec2(4.0, 2.0),
                     egui::Align2::LEFT_TOP,
                     (ch + 1).to_string(),
-                    egui::FontId::proportional(9.0),
-                    ink.gamma_multiply(0.7),
+                    egui::FontId::monospace(9.0),
+                    ink.muted,
                 );
                 if level > 0 {
                     let pct = (level as f32 / 255.0 * 100.0).round() as u32;
                     painter.text(
-                        cell.right_top() + egui::vec2(-3.0, 1.0),
-                        egui::Align2::RIGHT_TOP,
-                        format!("{pct}%"),
-                        egui::FontId::proportional(9.5),
-                        ink,
+                        cell.right_bottom() + egui::vec2(-4.0, -2.0),
+                        egui::Align2::RIGHT_BOTTOM,
+                        format!("{pct}"),
+                        egui::FontId::monospace(11.5),
+                        ink.primary,
                     );
                 }
-                // Patched occupant: fixture id/name + attribute, two lines.
-                if let Some((fi, attr)) = &occ[ch] {
-                    let id = scene.fixtures[*fi]
-                        .mvr
-                        .as_deref()
-                        .map(|m| m.fixture_id.clone())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| scene.fixtures[*fi].name.clone());
-                    painter.text(
-                        cell.left_bottom() + egui::vec2(3.0, -11.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        truncate(&id, 10),
-                        egui::FontId::proportional(8.5),
-                        ink,
-                    );
-                    painter.text(
-                        cell.left_bottom() + egui::vec2(3.0, -2.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        truncate(attr, 11),
-                        egui::FontId::proportional(8.5),
-                        ink.gamma_multiply(0.8),
-                    );
-                }
+            }
+        }
+        // Hover tooltip with the channel's full occupant + value.
+        if let Some(pos) = resp.hover_pos() {
+            let rel = pos - rect.min;
+            let (c, r) = ((rel.x / cell_w) as usize, (rel.y / cell_h) as usize);
+            if c < COLS && r < ROWS {
+                let ch = r * COLS + c;
+                let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
+                let pct = (level as f32 / 255.0 * 100.0).round() as u32;
+                let detail = match &occ[ch] {
+                    Some((fi, attr)) => {
+                        let name = scene.fixtures[*fi].name.clone();
+                        format!("Ch {} · {name} · {attr}\n{level}  ({pct}%)", ch + 1)
+                    }
+                    None => format!("Ch {} · unpatched\n{level}  ({pct}%)", ch + 1),
+                };
+                egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new("dmx-cell-tip"), |ui| {
+                    ui.label(detail);
+                });
             }
         }
         if resp.clicked()
@@ -1800,6 +1834,30 @@ pub fn dmx_universe_grid(
             }
         }
     });
+}
+
+/// A stable identity colour for a fixture index — golden-ratio hue spacing so
+/// adjacent fixtures stay visually distinct in the DMX grid.
+fn fixture_tint(i: usize) -> Color32 {
+    let h = (i as f32 * 0.618_034).fract();
+    hsv_to_color(h, 0.55, 0.95)
+}
+
+fn hsv_to_color(h: f32, s: f32, v: f32) -> Color32 {
+    let i = (h * 6.0).floor();
+    let f = h * 6.0 - i;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    let (r, g, b) = match (i as i32).rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
 /// Bottom tab: the per-fixture DMX patch editor.
@@ -1913,43 +1971,6 @@ pub fn patch_editor(ui: &mut egui::Ui, scene: &Scene, patch: &mut PatchTable) {
                 }
             });
     });
-}
-
-/// Cell background for the universe grid (high contrast, like a console patch
-/// sheet): unpatched cells are near-white, patched cells carry a blue tint that
-/// deepens with the live level.
-fn cell_bg(level: u8, patched: bool) -> Color32 {
-    if !patched {
-        return Color32::from_rgb(232, 233, 236);
-    }
-    let t = level as f32 / 255.0;
-    let lo = [206.0, 224.0, 247.0]; // patched, dark
-    let hi = [33.0, 99.0, 222.0]; // patched, full
-    Color32::from_rgb(
-        (lo[0] + (hi[0] - lo[0]) * t) as u8,
-        (lo[1] + (hi[1] - lo[1]) * t) as u8,
-        (lo[2] + (hi[2] - lo[2]) * t) as u8,
-    )
-}
-
-/// Readable text colour for a cell: dark ink on light cells, light ink on the
-/// deep-blue lit cells (luminance-based).
-fn cell_ink(bg: Color32) -> Color32 {
-    let l = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
-    if l > 140.0 {
-        Color32::from_rgb(38, 42, 50)
-    } else {
-        Color32::from_rgb(236, 239, 245)
-    }
-}
-
-/// Truncate a label to `n` chars with an ellipsis (for tight grid cells).
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() > n {
-        format!("{}…", s.chars().take(n).collect::<String>())
-    } else {
-        s.to_string()
-    }
 }
 
 /// Compact a sorted universe list for the source table (e.g. `1,2,5`).

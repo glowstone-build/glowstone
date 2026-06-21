@@ -450,22 +450,33 @@ pub fn profile_editor_window(
         .or_insert_with(|| super::panels::load_gdtf_textures(ctx, &gdtf));
 
     let mut keep = true;
-    let title = format!("Fixture Profile — {}", gdtf.name);
+    let title = format!("{}  Fixture Profile — {}", theme::icon::PROFILE, gdtf.name);
     egui::Window::new(title)
         .open(&mut keep)
         .resizable(true)
-        .default_size([720.0, 480.0])
+        .collapsible(false)
+        .default_size([860.0, 600.0])
+        .min_size([580.0, 420.0])
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ctx.screen_rect().center())
         .show(ctx, |ui| {
+            // Both columns get a concrete body height (taller than before, and the
+            // window stays resizable). A fixed height — rather than
+            // available_height — avoids the auto-size/auto-shrink collapse loop
+            // that previously shrank the window to its title bar.
+            // A fixed-height body so the (resizable) window opens tall regardless
+            // of which tab's content is shown, and the resize handle works.
+            let body_h = 540.0;
             ui.horizontal(|ui| {
                 // Left: emitter / geometry tree.
                 ui.vertical(|ui| {
-                    ui.set_min_width(150.0);
-                    ui.label(RichText::new("EMITTERS").small().strong());
+                    ui.set_min_width(170.0);
+                    theme::section(ui, "EMITTERS");
                     let emitters = gdtf.emitters(scene.fixtures[ed.fixture].mode_index);
                     if emitters.is_empty() {
                         ui.label(RichText::new("(single source)").weak().small());
                     }
-                    ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                    ScrollArea::vertical().id_salt("prof-emitters").max_height(body_h).show(ui, |ui| {
                         for (i, em) in emitters.iter().enumerate() {
                             let tag = format!("{}  ·  {}", i, em.name);
                             if ui.selectable_label(ed.emitter == i, tag).clicked() {
@@ -475,7 +486,8 @@ pub fn profile_editor_window(
                     });
                 });
                 ui.separator();
-                // Right: tabbed detail.
+                // Right: tabbed detail, in a fixed-height scroll so the window
+                // keeps a tall, stable footprint.
                 ui.vertical(|ui| {
                     ui.horizontal_wrapped(|ui| {
                         for t in ProfileTab::ALL {
@@ -483,18 +495,23 @@ pub fn profile_editor_window(
                         }
                     });
                     ui.separator();
-                    ScrollArea::vertical().show(ui, |ui| {
-                        let fixture = &mut scene.fixtures[ed.fixture];
-                        match ed.tab {
-                            ProfileTab::Identity => tab_identity(ui, fixture, &gdtf),
-                            ProfileTab::Physical => tab_physical(ui, &gdtf, prefs),
-                            ProfileTab::Optics => tab_optics(ui, fixture, &gdtf, ed.emitter),
-                            ProfileTab::Modes => tab_modes(ui, fixture, &gdtf),
-                            ProfileTab::Channels => tab_channels(ui, fixture, &gdtf),
-                            ProfileTab::Wheels => tab_wheels(ui, &gdtf, tex),
-                            ProfileTab::Defaults => tab_defaults(ui, fixture, &gdtf),
-                        }
-                    });
+                    ScrollArea::vertical()
+                        .id_salt("prof-detail")
+                        .max_height(body_h)
+                        .min_scrolled_height(body_h)
+                        .show(ui, |ui| {
+                            ui.set_min_width(560.0);
+                            let fixture = &mut scene.fixtures[ed.fixture];
+                            match ed.tab {
+                                ProfileTab::Identity => tab_identity(ui, fixture, &gdtf),
+                                ProfileTab::Physical => tab_physical(ui, &gdtf, prefs),
+                                ProfileTab::Optics => tab_optics(ui, fixture, &gdtf, ed.emitter),
+                                ProfileTab::Modes => tab_modes(ui, fixture, &gdtf),
+                                ProfileTab::Channels => tab_channels(ui, fixture, &gdtf),
+                                ProfileTab::Wheels => tab_wheels(ui, &gdtf, tex),
+                                ProfileTab::Defaults => tab_defaults(ui, fixture, &gdtf),
+                            }
+                        });
                 });
             });
         });

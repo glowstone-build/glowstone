@@ -132,7 +132,7 @@ pub fn apply(ctx: &egui::Context, prefs: &Preferences) {
             Color32::from_gray(28),
             Color32::from_gray(36),
             Color32::from_gray(14),
-            Color32::from_gray(24),
+            Color32::from_gray(33), // window/popover fill — clearly above the canvas + viewport
             Color32::from_white_alpha(6),
             Color32::from_white_alpha(20),
             Color32::from_white_alpha(34),
