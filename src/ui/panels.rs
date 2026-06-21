@@ -186,7 +186,21 @@ pub fn scene_outliner(
                 }
             });
         if let Some((i, shift, toggle)) = click {
-            apply_fixture_click(selection, anchor, i, shift, toggle, scene.fixtures.len());
+            if shift {
+                // Range follows the VISIBLE (sorted) order, not raw scene indices:
+                // select every fixture whose display row is between the anchor's
+                // row and the clicked row.
+                let click_pos = order.iter().position(|&x| x == i).unwrap_or(0);
+                let anchor_pos = anchor
+                    .and_then(|a| order.iter().position(|&x| x == a))
+                    .unwrap_or(click_pos);
+                let (lo, hi) = (anchor_pos.min(click_pos), anchor_pos.max(click_pos));
+                selection.fixtures = order[lo..=hi].to_vec();
+                selection.environment = None;
+                // keep the anchor for chained shift-clicks
+            } else {
+                apply_fixture_click(selection, anchor, i, false, toggle, scene.fixtures.len());
+            }
         }
     });
 
