@@ -27,7 +27,7 @@ env_logger = "0.11"
 log = "0.4"
 # Image decode/encode: headless screenshot PNG + GDTF wheel/thumbnail images +
 # HDR (Radiance .hdr) + JPEG for world/environment HDRI maps.
-image = { version = "0.25", default-features = false, features = ["png", "hdr", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "hdr", "jpeg", "exr"] }
 
 # GDTF import (fixture library): GDTF is a ZIP of an XML description + glTF
 # models + wheel images.

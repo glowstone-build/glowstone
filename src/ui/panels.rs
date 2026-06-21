@@ -1614,7 +1614,10 @@ pub fn viewport(
     // (bloom/beam/steps) stay in Preferences; toggles in the View menu.
     egui::Area::new(egui::Id::new("viewport-display-overlay"))
         .fixed_pos(rect.left_top() + egui::vec2(8.0, if prefs.show_fps { 28.0 } else { 8.0 }))
-        .order(egui::Order::Foreground)
+        // Middle (not Foreground): above the dock/viewport so it captures its own
+        // clicks, but BELOW the floating windows (Preferences/About/…), which are
+        // also Middle but created after the dock — so they render on top.
+        .order(egui::Order::Middle)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style())
                 .inner_margin(egui::Margin::symmetric(6, 3))
@@ -2113,12 +2116,16 @@ pub fn fixture_manager(
             ui.label(RichText::new(format!("Bulk · {}", sel.len())).small().strong().color(accent));
             ui.add(DragValue::new(&mut fm.bulk_universe).range(1..=63999).prefix("U "));
             ui.add(DragValue::new(&mut fm.bulk_address).range(1..=512).prefix("@ "));
-            if ui.button("Patch seq").on_hover_text("Assign the selected fixtures sequentially from U.@ by footprint").clicked() {
-                let (mut u, mut a) = (fm.bulk_universe, fm.bulk_address);
-                for &i in &sel {
-                    let fp = patch.get(i).map(|p| p.footprint).unwrap_or(1).max(1);
+            if ui.button("Patch seq").on_hover_text("Assign the selected fixtures sequentially from U.@ by footprint, in the order shown").clicked() {
+                // Assign in the VISIBLE (sorted) order, not raw selection order, so
+                // the sequence matches what the user sees.
+                let seq: Vec<usize> =
+                    fixture_order(scene, patch, fm.sort).into_iter().filter(|i| sel.contains(i)).collect();
+                let (mut u, mut a) = (fm.bulk_universe.max(1), fm.bulk_address.clamp(1, 512));
+                for &i in &seq {
+                    let fp = patch.get(i).map(|p| p.footprint).unwrap_or(1).clamp(1, 512);
                     if a as u32 + fp as u32 - 1 > 512 {
-                        u += 1;
+                        u = (u + 1).min(63999); // next universe (clamped, no u16 wrap)
                         a = 1;
                     }
                     if let Some(p) = patch.get_mut(i) {
@@ -2254,14 +2261,16 @@ pub fn fixture_manager(
     });
     if let Some((i, shift, toggle)) = click {
         if shift {
+            // Re-anchor if the shared anchor is stale (deleted, or filtered out of
+            // the visible list) so the range can't span to a phantom row.
+            if anchor.map_or(true, |a| !order.contains(&a)) {
+                *anchor = Some(i);
+            }
             let cpos = order.iter().position(|&x| x == i).unwrap_or(0);
-            let apos = anchor.and_then(|a| order.iter().position(|&x| x == a)).unwrap_or(cpos);
+            let apos = order.iter().position(|&x| Some(x) == *anchor).unwrap_or(cpos);
             let (lo, hi) = (apos.min(cpos), apos.max(cpos));
             selection.fixtures = order[lo..=hi].to_vec();
             selection.environment = None;
-            if anchor.is_none() {
-                *anchor = Some(i);
-            }
         } else {
             apply_fixture_click(selection, anchor, i, false, toggle, scene.fixtures.len());
         }

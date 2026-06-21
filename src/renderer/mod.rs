@@ -154,6 +154,10 @@ pub struct Renderer {
     world_tex: world::WorldTexture,
     world_bind_group: wgpu::BindGroup,
     world_key: usize,
+    /// Whether the current world map actually DECODED (not just bytes present) —
+    /// gates the sky pass + the IBL flag so a failed/unsupported map degrades to
+    /// the dark void instead of a white flood.
+    world_loaded: bool,
 
     // Gobo/animation texture atlas (built from GDTF wheel media on first load).
     gobo_atlas: atlas::GoboAtlas,
@@ -504,6 +508,7 @@ impl Renderer {
             world_tex,
             world_bind_group,
             world_key: 0,
+            world_loaded: false,
             gobo_atlas,
             shadow,
             volumetric_pipeline,
@@ -584,12 +589,21 @@ impl Renderer {
             return;
         }
         let tex = match &world.hdri {
-            Some(bytes) => world::WorldTexture::from_bytes(&self.device, &self.queue, bytes)
-                .unwrap_or_else(|| {
+            Some(bytes) => match world::WorldTexture::from_bytes(&self.device, &self.queue, bytes) {
+                Some(t) => {
+                    self.world_loaded = true;
+                    t
+                }
+                None => {
                     log::warn!("world: could not decode environment map '{}'", world.hdri_name);
+                    self.world_loaded = false;
                     world::WorldTexture::placeholder(&self.device, &self.queue)
-                }),
-            None => world::WorldTexture::placeholder(&self.device, &self.queue),
+                }
+            },
+            None => {
+                self.world_loaded = false;
+                world::WorldTexture::placeholder(&self.device, &self.queue)
+            }
         };
         self.world_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("world-bg"),
@@ -953,7 +967,7 @@ impl Renderer {
         camera_uniform.render_mode[1] = settings.gobo_sharpness.max(0.0); // floor-pool gobo sharpen
         {
             let w = &scene.world;
-            let has = if w.hdri.is_some() { 1.0 } else { 0.0 };
+            let has = if self.world_loaded { 1.0 } else { 0.0 };
             camera_uniform.world = [w.brightness, w.rotation, w.ambient, has];
         }
 
@@ -1474,7 +1488,7 @@ impl Renderer {
             // World HDRI background: a fullscreen sky behind everything (depth
             // Always, no write) — opaque geometry below overdraws it. Only in
             // Beauty mode, when a map is loaded and the background is enabled.
-            if scene.world.hdri.is_some()
+            if self.world_loaded
                 && scene.world.show_background
                 && settings.mode == ViewportMode::Beauty
             {

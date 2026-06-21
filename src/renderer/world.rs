@@ -17,18 +17,20 @@ pub struct WorldTexture {
 }
 
 impl WorldTexture {
-    /// A 1×1 white placeholder — bound when no HDRI is loaded (the shaders gate on
-    /// the has-HDRI flag, so it is never actually shown).
+    /// A 1×1 **black** placeholder — bound when no HDRI is loaded (or one failed
+    /// to decode). Black, not white, so the failure mode is the dark void rather
+    /// than a white flood even if something samples it.
     pub fn placeholder(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        Self::build(device, queue, 1, 1, vec![[1.0f32, 1.0, 1.0, 1.0]])
+        Self::build(device, queue, 1, 1, vec![[0.0f32, 0.0, 0.0, 1.0]])
     }
 
-    /// Decode equirectangular image bytes (`.hdr` / `.png` / `.jpg`) into the GPU
-    /// texture. Returns `None` if the image can't be decoded.
+    /// Decode equirectangular image bytes (`.hdr` / `.exr` / `.png` / `.jpg`) into
+    /// the GPU texture. Returns `None` if the image can't be decoded.
     pub fn from_bytes(device: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) -> Option<Self> {
         let mut img = image::load_from_memory(bytes).ok()?;
         if img.width() > MAX_W {
-            let h = (MAX_W / 2).max(1);
+            // Preserve the source aspect (most equirect maps are 2:1, but not all).
+            let h = (img.height() * MAX_W / img.width().max(1)).max(1);
             img = img.resize_exact(MAX_W, h, image::imageops::FilterType::Triangle);
         }
         let rgba = img.to_rgba32f();
@@ -51,12 +53,15 @@ impl WorldTexture {
             view_formats: &[],
         });
 
+        // f16 maxes at 65504; clamp so a very bright HDR sun doesn't become +inf
+        // (which would poison the box-filtered IBL mips).
+        let to_f16 = |x: f32| f16::from_f32(x.clamp(0.0, 65504.0));
         let mut cur = mip0;
         let (mut cw, mut ch) = (w, h);
         for mip in 0..mip_count {
             let half: Vec<[f16; 4]> = cur
                 .iter()
-                .map(|p| [f16::from_f32(p[0]), f16::from_f32(p[1]), f16::from_f32(p[2]), f16::from_f32(p[3])])
+                .map(|p| [to_f16(p[0]), to_f16(p[1]), to_f16(p[2]), to_f16(p[3])])
                 .collect();
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
