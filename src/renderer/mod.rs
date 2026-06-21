@@ -136,7 +136,9 @@ pub struct Renderer {
 
     // Imported MVR static geometry (stage/truss/set): cache of baked meshes
     // keyed by the model blob's Arc pointer, plus a per-frame instance buffer.
-    scene_geom_cache: HashMap<usize, GpuMesh>,
+    // `None` = a model that failed to bake (unsupported/empty); cached so it is
+    // not re-parsed (and re-warned) every frame.
+    scene_geom_cache: HashMap<usize, Option<GpuMesh>>,
     scene_geom_instances: GrowBuffer,
 
     // Placeholder cone bodies for GDTF fixtures whose 3D models didn't bake
@@ -532,22 +534,25 @@ impl Renderer {
         self.gdtf_cache.insert(key, meshes);
     }
 
-    /// Bake an imported MVR static-geometry model (a GLB blob) into a cached
+    /// Bake an imported MVR static-geometry model (GLB or 3DS blob) into a cached
     /// mesh, keyed by the blob's `Arc` pointer so identical instances share and
-    /// re-imports allocate fresh entries. Returns the cache key, or `None` if the
-    /// GLB had no drawable geometry.
+    /// re-imports allocate fresh entries. The result (including a *failure*) is
+    /// cached so a model is parsed — and warned about — at most once, not every
+    /// frame. Returns the cache key, or `None` if the model had no drawable
+    /// geometry.
     fn ensure_scene_geom_loaded(&mut self, model: &crate::mvr::GeometryModel) -> Option<usize> {
         let key = Arc::as_ptr(&model.glb) as usize;
         if !self.scene_geom_cache.contains_key(&key) {
-            let verts = fixture_model::load_glb(&model.glb);
-            if verts.is_empty() {
-                log::warn!("mvr: model '{}' baked to 0 triangles", model.file);
-                return None;
-            }
-            let mesh = GpuMesh::new(&self.device, &model.file, &verts);
-            self.scene_geom_cache.insert(key, mesh);
+            let verts = fixture_model::load_model(&model.file, &model.glb);
+            let entry = if verts.is_empty() {
+                log::warn!("mvr: model '{}' produced no geometry (unsupported/empty)", model.file);
+                None
+            } else {
+                Some(GpuMesh::new(&self.device, &model.file, &verts))
+            };
+            self.scene_geom_cache.insert(key, entry);
         }
-        Some(key)
+        self.scene_geom_cache.get(&key).and_then(|m| m.as_ref()).map(|_| key)
     }
 
     /// Render one frame. Returns `true` if a frame was presented (a `false`
@@ -978,12 +983,21 @@ impl Renderer {
         let glb_flip = crate::mvr::glb_yup_to_zup();
         let mut scene_geom_instances: Vec<MeshInstance> = Vec::new();
         let mut scene_geom_draws: Vec<(usize, u32)> = Vec::new();
+        let mut total_models = 0usize;
         for obj in &scene.geometry {
             for model in &obj.models {
+                total_models += 1;
                 if let Some(key) = self.ensure_scene_geom_loaded(model) {
+                    // glTF is +Y-up and needs the flip into the +Z-up geometry
+                    // frame; native-Z-up .3ds does not.
+                    let flip = if fixture_model::model_needs_yup_flip(&model.file) {
+                        glb_flip
+                    } else {
+                        Mat4::IDENTITY
+                    };
                     let idx = scene_geom_instances.len() as u32;
                     scene_geom_instances.push(MeshInstance {
-                        model: (obj.transform * glb_flip).to_cols_array_2d(),
+                        model: (obj.transform * flip).to_cols_array_2d(),
                         color: [0.13, 0.13, 0.15],
                         intensity: 1.0,
                         selected: 0.0,
@@ -996,8 +1010,9 @@ impl Renderer {
             .upload(&self.device, &self.queue, &scene_geom_instances);
         // Drop baked meshes no longer referenced by the scene (e.g. after a new
         // MVR import replaces the geometry) so the cache can't grow unbounded.
-        // Guarded so the steady state pays nothing.
-        if self.scene_geom_cache.len() > scene_geom_draws.len() {
+        // Compare against the total model count (incl. cached failures) so the
+        // steady state — failures and all — pays nothing.
+        if self.scene_geom_cache.len() > total_models {
             let live: std::collections::HashSet<usize> = scene
                 .geometry
                 .iter()
@@ -1306,7 +1321,7 @@ impl Renderer {
             if !scene_geom_draws.is_empty() {
                 spass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
                 for (key, idx) in &scene_geom_draws {
-                    if let Some(mesh) = self.scene_geom_cache.get(key) {
+                    if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         spass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         spass.draw(0..mesh.vertex_count, *idx..*idx + 1);
                     }
@@ -1386,7 +1401,7 @@ impl Renderer {
             if !scene_geom_draws.is_empty() {
                 pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
                 for (key, idx) in &scene_geom_draws {
-                    if let Some(mesh) = self.scene_geom_cache.get(key) {
+                    if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
                     }
