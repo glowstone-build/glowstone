@@ -717,6 +717,145 @@ impl Renderer {
         (width, height, pixels)
     }
 
+    /// Apply an egui textures delta (font atlas, user images) to the egui
+    /// renderer — used by the headless UI capture to settle the atlas across
+    /// frames before the final paint.
+    pub fn apply_egui_textures(&mut self, delta: &egui::TexturesDelta) {
+        for (id, d) in &delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, d);
+        }
+        for id in &delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+    }
+
+    /// Render the **whole window** — the 3D viewport image + the egui chrome
+    /// (panels, menus, dock) — to an offscreen texture and read it back as RGBA8.
+    /// Used by the headless `PREVIZ_UI` path so the interface can be screenshotted
+    /// without a visible window (and without Screen-Recording permission). The
+    /// caller supplies a tessellated egui frame at size `(w, h)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_ui(
+        &mut self,
+        size: (u32, u32),
+        scene: &Scene,
+        camera: &OrbitCamera,
+        selection: &Selection,
+        settings: &RenderSettings,
+        paint_jobs: &[egui::ClippedPrimitive],
+        textures_delta: &egui::TexturesDelta,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+    ) -> (u32, u32, Vec<u8>) {
+        let (width, height) = size;
+        for (id, delta) in &textures_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+        }
+        for id in &textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-capture-target"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ui-capture-encoder"),
+        });
+        let user_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            paint_jobs,
+            screen_descriptor,
+        );
+        // 3D scene into the LDR target (the egui viewport image samples it).
+        self.record_scene(&mut encoder, scene, camera, selection, settings);
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ui-capture-egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            self.egui_renderer.render(&mut pass, paint_jobs, screen_descriptor);
+        }
+
+        let unpadded = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui-capture-readback"),
+            size: padded as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue
+            .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().expect("map channel").expect("map readback");
+        let data = slice.get_mapped_range();
+        let bgra = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut pixels = Vec::with_capacity(unpadded as usize * height as usize);
+        for row in 0..height as usize {
+            let start = row * padded as usize;
+            let line = &data[start..start + unpadded as usize];
+            if bgra {
+                for px in line.chunks_exact(4) {
+                    pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                }
+            } else {
+                pixels.extend_from_slice(line);
+            }
+        }
+        drop(data);
+        readback.unmap();
+        (width, height, pixels)
+    }
+
     /// Record the full offscreen 3D frame into `encoder`: forward scene ->
     /// volumetric beams -> bloom -> tonemap into the LDR target. Shared by
     /// [`render`](Self::render) and [`capture`](Self::capture).

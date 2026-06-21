@@ -2,6 +2,7 @@
 //! each dock panel to its drawing function in [`panels`].
 
 mod panels;
+pub mod theme;
 mod windows;
 
 use std::collections::HashMap;
@@ -119,17 +120,24 @@ impl Ui {
     }
 
     /// The default dock layout (also used by Window ▸ Reset Panel Layout).
+    ///
+    /// egui_dock's `fraction` is the share given to the side being split toward:
+    /// `split_left(n, f)` makes the NEW left panel `f` of the width, `split_right`
+    /// makes the new right panel `1 - f`, `split_below` the new bottom `1 - f`.
+    /// (The old code passed 0.80 to `split_left` expecting the central to keep
+    /// 80% — that made the Scene sidebar 80% wide, the startup-layout bug.)
     fn default_dock() -> DockState<Tab> {
-        // Central "Viewport", then split off the surrounding panels.
-        // `fraction` is the share the *old* (central) node keeps after a split.
         let mut dock = DockState::new(vec![Tab::Viewport]);
         let surface = dock.main_surface_mut();
+        // Left sidebar (Scene + Library) ~17% of width.
         let [center, _left] =
-            surface.split_left(NodeIndex::root(), 0.80, vec![Tab::Scene, Tab::Library]);
-        let [center, _inspector] = surface.split_right(center, 0.76, vec![Tab::Inspector]);
+            surface.split_left(NodeIndex::root(), 0.17, vec![Tab::Scene, Tab::Library]);
+        // Right inspector ~21% (split_right new panel gets 1 - fraction).
+        let [center, _inspector] = surface.split_right(center, 0.79, vec![Tab::Inspector]);
+        // Bottom DMX/Patch/Connectivity strip ~30% of the viewport column height.
         let [_viewport, _dmx] = surface.split_below(
             center,
-            0.74,
+            0.70,
             vec![Tab::DmxMonitor, Tab::Patch, Tab::Connectivity],
         );
         dock

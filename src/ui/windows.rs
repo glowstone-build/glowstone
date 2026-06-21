@@ -71,23 +71,10 @@ impl Preferences {
         }
     }
 
-    /// Apply theme + accent + DPI to the egui context (cheap; called per frame).
+    /// Apply the full app theme (visuals + spacing + type scale + DPI) for this
+    /// frame. Delegates to [`super::theme::apply`] — the single source of tokens.
     pub fn apply_theme(&self, ctx: &egui::Context) {
-        let mut v = if self.theme_light {
-            egui::Visuals::light()
-        } else {
-            egui::Visuals::dark()
-        };
-        let a = egui::Color32::from_rgb(
-            (self.accent[0] * 255.0) as u8,
-            (self.accent[1] * 255.0) as u8,
-            (self.accent[2] * 255.0) as u8,
-        );
-        v.selection.bg_fill = a;
-        v.hyperlink_color = a;
-        v.widgets.hovered.bg_fill = a.gamma_multiply(0.5);
-        ctx.set_visuals(v);
-        ctx.set_zoom_factor(self.ui_scale.clamp(0.6, 2.5));
+        super::theme::apply(ctx, self);
     }
 }
 

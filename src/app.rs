@@ -62,6 +62,8 @@ impl ApplicationHandler for App {
 
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(egui::Visuals::dark());
+        // Install the Phosphor icon font once; the full theme is applied per frame.
+        crate::ui::theme::install_fonts(&egui_ctx);
 
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -282,6 +284,23 @@ impl ApplicationHandler for App {
         // sequence, advancing the scene between frames — to verify wheel motion.
         if let Ok(dir) = std::env::var("PREVIZ_ANIM") {
             render_anim_sequence(self.state.as_mut().unwrap(), &dir);
+            event_loop.exit();
+            return;
+        }
+
+        // Headless FULL-UI screenshot: PREVIZ_UI=path.png renders the whole
+        // window (3D viewport + egui panels/menus/dock) offscreen to a PNG and
+        // exits — so the interface can be verified without a visible window /
+        // Screen-Recording permission. PREVIZ_UI_RES=WxH sets the size.
+        if let Ok(path) = std::env::var("PREVIZ_UI") {
+            let (w, h) = std::env::var("PREVIZ_UI_RES")
+                .ok()
+                .and_then(|r| {
+                    let (w, h) = r.split_once('x')?;
+                    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+                })
+                .unwrap_or((1600u32, 1000u32));
+            render_ui_screenshot(self.state.as_mut().unwrap(), &path, w, h);
             event_loop.exit();
             return;
         }
@@ -788,6 +807,64 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
         state.scene.advance(0.05);
     }
     log::info!("wheel: wrote 10 frames to {dir}");
+}
+
+/// Render the whole egui UI + 3D viewport offscreen to a PNG (headless, no
+/// visible window). Runs a few settle frames so the dock layout + viewport panel
+/// size stabilise, then captures the final frame.
+fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
+    let mut jobs: Vec<egui::ClippedPrimitive> = Vec::new();
+    let mut sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
+    for i in 0..3 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(w as f32, h as f32),
+            )),
+            ..Default::default()
+        };
+        let viewport_texture = state.renderer.viewport.texture_id;
+        let egui_ctx = state.egui_ctx.clone();
+        let out = egui_ctx.run(raw, |ctx| {
+            ctx.set_pixels_per_point(1.0);
+            state.ui.show(
+                ctx,
+                &mut state.scene,
+                &mut state.camera,
+                &mut state.dmx,
+                viewport_texture,
+                60.0,
+            );
+        });
+        // Settle the atlas + size the 3D viewport to the panel's request.
+        state.renderer.apply_egui_textures(&out.textures_delta);
+        state.renderer.resize_viewport(state.ui.requested_viewport_px);
+        if i == 2 {
+            sd = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [w, h],
+                pixels_per_point: out.pixels_per_point,
+            };
+            jobs = egui_ctx.tessellate(out.shapes, out.pixels_per_point);
+        }
+    }
+    let empty = egui::TexturesDelta::default();
+    let (rw, rh, px) = state.renderer.capture_ui(
+        (w, h),
+        &state.scene,
+        &state.camera,
+        &state.ui.selection,
+        &state.ui.settings,
+        &jobs,
+        &empty,
+        &sd,
+    );
+    match image::RgbaImage::from_raw(rw, rh, px) {
+        Some(img) => match img.save(path) {
+            Ok(()) => log::info!("UI screenshot: {path} ({rw}x{rh})"),
+            Err(e) => log::error!("UI screenshot save {path}: {e}"),
+        },
+        None => log::error!("UI screenshot: bad buffer"),
+    }
 }
 
 impl State {
