@@ -2046,29 +2046,48 @@ fn hsv_to_color(h: f32, s: f32, v: f32) -> Color32 {
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
-/// Bottom tab: the per-fixture DMX patch editor.
-pub fn patch_editor(ui: &mut egui::Ui, scene: &Scene, patch: &mut PatchTable) {
-    ui.horizontal(|ui| {
-        ui.heading("Patch");
-        if ui
-            .button("Reset to imported")
-            .on_hover_text("Restore addresses from the import (MVR patch / GDTF footprints), discarding manual edits")
-            .clicked()
-        {
-            patch.reconcile_from_scene(scene);
-        }
-    });
-    ui.separator();
+/// Fixture-manager panel state: text filter, sort, and quick filters. Sort reuses
+/// the scene outliner's [`SceneSort`] (Patch / Name / Type).
+pub struct FmState {
+    pub search: String,
+    pub sort: SceneSort,
+    pub conflicts_only: bool,
+    pub unpatched_only: bool,
+    pub bulk_universe: u16,
+    pub bulk_address: u16,
+}
 
-    if scene.fixtures.is_empty() {
-        ui.label(RichText::new("No fixtures to patch.").weak().small());
-        return;
+impl Default for FmState {
+    fn default() -> Self {
+        Self {
+            search: String::new(),
+            sort: SceneSort::Patch,
+            conflicts_only: false,
+            unpatched_only: false,
+            bulk_universe: 1,
+            bulk_address: 1,
+        }
     }
+}
+
+/// Bottom tab: the **Fixture Manager** — a data-dense, sortable, filterable table
+/// of every fixture with multi-select (synced to the 3D/Inspector selection) and
+/// bulk patch editing. Replaces the old one-row-at-a-time patch editor.
+pub fn fixture_manager(
+    ui: &mut egui::Ui,
+    scene: &Scene,
+    patch: &mut PatchTable,
+    selection: &mut Selection,
+    anchor: &mut Option<usize>,
+    live_mask: &[bool],
+    fm: &mut FmState,
+) {
+    use theme::icon;
+    let ink = theme::ink(!ui.visuals().dark_mode);
+    let accent = ui.visuals().selection.stroke.color;
 
     let mut conflicted = vec![false; scene.fixtures.len()];
     for c in patch.conflicts() {
-        // Guard: patch entry indices may transiently exceed the fixture count
-        // (mid-import / before reconcile).
         if let Some(s) = conflicted.get_mut(c.a) {
             *s = true;
         }
@@ -2076,93 +2095,197 @@ pub fn patch_editor(ui: &mut egui::Ui, scene: &Scene, patch: &mut PatchTable) {
             *s = true;
         }
     }
+    let nconf = conflicted.iter().filter(|&&c| c).count();
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        Grid::new("patch-grid")
-            .num_columns(7)
-            .striped(true)
-            .spacing([10.0, 4.0])
-            .show(ui, |ui| {
-                for h in ["Fixture", "Univ", "Addr", "Mode", "Ch", "Src", ""] {
-                    ui.strong(RichText::new(h).small());
+    // --- header: title + selection count + reset ---
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{}  Fixtures", icon::FIXTURE)).heading());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(theme::ico(icon::RESET)).on_hover_text("Reset addresses to the import (MVR/GDTF), discarding manual edits").clicked() {
+                patch.reconcile_from_scene(scene);
+            }
+            let nsel = selection.fixtures.len();
+            if nsel > 0 {
+                ui.label(RichText::new(format!("{nsel} selected")).small().color(accent));
+            }
+        });
+    });
+
+    // --- filter row: search + sort + quick filters ---
+    ui.horizontal_wrapped(|ui| {
+        ui.label(theme::ico(icon::SEARCH).weak());
+        ui.add(egui::TextEdit::singleline(&mut fm.search).hint_text("Filter…").desired_width(120.0));
+        ui.separator();
+        ui.label(theme::ico(icon::SORT).weak());
+        for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type] {
+            ui.selectable_value(&mut fm.sort, s, s.label());
+        }
+        ui.separator();
+        ui.toggle_value(&mut fm.conflicts_only, format!("{} {nconf}", icon::WARNING))
+            .on_hover_text("Show only fixtures with an address conflict");
+        ui.toggle_value(&mut fm.unpatched_only, "unpatched").on_hover_text("Show only unpatched fixtures");
+    });
+
+    // --- bulk toolbar (only when fixtures are selected) ---
+    let sel: Vec<usize> = selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+    if !sel.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("Bulk · {}", sel.len())).small().strong().color(accent));
+            ui.add(DragValue::new(&mut fm.bulk_universe).range(1..=63999).prefix("U "));
+            ui.add(DragValue::new(&mut fm.bulk_address).range(1..=512).prefix("@ "));
+            if ui.button("Patch seq").on_hover_text("Assign the selected fixtures sequentially from U.@ by footprint").clicked() {
+                let (mut u, mut a) = (fm.bulk_universe, fm.bulk_address);
+                for &i in &sel {
+                    let fp = patch.get(i).map(|p| p.footprint).unwrap_or(1).max(1);
+                    if a as u32 + fp as u32 - 1 > 512 {
+                        u += 1;
+                        a = 1;
+                    }
+                    if let Some(p) = patch.get_mut(i) {
+                        p.universe = u;
+                        p.address = a;
+                        p.enabled = true;
+                        p.source = PatchSource::Manual;
+                    }
+                    a += fp;
+                }
+            }
+            if ui.button("Set U").on_hover_text("Set the universe of all selected").clicked() {
+                for &i in &sel {
+                    if let Some(p) = patch.get_mut(i) {
+                        p.universe = fm.bulk_universe;
+                        p.enabled = true;
+                        p.source = PatchSource::Manual;
+                    }
+                }
+            }
+            if ui.button("Enable").clicked() {
+                for &i in &sel {
+                    if let Some(p) = patch.get_mut(i) {
+                        p.enabled = true;
+                    }
+                }
+            }
+            if ui.button("Disable").clicked() {
+                for &i in &sel {
+                    if let Some(p) = patch.get_mut(i) {
+                        p.enabled = false;
+                    }
+                }
+            }
+        });
+    }
+    ui.separator();
+
+    if scene.fixtures.is_empty() {
+        ui.label(RichText::new("No fixtures — add from the Library or import an MVR.").weak().small());
+        return;
+    }
+
+    // --- display order: sort then filter ---
+    let q = fm.search.trim().to_lowercase();
+    let order: Vec<usize> = fixture_order(scene, patch, fm.sort)
+        .into_iter()
+        .filter(|&i| {
+            let f = &scene.fixtures[i];
+            if !q.is_empty() && !f.name.to_lowercase().contains(&q) && !f.profile.to_lowercase().contains(&q) {
+                return false;
+            }
+            if fm.conflicts_only && !conflicted[i] {
+                return false;
+            }
+            if fm.unpatched_only && patch.get(i).is_some_and(|p| p.enabled) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    let mut click: Option<(usize, bool, bool)> = None;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        Grid::new("fixtures-grid").num_columns(7).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
+            for h in ["Fixture", "Type", "Univ", "Addr", "Mode", "Ch", ""] {
+                ui.strong(RichText::new(h).small().color(ink.tertiary));
+            }
+            ui.end_row();
+
+            for &i in &order {
+                let fixture = &scene.fixtures[i];
+                // Name cell: selects the row (syncs the 3D/Inspector selection);
+                // shift = range, ⌘/Ctrl = toggle. Live fixtures get a green dot.
+                let selected = selection.contains_fixture(i);
+                let live = live_mask.get(i).copied().unwrap_or(false);
+                let dot = if live { "● " } else { "" };
+                let resp = ui.selectable_label(selected, RichText::new(format!("{dot}{}", fixture.name)).small());
+                if resp.clicked() {
+                    let m = ui.input(|x| x.modifiers);
+                    click = Some((i, m.shift, m.command || m.ctrl));
+                }
+                ui.label(RichText::new(fixture.profile.as_str()).weak().small());
+
+                // Universe / address.
+                if let Some(p) = patch.get_mut(i) {
+                    let mut edited = ui.add(DragValue::new(&mut p.universe).range(1..=63999).speed(0.1)).changed();
+                    edited |= ui.add(DragValue::new(&mut p.address).range(1..=512).speed(0.2)).changed();
+                    if edited {
+                        p.enabled = true;
+                        p.source = PatchSource::Manual;
+                    }
+                } else {
+                    ui.label("");
+                    ui.label("");
+                }
+
+                // Mode selector (GDTF modes; plain fixtures are synthetic).
+                let mut new_mode = None;
+                match fixture.gdtf.as_ref() {
+                    Some(gdtf) if !gdtf.modes.is_empty() => {
+                        let cur = patch.get(i).map(|p| p.mode_index).unwrap_or(0);
+                        let cur_name = gdtf.modes.get(cur).map(|m| m.name.clone()).unwrap_or_default();
+                        egui::ComboBox::from_id_salt(("fm-mode", i))
+                            .selected_text(RichText::new(cur_name).small())
+                            .show_ui(ui, |ui| {
+                                for (mi, m) in gdtf.modes.iter().enumerate() {
+                                    if ui.selectable_label(mi == cur, &m.name).clicked() {
+                                        new_mode = Some(mi);
+                                    }
+                                }
+                            });
+                    }
+                    _ => {
+                        ui.label(RichText::new("—").weak().small());
+                    }
+                }
+                if let Some(mi) = new_mode {
+                    patch.set_mode(fixture, i, mi);
+                }
+
+                ui.label(RichText::new(patch.get(i).map(|p| p.footprint.to_string()).unwrap_or_default()).small());
+                if conflicted[i] {
+                    ui.colored_label(theme::CONFLICT, theme::icon::WARNING).on_hover_text("Address conflict");
+                } else if patch.get(i).is_some_and(|p| !p.enabled) {
+                    ui.label(RichText::new("off").weak().small());
+                } else {
+                    ui.label("");
                 }
                 ui.end_row();
-
-                for (i, fixture) in scene.fixtures.iter().enumerate() {
-                    ui.label(RichText::new(&fixture.name).small());
-
-                    // Universe / address (scoped &mut borrow of the entry).
-                    {
-                        let Some(p) = patch.get_mut(i) else {
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
-                            ui.end_row();
-                            continue;
-                        };
-                        let mut edited = ui.add(DragValue::new(&mut p.universe).range(1..=63999).speed(0.1)).changed();
-                        edited |= ui.add(DragValue::new(&mut p.address).range(1..=512).speed(0.2)).changed();
-                        if edited {
-                            p.enabled = true;
-                            p.source = PatchSource::Manual;
-                        }
-                    }
-
-                    // Mode selector (GDTF modes; plain fixtures are synthetic).
-                    let mut new_mode = None;
-                    match fixture.gdtf.as_ref() {
-                        Some(gdtf) if !gdtf.modes.is_empty() => {
-                            let cur = patch.get(i).map(|p| p.mode_index).unwrap_or(0);
-                            let cur_name = gdtf
-                                .modes
-                                .get(cur)
-                                .map(|m| m.name.clone())
-                                .unwrap_or_default();
-                            egui::ComboBox::from_id_salt(("patch-mode", i))
-                                .selected_text(RichText::new(cur_name).small())
-                                .show_ui(ui, |ui| {
-                                    for (mi, m) in gdtf.modes.iter().enumerate() {
-                                        if ui.selectable_label(mi == cur, &m.name).clicked() {
-                                            new_mode = Some(mi);
-                                        }
-                                    }
-                                });
-                        }
-                        _ => {
-                            ui.label(RichText::new("Synthetic").weak().small());
-                        }
-                    }
-                    if let Some(mi) = new_mode {
-                        patch.set_mode(fixture, i, mi);
-                    }
-
-                    // Footprint + source badge.
-                    ui.label(
-                        RichText::new(patch.get(i).map(|p| p.footprint.to_string()).unwrap_or_default())
-                            .small(),
-                    );
-                    ui.label(
-                        RichText::new(patch.get(i).map(|p| p.source.label()).unwrap_or(""))
-                            .weak()
-                            .small(),
-                    );
-
-                    // Enabled checkbox + conflict badge.
-                    ui.horizontal(|ui| {
-                        if let Some(p) = patch.get_mut(i) {
-                            ui.checkbox(&mut p.enabled, "").on_hover_text("Occupy these channels");
-                        }
-                        if conflicted[i] {
-                            ui.colored_label(Color32::from_rgb(230, 90, 90), "⚠")
-                                .on_hover_text("Overlaps another fixture's address");
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
+            }
+        });
     });
+    if let Some((i, shift, toggle)) = click {
+        if shift {
+            let cpos = order.iter().position(|&x| x == i).unwrap_or(0);
+            let apos = anchor.and_then(|a| order.iter().position(|&x| x == a)).unwrap_or(cpos);
+            let (lo, hi) = (apos.min(cpos), apos.max(cpos));
+            selection.fixtures = order[lo..=hi].to_vec();
+            selection.environment = None;
+            if anchor.is_none() {
+                *anchor = Some(i);
+            }
+        } else {
+            apply_fixture_click(selection, anchor, i, false, toggle, scene.fixtures.len());
+        }
+    }
 }
 
 /// Compact a sorted universe list for the source table (e.g. `1,2,5`).

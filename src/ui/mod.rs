@@ -69,9 +69,9 @@ impl Tab {
             Tab::Scene => "Scene",
             Tab::Library => "Library",
             Tab::Inspector => "Inspector",
-            Tab::DmxMonitor => "DMX Universe",
+            Tab::DmxMonitor => "DMX",
             Tab::Connectivity => "Connectivity",
-            Tab::Patch => "Patch",
+            Tab::Patch => "Fixtures",
         }
     }
 
@@ -85,7 +85,7 @@ impl Tab {
             Tab::Inspector => icon::INSPECTOR,
             Tab::DmxMonitor => icon::DMX,
             Tab::Connectivity => icon::CONNECT,
-            Tab::Patch => icon::PATCH,
+            Tab::Patch => icon::FIXTURE,
         }
     }
 }
@@ -118,6 +118,8 @@ pub struct Ui {
     scene_anchor: Option<usize>,
     /// Sort order for the Scene panel's Fixtures folder.
     scene_sort: panels::SceneSort,
+    /// Fixture-manager (Fixtures tab) state: filter / sort / bulk values.
+    fm: panels::FmState,
     /// The `s` quick-select palette is open.
     quick_select: bool,
 }
@@ -141,6 +143,7 @@ impl Ui {
             lib: panels::LibState::default(),
             scene_anchor: None,
             scene_sort: panels::SceneSort::Patch,
+            fm: panels::FmState::default(),
             quick_select: false,
         }
     }
@@ -213,6 +216,7 @@ impl Ui {
             lib: &mut self.lib,
             scene_anchor: &mut self.scene_anchor,
             scene_sort: &mut self.scene_sort,
+            fm: &mut self.fm,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
             dmx_status: dmxv.status,
@@ -714,6 +718,7 @@ struct PanelViewer<'a> {
     lib: &'a mut panels::LibState,
     scene_anchor: &'a mut Option<usize>,
     scene_sort: &'a mut panels::SceneSort,
+    fm: &'a mut panels::FmState,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
     dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
@@ -788,7 +793,15 @@ impl TabViewer for PanelViewer<'_> {
                 self.dmx_pending,
                 self.dmx_running,
             ),
-            Tab::Patch => panels::patch_editor(ui, self.scene, self.dmx_patch),
+            Tab::Patch => panels::fixture_manager(
+                ui,
+                self.scene,
+                self.dmx_patch,
+                self.selection,
+                self.scene_anchor,
+                self.dmx_live_mask,
+                self.fm,
+            ),
         }
     }
 
