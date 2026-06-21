@@ -52,6 +52,22 @@ pub enum Tab {
     Patch,
 }
 
+/// A workspace layout preset, switchable from the Window menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Workspace {
+    Design,
+    Patch,
+    Visualize,
+}
+
+impl Workspace {
+    const ALL: [(Workspace, &'static str); 3] = [
+        (Workspace::Design, "Design"),
+        (Workspace::Patch, "Patch"),
+        (Workspace::Visualize, "Visualise"),
+    ];
+}
+
 impl Tab {
     /// Panels shown in the Window menu (Viewport is fixed, so excluded there).
     const TOGGLEABLE: [Tab; 6] = [
@@ -156,19 +172,37 @@ impl Ui {
     /// (The old code passed 0.80 to `split_left` expecting the central to keep
     /// 80% — that made the Scene sidebar 80% wide, the startup-layout bug.)
     fn default_dock() -> DockState<Tab> {
+        Self::workspace_dock(Workspace::Design)
+    }
+
+    /// A workspace layout preset (à la Blender's workspace tabs / depence's
+    /// Construction·ShowControl·Animation presets): each pre-arranges the panels
+    /// for one stage of the lighting workflow.
+    fn workspace_dock(ws: Workspace) -> DockState<Tab> {
         let mut dock = DockState::new(vec![Tab::Viewport]);
         let surface = dock.main_surface_mut();
-        // Left sidebar (Scene + Library) ~17% of width.
-        let [center, _left] =
-            surface.split_left(NodeIndex::root(), 0.17, vec![Tab::Scene, Tab::Library]);
-        // Right inspector ~21% (split_right new panel gets 1 - fraction).
-        let [center, _inspector] = surface.split_right(center, 0.79, vec![Tab::Inspector]);
-        // Bottom DMX/Patch/Connectivity strip ~30% of the viewport column height.
-        let [_viewport, _dmx] = surface.split_below(
-            center,
-            0.70,
-            vec![Tab::DmxMonitor, Tab::Patch, Tab::Connectivity],
-        );
+        match ws {
+            // DESIGN: balanced — outliner + library left, inspector right, the
+            // Fixtures/DMX data as a bottom strip. The everyday layout.
+            Workspace::Design => {
+                let [c, _l] = surface.split_left(NodeIndex::root(), 0.17, vec![Tab::Scene, Tab::Library]);
+                let [c, _i] = surface.split_right(c, 0.79, vec![Tab::Inspector]);
+                surface.split_below(c, 0.70, vec![Tab::Patch, Tab::DmxMonitor, Tab::Connectivity]);
+            }
+            // PATCH: the systems tech — the Fixtures sheet + DMX dominate (a tall
+            // bottom data area), the viewport just for orientation.
+            Workspace::Patch => {
+                let [c, _l] = surface.split_left(NodeIndex::root(), 0.16, vec![Tab::Scene]);
+                let [c, _i] = surface.split_right(c, 0.80, vec![Tab::Inspector]);
+                surface.split_below(c, 0.42, vec![Tab::Patch, Tab::DmxMonitor, Tab::Connectivity]);
+            }
+            // VISUALISE: the previz artist — maximise the viewport; thin Scene
+            // (World + outliner) left, Inspector right, no data strip.
+            Workspace::Visualize => {
+                let [c, _l] = surface.split_left(NodeIndex::root(), 0.15, vec![Tab::Scene]);
+                surface.split_right(c, 0.82, vec![Tab::Inspector]);
+            }
+        }
         dock
     }
 
@@ -382,6 +416,13 @@ impl Ui {
             if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl {
                 self.quick_select = true;
             }
+            // `a` = select all fixtures; `l` = toggle fixture labels.
+            if i.key_pressed(Key::A) && !i.modifiers.command && !i.modifiers.ctrl && !scene.fixtures.is_empty() {
+                self.selection = Selection { fixtures: (0..scene.fixtures.len()).collect(), environment: None };
+            }
+            if i.key_pressed(Key::L) && !i.modifiers.command {
+                self.prefs.show_labels = !self.prefs.show_labels;
+            }
             for (key, view) in [
                 (Key::Num5, CameraView::Perspective),
                 (Key::Num7, CameraView::Top),
@@ -396,6 +437,32 @@ impl Ui {
         });
         if del && !self.selection.fixtures.is_empty() {
             self.delete_selected(scene);
+        }
+
+        // Arrow keys nudge the selected fixtures on the floor plane (Shift = 1 m,
+        // else 0.1 m), but only when the viewport has focus so they don't fight
+        // panel scrolling. PageUp/Down nudge height.
+        if self.viewport_focused && !self.selection.fixtures.is_empty() {
+            let (mut dx, mut dz, mut dy) = (0.0f32, 0.0f32, 0.0f32);
+            let step = ctx.input(|i| {
+                use egui::Key;
+                let s = if i.modifiers.shift { 1.0 } else { 0.1 };
+                if i.key_pressed(Key::ArrowLeft) { dx -= s; }
+                if i.key_pressed(Key::ArrowRight) { dx += s; }
+                if i.key_pressed(Key::ArrowUp) { dz -= s; }
+                if i.key_pressed(Key::ArrowDown) { dz += s; }
+                if i.key_pressed(Key::PageUp) { dy += s; }
+                if i.key_pressed(Key::PageDown) { dy -= s; }
+                Vec3::new(dx, dy, dz)
+            });
+            if step != Vec3::ZERO {
+                for &fi in &self.selection.fixtures {
+                    if let Some(f) = scene.fixtures.get_mut(fi) {
+                        f.position += step;
+                        f.snap_movement();
+                    }
+                }
+            }
         }
     }
 
@@ -559,6 +626,16 @@ impl Ui {
                     }
                 });
                 ui.menu_button("Window", |ui| {
+                    ui.menu_button(format!("{}  Workspace", icon::LAYOUT), |ui| {
+                        for (ws, name) in Workspace::ALL {
+                            if ui.button(name).clicked() {
+                                self.dock = Self::workspace_dock(ws);
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.label(egui::RichText::new("Panels").small().weak());
                     for tab in Tab::TOGGLEABLE {
                         let mut open = self.is_tab_open(tab);
                         if ui.checkbox(&mut open, format!("{}  {}", tab.icon(), tab.title())).changed() {
@@ -566,7 +643,7 @@ impl Ui {
                         }
                     }
                     ui.separator();
-                    if ui.button(format!("{}  Reset Panel Layout", icon::LAYOUT)).clicked() {
+                    if ui.button(format!("{}  Reset Layout", icon::LAYOUT)).clicked() {
                         self.dock = Self::default_dock();
                         ui.close();
                     }
@@ -754,12 +831,12 @@ impl TabViewer for PanelViewer<'_> {
                 self.requested_viewport_px,
                 self.fps,
                 self.prefs,
+                self.settings,
             ),
             Tab::Scene => panels::scene_outliner(
                 ui,
                 self.scene,
                 self.selection,
-                self.settings,
                 self.dmx_patch,
                 self.dmx_live_mask,
                 self.scene_anchor,

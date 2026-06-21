@@ -406,14 +406,16 @@ pub fn shortcuts_window(ctx: &egui::Context, open: &mut bool) {
         .show(ctx, |ui| {
             let rows = [
                 ("Orbit / Pan / Zoom", "drag / shift+drag / scroll"),
-                ("Select fixture", "click  (⌘/Ctrl-click = multi)"),
-                ("Duplicate / Array", "D"),
-                ("Frame selection", "F"),
-                ("Frame all", "Shift+F"),
-                ("Top / Front / Right view", "numpad 7 / 1 / 3"),
-                ("Perspective view", "numpad 5"),
-                ("Delete selected", "Delete / Backspace"),
+                ("Select fixture", "click  (⌘/Ctrl = multi, Shift = range)"),
+                ("Select all fixtures", "A"),
+                ("Quick-select menu", "S"),
                 ("Deselect all", "Esc"),
+                ("Nudge selected (floor / height)", "arrows / PageUp·Down  (Shift = 1 m)"),
+                ("Duplicate / Array", "D"),
+                ("Delete selected", "Delete / Backspace"),
+                ("Frame selection / all", "F / Shift+F"),
+                ("Top / Front / Right / Persp view", "numpad 7 / 1 / 3 / 5"),
+                ("Toggle fixture labels", "L"),
                 ("Preferences", "⌘/Ctrl+,"),
             ];
             Grid::new("shortcuts").num_columns(2).spacing([20.0, 6.0]).striped(true).show(ui, |ui| {

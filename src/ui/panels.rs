@@ -89,7 +89,6 @@ pub fn scene_outliner(
     ui: &mut egui::Ui,
     scene: &mut Scene,
     selection: &mut Selection,
-    settings: &mut RenderSettings,
     patch: &PatchTable,
     live_mask: &[bool],
     anchor: &mut Option<usize>,
@@ -243,53 +242,9 @@ pub fn scene_outliner(
         world_controls(ui, &mut scene.world, &ink);
     });
 
-    ui.add_space(6.0);
-    ui.separator();
-    folder_header(icon::SETTINGS, "View", 0, true, &ink).show(ui, |ui| {
-    Grid::new("view-grid")
-        .num_columns(2)
-        .spacing([12.0, 6.0])
-        .show(ui, |ui| {
-            ui.label("Mode");
-            ui.horizontal(|ui| {
-                for m in ViewportMode::ALL {
-                    if ui.selectable_label(settings.mode == m, m.label()).clicked() {
-                        settings.mode = m;
-                    }
-                }
-            });
-            ui.end_row();
-
-            ui.label("Exposure");
-            ui.add(DragValue::new(&mut settings.exposure).speed(0.01).range(0.05..=8.0));
-            ui.end_row();
-
-            ui.label("Bloom");
-            ui.add(DragValue::new(&mut settings.bloom).speed(0.01).range(0.0..=3.0));
-            ui.end_row();
-
-            ui.label("Beam");
-            ui.add(DragValue::new(&mut settings.beam_intensity).speed(2.0).range(0.0..=4000.0));
-            ui.end_row();
-
-            ui.label("Steps");
-            ui.add(DragValue::new(&mut settings.steps).speed(1.0).range(8..=192));
-            ui.end_row();
-
-            ui.label("Beam gizmo");
-            ui.checkbox(&mut settings.show_beam_wireframes, "wireframe");
-            ui.end_row();
-
-            ui.label("Origin grid");
-            ui.checkbox(&mut settings.show_grid, "show");
-            ui.end_row();
-        });
-        ui.label(
-            RichText::new("Beam look also follows the Fog Box density / anisotropy / tint.")
-                .weak()
-                .small(),
-        );
-    });
+    // (Render/look controls live on the viewport overlay (Mode + Exposure), the
+    // View menu (grid / gizmo / label toggles) and Preferences > Rendering — not
+    // duplicated here, so the Scene panel stays a clean outliner.)
 }
 
 /// The World / environment controls: load an equirectangular HDRI (sky +
@@ -1487,6 +1442,7 @@ pub fn viewport(
     requested_px: &mut (u32, u32),
     fps: f32,
     prefs: &Preferences,
+    settings: &mut RenderSettings,
 ) {
     let available = ui.available_size();
     let ppp = ui.pixels_per_point();
@@ -1651,6 +1607,30 @@ pub fn viewport(
             color,
         );
     }
+
+    // Display overlay (top-left, on the viewport where the eyes are — Blender's
+    // shading buttons live here too): the display Mode + exposure, the two
+    // controls a designer reaches for constantly. Advanced look settings
+    // (bloom/beam/steps) stay in Preferences; toggles in the View menu.
+    egui::Area::new(egui::Id::new("viewport-display-overlay"))
+        .fixed_pos(rect.left_top() + egui::vec2(8.0, if prefs.show_fps { 28.0 } else { 8.0 }))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style())
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for m in ViewportMode::ALL {
+                            if ui.selectable_label(settings.mode == m, m.label()).clicked() {
+                                settings.mode = m;
+                            }
+                        }
+                        ui.separator();
+                        ui.label(RichText::new("Exp").small());
+                        ui.add(DragValue::new(&mut settings.exposure).speed(0.01).range(0.05..=8.0));
+                    });
+                });
+        });
 }
 
 /// Bottom tab: Art-Net / sACN connectivity settings + live source status.
