@@ -218,12 +218,17 @@ pub fn scene_outliner(
 
     // ---- GROUPS: saved named selections (console-style), recalled by click ----
     folder_header(icon::CATEGORY, "Groups", groups.len(), true, &ink).show(ui, |ui| {
+        // Default name is the first "Group N" not already taken (so it can't
+        // collide after a delete + re-save).
+        let default_name = (1..)
+            .map(|n| format!("Group {n}"))
+            .find(|cand| !groups.iter().any(|g| &g.name == cand))
+            .unwrap_or_else(|| "Group".into());
         ui.horizontal(|ui| {
-            let hint = format!("Group {}", groups.len() + 1);
             ui.add(
                 egui::TextEdit::singleline(group_name)
                     .desired_width(110.0)
-                    .hint_text(&hint),
+                    .hint_text(&default_name),
             );
             let can_save = !selection.fixtures.is_empty();
             if ui
@@ -231,24 +236,28 @@ pub fn scene_outliner(
                 .on_hover_text("Save the current fixture selection as a group")
                 .clicked()
             {
-                let name = if group_name.trim().is_empty() { hint } else { group_name.trim().to_string() };
-                groups.push(SelectionGroup { name, fixtures: selection.fixtures.clone() });
+                let name = if group_name.trim().is_empty() { default_name } else { group_name.trim().to_string() };
+                // Store sorted + deduped so recall order and the active-match are stable.
+                let mut fixtures = selection.fixtures.clone();
+                fixtures.sort_unstable();
+                fixtures.dedup();
+                groups.push(SelectionGroup { name, fixtures });
                 group_name.clear();
             }
         });
         if groups.is_empty() {
             ui.label(RichText::new("none — select fixtures, then Save").weak().small());
         }
+        // The current selection, sorted once, to highlight the matching group.
+        let mut have = selection.fixtures.clone();
+        have.sort_unstable();
+        have.dedup();
         let mut recall: Option<usize> = None;
         let mut remove: Option<usize> = None;
         for (gi, g) in groups.iter().enumerate() {
             ui.horizontal(|ui| {
-                // Highlight the group if the current selection exactly matches it.
-                let mut want = g.fixtures.clone();
-                want.sort_unstable();
-                let mut have = selection.fixtures.clone();
-                have.sort_unstable();
-                let active = !want.is_empty() && want == have;
+                // Groups are stored sorted+deduped, so compare directly (cheap).
+                let active = !g.fixtures.is_empty() && g.fixtures == have;
                 if ui
                     .selectable_label(active, format!("{}  ({})", g.name, g.fixtures.len()))
                     .on_hover_text("Recall this selection")
@@ -1486,21 +1495,6 @@ fn decode_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui:
     Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
 }
 
-/// Remove the selected fixtures from the scene and clear the selection. Shared by
-/// the Delete shortcut, the Edit menu, and the viewport context menu so deletion
-/// behaves identically everywhere.
-pub fn delete_selected_fixtures(scene: &mut Scene, selection: &mut Selection, anchor: &mut Option<usize>) {
-    let mut ids = selection.fixtures.clone();
-    ids.sort_unstable();
-    for &i in ids.iter().rev() {
-        if i < scene.fixtures.len() {
-            scene.fixtures.remove(i);
-        }
-    }
-    *selection = Selection::default();
-    *anchor = None; // indices shifted; old anchor is meaningless
-}
-
 /// Extend the selection to every fixture sharing a profile with the current
 /// selection ("Select same type").
 fn select_same_type(scene: &Scene, selection: &mut Selection) {
@@ -1538,6 +1532,9 @@ fn frame_selection(scene: &Scene, selection: &Selection, camera: &mut OrbitCamer
 /// position. Reads the snapshot in `op.start`, so it's idempotent — called every
 /// frame the op is live; cancelling restores from the same snapshot.
 fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cur: egui::Pos2) {
+    // Position/orientation are read directly by the renderer, so they need no
+    // snap_movement() — and calling it every frame would freeze each fixture's
+    // wheel-motion phase. (Cancel restores from the same snapshot the same way.)
     let d = cur - op.start_screen; // pixel delta
     let (right, up, _fwd) = camera.view_basis();
     match op.kind {
@@ -1551,7 +1548,6 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
             for (i, p0, _q) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     f.position = *p0 + world;
-                    f.snap_movement();
                 }
             }
         }
@@ -1563,7 +1559,6 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     f.position = op.pivot + rot * (*p0 - op.pivot);
                     f.orientation = rot * *q0;
-                    f.snap_movement();
                 }
             }
         }
@@ -1580,7 +1575,6 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
                         off * factor
                     };
                     f.position = op.pivot + new;
-                    f.snap_movement();
                 }
             }
         }
@@ -1605,6 +1599,7 @@ pub fn viewport(
     prefs: &Preferences,
     settings: &mut RenderSettings,
     transform: &mut Option<TransformOp>,
+    delete_requested: &mut bool,
 ) {
     let available = ui.available_size();
     let ppp = ui.pixels_per_point();
@@ -1643,7 +1638,11 @@ pub fn viewport(
                 }
             }
         });
-        let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape)) || response.secondary_clicked();
+        // Esc / right-click cancels; pressing outside the viewport (focus lost) also
+        // cancels, so a transform can never get stuck owning the viewport.
+        let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape))
+            || response.secondary_clicked()
+            || !*viewport_focused;
         let confirm = ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))
             || response.clicked();
         if cancel {
@@ -1651,7 +1650,6 @@ pub fn viewport(
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     f.position = *p0;
                     f.orientation = *q0;
-                    f.snap_movement();
                 }
             }
             *transform = None;
@@ -1792,7 +1790,8 @@ pub fn viewport(
                     .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
                     .clicked()
                 {
-                    delete_selected_fixtures(scene, selection, scene_anchor);
+                    // Committed after the dock so the patch/groups/cues remap too.
+                    *delete_requested = true;
                     ui.close();
                 }
             }

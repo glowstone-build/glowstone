@@ -64,6 +64,17 @@ pub struct SelectionGroup {
     pub fixtures: Vec<usize>,
 }
 
+/// Map a fixture index through a removal of `removed` (a sorted, deduped set of
+/// deleted indices): `None` if `idx` was itself removed, else `idx` shifted down
+/// by the number of removed indices below it.
+fn remap_index(idx: usize, removed: &[usize]) -> Option<usize> {
+    if removed.binary_search(&idx).is_ok() {
+        return None;
+    }
+    let below = removed.partition_point(|&r| r < idx);
+    Some(idx - below)
+}
+
 /// An in-progress modal transform of the selected fixtures (Blender's G/R/S):
 /// grab / rotate / scale driven by mouse motion, optionally axis-constrained,
 /// confirmed by click/Enter or cancelled by Esc/right-click.
@@ -231,6 +242,10 @@ pub struct Ui {
     group_name: String,
     /// The cue list + crossfade engine.
     cues: cues::CueEngine,
+    /// A delete was requested (from a shortcut / menu / context menu) — committed
+    /// once after the dock, where the patch is reachable, so the patch / groups /
+    /// cues all get remapped in lock-step with the fixture removal.
+    pending_delete: bool,
 }
 
 impl Ui {
@@ -258,6 +273,7 @@ impl Ui {
             groups: Vec::new(),
             group_name: String::new(),
             cues: cues::CueEngine::default(),
+            pending_delete: false,
         }
     }
 
@@ -358,6 +374,7 @@ impl Ui {
             groups: &mut self.groups,
             group_name: &mut self.group_name,
             cues: &mut self.cues,
+            delete_requested: &mut self.pending_delete,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
             dmx_status: dmxv.status,
@@ -372,6 +389,12 @@ impl Ui {
         };
 
         DockArea::new(&mut self.dock).show(ctx, &mut viewer);
+
+        // Commit a requested delete now (viewer borrows released): the patch is
+        // reachable here, so fixtures + patch + cues + groups are remapped together.
+        if self.pending_delete {
+            self.commit_delete(scene, dmx.patch_mut());
+        }
 
         // Floating windows (viewer borrows released — scene/selection free again).
         duplicate_window(ctx, scene, &mut self.selection, &mut self.duplicate);
@@ -548,7 +571,7 @@ impl Ui {
             i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)
         });
         if del && !self.selection.fixtures.is_empty() {
-            self.delete_selected(scene);
+            self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
         }
 
         // Arrow keys nudge the selected fixtures on the floor plane (Shift = 1 m,
@@ -579,8 +602,33 @@ impl Ui {
     }
 
     /// Remove every selected fixture and clear the selection.
-    fn delete_selected(&mut self, scene: &mut Scene) {
-        panels::delete_selected_fixtures(scene, &mut self.selection, &mut self.scene_anchor);
+    /// Commit a requested fixture deletion, remapping every index-keyed structure
+    /// in lock-step so nothing is silently corrupted: the patch entries, the cue
+    /// look lists, and the saved selection groups all follow the removal. Called
+    /// once after the dock, where the patch is reachable.
+    fn commit_delete(&mut self, scene: &mut Scene, patch: &mut crate::dmx::PatchTable) {
+        self.pending_delete = false;
+        let mut removed: Vec<usize> =
+            self.selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+        removed.sort_unstable();
+        removed.dedup();
+        if removed.is_empty() {
+            return;
+        }
+        // Descending so earlier indices stay valid as we remove.
+        for &i in removed.iter().rev() {
+            scene.fixtures.remove(i);
+            patch.remove_at(i);
+            self.cues.remove_fixture(i);
+        }
+        // Groups store arbitrary index references: remap each through the shift,
+        // dropping deleted members, then drop any group left empty.
+        for g in &mut self.groups {
+            g.fixtures = g.fixtures.iter().filter_map(|&idx| remap_index(idx, &removed)).collect();
+        }
+        self.groups.retain(|g| !g.fixtures.is_empty());
+        self.selection = Selection::default();
+        self.scene_anchor = None;
     }
 
     /// Import any `.gdtf` / `.mvr` files dropped onto the window.
@@ -678,7 +726,7 @@ impl Ui {
                         ui.close();
                     }
                     if ui.add_enabled(!self.selection.fixtures.is_empty(), egui::Button::new(format!("{}  Delete Selected", icon::TRASH))).clicked() {
-                        self.delete_selected(scene);
+                        self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
                         ui.close();
                     }
                     if ui.button(format!("{}  Deselect All", icon::DESELECT)).clicked() {
@@ -904,6 +952,7 @@ struct PanelViewer<'a> {
     groups: &'a mut Vec<SelectionGroup>,
     group_name: &'a mut String,
     cues: &'a mut cues::CueEngine,
+    delete_requested: &'a mut bool,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
     dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
@@ -941,6 +990,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.prefs,
                 self.settings,
                 self.transform,
+                self.delete_requested,
             ),
             Tab::Scene => panels::scene_outliner(
                 ui,
@@ -1006,5 +1056,21 @@ impl TabViewer for PanelViewer<'_> {
             Tab::Viewport => [false, false],
             _ => [true, true],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remap_index;
+
+    #[test]
+    fn remap_index_after_delete() {
+        // Delete fixtures 1 and 3 from a 5-fixture scene (0..5).
+        let removed = [1usize, 3];
+        assert_eq!(remap_index(0, &removed), Some(0));
+        assert_eq!(remap_index(1, &removed), None); // deleted
+        assert_eq!(remap_index(2, &removed), Some(1)); // one below removed
+        assert_eq!(remap_index(3, &removed), None); // deleted
+        assert_eq!(remap_index(4, &removed), Some(2)); // two below removed
     }
 }

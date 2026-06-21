@@ -181,6 +181,17 @@ impl PatchTable {
         self.entries.get_mut(i).and_then(|e| e.patch.as_mut())
     }
 
+    /// Remove the patch entry for a deleted fixture, keeping the table aligned to
+    /// `scene.fixtures` so the *other* fixtures' addresses survive (a plain
+    /// `sync()` after a middle-delete would fingerprint-mismatch and reconcile the
+    /// whole table, wiping manual/auto addressing). Callers must remove entries in
+    /// descending index order, in lock-step with `scene.fixtures.remove(i)`.
+    pub fn remove_at(&mut self, i: usize) {
+        if i < self.entries.len() {
+            self.entries.remove(i);
+        }
+    }
+
     fn enabled_at(&self, i: usize) -> Option<&Patch> {
         self.get(i).filter(|p| p.enabled)
     }

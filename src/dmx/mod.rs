@@ -263,6 +263,12 @@ impl DmxIo {
         &mut self.config
     }
 
+    /// The patch table, for edits that must stay aligned to the scene (fixture
+    /// deletion removes the matching entry here so addresses aren't reconciled away).
+    pub fn patch_mut(&mut self) -> &mut PatchTable {
+        &mut self.patch
+    }
+
     pub fn view(&mut self) -> DmxView<'_> {
         DmxView {
             running: self.worker.is_some(),

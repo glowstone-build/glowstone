@@ -7,10 +7,11 @@
 //! optics (gobo / prism / wheel slot) snap at the start, since wheel slots don't
 //! interpolate. The fade is ticked once per real frame from `app::render`.
 //!
-//! Note: this is the offline-previz look engine. Live DMX (a connected console)
-//! is decoded into the fixtures every frame *before* the cue tick, so with a
-//! console driving the rig the cue values are overwritten — cues are for building
-//! and showing looks without a console.
+//! Note: this is the offline-previz look engine. The cue tick runs each frame
+//! *after* live-DMX decode (see `app::render`), so while a fade is in progress the
+//! cue WINS over a connected console — the recalled look is what you see. Outside
+//! a fade nothing is written, so live DMX drives the rig normally. Cues are meant
+//! for building and showing looks without a console; don't run both at once.
 
 use egui::{Grid, RichText};
 
@@ -22,6 +23,19 @@ use super::theme;
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// Interpolate an angle in degrees along the SHORTEST path, so a pan/tilt fade
+/// from +170° to −170° crosses 0 (20°) instead of spinning the long way (340°).
+#[inline]
+fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+    let mut d = (b - a) % 360.0;
+    if d > 180.0 {
+        d -= 360.0;
+    } else if d < -180.0 {
+        d += 360.0;
+    }
+    a + d * t
 }
 
 /// The controllable look of one fixture, captured into / restored from a cue.
@@ -49,13 +63,20 @@ impl FixtureLook {
 
     /// Write `lerp(self → to, a)` of the continuous fields into the fixture.
     fn apply_lerp(&self, to: &FixtureLook, a: f32, f: &mut Fixture) {
-        f.pan = lerp(self.pan, to.pan, a);
-        f.tilt = lerp(self.tilt, to.tilt, a);
+        f.pan = lerp_angle(self.pan, to.pan, a);
+        f.tilt = lerp_angle(self.tilt, to.tilt, a);
         f.intensity = lerp(self.intensity, to.intensity, a);
         f.beam_angle = lerp(self.beam_angle, to.beam_angle, a);
         for c in 0..3 {
             f.color[c] = lerp(self.color[c], to.color[c], a);
         }
+        // The cue fade IS the head movement: pin the slewed follower to the faded
+        // target (and kill velocity) so the motor slew doesn't compound a second
+        // ease on top of the cue's fade time.
+        f.pan_actual = f.pan;
+        f.tilt_actual = f.tilt;
+        f.pan_vel = 0.0;
+        f.tilt_vel = 0.0;
     }
 }
 
@@ -139,12 +160,48 @@ impl CueEngine {
     }
 
     fn prev(&mut self, scene: &mut Scene) {
-        let prev = match self.current {
-            Some(c) if c > 0 => c - 1,
-            _ => 0,
+        // Symmetric with go(): only steps when there's a current cue to step back
+        // from (Prev with no active cue does nothing, rather than jumping to 0).
+        if let Some(c) = self.current
+            && c > 0
+        {
+            self.recall(c - 1, scene);
+        }
+    }
+
+    /// A fixture was deleted from the scene at index `i` — drop its slot from every
+    /// cue's look list so the lists stay aligned to `scene.fixtures`, and abort any
+    /// running fade (its snapshot is now misaligned). Call in descending index
+    /// order, in lock-step with `scene.fixtures.remove(i)`.
+    pub fn remove_fixture(&mut self, i: usize) {
+        for cue in &mut self.cues {
+            if i < cue.looks.len() {
+                cue.looks.remove(i);
+            }
+        }
+        self.fade = None;
+    }
+
+    /// A cue was deleted at `removed` — keep `current` and any running fade pointing
+    /// at the right cue (or clear them).
+    fn on_cue_removed(&mut self, removed: usize) {
+        let fix = |idx: usize| -> Option<usize> {
+            if idx == removed {
+                None
+            } else if idx > removed {
+                Some(idx - 1)
+            } else {
+                Some(idx)
+            }
         };
-        if prev < self.cues.len() {
-            self.recall(prev, scene);
+        self.current = self.current.and_then(fix);
+        // If the in-flight fade targeted the removed cue (or shifts), stop it.
+        match self.fade.as_mut() {
+            Some(f) => match fix(f.to) {
+                Some(t) => f.to = t,
+                None => self.fade = None,
+            },
+            None => {}
         }
     }
 
@@ -271,11 +328,48 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
     }
     if let Some(i) = remove {
         engine.cues.remove(i);
-        // Keep `current` pointing at a valid cue (or clear it).
-        engine.current = match engine.current {
-            Some(c) if c == i => None,
-            Some(c) if c > i => Some(c - 1),
-            other => other,
-        };
+        // Keep `current` + any running fade pointing at the right cue (or clear).
+        engine.on_cue_removed(i);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lerp_angle_takes_shortest_path() {
+        // +170 -> -170 is 20 deg the short way (through 180), not 340 the long way.
+        assert!((lerp_angle(170.0, -170.0, 0.5) - 180.0).abs() < 1e-3);
+        assert!((lerp_angle(170.0, -170.0, 1.0) - 190.0).abs() < 1e-3); // 190 ≡ -170
+        // Plain interpolation within a half-turn.
+        assert!((lerp_angle(0.0, 90.0, 0.5) - 45.0).abs() < 1e-3);
+    }
+
+    fn cue(n: usize, looks: usize) -> Cue {
+        Cue {
+            name: format!("Cue {n}"),
+            looks: (0..looks)
+                .map(|_| FixtureLook { pan: 0.0, tilt: 0.0, color: [0.0; 3], intensity: 0.0, beam_angle: 0.0, optics: OpticalControls::default() })
+                .collect(),
+            fade: 1.0,
+        }
+    }
+
+    #[test]
+    fn remove_fixture_shrinks_every_cue_look_list() {
+        let mut e = CueEngine { cues: vec![cue(1, 3), cue(2, 3)], ..Default::default() };
+        e.remove_fixture(1);
+        assert_eq!(e.cues[0].looks.len(), 2);
+        assert_eq!(e.cues[1].looks.len(), 2);
+    }
+
+    #[test]
+    fn on_cue_removed_fixes_current_index() {
+        let mut e = CueEngine { cues: vec![cue(1, 0), cue(2, 0), cue(3, 0)], current: Some(2), ..Default::default() };
+        e.on_cue_removed(1); // delete the middle cue
+        assert_eq!(e.current, Some(1)); // index 2 shifted down to 1
+        e.on_cue_removed(1); // delete the cue current now points at
+        assert_eq!(e.current, None);
     }
 }
