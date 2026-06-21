@@ -148,8 +148,13 @@ fn opt_anim(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, scr
 // the curved edges of both neighbours show with the holder metal between them.
 fn opt_disc(guv: vec2<f32>, position: f32, n: f32, gap: f32, rot: f32) -> vec4<f32> {
     let pitch = 6.2831853 / n;
-    let R = 1.6;                       // hub distance (wheel radius / beam radius)
     let rg = 0.5;                      // slot radius (fills the beam when parked)
+    // Hub distance SCALES with the slot count so adjacent slots keep a real metal
+    // gap (centre spacing = 2·R·sin(pitch/2) = gobo Ø·(1+gap_frac)) instead of
+    // crowding edge-to-edge as N grows. gap_frac comes from the `gap` param
+    // (gobo wheels ~0.5, colour wheels ~0.06 so colours nearly abut).
+    let gap_frac = clamp(gap * 2.0, 0.04, 0.9);
+    let R = clamp(rg * (1.0 + gap_frac) / sin(pitch * 0.5), 1.0, 4.0);
     let p = guv - vec2<f32>(0.5, 0.5); // beam-local (radius 0.5)
     let ang = position * pitch;        // disc rotation
     let ca = cos(ang);
@@ -162,8 +167,9 @@ fn opt_disc(guv: vec2<f32>, position: f32, n: f32, gap: f32, rot: f32) -> vec4<f
     let sth = slot * pitch;
     let w_s = vec2<f32>(R * sin(sth), R * cos(sth)); // slot centre on the disc
     let d = w - w_s;
-    let rim = rg * (1.0 - 0.35 * gap);
-    let inside = select(0.0, 1.0, length(d) <= rim);
+    // The slot fills the beam when parked; the metal gap between slots is now the
+    // geometric spacing (adaptive R), so the rim is just the slot aperture.
+    let inside = select(0.0, 1.0, length(d) <= rg);
     // express the offset in the slot's image frame (upright when parked) + own spin
     let gth = -sth + rot;
     let gc = cos(gth);
