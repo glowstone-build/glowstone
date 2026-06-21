@@ -107,9 +107,10 @@ impl WheelMotion {
             self.positions.resize(n, 0.0);
         }
 
-        // A stepper traverses ~constant speed; a slot move in ~0.25 s.
-        const WHEEL_SLOT_RATE: f32 = 4.0; // slots/s for a select move
-        const SCROLL_MAX: f32 = 6.0; // slots/s at full continuous scroll
+        // A real wheel indexes a slot fast (~0.1 s) — snappier than before so the
+        // disc visibly spins through the change rather than crawling.
+        const WHEEL_SLOT_RATE: f32 = 8.0; // slots/s for a select move
+        const SCROLL_MAX: f32 = 10.0; // slots/s at full continuous scroll
 
         for (i, comp) in components.iter().enumerate() {
             let ctl = c.wheel(i);

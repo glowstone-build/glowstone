@@ -136,6 +136,43 @@ fn opt_anim(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, scr
 // adjacent slots (and, with a `gap`, shows the dark metal holder between gobos —
 // colour wheels pass gap≈0 so slots abut). `base < 0` = no wheel (clear).
 // See .context/research-wheel-optics.md.
+// Where a beam fragment lands on a PHYSICAL ROTATING WHEEL DISC. The N slots sit
+// at radius R around a hub below the gate; the disc spins by `position`·pitch so
+// the gate looks onto a different part of the turning disc. Returns:
+//   xy = the in-slot image UV (centred, upright when the slot is parked, and
+//        rotated by the disc spin + the slot's own `rot` otherwise),
+//   z  = wrapped slot index,
+//   w  = holder mask (1 = inside a slot, 0 = metal between slots / outside the rim).
+// Because the gate is OFF-CENTRE on the disc, a select move makes the projected
+// slot ROTATE and translate (not a flat strip sliding by), and between two slots
+// the curved edges of both neighbours show with the holder metal between them.
+fn opt_disc(guv: vec2<f32>, position: f32, n: f32, gap: f32, rot: f32) -> vec4<f32> {
+    let pitch = 6.2831853 / n;
+    let R = 1.6;                       // hub distance (wheel radius / beam radius)
+    let rg = 0.5;                      // slot radius (fills the beam when parked)
+    let p = guv - vec2<f32>(0.5, 0.5); // beam-local (radius 0.5)
+    let ang = position * pitch;        // disc rotation
+    let ca = cos(ang);
+    let sa = sin(ang);
+    let v = p + vec2<f32>(0.0, R);     // relative to the hub at (0, -R)
+    let w = vec2<f32>(ca * v.x - sa * v.y, sa * v.x + ca * v.y); // v rotated by +ang
+    let theta = atan2(w.x, w.y);       // angle from the +y (gate) axis
+    let slot = floor(theta / pitch + 0.5);
+    let slot_w = slot - floor(slot / n) * n;
+    let sth = slot * pitch;
+    let w_s = vec2<f32>(R * sin(sth), R * cos(sth)); // slot centre on the disc
+    let d = w - w_s;
+    let rim = rg * (1.0 - 0.35 * gap);
+    let inside = select(0.0, 1.0, length(d) <= rim);
+    // express the offset in the slot's image frame (upright when parked) + own spin
+    let gth = -sth + rot;
+    let gc = cos(gth);
+    let gs = sin(gth);
+    let gd = vec2<f32>(gc * d.x - gs * d.y, gs * d.x + gc * d.y);
+    let uv = clamp(gd / (2.0 * rg) + vec2<f32>(0.5, 0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+    return vec4<f32>(uv.x, uv.y, slot_w, inside);
+}
+
 fn opt_wheel(
     tex: texture_2d_array<f32>, samp: sampler, guv: vec2<f32>,
     base: f32, position: f32, n: f32, gap: f32, rot: f32, lod: f32,
@@ -143,18 +180,14 @@ fn opt_wheel(
     if (base < 0.0 || n < 1.0) {
         return vec4<f32>(1.0, 1.0, 1.0, 1.0);
     }
-    const GATE_FRAC: f32 = 0.7;        // gate width in slot units (gate < 1 slot)
-    let tcoord = guv.x - 0.5;          // tangential position across the beam
-    let u = position + tcoord * GATE_FRAC;
-    let cell = floor(u + 0.5);
-    // wrapped slot index in [0, n)
-    let slot = cell - floor(cell / n) * n;
-    let frac = (u + 0.5) - cell;       // 0..1 within the pitch
-    let d = abs(frac - 0.5);           // 0 centre … 0.5 boundary
-    if (gap > 0.001 && d > (0.5 - gap * 0.5)) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // opaque holder gap (gobo) / seam
+    if (n < 1.5) {
+        return opt_layer(tex, samp, guv, i32(base), rot, lod); // single slot
     }
-    return opt_layer(tex, samp, guv, i32(base + slot), rot, lod);
+    let disc = opt_disc(guv, position, n, gap, rot);
+    if (disc.w < 0.5) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // holder metal between gobos
+    }
+    return textureSampleLevel(tex, samp, disc.xy, clamp(i32(base + disc.z), 0, ATLAS_MAX_LAYER), lod);
 }
 
 // CMY: three graduated dichroic FLAGS sliding across the aperture on distinct
@@ -174,31 +207,19 @@ fn opt_color_strip(
     if (base < 0.0 || n < 1.0) {
         return vec3<f32>(1.0, 1.0, 1.0);
     }
-    const GATE_FRAC: f32 = 0.7;
-    let tcoord = guv.x - 0.5;
-    let u = position + tcoord * GATE_FRAC;
-    let cell = floor(u + 0.5);
-    let slot = cell - floor(cell / n) * n;
-    let frac = (u + 0.5) - cell;       // 0..1 within the pitch (0.5 = slot centre)
-    let d = abs(frac - 0.5);           // 0 centre … 0.5 boundary
-    // The two slots straddling the gate, and a SOFT cross-fade between them near
-    // the boundary — a real colour-wheel spoke is a thin out-of-focus edge, not a
-    // hard black line. Sharper than the CMY flags (the wheel sits nearer the gate),
-    // but no longer a harsh seam.
-    let dir = select(-1.0, 1.0, frac >= 0.5);
-    let nb = cell + dir;
-    let slotB = nb - floor(nb / n) * n;
-    let colA = textureSampleLevel(tex, samp, vec2<f32>((slot + 0.5) / n, 0.5), i32(base), 0.0).rgb;
-    let colB = textureSampleLevel(tex, samp, vec2<f32>((slotB + 0.5) / n, 0.5), i32(base), 0.0).rgb;
-    const SEAM: f32 = 0.16;            // blend-zone half-width (in pitch units)
-    let t = smoothstep(0.5 - SEAM, 0.5, d) * 0.5; // → 50/50 at the boundary
-    var col = mix(colA, colB, t);
-    if (gap > 0.001) {
-        // Thin, soft, shallow darkening at the divider — never fully black.
-        let spoke = smoothstep(0.5 - gap, 0.5, d);
-        col = col * (1.0 - 0.45 * spoke);
+    if (n < 1.5) {
+        return textureSampleLevel(tex, samp, vec2<f32>(0.5, 0.5), i32(base), 0.0).rgb;
     }
-    return col;
+    // Same physical rotating disc as the gobo wheel, so the colour sectors CURVE as
+    // the wheel turns. The chosen slot's dichroic band is read; near the spoke the
+    // colour darkens softly toward the divider (a thin out-of-focus edge, not a hard
+    // black line — and still sharper than the CMY flags, which sit further off-gate).
+    let disc = opt_disc(guv, position, n, gap, 0.0);
+    let su = (disc.z + 0.5) / n; // centre of the slot's band
+    let col = textureSampleLevel(tex, samp, vec2<f32>(su, 0.5), i32(base), 0.0).rgb;
+    let r = length(disc.xy - vec2<f32>(0.5, 0.5)) * 2.0; // 0 centre … ~1 at the spoke
+    let edge = smoothstep(0.72, 1.0, r);
+    return col * (1.0 - 0.4 * edge);
 }
 
 fn opt_cmy_flag(u: f32, c: f32) -> f32 {
