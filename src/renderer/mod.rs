@@ -1927,7 +1927,9 @@ fn build_beam_gpus(
     // wild colour fringing on every gobo edge; on an open/colour beam it's the
     // pleasing two-sided rim. So damp CA hard when a pattern is present, keep it
     // full otherwise. (Colour wheels are solid → no fine detail → not "patterned".)
-    let has_pattern = o.anim.is_some() || o.wheels.iter().any(|w| !w.is_color);
+    // CA damping keys on a REAL gobo (gobo_engaged), not "a gobo wheel is present"
+    // — the disc is always emitted now, so an open beam must still get full CA.
+    let has_pattern = o.anim.is_some() || o.gobo_engaged;
     let ca_strength = if has_pattern { o.ca_strength * 0.18 } else { o.ca_strength };
     wheels_out.extend(my_wheels);
     let cmyf = [o.cmy[0], o.cmy[1], o.cmy[2], 0.0];

@@ -283,6 +283,10 @@ pub struct BeamOptics {
     pub anim: Option<(String, f32)>,
     /// Prism facet copies (empty = no prism; stacked prisms compose).
     pub prism: Vec<PrismBeam>,
+    /// A real (non-open) gobo is in the beam. The gobo disc is ALWAYS emitted (it
+    /// physically lives in the shaft), so this — not "any gobo wheel present" — is
+    /// what gates gobo-only effects like CA damping.
+    pub gobo_engaged: bool,
 }
 
 /// Linear map of a control fraction through a GDTF attribute's physical range,
@@ -483,6 +487,7 @@ pub fn resolve(
     let mut anim: Option<(String, f32)> = None;
     let mut prism: Vec<PrismBeam> = Vec::new();
     let mut frost = 0.0_f32;
+    let mut gobo_engaged = false;
     /// Holder-gap fractions from `research-wheel-optics.md`.
     const GOBO_GAP: f32 = 0.18;
     const COLOR_GAP: f32 = 0.02;
@@ -518,13 +523,17 @@ pub fn resolve(
                 }
             }
             WheelKind::Gobo => {
-                // Emit while engaged OR still slewing back toward open, so the
-                // physical move (incl. return-to-open) is always visible.
-                let active = ctl.value > 0.005 || position.abs() > 0.02 || (ctl.spin - 0.5).abs() > 0.02;
-                if active
-                    && comp.slots >= 1
+                // The gobo disc is ALWAYS physically in the shaft — emit it every
+                // frame (the open slot is just a clear hole). Selecting a gobo then
+                // ROTATES the disc from open to that slot instead of the wheel
+                // popping into existence. CA/pattern effects gate on `gobo_engaged`
+                // (a real, non-open slot) so an open beam stays clean.
+                if comp.slots >= 1
                     && let Some(w) = comp.wheel.clone()
                 {
+                    if ctl.value > 0.005 {
+                        gobo_engaged = true;
+                    }
                     wheels.push(WheelSel {
                         wheel: w,
                         position,
@@ -637,6 +646,7 @@ pub fn resolve(
         cmy: cmy_spatial,
         anim,
         prism,
+        gobo_engaged,
     }
 }
 
