@@ -127,13 +127,21 @@ fn emit_3ds_trimesh(body: &[u8], out: &mut Vec<MeshVertex>) {
         }
         pos += len;
     }
+    // MVR authors `.3ds` geometry in MILLIMETRES (the MVR coordinate unit), while
+    // the app world + the GLB path + the placement matrix are in metres — so scale
+    // mm → m here, else the geometry renders ~1000× too large.
+    const MM_TO_M: f32 = 0.001;
     for f in &faces {
         if let (Some(&v0), Some(&v1), Some(&v2)) =
             (verts.get(f[0] as usize), verts.get(f[1] as usize), verts.get(f[2] as usize))
         {
             let n = (v1 - v0).cross(v2 - v0).normalize_or_zero();
             for &p in &[v0, v1, v2] {
-                out.push(MeshVertex { position: p.to_array(), normal: n.to_array(), emissive: 0.0 });
+                out.push(MeshVertex {
+                    position: (p * MM_TO_M).to_array(),
+                    normal: n.to_array(),
+                    emissive: 0.0,
+                });
             }
         }
     }
@@ -338,7 +346,8 @@ mod tests_3ds {
         assert_eq!(out.len(), 3, "one triangle = three vertices");
         // Triangle lies in the XY plane → flat normal along Z.
         assert!(out[0].normal[2].abs() > 0.9, "flat normal should point along +/-Z");
-        assert_eq!(out[1].position, [1.0, 0.0, 0.0]);
+        // Vertices are scaled mm → m (×0.001).
+        assert!((out[1].position[0] - 0.001).abs() < 1e-6);
     }
 
     #[test]
