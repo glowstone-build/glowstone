@@ -233,17 +233,26 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             // blurred by focus error + frost (mip LOD), with per-channel chromatic
             // aberration so the gobo's pattern edges fringe too. Skip if occluded.
             let guv = opt_project(rel, depth, fx.cookie_r.xyz, fx.cookie_u.xyz, cone_r);
-            let lod = opt_lod(depth, fx.shape.y, frost);
+            // Aperture-dependent DoF LOD. The aerial shaft has no surface
+            // footprint, so DON'T sharpen it (would alias gobo cross-sections
+            // into longitudinal stripes) — the 512² Lanczos atlas carries the
+            // detail; pass sharpen = 0.
+            let lod = opt_lod(depth, fx.shape.y, frost, tan_half, iris, lens_r);
             let trans = opt_cookie_ca(
                 gobo_tex, gobo_samp, guv,
                 fx.cookie_r.w, fx.cookie_u.w, fx.extra.x, fx.extra.y,
-                i32(fx.extra.z), fx.extra.w, lod, fx.misc.x,
+                i32(fx.extra.z), fx.extra.w, lod, fx.misc.x, 0.0,
             );
             if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
                 continue;
             }
 
-            let atten = 1.0 / (1.0 + depth * depth * 0.015);
+            // Laser (misc.y): a coherent collimated beam is visible ONLY via
+            // Tyndall scatter off haze — no inverse-square cone falloff along the
+            // streak, strong forward single-scatter. Lamps keep the cone atten.
+            let laser = fx.misc.y > 0.5;
+            let atten = select(1.0 / (1.0 + depth * depth * 0.015), 1.0, laser);
+            let tyndall = select(1.0, 3.0, laser);
             let phase = max(hg(dot(bdir, -rd), g), 0.05);
             // Hero beams cast shadows into the haze: darken the shaft where geometry
             // occludes the light at this sample point (beam blocked mid-air).
@@ -252,7 +261,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             if (sidx >= 0) {
                 vis = opt_shadow(p, shadow_mats[sidx], shadow_atlas, shadow_samp, sidx);
             }
-            lin += fx.color.rgb * trans * (rad3 * (atten * phase * beam * vis));
+            lin += fx.color.rgb * trans * (rad3 * (atten * phase * beam * vis * tyndall));
         }
 
         let step_tr = exp(-sigma_t * dt);

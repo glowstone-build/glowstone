@@ -7,6 +7,7 @@ use std::sync::Arc;
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
 use glam::{Vec2, Vec3};
 
+use super::windows::{LabelMode, Preferences, ProfileEditor};
 use super::{DuplicateDialog, GdtfTextures};
 use crate::dmx::patch::channel_map;
 use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
@@ -303,6 +304,7 @@ pub fn inspector(
     scene: &mut Scene,
     selection: &Selection,
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
+    profile: &mut Option<ProfileEditor>,
 ) {
     ui.heading("Inspector");
     ui.separator();
@@ -329,9 +331,10 @@ pub fn inspector(
             ui.label("Nothing selected.");
         }
         [id] => {
-            let fixture = &mut scene.fixtures[*id];
+            let id = *id;
+            let fixture = &mut scene.fixtures[id];
             if fixture.is_gdtf() {
-                gdtf_inspector(ui, fixture, gdtf_textures);
+                gdtf_inspector(ui, fixture, gdtf_textures, id, profile);
             } else {
                 fixture_inspector(ui, fixture);
             }
@@ -622,6 +625,8 @@ fn gdtf_inspector(
     ui: &mut egui::Ui,
     fixture: &mut Fixture,
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
+    fixture_id: usize,
+    profile: &mut Option<ProfileEditor>,
 ) {
     let gdtf = fixture.gdtf.clone().expect("gdtf");
     let key = Arc::as_ptr(&gdtf) as usize;
@@ -629,7 +634,14 @@ fn gdtf_inspector(
         .entry(key)
         .or_insert_with(|| load_gdtf_textures(ui.ctx(), &gdtf));
 
-    ui.heading(gdtf.name.as_str());
+    ui.horizontal(|ui| {
+        ui.heading(gdtf.name.as_str());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("⚙ Profile…").on_hover_text("Open the full fixture profile editor").clicked() {
+                *profile = Some(ProfileEditor::new(fixture_id));
+            }
+        });
+    });
     ui.label(
         RichText::new(format!("{} · {}", gdtf.manufacturer, gdtf.long_name))
             .weak()
@@ -730,10 +742,16 @@ fn gdtf_inspector(
         .striped(true)
         .show(ui, |ui| {
             ui.label("Pan");
-            ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"));
+            ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"))
+                .on_hover_text(format!("commanded · now {:.0}°", fixture.pan_actual));
             ui.end_row();
             ui.label("Tilt");
-            ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-135.0..=135.0).suffix("°"));
+            ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-135.0..=135.0).suffix("°"))
+                .on_hover_text(format!("commanded · now {:.0}°", fixture.tilt_actual));
+            ui.end_row();
+            ui.label("Move speed")
+                .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
+            ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0));
             ui.end_row();
             ui.label("Intensity");
             ui.add(DragValue::new(&mut fixture.intensity).speed(0.005).range(0.0..=1.0));
@@ -876,6 +894,10 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
                 ui.label("CTO (warm)");
                 ui.add_enabled(has("CTO"), Slider::new(&mut o.cto, 0.0..=1.0));
                 ui.end_row();
+                ui.label("Tint ±green")
+                    .on_hover_text("Plus/minus-green (CC axis): −1 magenta … +1 green");
+                ui.add(Slider::new(&mut o.green, -1.0..=1.0));
+                ui.end_row();
                 let cmy = has("ColorSub_C") || has("ColorSub_M") || has("ColorSub_Y");
                 ui.label("Cyan");
                 ui.add_enabled(cmy, Slider::new(&mut o.cmy[0], 0.0..=1.0));
@@ -917,13 +939,19 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
                             ui.add(Slider::new(&mut w.spin, 0.0..=1.0).text("0.5=stop"));
                             ui.end_row();
                         }
+                        if matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) {
+                            ui.label("  shake");
+                            ui.add(Slider::new(&mut w.shake, 0.0..=1.0))
+                                .on_hover_text("Oscillate the indexed element");
+                            ui.end_row();
+                        }
                     }
                 });
             }
         });
 }
 
-fn load_gdtf_textures(ctx: &egui::Context, gdtf: &GdtfFixture) -> GdtfTextures {
+pub(super) fn load_gdtf_textures(ctx: &egui::Context, gdtf: &GdtfFixture) -> GdtfTextures {
     let thumbnail = gdtf
         .thumbnail
         .as_ref()
@@ -969,6 +997,7 @@ pub fn viewport(
     texture: egui::TextureId,
     requested_px: &mut (u32, u32),
     fps: f32,
+    prefs: &Preferences,
 ) {
     let available = ui.available_size();
     let ppp = ui.pixels_per_point();
@@ -1062,21 +1091,75 @@ pub fn viewport(
         egui::Color32::from_white_alpha(110),
     );
 
+    // Fixture labels, projected to screen (name / ID / DMX address).
+    if prefs.show_labels {
+        let aspect = (rect.width() / rect.height().max(1.0)).max(0.0001);
+        let vp = camera.view_proj(aspect);
+        let painter = ui.painter_at(rect);
+        for (i, f) in scene.fixtures.iter().enumerate() {
+            let selected = selection.contains_fixture(i);
+            if prefs.labels_selected_only && !selected {
+                continue;
+            }
+            // Label just above the fixture body.
+            let world = f.position + Vec3::new(0.0, 0.35, 0.0);
+            let clip = vp * world.extend(1.0);
+            if clip.w <= 0.0 {
+                continue; // behind camera
+            }
+            let ndc = clip.truncate() / clip.w;
+            if ndc.x < -1.2 || ndc.x > 1.2 || ndc.y < -1.2 || ndc.y > 1.2 {
+                continue;
+            }
+            let sx = rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width();
+            let sy = rect.min.y + (0.5 - ndc.y * 0.5) * rect.height();
+            let text = match prefs.label_mode {
+                LabelMode::Name => f.name.clone(),
+                LabelMode::FixtureId => f
+                    .mvr
+                    .as_deref()
+                    .map(|m| m.fixture_id.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| f.name.clone()),
+                LabelMode::Address => f
+                    .mvr
+                    .as_deref()
+                    .and_then(|m| m.addresses.first())
+                    .map(|a| format!("{}.{:03}", a.universe(), a.channel()))
+                    .unwrap_or_else(|| "—".into()),
+            };
+            let col = if selected {
+                egui::Color32::from_rgb(120, 200, 255)
+            } else {
+                egui::Color32::from_white_alpha(180)
+            };
+            painter.text(
+                egui::pos2(sx, sy),
+                egui::Align2::CENTER_BOTTOM,
+                text,
+                egui::FontId::proportional(11.0),
+                col,
+            );
+        }
+    }
+
     // FPS HUD (top-left), color-coded.
-    let color = if fps >= 55.0 {
-        egui::Color32::from_rgb(120, 230, 120)
-    } else if fps >= 30.0 {
-        egui::Color32::from_rgb(235, 215, 110)
-    } else {
-        egui::Color32::from_rgb(235, 120, 110)
-    };
-    ui.painter().text(
-        rect.left_top() + egui::vec2(8.0, 6.0),
-        egui::Align2::LEFT_TOP,
-        format!("{fps:.0} fps"),
-        egui::FontId::monospace(13.0),
-        color,
-    );
+    if prefs.show_fps {
+        let color = if fps >= 55.0 {
+            egui::Color32::from_rgb(120, 230, 120)
+        } else if fps >= 30.0 {
+            egui::Color32::from_rgb(235, 215, 110)
+        } else {
+            egui::Color32::from_rgb(235, 120, 110)
+        };
+        ui.painter().text(
+            rect.left_top() + egui::vec2(8.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            format!("{fps:.0} fps"),
+            egui::FontId::monospace(13.0),
+            color,
+        );
+    }
 }
 
 /// Bottom tab: Art-Net / sACN connectivity settings + live source status.

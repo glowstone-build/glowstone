@@ -49,9 +49,62 @@ impl Default for OrbitCamera {
     }
 }
 
+/// Canned orthographic-style viewpoints (set via the View menu / shortcuts).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CameraView {
+    Perspective,
+    Top,
+    Front,
+    Back,
+    Left,
+    Right,
+}
+
+impl CameraView {
+    pub const ALL: [CameraView; 6] = [
+        Self::Perspective,
+        Self::Top,
+        Self::Front,
+        Self::Back,
+        Self::Left,
+        Self::Right,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Perspective => "Perspective",
+            Self::Top => "Top",
+            Self::Front => "Front",
+            Self::Back => "Back",
+            Self::Left => "Left",
+            Self::Right => "Right",
+        }
+    }
+}
+
 impl OrbitCamera {
     /// Keep pitch a hair away from straight up/down.
     const PITCH_LIMIT: f32 = 1.5533; // ~89 degrees in radians
+
+    /// Snap the orbit angles to a canned view (keeps target + distance).
+    pub fn set_view(&mut self, view: CameraView) {
+        let (yaw, pitch) = match view {
+            CameraView::Perspective => (0.6, 0.08),
+            CameraView::Top => (0.0, Self::PITCH_LIMIT),
+            CameraView::Front => (0.0, 0.0),
+            CameraView::Back => (std::f32::consts::PI, 0.0),
+            CameraView::Right => (std::f32::consts::FRAC_PI_2, 0.0),
+            CameraView::Left => (-std::f32::consts::FRAC_PI_2, 0.0),
+        };
+        self.yaw = yaw;
+        self.pitch = pitch.clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
+    }
+
+    /// Frame an explicit AABB (min/max): aim at its centre and dolly to fit.
+    pub fn frame_aabb(&mut self, min: Vec3, max: Vec3) {
+        let center = (min + max) * 0.5;
+        let radius = ((max - min).length() * 0.5).max(0.6);
+        self.frame(center, radius * 1.1);
+    }
 
     /// World-space eye position derived from the orbit angles.
     pub fn eye(&self) -> Vec3 {

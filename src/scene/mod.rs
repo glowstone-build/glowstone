@@ -81,6 +81,9 @@ pub struct RenderSettings {
     pub bloom: f32,
     pub beam_intensity: f32,
     pub steps: u32,
+    /// Floor-pool gobo edge sharpening amount (0 = off). Drives the contour
+    /// steepening in mesh.wgsl via `camera.render_mode.y`.
+    pub gobo_sharpness: f32,
     pub show_beam_wireframes: bool,
     /// Show the origin grid + world axes.
     pub show_grid: bool,
@@ -100,6 +103,7 @@ impl Default for RenderSettings {
             // longitudinal stripes below ~64 samples — the speed-up comes from the
             // lossless per-fixture pre-cull, not from marching fewer steps.
             steps: 80,
+            gobo_sharpness: 0.6,
             show_beam_wireframes: false,
             show_grid: true,
             mode: ViewportMode::Beauty,
@@ -170,6 +174,7 @@ impl Scene {
         let mut fixture = Fixture::from_profile(par, "PAR Can 1", Vec3::new(0.0, 4.0, 0.0));
         fixture.tilt = 45.0;
         fixture.intensity = 1.0;
+        fixture.snap_movement(); // start at the commanded pose, don't slew on launch
 
         let fog = &library.environments[0];
         // Sit the fog box ON the floor (y=0), not centred at the origin — otherwise
@@ -201,6 +206,17 @@ impl Scene {
                 None => &[],
             };
             f.motion.advance(&f.optics, components, dt);
+            // Slew the head toward its commanded pan/tilt at motor speed.
+            f.advance_movement(dt);
+        }
+    }
+
+    /// Settle every fixture's slewed pan/tilt to its commanded target (no
+    /// motion lag). Headless capture paths render without the per-frame
+    /// [`advance`](Self::advance) integrator, so they call this after posing.
+    pub fn snap_movement(&mut self) {
+        for f in &mut self.fixtures {
+            f.snap_movement();
         }
     }
 
@@ -211,6 +227,7 @@ impl Scene {
         // Place new fixtures a few metres up, aimed down.
         let mut fixture = Fixture::from_profile(profile, name, Vec3::new(0.0, 4.0, 0.0));
         fixture.tilt = 30.0;
+        fixture.snap_movement(); // appear at the placed pose, not slewing from 0
         self.fixtures.push(fixture);
         self.fixtures.len() - 1
     }
@@ -233,6 +250,7 @@ impl Scene {
             f.position = base.position + offset * i as f32;
             f.pan = base.pan + y_angle_deg * i as f32;
             f.name = format!("{} ({i})", base.name);
+            f.snap_movement(); // each copy starts at its fanned pose
             self.fixtures.push(f);
         }
         (count > 0).then_some(first)

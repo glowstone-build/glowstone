@@ -83,8 +83,8 @@ pub fn apply(
 /// Per-group accumulator for the cell layer model (one `(geometry, instance)`).
 #[derive(Clone, Default)]
 struct Group {
-    /// r/g/b/w channel values, present where the group has that channel.
-    rgbw: [Option<f32>; 4],
+    /// r/g/b/w/amber/lime channel values, present where the group has that channel.
+    rgbwal: [Option<f32>; 6],
     dimmer: Option<f32>,
     /// Raw shutter channel + value; the master pass decodes strobe sub-ranges,
     /// layers reduce it to an open/close gate.
@@ -104,6 +104,13 @@ fn decode_gdtf(
 ) {
     let n_cells = mode.emitters.len();
     let mut groups: Vec<Group> = Vec::new();
+
+    // Shake is recomputed from the live channels each frame; clear it first so a
+    // shake commanded on one channel of a component isn't cancelled by another
+    // channel's static range (and stale shake can't persist once it ends).
+    for w in &mut fixture.optics.wheels {
+        w.shake = 0.0;
+    }
 
     for rc in &mode.resolved {
         let ch = &mode.channels[rc.channel];
@@ -134,6 +141,8 @@ fn decode_gdtf(
             "ColorAdd_G" => Some(1),
             "ColorAdd_B" => Some(2),
             "ColorAdd_W" | "ColorAdd_WW" | "ColorAdd_CW" => Some(3),
+            "ColorAdd_A" | "ColorAdd_Amber" => Some(4),
+            "ColorAdd_L" | "ColorAdd_Lime" | "ColorAdd_G_Y" => Some(5),
             _ => None,
         };
         let is_layer_attr = cell_slot.is_some()
@@ -148,7 +157,7 @@ fn decode_gdtf(
                 group.cells = rc.cells.clone();
             }
             if let Some(slot) = cell_slot {
-                group.rgbw[slot] = Some(v01);
+                group.rgbwal[slot] = Some(v01);
                 continue;
             }
             match ch.attribute.as_str() {
@@ -168,8 +177,14 @@ fn decode_gdtf(
     }
 
     // --- compose the layers into cells + the fixture master ---
+    // Additive emitters fold by chromaticity vector (white = source CCT, plus
+    // amber/lime if present) — not a flat W add — so a pure-amber pixel reads amber.
+    let emitters = crate::optics::color::Emitters {
+        white: crate::optics::color::cct_to_linear_rgb(gdtf.beam.color_temp),
+        ..Default::default()
+    };
     let all = |g: &Group| g.cells.len() >= n_cells;
-    let has_color = |g: &Group| g.rgbw.iter().any(|c| c.is_some());
+    let has_color = |g: &Group| g.rgbwal.iter().any(|c| c.is_some());
     let gate = |g: &Group| -> f32 {
         g.shutter
             .map(|(ci, v)| shutter_open_gate(&mode.channels[ci], v))
@@ -195,12 +210,12 @@ fn decode_gdtf(
     let mut covered = vec![false; n_cells];
     for g in groups.iter().filter(|g| has_color(g)) {
         let scale = g.dimmer.unwrap_or(1.0) * gate(g);
-        let w = g.rgbw[3].unwrap_or(0.0);
-        let rgb = [
-            (g.rgbw[0].unwrap_or(0.0) + w).min(2.0) * scale,
-            (g.rgbw[1].unwrap_or(0.0) + w).min(2.0) * scale,
-            (g.rgbw[2].unwrap_or(0.0) + w).min(2.0) * scale,
-        ];
+        let lv = |i: usize| g.rgbwal[i].unwrap_or(0.0);
+        let folded = crate::optics::color::fold_rgbwal(
+            [lv(0), lv(1), lv(2), lv(3), lv(4), lv(5)],
+            &emitters,
+        );
+        let rgb = [folded[0] * scale, folded[1] * scale, folded[2] * scale];
         let targets = if g.cells.is_empty() { &all_cells } else { &g.cells };
         for &c in targets {
             let c = c as usize;
@@ -254,6 +269,14 @@ fn apply_wheel(fixture: &mut Fixture, ci: usize, role: WheelRole, ch: &DmxChanne
     let Some(ctl) = fixture.optics.wheels.get_mut(ci) else {
         return;
     };
+    // A "shake" channel-function sub-range oscillates the indexed element. It can
+    // appear on any of the component's channels; handle it before the role.
+    if let Some((idx, f)) = active_function(ch, v01) {
+        if is_shake(f) {
+            ctl.shake = subrange_t(ch, idx, v01).max(0.1);
+            return;
+        }
+    }
     match role {
         WheelRole::Value => {
             if let Some((idx, f)) = active_function(ch, v01) {
@@ -314,6 +337,8 @@ fn apply_gdtf_channel(
     match ch.attribute.as_str() {
         "Pan" => fixture.pan = pan_deg(gdtf, mode_index, v01),
         "Tilt" => fixture.tilt = tilt_deg(gdtf, mode_index, v01),
+        // Motor speed: 0 = fastest ("tracking"), up = slower. Drives the slew.
+        "PositionMSpeed" => fixture.move_speed = v01,
         "Dimmer" => fixture.intensity = v01,
         // Subtractive colour mixing drives the beam tint directly.
         "ColorSub_C" => fixture.optics.cmy[0] = v01,
@@ -325,6 +350,10 @@ fn apply_gdtf_channel(
         "ColorAdd_G" => fixture.optics.cmy[1] = 1.0 - v01,
         "ColorAdd_B" => fixture.optics.cmy[2] = 1.0 - v01,
         "CTO" | "CTC" | "CTB" => fixture.optics.cto = v01,
+        // Plus/minus-green tint: DMX 0..1 → magenta..green around neutral 0.5.
+        "Tint" | "GreenMagenta" | "MagentaGreen" | "Green" => {
+            fixture.optics.green = v01 * 2.0 - 1.0
+        }
         "Zoom" => fixture.optics.zoom = v01,
         "Focus1" | "Focus2" => fixture.optics.focus = v01,
         "Iris" => fixture.optics.iris = v01,
@@ -425,7 +454,13 @@ fn subrange_t(ch: &DmxChannel, idx: usize, v01: f32) -> f32 {
 fn is_rotation(f: &ChannelFunction) -> bool {
     let a = f.attribute.to_lowercase();
     let n = f.name.to_lowercase();
-    a.contains("rotat") || a.contains("spin") || n.contains("rotat") || n.contains("spin")
+    (a.contains("rotat") || a.contains("spin") || n.contains("rotat") || n.contains("spin"))
+        && !is_shake(f)
+}
+
+/// Whether a channel function is a wheel-shake (oscillation) sub-range.
+fn is_shake(f: &ChannelFunction) -> bool {
+    f.attribute.to_lowercase().contains("shake") || f.name.to_lowercase().contains("shake")
 }
 
 #[cfg(test)]

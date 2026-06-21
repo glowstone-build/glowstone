@@ -125,6 +125,28 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Optional laser-engine demo: PREVIZ_LASER replaces the scene with a fan
+        // of R/G/B lasers aimed across the haze (verifies the laser render path).
+        if std::env::var("PREVIZ_LASER").is_ok() {
+            let state = self.state.as_mut().unwrap();
+            let lib = crate::scene::Library::standard();
+            state.scene.fixtures.clear();
+            let lasers: Vec<_> = lib.fixtures.iter().filter(|p| p.laser).cloned().collect();
+            for (k, p) in lasers.iter().cycle().take(9).enumerate() {
+                let mut f = crate::scene::Fixture::from_profile(
+                    p,
+                    format!("{} {}", p.name, k),
+                    glam::Vec3::new(-4.0 + k as f32, 6.0, -3.0),
+                );
+                f.intensity = 1.0;
+                f.tilt = 55.0;
+                f.pan = -40.0 + k as f32 * 10.0;
+                f.snap_movement();
+                state.scene.fixtures.push(f);
+            }
+            state.ui.selection = crate::scene::Selection::default();
+        }
+
         // Optional MVR scene import for testing: PREVIZ_MVR=scene.mvr loads a full
         // scene (fixtures + static stage/truss geometry), replacing the demo
         // fixtures, and frames the camera on the rig.
@@ -303,6 +325,9 @@ impl ApplicationHandler for App {
             if let Some(d) = envf("PREVIZ_CAM_DIST") {
                 state.camera.distance = d;
             }
+            // Headless render skips the per-frame motion integrator; settle the
+            // posed heads so the screenshot shows the commanded pan/tilt.
+            state.scene.snap_movement();
             let (w, h, pixels) =
                 state
                     .renderer
@@ -322,6 +347,7 @@ impl ApplicationHandler for App {
         if let Ok(n) = std::env::var("PREVIZ_BENCH") {
             let n: u32 = n.parse().unwrap_or(120);
             let state = self.state.as_mut().unwrap();
+            state.scene.snap_movement();
             for _ in 0..10 {
                 let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
             }
@@ -587,6 +613,7 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
             f.tilt = 28.0;
             apply(f);
         }
+        state.scene.snap_movement();
         let (w, h, px) = state
             .renderer
             .capture(&state.scene, &state.camera, &state.ui.settings);
@@ -611,6 +638,7 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
         f.optics.zoom = 0.0; // narrow
         wheel(f, K::Prism, 1, 1.0, 0.5, 0.0);
     }
+    state.scene.snap_movement();
     let mut cam = state.camera.clone();
     cam.target = glam::Vec3::new(0.0, 0.0, 0.0);
     cam.pitch = 1.3; // look down
@@ -628,6 +656,7 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
         f.tilt = 35.0;
         f.optics.zoom = 0.3;
     }
+    state.scene.snap_movement();
     {
         let frame = state.scene.fixtures[idx].position;
         let mut cam = state.camera.clone();
@@ -652,6 +681,7 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
     state
         .scene
         .duplicate_fixture(idx, glam::Vec3::new(0.0, 0.0, 0.0), 36.0, 9);
+    state.scene.snap_movement();
     let (w, h, px) = state
         .renderer
         .capture(&state.scene, &state.camera, &state.ui.settings);
@@ -688,6 +718,7 @@ fn render_anim_sequence(state: &mut State, dir: &str) {
             w.spin = 0.95;
         }
     }
+    state.scene.snap_movement(); // settle tilt before the (wheel-only) sequence
     for frame in 0..6 {
         let (w, h, px) = state
             .renderer

@@ -56,11 +56,37 @@ fn opt_radial_ca(pu: f32, pv: f32, beam_r: f32, n: f32, k: f32) -> vec3<f32> {
     );
 }
 
-// Mip-LOD for the gobo from focus error (sharp at focus_dist) + frost blur.
-fn opt_lod(depth: f32, focus_dist: f32, frost01: f32) -> f32 {
-    let defocus = abs(depth - focus_dist) / max(focus_dist, 0.5);
-    let sigma = 0.5 * defocus + 1.2 * frost01;
+// Mip-LOD for the gobo from APERTURE-DEPENDENT depth of field + frost.
+// Sharp (mip0) at focus_dist; the in-focus band WIDENS for narrow / iris-stopped
+// beams (high f-number) and TIGHTENS for wide-open beams — like a real ERS /
+// profile spot (the "donut" trick: stopping the iris deepens DoF). Defocus is
+// measured in reciprocal distance (diopters) so the band is asymmetric and
+// unbounded past the hyperfocal point — a far-focused beam stays sharp on the
+// floor. Returns EXACTLY 0 in the hyperfocal band so gobo sharpening sees an
+// un-blurred mip0. See .context/research-focus-dof.md.
+fn opt_lod(
+    depth: f32, focus_dist: f32, frost01: f32,
+    tan_half: f32, iris: f32, lens_r: f32,
+) -> f32 {
+    // Aperture / DoF gain ∝ (lens radius + floor) · iris · beam half-angle.
+    // Narrow beam or stopped iris → small k_ap → wide DoF.
+    let k_ap = 0.45 * (0.04 + lens_r) * clamp(iris, 0.02, 1.0) * max(tan_half, 1e-3);
+    // Diopter defocus with a hyperfocal deadband (at/after focus → mip0).
+    let diopter = abs(1.0 / max(focus_dist, 0.25) - 1.0 / max(depth, 0.25));
+    let defocus = max(diopter - 0.006, 0.0);
+    // Blur as a fraction of the cone radius (×~half the atlas width) + frost.
+    let sigma = k_ap * defocus * 200.0 + 1.2 * frost01;
     return clamp(log2(1.0 + sigma * 64.0), 0.0, 8.0);
+}
+
+// Contour-preserving edge steepening for a transmittance/mask value, fixed-point
+// at 0, 0.5, 1 so the 0.5 iso-contour (the gobo edge) can't move (no fattening/
+// thinning). `k` ~ sharpen amount; the multiplier peaks at a=0.5 and is 1 at the
+// solid/empty extremes. Cheaper than CAS (no extra taps) and ideal for masks;
+// used on the floor pool only — it maximally steepens mid-tones, which would
+// alias the aerial shaft into stripes.
+fn opt_sharpen_iso(a: f32, k: f32) -> f32 {
+    return clamp(0.5 + (a - 0.5) * (1.0 + k * (1.0 - abs(2.0 * a - 1.0))), 0.0, 1.0);
 }
 
 // Sample one atlas layer at a rotated UV. The UV is clamped (the sampler is
@@ -116,20 +142,36 @@ fn opt_cookie_at(
 fn opt_cookie_ca(
     t: texture_2d_array<f32>, s: sampler, guv: vec2<f32>,
     g1: f32, r1: f32, g2: f32, r2: f32,
-    anim_layer: i32, anim_scroll: f32, lod: f32, ca: f32,
+    anim_layer: i32, anim_scroll: f32, lod: f32, ca: f32, sharpen: f32,
 ) -> vec3<f32> {
     // Green/centre cookie + animation are always needed; sample once. With no
     // chromatic aberration the red/blue offset samples coincide with green, so
     // skip them — byte-for-byte identical, up to 2 fewer cookie evaluations.
     let cg = opt_cookie_at(t, s, guv, g1, r1, g2, r2, lod);
     let anim = opt_anim(t, s, guv, anim_layer, anim_scroll, lod);
+    var out: vec3<f32>;
     if (abs(ca) <= 0.001) {
-        return vec3<f32>(cg.r * cg.a, cg.g * cg.a, cg.b * cg.a) * anim;
+        out = vec3<f32>(cg.r * cg.a, cg.g * cg.a, cg.b * cg.a) * anim;
+    } else {
+        let off = vec2<f32>(ca * 0.5, 0.0);
+        let cr = opt_cookie_at(t, s, guv + off, g1, r1, g2, r2, lod);
+        let cb = opt_cookie_at(t, s, guv - off, g1, r1, g2, r2, lod);
+        out = vec3<f32>(cr.r * cr.a, cg.g * cg.a, cb.b * cb.a) * anim;
     }
-    let off = vec2<f32>(ca * 0.5, 0.0);
-    let cr = opt_cookie_at(t, s, guv + off, g1, r1, g2, r2, lod);
-    let cb = opt_cookie_at(t, s, guv - off, g1, r1, g2, r2, lod);
-    return vec3<f32>(cr.r * cr.a, cg.g * cg.a, cb.b * cb.a) * anim;
+    // Edge sharpening, faded out with defocus (exp2(-lod) = fraction of mip0
+    // detail still present) so blurred mips are never re-sharpened. Zero-tap
+    // contour steepening; callers pass sharpen=0 to disable (aerial shaft).
+    if (sharpen > 0.001) {
+        let gain = sharpen * max(exp2(-lod) - 0.03, 0.0);
+        if (gain > 0.0) {
+            out = vec3<f32>(
+                opt_sharpen_iso(out.r, gain),
+                opt_sharpen_iso(out.g, gain),
+                opt_sharpen_iso(out.b, gain),
+            );
+        }
+    }
+    return out;
 }
 
 // Hard-shadow visibility (1 = lit, 0 = occluded) of a world-space point from a

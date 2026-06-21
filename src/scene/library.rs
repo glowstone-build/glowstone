@@ -24,6 +24,9 @@ pub struct FixtureProfile {
     pub default_beam_angle: f32,
     /// Default emitted color, linear RGB.
     pub default_color: [f32; 3],
+    /// A laser engine: rendered as a thin, near-collimated, haze-only streak
+    /// (no inverse-square falloff, razor edge) rather than a lamp cone.
+    pub laser: bool,
 }
 
 /// What kind of environment volume this is.
@@ -57,13 +60,42 @@ pub struct Library {
 impl Library {
     pub fn standard() -> Self {
         Self {
-            fixtures: vec![FixtureProfile {
-                name: "PAR Can",
-                category: "Generic",
-                geometry: FixtureGeometry::Cylinder,
-                default_beam_angle: 24.0,
-                default_color: [1.0, 0.95, 0.85],
-            }],
+            fixtures: vec![
+                FixtureProfile {
+                    name: "PAR Can",
+                    category: "Generic",
+                    geometry: FixtureGeometry::Cylinder,
+                    default_beam_angle: 24.0,
+                    default_color: [1.0, 0.95, 0.85],
+                    laser: false,
+                },
+                // Laser engines: near-spectral, gamut-clamped chroma (638/520/445 nm),
+                // razor-thin haze-only streaks. See .context/research-color-physics.md.
+                FixtureProfile {
+                    name: "Laser — Red",
+                    category: "Laser",
+                    geometry: FixtureGeometry::Cone,
+                    default_beam_angle: 0.2,
+                    default_color: [1.0, 0.02, 0.0],
+                    laser: true,
+                },
+                FixtureProfile {
+                    name: "Laser — Green",
+                    category: "Laser",
+                    geometry: FixtureGeometry::Cone,
+                    default_beam_angle: 0.2,
+                    default_color: [0.18, 1.0, 0.05],
+                    laser: true,
+                },
+                FixtureProfile {
+                    name: "Laser — Blue",
+                    category: "Laser",
+                    geometry: FixtureGeometry::Cone,
+                    default_beam_angle: 0.2,
+                    default_color: [0.18, 0.03, 1.0],
+                    laser: true,
+                },
+            ],
             environments: vec![EnvironmentProfile {
                 name: "Fog Box",
                 category: "Environments",

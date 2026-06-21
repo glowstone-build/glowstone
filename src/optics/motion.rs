@@ -18,10 +18,13 @@ use crate::gdtf::{OpticalComponent, WheelKind};
 use super::OpticalControls;
 
 /// Accumulated motion phases for one fixture, aligned with the mode's
-/// component list (radians for rotations, wrapping 0..1 for scrolls).
+/// component list (radians for rotations, wrapping 0..1 for scrolls). A second
+/// parallel set of `shake_phases` (wrapping 0..1) drives the gobo/colour shake
+/// oscillation independent of the continuous spin.
 #[derive(Clone, Debug, Default)]
 pub struct WheelMotion {
     pub phases: Vec<f32>,
+    pub shake_phases: Vec<f32>,
 }
 
 /// Bipolar speed control: 0.5 = stopped, 0 = full reverse, 1 = full forward.
@@ -35,6 +38,18 @@ impl WheelMotion {
         self.phases.get(i).copied().unwrap_or(0.0)
     }
 
+    /// The shake oscillation offset (radians) for component `i` at amplitude
+    /// scaled by its `shake` control — a sine sway of the indexed element.
+    pub fn shake_offset(&self, i: usize, shake: f32) -> f32 {
+        if shake <= 0.01 {
+            return 0.0;
+        }
+        const MAX_AMP: f32 = 0.35; // ~20° sway at full
+        (self.shake_phases.get(i).copied().unwrap_or(0.0) * std::f32::consts::TAU).sin()
+            * MAX_AMP
+            * shake.clamp(0.0, 1.0)
+    }
+
     /// Advance all phases by `dt` seconds given the current control values and
     /// the fixture's component chain.
     pub fn advance(&mut self, c: &OpticalControls, components: &[OpticalComponent], dt: f32) {
@@ -42,8 +57,17 @@ impl WheelMotion {
         if self.phases.len() != components.len() {
             self.phases.resize(components.len(), 0.0);
         }
+        if self.shake_phases.len() != components.len() {
+            self.shake_phases.resize(components.len(), 0.0);
+        }
         for (i, comp) in components.iter().enumerate() {
-            let spin = bipolar(c.wheel(i).spin);
+            let ctl = c.wheel(i);
+            // Shake oscillation: 1..9 Hz, wrapping 0..1.
+            if ctl.shake > 0.01 && matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) {
+                let hz = 1.0 + 8.0 * ctl.shake;
+                self.shake_phases[i] = (self.shake_phases[i] + hz * dt).rem_euclid(1.0);
+            }
+            let spin = bipolar(ctl.spin);
             if spin.abs() < 1e-3 {
                 continue;
             }

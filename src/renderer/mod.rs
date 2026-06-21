@@ -725,6 +725,8 @@ impl Renderer {
         // --- camera uniform ---
         let mut camera_uniform = camera.uniform(aspect);
         camera_uniform.render_mode[0] = settings.mode.shader_code();
+        camera_uniform.render_mode[1] = settings.gobo_sharpness.max(0.0); // floor-pool gobo sharpen
+
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
 
@@ -784,7 +786,7 @@ impl Renderer {
                 * Mat4::from_quat(fixture.orientation)
                 * gdtf_to_world;
             let asm =
-                fixture_model::assemble(&gdtf, fixture.mode_index, root, fixture.pan, fixture.tilt);
+                fixture_model::assemble(&gdtf, fixture.mode_index, root, fixture.pan_actual, fixture.tilt_actual);
             beam_frames[i] = asm.beams;
             let selected = if selection.contains_fixture(i) { 1.0 } else { 0.0 };
             let drawn_before = gdtf_draws.len();
@@ -1488,6 +1490,52 @@ fn lens_instance(
     }
 }
 
+/// Build the GPU beam + lens for a laser engine: a thin, near-collimated streak.
+/// `misc.y = 1` switches the shaders to no inverse-square falloff + razor edge +
+/// Tyndall boost (visible only in haze). A physically razor-thin laser (mm core)
+/// under-samples in the half-res raymarch and breaks into speckle, so the
+/// rendered core is a few cm with a soft super-Gaussian edge — wide enough to
+/// read as a continuous streak — while a tiny divergence keeps it collimated.
+fn build_laser(
+    f: &fixture_model::BeamFrame,
+    fixture: &Fixture,
+    atlas_layers: f32,
+) -> BeamBuild {
+    const LASER_RANGE: f32 = 80.0;
+    const LASER_CORE: f32 = 0.11;
+    let i = (fixture.intensity * fixture.optics.dimmer).max(0.0);
+    let tan_half = (fixture.beam_angle * 0.5).to_radians().tan().clamp(2.5e-3, 0.02);
+    let g = i * 1.2; // HDR gain; the no-falloff streak keeps it bright far out
+    BeamBuild {
+        beams: if i < 1e-4 {
+            Vec::new()
+        } else {
+            vec![FixtureGpu {
+                pos_range: [f.origin.x, f.origin.y, f.origin.z, LASER_RANGE],
+                dir_cos: [f.dir.x, f.dir.y, f.dir.z, tan_half],
+                color: [fixture.color[0] * g, fixture.color[1] * g, fixture.color[2] * g, LASER_CORE],
+                cookie_r: [f.right.x, f.right.y, f.right.z, -1.0],
+                cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],
+                extra: [-1.0, 0.0, -1.0, 0.0],
+                shape: [4.0, 8.0, 1.0, 0.0], // soft-ish edge → survives downsampling
+                misc: [0.0, 1.0, atlas_layers, -1.0], // misc.y = laser flag
+            }]
+        },
+        lenses: vec![lens_instance(
+            f.origin + f.dir * 0.02,
+            f.dir,
+            f.right,
+            f.up,
+            LASER_CORE * 1.5,
+            fixture.color,
+            i,
+            tan_half,
+            6.0,
+            8.0,
+        )],
+    }
+}
+
 /// Resolve a fixture's optical chain into the GPU beam(s) the shaders consume
 /// plus the front-lens discs. A single-emitter fixture yields one beam (or one
 /// per facet when a prism is engaged); a multi-emitter fixture yields one beam
@@ -1514,10 +1562,18 @@ fn build_beam_gpus(
         }
     };
 
+    // Laser engines render the same way whether or not they carry a GDTF model
+    // (a `LampType="Laser"` GDTF still aims its <Beam> geometry) — handle them
+    // first so the flag isn't dead for imported lasers.
+    if fixture.is_laser {
+        let f = frames.first().copied().unwrap_or_else(fallback_frame);
+        return build_laser(&f, fixture, atlas_layers);
+    }
+
     let Some(gdtf) = &fixture.gdtf else {
-        // Placeholder (non-GDTF) fixture: a plain super-Gaussian cone, no cookie.
         let f = fallback_frame();
         let i = fixture.intensity.max(0.0);
+        // Placeholder (non-GDTF) fixture: a plain super-Gaussian cone, no cookie.
         let tan_half = (fixture.beam_angle * 0.5).to_radians().tan().max(1e-3);
         return BeamBuild {
             // A blacked-out fixture emits nothing, so it must not cost anything in the

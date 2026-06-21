@@ -16,10 +16,12 @@ use std::sync::Arc;
 
 use crate::gdtf::GdtfFixture;
 
-/// Edge length of each atlas layer (square). 256 is plenty for previz gobos.
-const RES: u32 = 256;
+/// Edge length of each atlas layer (square). 512 gives the projected cookie 2×
+/// angular resolution before the GPU mip chain takes over — and a real signal
+/// for the runtime CAS sharpener. (RGBA8 × LAYERS × full mips ≈ 192 MB @ 48.)
+const RES: u32 = 512;
 /// Total layers the array can hold (white + all wheels of all fixtures).
-const LAYERS: u32 = 64;
+const LAYERS: u32 = 48;
 
 pub struct GoboAtlas {
     texture: wgpu::Texture,
@@ -162,10 +164,13 @@ impl GoboAtlas {
 
 /// Decode a gobo PNG to RES×RES RGBA8: keep its color, set alpha to the
 /// transmittance mask (luminance × source alpha) so dark/holder areas occlude.
+/// Lanczos3 resize (sharper low-pass than the old tent filter) plus a mild
+/// linear-space unsharp on the transmittance channel recover detail lost to the
+/// low-res source; the GPU's runtime CAS finishes the in-focus edge.
 fn decode_gobo(bytes: &[u8]) -> Option<Vec<u8>> {
     let img = image::load_from_memory(bytes).ok()?;
     let img = img
-        .resize_exact(RES, RES, image::imageops::FilterType::Triangle)
+        .resize_exact(RES, RES, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
     let mut out = img.into_raw();
     for px in out.chunks_exact_mut(4) {
@@ -173,7 +178,65 @@ fn decode_gobo(bytes: &[u8]) -> Option<Vec<u8>> {
         let lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
         px[3] = (lum * (a / 255.0) * 255.0).round().clamp(0.0, 255.0) as u8;
     }
+    // Mild unsharp on the (linear) transmittance alpha — undo resize softness.
+    unsharp_alpha(&mut out, RES, 0.5, 0.9, 2);
     Some(out)
+}
+
+/// In-place unsharp mask on the alpha (transmittance) channel of an RES×RES
+/// RGBA8 buffer. Transmittance is linear data (it multiplies light), so sharpen
+/// it directly. `amount` ~0.5, `sigma` ~0.9 px, `thr_u8` skips flat areas to
+/// avoid amplifying decode noise. Conservative — the runtime CAS does the rest.
+fn unsharp_alpha(buf: &mut [u8], dim: u32, amount: f32, sigma: f32, thr_u8: u8) {
+    let n = (dim * dim) as usize;
+    let a: Vec<f32> = (0..n).map(|i| buf[i * 4 + 3] as f32 / 255.0).collect();
+    let blur = gaussian_blur(&a, dim, sigma);
+    let thr = thr_u8 as f32 / 255.0;
+    for i in 0..n {
+        let c = a[i];
+        let hi = c - blur[i];
+        let s = if hi.abs() < thr { c } else { c + amount * hi };
+        buf[i * 4 + 3] = (s.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+}
+
+/// Separable Gaussian blur of a single-channel `dim`×`dim` image (clamp edges).
+fn gaussian_blur(src: &[f32], dim: u32, sigma: f32) -> Vec<f32> {
+    let radius = (sigma * 3.0).ceil().max(1.0) as i32;
+    let mut kernel = Vec::with_capacity((radius * 2 + 1) as usize);
+    let mut ksum = 0.0;
+    for k in -radius..=radius {
+        let w = (-(k * k) as f32 / (2.0 * sigma * sigma)).exp();
+        kernel.push(w);
+        ksum += w;
+    }
+    for w in &mut kernel {
+        *w /= ksum;
+    }
+    let d = dim as i32;
+    let at = |x: i32, y: i32, v: &[f32]| v[(y.clamp(0, d - 1) * d + x.clamp(0, d - 1)) as usize];
+    // Horizontal then vertical pass.
+    let mut tmp = vec![0.0f32; src.len()];
+    for y in 0..d {
+        for x in 0..d {
+            let mut acc = 0.0;
+            for (ki, w) in kernel.iter().enumerate() {
+                acc += w * at(x + ki as i32 - radius, y, src);
+            }
+            tmp[(y * d + x) as usize] = acc;
+        }
+    }
+    let mut out = vec![0.0f32; src.len()];
+    for y in 0..d {
+        for x in 0..d {
+            let mut acc = 0.0;
+            for (ki, w) in kernel.iter().enumerate() {
+                acc += w * at(x, y + ki as i32 - radius, &tmp);
+            }
+            out[(y * d + x) as usize] = acc;
+        }
+    }
+    out
 }
 
 /// Box-downsample an RGBA8 image from `src_dim`² to `dst_dim`² (dst = src/2).

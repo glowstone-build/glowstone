@@ -132,11 +132,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             continue;
         }
         let guv = opt_project(rel, depth, lt.cookie_r.xyz, lt.cookie_u.xyz, cone_r);
-        let lod = opt_lod(depth, lt.shape.y, lt.shape.w);
+        // Aperture-dependent DoF LOD (tan_half, iris, lens_r). The floor pool is
+        // a stable surface projection, so sharpen the in-focus cookie fully.
+        let lod = opt_lod(depth, lt.shape.y, lt.shape.w, lt.dir_cos.w, lt.shape.z, lt.color.w);
         let trans = opt_cookie_ca(
             gobo_tex, gobo_samp, guv,
             lt.cookie_r.w, lt.cookie_u.w, lt.extra.x, lt.extra.y,
-            i32(lt.extra.z), lt.extra.w, lod, lt.misc.x,
+            i32(lt.extra.z), lt.extra.w, lod, lt.misc.x, camera.render_mode.y,
         );
         if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
             continue;

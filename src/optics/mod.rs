@@ -34,11 +34,14 @@ pub struct WheelControl {
     pub index: f32,
     /// Continuous rotation/scroll speed, bipolar: 0.5 = stop.
     pub spin: f32,
+    /// Shake amount `0..1` (gobo/colour wheel shake): the indexed element
+    /// oscillates back and forth; higher = faster + wider. 0 = no shake.
+    pub shake: f32,
 }
 
 impl Default for WheelControl {
     fn default() -> Self {
-        Self { value: 0.0, index: 0.0, spin: 0.5 }
+        Self { value: 0.0, index: 0.0, spin: 0.5, shake: 0.0 }
     }
 }
 
@@ -56,6 +59,9 @@ pub struct OpticalControls {
     pub iris: f32,
     /// Color-temperature-orange filter: 0 = off, 1 = full warm.
     pub cto: f32,
+    /// Plus/minus-green tint (the CC axis orthogonal to CCT): -1 = magenta,
+    /// 0 = neutral, +1 = green.
+    pub green: f32,
     /// Subtractive cyan / magenta / yellow flags, each `0..1`.
     pub cmy: [f32; 3],
     /// Shutter open amount (1 = open) and strobe rate (0 = off).
@@ -76,6 +82,7 @@ impl Default for OpticalControls {
             focus: 0.5,
             iris: 1.0,
             cto: 0.0,
+            green: 0.0,
             cmy: [0.0, 0.0, 0.0],
             shutter: 1.0,
             strobe: 0.0,
@@ -307,7 +314,10 @@ pub fn resolve(
         match comp.kind {
             WheelKind::Color => {
                 if let Some(w) = wheel_name(gdtf, comp) {
-                    let t = color_wheel_tint(gdtf, &w, ctl.value, phase);
+                    // Shake sways the slot position back and forth across the wheel.
+                    let shake = m.shake_offset(i, ctl.shake) / TAU; // turns → slot fraction
+                    let sel = (ctl.value + shake).clamp(0.0, 1.0);
+                    let t = color_wheel_tint(gdtf, &w, sel, phase);
                     tint_wheels = [tint_wheels[0] * t[0], tint_wheels[1] * t[1], tint_wheels[2] * t[2]];
                 }
             }
@@ -320,8 +330,8 @@ pub fn resolve(
                         gobos.push(WheelSel {
                             wheel: w,
                             slot_frac: ctl.value.clamp(0.0, 1.0) * (n as f32 - 1.0),
-                            // Image rotation: accumulated spin phase + indexed turn.
-                            rot: phase + ctl.index * TAU,
+                            // Image rotation: spin phase + indexed turn + shake sway.
+                            rot: phase + ctl.index * TAU + m.shake_offset(i, ctl.shake),
                         });
                     }
                 }
@@ -353,7 +363,22 @@ pub fn resolve(
     let gobo2 = gobo_it.next();
 
     // --- focus / dispersion ---
-    let focus_dist = map_attr(gdtf, "Focus1Distance", c.focus, (5.0, 15.0));
+    // GDTF Focus1 is normalised 0..1 (no metres); map it in reciprocal distance
+    // so equal knob steps give equal *perceived* focus change and focus≈0 reaches
+    // past the hyperfocal point (a far-focused beam stays sharp on the floor).
+    // Prefer a real Focus1Distance (Length) when the fixture exposes one.
+    let focus_dist = match gdtf.physical_range("Focus1Distance") {
+        Some((a, b)) if (b - a).abs() > 0.5 => {
+            let (lo, hi) = (a.min(b), a.max(b));
+            lo + (hi - lo) * (1.0 - c.focus.clamp(0.0, 1.0))
+        }
+        _ => {
+            const NEAR: f32 = 2.0;
+            const FAR: f32 = 40.0;
+            let inv = (1.0 / FAR) + ((1.0 / NEAR) - (1.0 / FAR)) * c.focus.clamp(0.0, 1.0);
+            1.0 / inv
+        }
+    };
     let focus_defocus = (c.focus - 0.5).abs() * 2.0;
     // Lens dispersion: a tunable base plus extra fringing when out of focus
     // (longitudinal CA grows with focus error).
@@ -376,11 +401,15 @@ pub fn resolve(
         [1.0, 1.0, 1.0]
     };
     let t_cmy = color::cmy_transmittance(c.cmy);
-    let tint = [
+    let mut tint = [
         source[0] * t_cto[0] * t_cmy[0] * tint_wheels[0],
         source[1] * t_cto[1] * t_cmy[1] * tint_wheels[1],
         source[2] * t_cto[2] * t_cmy[2] * tint_wheels[2],
     ];
+    // Plus/minus-green correction (orthogonal CC axis).
+    if c.green.abs() > 1e-3 {
+        tint = color::green_tint(tint, c.green);
+    }
 
     BeamOptics {
         tint,

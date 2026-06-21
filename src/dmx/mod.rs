@@ -253,6 +253,16 @@ impl DmxIo {
 
     /// All disjoint borrows the UI panels need, in one call (so the panels can
     /// hold several `&mut` views of `DmxIo` at once).
+    /// Whether the receive worker thread is running.
+    pub fn is_running(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// The UI-facing config (mutated by the Preferences window).
+    pub fn config_mut(&mut self) -> &mut DmxConfig {
+        &mut self.config
+    }
+
     pub fn view(&mut self) -> DmxView<'_> {
         DmxView {
             running: self.worker.is_some(),

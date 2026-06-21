@@ -73,13 +73,93 @@ pub fn filter_from_to(source: [f32; 3], target: [f32; 3]) -> [f32; 3] {
     [r[0] / m, r[1] / m, r[2] / m]
 }
 
-/// Subtractive CMY dichroic transmittance. Each flag `0..1` absorbs its
-/// complementary primary (cyan↘red, magenta↘green, yellow↘blue) with a small
-/// `leak` so a fully-inserted flag never reaches pure black (real dichroics).
+/// Subtractive CMY dichroic transmittance, computed in the **optical-density**
+/// (log10) domain with per-flag spectral shoulders and a convex insertion ramp.
+///
+/// Component-wise `1 − k·c` in linear light marches chroma straight to the axis
+/// (greys out) and lacks the neighbour bleed a real dichroic has, so two-flag
+/// combos land at the wrong hue. Here each flag absorbs its complement strongly
+/// (`D_PEAK`) and bleeds a little into the two neighbour channels (`D_SHOULDER`),
+/// keeping mid-insertion hue on a realistic curved path; densities add, so
+/// stacked flags / CTO compose by summing `D`. `cmy` = cyan/magenta/yellow
+/// insertion, each `0..1`. (Burns subtractive mixture ≈ geometric mean ≡ log-add.)
 pub fn cmy_transmittance(cmy: [f32; 3]) -> [f32; 3] {
-    let leak = 0.02;
-    let f = |x: f32| 1.0 - (1.0 - leak) * x.clamp(0.0, 1.0);
-    [f(cmy[0]), f(cmy[1]), f(cmy[2])]
+    const D_PEAK: f32 = 1.8; // full-flag peak density: 10^-1.8 ≈ 1.6% leak
+    const D_SHOULDER: f32 = 0.10; // neighbour bleed at full insertion
+    const GAMMA_INS: f32 = 1.6; // convex: saturation kicks in deeper into the fader
+    let peaks = [
+        [D_PEAK, D_SHOULDER, D_SHOULDER], // cyan ↘ R
+        [D_SHOULDER, D_PEAK, D_SHOULDER], // magenta ↘ G
+        [D_SHOULDER, D_SHOULDER, D_PEAK], // yellow ↘ B
+    ];
+    let mut d = [0.0f32; 3];
+    for f in 0..3 {
+        let ramp = cmy[f].clamp(0.0, 1.0).powf(GAMMA_INS);
+        for ch in 0..3 {
+            d[ch] += peaks[f][ch] * ramp;
+        }
+    }
+    [10f32.powf(-d[0]), 10f32.powf(-d[1]), 10f32.powf(-d[2])]
+}
+
+/// Additive-emitter chromaticities for the RGB(W/A/L) fold (linear-sRGB,
+/// Y-normalised). White defaults to the source CCT; amber ≈ 590 nm, lime ≈ 565 nm.
+#[derive(Clone, Copy, Debug)]
+pub struct Emitters {
+    pub white: [f32; 3],
+    pub amber: [f32; 3],
+    pub lime: [f32; 3],
+    pub w_share: f32,
+    pub a_share: f32,
+    pub l_share: f32,
+}
+
+impl Default for Emitters {
+    fn default() -> Self {
+        Self {
+            white: [1.0, 1.0, 1.0],
+            amber: [1.0, 0.42, 0.0],
+            lime: [0.55, 1.0, 0.10],
+            w_share: 1.0,
+            a_share: 0.7,
+            l_share: 1.1,
+        }
+    }
+}
+
+/// Fold additive emitters `[r, g, b, w, a, l]` (`0..1`) into one linear-sRGB
+/// tint. Each extra emitter (white/amber/lime) contributes its OWN chromaticity
+/// vector scaled by its level + lumen share — NOT a flat add to R,G,B (which
+/// desaturates and shifts hue: a pure-amber command must read amber, not white).
+pub fn fold_rgbwal(levels: [f32; 6], e: &Emitters) -> [f32; 3] {
+    let [r, g, b, w, a, l] = levels;
+    let mut o = [r, g, b];
+    let add = |o: &mut [f32; 3], c: [f32; 3], k: f32| {
+        o[0] += c[0] * k;
+        o[1] += c[1] * k;
+        o[2] += c[2] * k;
+    };
+    add(&mut o, e.white, w * e.w_share);
+    add(&mut o, e.amber, a * e.a_share);
+    add(&mut o, e.lime, l * e.l_share);
+    o
+}
+
+/// Plus/minus-green correction (the CC / "tint" axis orthogonal to CCT): `t > 0`
+/// adds green, `t < 0` adds magenta. A Duv-style nudge — green up/down with the
+/// red+blue compensated oppositely — then renormalised so it only shifts hue,
+/// not luminance. `t ∈ [-1, 1]`.
+pub fn green_tint(rgb: [f32; 3], t: f32) -> [f32; 3] {
+    const K: f32 = 0.15;
+    let t = t.clamp(-1.0, 1.0);
+    let g = 1.0 + K * t;
+    let rb = 1.0 - 0.5 * K * t;
+    let out = [rgb[0] * rb, rgb[1] * g, rgb[2] * rb];
+    // Preserve luminance (tint is a chroma shift, not a level change).
+    let l0 = luminance(rgb).max(1e-4);
+    let l1 = luminance(out).max(1e-4);
+    let s = l0 / l1;
+    [out[0] * s, out[1] * s, out[2] * s]
 }
 
 #[cfg(test)]
@@ -107,7 +187,36 @@ mod tests {
 
     #[test]
     fn cmy_subtracts() {
-        let t = cmy_transmittance([1.0, 0.0, 0.0]); // full cyan
-        assert!(t[0] < 0.05 && t[1] > 0.95 && t[2] > 0.95);
+        // Full cyan strongly cuts red, with a small realistic shoulder on G/B.
+        let t = cmy_transmittance([1.0, 0.0, 0.0]);
+        assert!(t[0] < 0.05, "red strongly absorbed, got {}", t[0]);
+        assert!(t[1] > 0.7 && t[2] > 0.7, "green/blue mostly pass: {t:?}");
+        // None at all = clear glass.
+        let open = cmy_transmittance([0.0, 0.0, 0.0]);
+        assert!(open.iter().all(|&c| c > 0.999), "open = clear: {open:?}");
+        // Convex ramp: half insertion is brighter than a linear-density midpoint
+        // (10^-0.9 ≈ 0.126), i.e. saturation kicks in deeper into the fader.
+        let half = cmy_transmittance([0.5, 0.0, 0.0]);
+        assert!(half[0] > 0.2, "convex ramp keeps half-insertion bright: {}", half[0]);
+    }
+
+    #[test]
+    fn rgbw_fold_keeps_amber_amber() {
+        let e = Emitters::default();
+        let amber = fold_rgbwal([0.0, 0.0, 0.0, 0.0, 1.0, 0.0], &e);
+        assert!(amber[0] > amber[1] && amber[1] > amber[2], "amber reads warm: {amber:?}");
+        // White emitter folds neutral-ish (not a hue shift).
+        let white = fold_rgbwal([0.0, 0.0, 0.0, 1.0, 0.0, 0.0], &e);
+        assert!((white[0] - white[2]).abs() < 0.2, "W ≈ neutral: {white:?}");
+    }
+
+    #[test]
+    fn green_tint_shifts_without_luma_change() {
+        let base = [0.8, 0.8, 0.8];
+        let g = green_tint(base, 1.0);
+        assert!(g[1] > g[0] && g[1] > g[2], "plus-green lifts green: {g:?}");
+        let m = green_tint(base, -1.0);
+        assert!(m[1] < m[0], "minus-green adds magenta: {m:?}");
+        assert!((luminance(g) - luminance(base)).abs() < 1e-3, "luma preserved");
     }
 }
