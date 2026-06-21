@@ -98,7 +98,7 @@ pub fn scene_outliner(
             }
         });
     if let Some((i, shift, toggle)) = click {
-        apply_fixture_click(selection, anchor, i, shift, toggle);
+        apply_fixture_click(selection, anchor, i, shift, toggle, scene.fixtures.len());
     }
 
     ui.add_space(8.0);
@@ -273,7 +273,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             icon: icon::ENVIRONMENT,
             name: p.name.to_string(),
             meta: format!("{w:.0} × {h:.0} × {d:.0} m"),
-            category: "Environment".into(),
+            category: if p.category.is_empty() { "Environment" } else { p.category }.to_string(),
             accent: false,
         });
     }
@@ -1362,7 +1362,7 @@ pub fn viewport(
         let m = ui.input(|i| i.modifiers);
         let toggle = m.command || m.ctrl;
         match pick(scene, ro, rd) {
-            Some(Hit::Fixture(i)) => apply_fixture_click(selection, scene_anchor, i, m.shift, toggle),
+            Some(Hit::Fixture(i)) => apply_fixture_click(selection, scene_anchor, i, m.shift, toggle, scene.fixtures.len()),
             Some(Hit::Environment(i)) => *selection = Selection::environment(i),
             None if !(toggle || m.shift) => *selection = Selection::default(),
             None => {}
@@ -1631,6 +1631,7 @@ pub fn connectivity(
 /// Bottom tab: the live 512-channel universe grid with patch occupants (replaces
 /// the old DMX Monitor stub). Each cell shows the channel number, its live level,
 /// and the patched fixture + attribute occupying it.
+#[allow(deprecated)] // egui 0.34 show_tooltip_at_pointer — migrated project-wide later
 pub fn dmx_universe_grid(
     ui: &mut egui::Ui,
     scene: &Scene,
@@ -1831,10 +1832,12 @@ pub fn dmx_universe_grid(
         {
             let rel = pos - rect.min;
             let (c, r) = ((rel.x / cell_w) as usize, (rel.y / cell_h) as usize);
+            // Select from the same occupancy map the grid is painted/hovered from
+            // (so a click agrees with the cell's shown identity, including gaps).
             if c < COLS && r < ROWS
-                && let Some((fi, _)) = patch.occupant(u, (r * COLS + c + 1) as u16)
+                && let Some((fi, _)) = &occ[r * COLS + c]
             {
-                *selection = Selection::fixture(fi);
+                *selection = Selection::fixture(*fi);
             }
         }
     });

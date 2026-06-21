@@ -315,6 +315,9 @@ impl PatchTable {
 
     /// The fixture index + in-footprint offset (0-based) occupying `channel`
     /// (1-based) in `universe`, among enabled entries. The first match wins.
+    /// (Footprint-span lookup; the DMX grid instead uses a per-channel map that
+    /// excludes gaps — kept for tests / future callers.)
+    #[allow(dead_code)]
     pub fn occupant(&self, universe: u16, channel: u16) -> Option<(usize, u16)> {
         self.entries.iter().enumerate().find_map(|(i, e)| {
             let p = e.patch.as_ref()?;

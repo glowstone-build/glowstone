@@ -372,6 +372,7 @@ impl Ui {
             }
         }
         self.selection = Selection::default();
+        self.scene_anchor = None; // indices shifted; old anchor is meaningless
     }
 
     /// Import any `.gdtf` / `.mvr` files dropped onto the window.

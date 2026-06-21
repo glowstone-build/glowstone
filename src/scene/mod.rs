@@ -169,7 +169,13 @@ pub fn apply_fixture_click(
     i: usize,
     shift: bool,
     toggle: bool,
+    count: usize,
 ) {
+    // Drop a stale anchor (e.g. fixtures deleted since it was set) so a
+    // shift-range can't span past the end of the scene.
+    if anchor.is_some_and(|a| a >= count) {
+        *anchor = None;
+    }
     if shift {
         let a = anchor.unwrap_or(i);
         selection.set_fixture_range(a, i);

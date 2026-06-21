@@ -812,6 +812,7 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
 /// Render the whole egui UI + 3D viewport offscreen to a PNG (headless, no
 /// visible window). Runs a few settle frames so the dock layout + viewport panel
 /// size stabilise, then captures the final frame.
+#[allow(deprecated)] // egui 0.34 Context::run — matches the live render() path
 fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     if let Ok(title) = std::env::var("PREVIZ_UI_TAB") {
         state.ui.focus_tab_by_title(&title);

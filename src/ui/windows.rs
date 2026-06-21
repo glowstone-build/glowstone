@@ -450,6 +450,8 @@ pub fn profile_editor_window(
         .or_insert_with(|| super::panels::load_gdtf_textures(ctx, &gdtf));
 
     let mut keep = true;
+    #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
+    let center = ctx.screen_rect().center();
     let title = format!("{}  Fixture Profile — {}", theme::icon::PROFILE, gdtf.name);
     egui::Window::new(title)
         .open(&mut keep)
@@ -458,7 +460,7 @@ pub fn profile_editor_window(
         .default_size([860.0, 600.0])
         .min_size([580.0, 420.0])
         .pivot(egui::Align2::CENTER_CENTER)
-        .default_pos(ctx.screen_rect().center())
+        .default_pos(center)
         .show(ctx, |ui| {
             // Both columns get a concrete body height (taller than before, and the
             // window stays resizable). A fixed height — rather than

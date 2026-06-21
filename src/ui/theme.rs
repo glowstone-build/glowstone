@@ -123,6 +123,7 @@ pub fn accent(prefs: &Preferences) -> Color32 {
 
 /// Apply the full theme (visuals + spacing + type scale + zoom) for this frame.
 /// Cheap; egui dedups identical styles.
+#[allow(deprecated)] // egui 0.34 style/set_style rename — migrated project-wide later
 pub fn apply(ctx: &egui::Context, prefs: &Preferences) {
     let a = accent(prefs);
     let dark = !prefs.theme_light;
