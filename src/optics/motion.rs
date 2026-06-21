@@ -87,7 +87,7 @@ impl WheelMotion {
             let slots = comp.slots.max(1) as f32;
             let spinning = matches!(comp.kind, WheelKind::Color) && (ctl.spin - 0.5).abs() > 0.02;
             if matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) && !spinning {
-                self.positions[i] = ctl.value.clamp(0.0, 1.0) * (slots - 1.0);
+                self.positions[i] = slot_target(ctl.value, slots);
             }
         }
         self.cmy = [c.cmy[0].clamp(0.0, 1.0), c.cmy[1].clamp(0.0, 1.0), c.cmy[2].clamp(0.0, 1.0)];
@@ -125,7 +125,10 @@ impl WheelMotion {
                 WheelKind::Gobo => {
                     // Wheel position slews to the selected slot (move = split+gap
                     // sweep); the gobo IMAGE spins independently via `phases`.
-                    let target = ctl.value.clamp(0.0, 1.0) * (slots - 1.0);
+                    // The select SNAPS to a whole slot (a console indexes the
+                    // wheel to a slot) so a steady selection parks on one gobo —
+                    // the split only shows while travelling between slots.
+                    let target = slot_target(ctl.value, slots);
                     slew_toward(&mut self.positions[i], target, WHEEL_SLOT_RATE, dt);
                     if spin.abs() >= 1e-3 {
                         self.phases[i] += spin * 876.0_f32.to_radians() * dt;
@@ -133,12 +136,12 @@ impl WheelMotion {
                 }
                 WheelKind::Color => {
                     // Spin = continuous wheel SCROLL (rainbow): position free-runs
-                    // and wraps. Otherwise slew to the selected slot.
+                    // and wraps. Otherwise slew to the selected slot (snapped).
                     if spin.abs() >= 1e-3 {
                         self.positions[i] =
                             (self.positions[i] + spin * SCROLL_MAX * dt).rem_euclid(slots);
                     } else {
-                        let target = ctl.value.clamp(0.0, 1.0) * (slots - 1.0);
+                        let target = slot_target(ctl.value, slots);
                         slew_toward(&mut self.positions[i], target, WHEEL_SLOT_RATE, dt);
                     }
                 }
@@ -163,6 +166,13 @@ impl WheelMotion {
             slew_toward(&mut self.cmy[k], c.cmy[k].clamp(0.0, 1.0), rate, dt);
         }
     }
+}
+
+/// The target wheel position (slot units) for a select `value` (0..1): the
+/// nearest whole slot, so a steady selection parks cleanly on one slot rather
+/// than between two (which would permanently split the beam).
+fn slot_target(value: f32, slots: f32) -> f32 {
+    (value.clamp(0.0, 1.0) * (slots - 1.0)).round()
 }
 
 /// Constant-rate linear slew of `v` toward `target`, capped at `rate` per second.
