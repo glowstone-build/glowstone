@@ -78,8 +78,14 @@ fn vs_main(in: VsIn) -> VsOut {
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let normal = normalize(in.world_normal);
+fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    // Two-sided shading: imported .3ds (and some GLB) geometry has unreliable
+    // winding and is drawn with culling off, so back faces would otherwise read
+    // as flat-dark. Flip the normal to face the camera for the lighting math.
+    var normal = normalize(in.world_normal);
+    if !front {
+        normal = -normal;
+    }
 
     // Unlit / wireframe viewport modes: skip all fixture/beam lighting, show the
     // raw geometry. (The volumetric pass is skipped on the CPU side for these.)

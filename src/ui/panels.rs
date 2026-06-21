@@ -114,8 +114,14 @@ pub fn scene_outliner(
     // Mark which fixtures are in an address conflict (computed once, not per row).
     let mut conflicted = vec![false; scene.fixtures.len()];
     for c in patch.conflicts() {
-        conflicted[c.a] = true;
-        conflicted[c.b] = true;
+        // Guard: patch entry indices may transiently exceed the fixture count
+        // (mid-import / before reconcile).
+        if let Some(s) = conflicted.get_mut(c.a) {
+            *s = true;
+        }
+        if let Some(s) = conflicted.get_mut(c.b) {
+            *s = true;
+        }
     }
 
     // ---- OBJECTS: imported MVR static geometry (stage / truss / set) ----
@@ -197,7 +203,11 @@ pub fn scene_outliner(
                 let (lo, hi) = (anchor_pos.min(click_pos), anchor_pos.max(click_pos));
                 selection.fixtures = order[lo..=hi].to_vec();
                 selection.environment = None;
-                // keep the anchor for chained shift-clicks
+                // Establish an anchor if this was the first (anchorless) click, so
+                // subsequent shift-clicks grow the range from here.
+                if anchor.is_none() {
+                    *anchor = Some(i);
+                }
             } else {
                 apply_fixture_click(selection, anchor, i, false, toggle, scene.fixtures.len());
             }
@@ -925,10 +935,17 @@ fn bulk_wheel(
     ui.end_row();
 }
 
-/// One bulk optics slider for an [`OpticField`], seeded from the primary and
-/// written to every selected fixture (range-aware: e.g. green tint is bipolar).
+/// One bulk optics slider for an [`OpticField`], written to every selected
+/// fixture (range-aware: e.g. green tint is bipolar). Seeds from the first
+/// selected fixture that actually exposes the field (the union may include a
+/// control the primary doesn't have), falling back to the primary.
 fn bulk_opt_field(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], f: OpticField) {
-    let mut v = f.get(&scene.fixtures[ids[0]].optics);
+    let seed = ids
+        .iter()
+        .copied()
+        .find(|&i| scene.fixtures[i].gdtf.as_ref().is_some_and(|g| f.supported(g)))
+        .unwrap_or(ids[0]);
+    let mut v = f.get(&scene.fixtures[seed].optics);
     ui.label(f.label());
     if ui.add(Slider::new(&mut v, f.range())).changed() {
         for &i in ids {
@@ -1988,8 +2005,14 @@ pub fn patch_editor(ui: &mut egui::Ui, scene: &Scene, patch: &mut PatchTable) {
 
     let mut conflicted = vec![false; scene.fixtures.len()];
     for c in patch.conflicts() {
-        conflicted[c.a] = true;
-        conflicted[c.b] = true;
+        // Guard: patch entry indices may transiently exceed the fixture count
+        // (mid-import / before reconcile).
+        if let Some(s) = conflicted.get_mut(c.a) {
+            *s = true;
+        }
+        if let Some(s) = conflicted.get_mut(c.b) {
+            *s = true;
+        }
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
