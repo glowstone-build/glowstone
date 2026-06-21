@@ -1,0 +1,281 @@
+//! Cues — saved fixture "looks" with crossfade playback (depence's Scenes /
+//! Repository, a console's cue list).
+//!
+//! A cue snapshots every fixture's controllable look (pan / tilt / colour /
+//! intensity / beam / optics). Recalling a cue crossfades the *continuous* fields
+//! (pan, tilt, colour, intensity, beam) over the cue's fade time; the discrete
+//! optics (gobo / prism / wheel slot) snap at the start, since wheel slots don't
+//! interpolate. The fade is ticked once per real frame from `app::render`.
+//!
+//! Note: this is the offline-previz look engine. Live DMX (a connected console)
+//! is decoded into the fixtures every frame *before* the cue tick, so with a
+//! console driving the rig the cue values are overwritten — cues are for building
+//! and showing looks without a console.
+
+use egui::{Grid, RichText};
+
+use crate::optics::OpticalControls;
+use crate::scene::{Fixture, Scene};
+
+use super::theme;
+
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// The controllable look of one fixture, captured into / restored from a cue.
+#[derive(Clone)]
+pub struct FixtureLook {
+    pub pan: f32,
+    pub tilt: f32,
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub beam_angle: f32,
+    pub optics: OpticalControls,
+}
+
+impl FixtureLook {
+    fn capture(f: &Fixture) -> Self {
+        Self {
+            pan: f.pan,
+            tilt: f.tilt,
+            color: f.color,
+            intensity: f.intensity,
+            beam_angle: f.beam_angle,
+            optics: f.optics.clone(),
+        }
+    }
+
+    /// Write `lerp(self → to, a)` of the continuous fields into the fixture.
+    fn apply_lerp(&self, to: &FixtureLook, a: f32, f: &mut Fixture) {
+        f.pan = lerp(self.pan, to.pan, a);
+        f.tilt = lerp(self.tilt, to.tilt, a);
+        f.intensity = lerp(self.intensity, to.intensity, a);
+        f.beam_angle = lerp(self.beam_angle, to.beam_angle, a);
+        for c in 0..3 {
+            f.color[c] = lerp(self.color[c], to.color[c], a);
+        }
+    }
+}
+
+/// A saved look: one [`FixtureLook`] per fixture (aligned to fixture index at
+/// capture time), plus a fade time.
+pub struct Cue {
+    pub name: String,
+    pub looks: Vec<FixtureLook>,
+    pub fade: f32,
+}
+
+/// An in-progress crossfade toward a target cue.
+struct Fade {
+    from: Vec<FixtureLook>,
+    to: usize,
+    t: f32,
+    dur: f32,
+}
+
+pub struct CueEngine {
+    pub cues: Vec<Cue>,
+    /// The last cue fully reached (for Go / highlight).
+    pub current: Option<usize>,
+    fade: Option<Fade>,
+    name_buf: String,
+    fade_buf: f32,
+}
+
+impl Default for CueEngine {
+    fn default() -> Self {
+        Self { cues: Vec::new(), current: None, fade: None, name_buf: String::new(), fade_buf: 2.0 }
+    }
+}
+
+impl CueEngine {
+    /// Capture the whole rig's current look as a new cue.
+    fn record(&mut self, scene: &Scene) {
+        let looks: Vec<FixtureLook> = scene.fixtures.iter().map(FixtureLook::capture).collect();
+        let name = if self.name_buf.trim().is_empty() {
+            format!("Cue {}", self.cues.len() + 1)
+        } else {
+            self.name_buf.trim().to_string()
+        };
+        self.cues.push(Cue { name, looks, fade: self.fade_buf.max(0.0) });
+        self.name_buf.clear();
+    }
+
+    /// Start recalling cue `idx`: snap the discrete optics now, crossfade the rest.
+    fn recall(&mut self, idx: usize, scene: &mut Scene) {
+        let Some(cue) = self.cues.get(idx) else { return };
+        // Snap optics immediately (wheel slots don't interpolate).
+        for (i, f) in scene.fixtures.iter_mut().enumerate() {
+            if let Some(look) = cue.looks.get(i) {
+                f.optics = look.optics.clone();
+            }
+        }
+        if cue.fade <= 0.0 {
+            // Instant: apply the final look and we're done.
+            for (i, f) in scene.fixtures.iter_mut().enumerate() {
+                if let Some(look) = cue.looks.get(i) {
+                    look.apply_lerp(look, 1.0, f);
+                }
+            }
+            self.current = Some(idx);
+            self.fade = None;
+            return;
+        }
+        let from = scene.fixtures.iter().map(FixtureLook::capture).collect();
+        self.fade = Some(Fade { from, to: idx, t: 0.0, dur: cue.fade });
+    }
+
+    /// Advance to the next cue in the list (Go). Stops at the last cue.
+    fn go(&mut self, scene: &mut Scene) {
+        let next = match self.current {
+            Some(c) => c + 1,
+            None => 0,
+        };
+        if next < self.cues.len() {
+            self.recall(next, scene);
+        }
+    }
+
+    fn prev(&mut self, scene: &mut Scene) {
+        let prev = match self.current {
+            Some(c) if c > 0 => c - 1,
+            _ => 0,
+        };
+        if prev < self.cues.len() {
+            self.recall(prev, scene);
+        }
+    }
+
+    /// Tick an in-progress crossfade. Call once per real frame with `dt` seconds.
+    pub fn tick(&mut self, scene: &mut Scene, dt: f32) {
+        let Some(fade) = self.fade.as_mut() else { return };
+        fade.t += dt;
+        let a = (fade.t / fade.dur.max(1e-3)).clamp(0.0, 1.0);
+        if let Some(cue) = self.cues.get(fade.to) {
+            for (i, f) in scene.fixtures.iter_mut().enumerate() {
+                if let (Some(from), Some(to)) = (fade.from.get(i), cue.looks.get(i)) {
+                    from.apply_lerp(to, a, f);
+                }
+            }
+        }
+        if a >= 1.0 {
+            self.current = Some(fade.to);
+            self.fade = None;
+        }
+    }
+
+    fn fading_progress(&self) -> Option<(usize, f32)> {
+        self.fade.as_ref().map(|f| (f.to, (f.t / f.dur.max(1e-3)).clamp(0.0, 1.0)))
+    }
+}
+
+/// The Cues panel: record the current look, fire cues, run the list with Go.
+pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
+    let accent = ui.visuals().selection.stroke.color;
+
+    ui.horizontal(|ui| {
+        ui.heading("Cues");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(format!("{}", engine.cues.len())).small().weak());
+        });
+    });
+    ui.separator();
+
+    // --- Record a new cue from the current rig look ---
+    ui.horizontal(|ui| {
+        let hint = format!("Cue {}", engine.cues.len() + 1);
+        ui.add(egui::TextEdit::singleline(&mut engine.name_buf).desired_width(120.0).hint_text(&hint));
+        ui.add(
+            egui::DragValue::new(&mut engine.fade_buf)
+                .range(0.0..=60.0)
+                .speed(0.1)
+                .suffix(" s"),
+        )
+        .on_hover_text("Fade time for the new cue");
+        if ui
+            .add_enabled(!scene.fixtures.is_empty(), egui::Button::new(format!("{}  Record", theme::icon::ADD)))
+            .on_hover_text("Capture the current look of every fixture as a cue")
+            .clicked()
+        {
+            engine.record(scene);
+        }
+    });
+
+    // --- Transport ---
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!engine.cues.is_empty(), egui::Button::new(format!("{}  Prev", theme::icon::PREV))).clicked() {
+            engine.prev(scene);
+        }
+        let can_go = match engine.current {
+            Some(c) => c + 1 < engine.cues.len(),
+            None => !engine.cues.is_empty(),
+        };
+        if ui
+            .add_enabled(can_go, egui::Button::new(RichText::new(format!("Go  {}", theme::icon::NEXT)).strong().color(accent)))
+            .on_hover_text("Fire the next cue in the list")
+            .clicked()
+        {
+            engine.go(scene);
+        }
+        match engine.current.and_then(|c| engine.cues.get(c)) {
+            Some(cue) => ui.label(RichText::new(format!("▶ {}", cue.name)).small().color(accent)),
+            None => ui.label(RichText::new("—").small().weak()),
+        };
+    });
+    if let Some((to, p)) = engine.fading_progress() {
+        let name = engine.cues.get(to).map(|c| c.name.as_str()).unwrap_or("");
+        ui.add(egui::ProgressBar::new(p).desired_height(6.0).text(RichText::new(format!("→ {name}")).small()));
+    }
+    ui.separator();
+
+    if engine.cues.is_empty() {
+        ui.label(RichText::new("none — set a look (Inspector / DMX), then Record").weak().small());
+        return;
+    }
+
+    // --- The cue list ---
+    let mut recall: Option<usize> = None;
+    let mut remove: Option<usize> = None;
+    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+        Grid::new("cue-list").num_columns(4).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
+            for i in 0..engine.cues.len() {
+                let is_current = engine.current == Some(i);
+                let label = format!("{}.  {}", i + 1, engine.cues[i].name);
+                if ui
+                    .selectable_label(is_current, RichText::new(label).color(if is_current { accent } else { ui.visuals().text_color() }))
+                    .on_hover_text("Recall this cue")
+                    .clicked()
+                {
+                    recall = Some(i);
+                }
+                ui.label(RichText::new(format!("{} fx", engine.cues[i].looks.len())).small().weak());
+                ui.add(
+                    egui::DragValue::new(&mut engine.cues[i].fade)
+                        .range(0.0..=60.0)
+                        .speed(0.1)
+                        .suffix(" s"),
+                )
+                .on_hover_text("Fade time");
+                if ui.small_button(theme::icon::TRASH).on_hover_text("Delete cue").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    });
+
+    if let Some(i) = recall {
+        engine.recall(i, scene);
+    }
+    if let Some(i) = remove {
+        engine.cues.remove(i);
+        // Keep `current` pointing at a valid cue (or clear it).
+        engine.current = match engine.current {
+            Some(c) if c == i => None,
+            Some(c) if c > i => Some(c - 1),
+            other => other,
+        };
+    }
+}

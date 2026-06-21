@@ -938,6 +938,11 @@ impl State {
         self.dmx.poll();
         self.dmx.decode(&mut self.scene);
 
+        // Crossfade any in-progress cue AFTER DMX decode (so an offline cue
+        // overrides the rest state) and BEFORE motion advance (so its pan/tilt
+        // feeds this frame's slew).
+        self.ui.tick_cues(&mut self.scene, dt);
+
         // Advance time-based wheel motion once per real frame (not in the
         // renderer, which also runs for headless capture).
         self.scene.advance(dt);

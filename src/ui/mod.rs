@@ -1,6 +1,7 @@
 //! egui + egui_dock setup: the dock layout and the [`TabViewer`] that routes
 //! each dock panel to its drawing function in [`panels`].
 
+mod cues;
 mod panels;
 pub mod theme;
 mod windows;
@@ -50,6 +51,8 @@ pub enum Tab {
     Connectivity,
     /// Per-fixture DMX patch editor.
     Patch,
+    /// Saved looks + crossfade playback (cue list).
+    Cues,
 }
 
 /// A saved, named selection of fixtures (console-style "groups"). Recalled by
@@ -150,12 +153,13 @@ impl Workspace {
 
 impl Tab {
     /// Panels shown in the Window menu (Viewport is fixed, so excluded there).
-    const TOGGLEABLE: [Tab; 6] = [
+    const TOGGLEABLE: [Tab; 7] = [
         Tab::Scene,
         Tab::Library,
         Tab::Inspector,
         Tab::DmxMonitor,
         Tab::Patch,
+        Tab::Cues,
         Tab::Connectivity,
     ];
 
@@ -168,6 +172,7 @@ impl Tab {
             Tab::DmxMonitor => "DMX",
             Tab::Connectivity => "Connectivity",
             Tab::Patch => "Fixtures",
+            Tab::Cues => "Cues",
         }
     }
 
@@ -182,6 +187,7 @@ impl Tab {
             Tab::DmxMonitor => icon::DMX,
             Tab::Connectivity => icon::CONNECT,
             Tab::Patch => icon::FIXTURE,
+            Tab::Cues => icon::PROFILE,
         }
     }
 }
@@ -223,6 +229,8 @@ pub struct Ui {
     /// Saved fixture selection groups + the new-group name buffer.
     groups: Vec<SelectionGroup>,
     group_name: String,
+    /// The cue list + crossfade engine.
+    cues: cues::CueEngine,
 }
 
 impl Ui {
@@ -249,7 +257,14 @@ impl Ui {
             transform: None,
             groups: Vec::new(),
             group_name: String::new(),
+            cues: cues::CueEngine::default(),
         }
+    }
+
+    /// Advance any in-progress cue crossfade. Called once per real frame from
+    /// `app::render`, after live DMX decode and before motion advance.
+    pub fn tick_cues(&mut self, scene: &mut Scene, dt: f32) {
+        self.cues.tick(scene, dt);
     }
 
     /// The default dock layout (also used by Window ▸ Reset Panel Layout).
@@ -275,14 +290,14 @@ impl Ui {
             Workspace::Design => {
                 let [c, _l] = surface.split_left(NodeIndex::root(), 0.17, vec![Tab::Scene, Tab::Library]);
                 let [c, _i] = surface.split_right(c, 0.79, vec![Tab::Inspector]);
-                surface.split_below(c, 0.70, vec![Tab::Patch, Tab::DmxMonitor, Tab::Connectivity]);
+                surface.split_below(c, 0.70, vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity]);
             }
             // PATCH: the systems tech — the Fixtures sheet + DMX dominate (a tall
             // bottom data area), the viewport just for orientation.
             Workspace::Patch => {
                 let [c, _l] = surface.split_left(NodeIndex::root(), 0.16, vec![Tab::Scene]);
                 let [c, _i] = surface.split_right(c, 0.80, vec![Tab::Inspector]);
-                surface.split_below(c, 0.42, vec![Tab::Patch, Tab::DmxMonitor, Tab::Connectivity]);
+                surface.split_below(c, 0.42, vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity]);
             }
             // VISUALISE: the previz artist — maximise the viewport; thin Scene
             // (World + outliner) left, Inspector right, no data strip.
@@ -342,6 +357,7 @@ impl Ui {
             transform: &mut self.transform,
             groups: &mut self.groups,
             group_name: &mut self.group_name,
+            cues: &mut self.cues,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
             dmx_status: dmxv.status,
@@ -438,6 +454,7 @@ impl Ui {
             Tab::Inspector,
             Tab::DmxMonitor,
             Tab::Patch,
+            Tab::Cues,
             Tab::Connectivity,
         ];
         for tab in tabs {
@@ -886,6 +903,7 @@ struct PanelViewer<'a> {
     transform: &'a mut Option<TransformOp>,
     groups: &'a mut Vec<SelectionGroup>,
     group_name: &'a mut String,
+    cues: &'a mut cues::CueEngine,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
     dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
@@ -972,6 +990,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.dmx_live_mask,
                 self.fm,
             ),
+            Tab::Cues => cues::cue_panel(ui, self.cues, self.scene),
         }
     }
 
