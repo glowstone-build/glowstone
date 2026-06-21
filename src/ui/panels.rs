@@ -23,6 +23,68 @@ const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// Left tab: the scene outliner — every fixture and environment, selectable —
 /// plus the global view/look controls.
+/// How the Scene panel's fixture list is ordered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SceneSort {
+    /// DMX patch (universe, address); unpatched fall to the end, by head number.
+    Patch,
+    Name,
+    /// By fixture profile / type, then name.
+    Type,
+}
+
+impl SceneSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Patch => "Patch",
+            Self::Name => "Name",
+            Self::Type => "Type",
+        }
+    }
+}
+
+/// The display order of fixture indices for the given sort.
+fn fixture_order(scene: &Scene, patch: &PatchTable, sort: SceneSort) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..scene.fixtures.len()).collect();
+    match sort {
+        SceneSort::Patch => {
+            // Patched first by (universe, address); unpatched after, by head
+            // (MVR unit number) then insertion index.
+            let key = |i: usize| -> (u8, u16, u16, i64, usize) {
+                match patch.get(i).filter(|p| p.enabled) {
+                    Some(p) => (0, p.universe, p.address, 0, i),
+                    None => {
+                        let head = scene.fixtures[i]
+                            .mvr
+                            .as_ref()
+                            .map(|m| m.unit_number as i64)
+                            .filter(|&n| n != 0)
+                            .unwrap_or(i64::MAX);
+                        (1, u16::MAX, u16::MAX, head, i)
+                    }
+                }
+            };
+            order.sort_by(|&a, &b| key(a).cmp(&key(b)));
+        }
+        SceneSort::Name => {
+            order.sort_by(|&a, &b| {
+                scene.fixtures[a].name.to_lowercase().cmp(&scene.fixtures[b].name.to_lowercase())
+            });
+        }
+        SceneSort::Type => {
+            order.sort_by(|&a, &b| {
+                let fa = &scene.fixtures[a];
+                let fb = &scene.fixtures[b];
+                fa.profile
+                    .to_lowercase()
+                    .cmp(&fb.profile.to_lowercase())
+                    .then(fa.name.to_lowercase().cmp(&fb.name.to_lowercase()))
+            });
+        }
+    }
+    order
+}
+
 pub fn scene_outliner(
     ui: &mut egui::Ui,
     scene: &mut Scene,
@@ -31,10 +93,12 @@ pub fn scene_outliner(
     patch: &PatchTable,
     live_mask: &[bool],
     anchor: &mut Option<usize>,
+    sort: &mut SceneSort,
 ) {
     use theme::icon;
     let ink = theme::ink(!ui.visuals().dark_mode);
     let accent = ui.visuals().selection.stroke.color;
+    const ROW_H: f32 = 34.0;
 
     ui.horizontal(|ui| {
         ui.heading("Scene");
@@ -54,96 +118,105 @@ pub fn scene_outliner(
         conflicted[c.b] = true;
     }
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("FIXTURES").size(10.0).strong().color(ink.tertiary));
-        ui.label(RichText::new(format!("{}", scene.fixtures.len())).small().color(ink.muted));
-    });
-    if scene.fixtures.is_empty() {
-        ui.label(RichText::new("none — add from the Library").weak().small());
-    }
-
-    // Bounded, scrollable fixture list so a big rig never pushes the View
-    // controls off-screen. Click selects; ⌘/Ctrl = toggle, Shift = range.
-    let mut click: Option<(usize, bool, bool)> = None;
-    egui::ScrollArea::vertical()
-        .id_salt("scene-fixtures")
-        .max_height(260.0)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            for (i, fixture) in scene.fixtures.iter().enumerate() {
-                // Keep the row tag short (universe.address); the mode is in the
-                // inspector. Long names would otherwise collide with it.
-                let patch_tag = match patch.get(i).filter(|p| p.enabled) {
-                    Some(p) => format!("{}.{:03}", p.universe, p.address),
-                    None => "unpatched".into(),
-                };
-                let live = live_mask.get(i).copied().unwrap_or(false);
-                let row_icon = if fixture.is_laser { icon::COLOR } else { icon::FIXTURE };
-                let resp = entity_row(
-                    ui,
-                    row_icon,
-                    &fixture.name,
-                    &fixture.profile,
-                    &patch_tag,
-                    conflicted[i],
-                    live,
-                    selection.contains_fixture(i),
-                    &ink,
-                    accent,
-                );
-                if resp.clicked() {
-                    let m = ui.input(|x| x.modifiers);
-                    click = Some((i, m.shift, m.command || m.ctrl));
-                }
-            }
-        });
-    if let Some((i, shift, toggle)) = click {
-        apply_fixture_click(selection, anchor, i, shift, toggle, scene.fixtures.len());
-    }
-
-    ui.add_space(8.0);
-    ui.label(RichText::new("ENVIRONMENTS").size(10.0).strong().color(ink.tertiary));
-    if scene.environments.is_empty() {
-        ui.label(RichText::new("none — add from the Library").weak().small());
-    }
-    for (i, env) in scene.environments.iter().enumerate() {
-        let resp = entity_row(
-            ui,
-            icon::ENVIRONMENT,
-            env.name.as_str(),
-            "Fog volume",
-            "",
-            false,
-            false,
-            selection.environment == Some(i),
-            &ink,
-            accent,
-        );
-        if resp.clicked() {
-            *selection = Selection::environment(i);
+    // ---- OBJECTS: imported MVR static geometry (stage / truss / set) ----
+    // Read-only; can be thousands of rows, so the body is virtualised and the
+    // folder defaults closed.
+    folder_header(ui, icon::GEOMETRY, "Objects", scene.geometry.len(), false, &ink).show(ui, |ui| {
+        if scene.geometry.is_empty() {
+            ui.label(RichText::new("none — import an MVR scene").weak().small());
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("scene-objects")
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show_rows(ui, ROW_H, scene.geometry.len(), |ui, range| {
+                    for i in range {
+                        let g = &scene.geometry[i];
+                        let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
+                        entity_row(ui, icon::GEOMETRY, &g.name, kind, "", false, false, false, &ink, accent);
+                    }
+                });
         }
-    }
+    });
 
-    // Imported MVR static geometry (stage / truss / set) — read-only list.
-    if !scene.geometry.is_empty() {
-        ui.add_space(8.0);
-        egui::CollapsingHeader::new(
-            RichText::new(format!("{}  GEOMETRY ({})", icon::GEOMETRY, scene.geometry.len()))
-                .size(10.0)
-                .strong()
-                .color(ink.tertiary),
-        )
-        .default_open(false)
-        .show(ui, |ui| {
-            for g in &scene.geometry {
-                ui.label(RichText::new(&g.name).weak().small());
+    // ---- FIXTURES: sortable, virtualised, patch-ordered ----
+    folder_header(ui, icon::FIXTURE, "Fixtures", scene.fixtures.len(), true, &ink).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(theme::ico(icon::SORT).weak()).on_hover_text("Sort fixtures by");
+            for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type] {
+                ui.selectable_value(sort, s, s.label());
             }
         });
-    }
+        if scene.fixtures.is_empty() {
+            ui.label(RichText::new("none — add from the Library").weak().small());
+            return;
+        }
+        let order = fixture_order(scene, patch, *sort);
+        let mut click: Option<(usize, bool, bool)> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("scene-fixtures")
+            .max_height(300.0)
+            .auto_shrink([false, true])
+            .show_rows(ui, ROW_H, order.len(), |ui, range| {
+                for di in range {
+                    let i = order[di];
+                    let fixture = &scene.fixtures[i];
+                    let patch_tag = match patch.get(i).filter(|p| p.enabled) {
+                        Some(p) => format!("{}.{:03}", p.universe, p.address),
+                        None => "unpatched".into(),
+                    };
+                    let live = live_mask.get(i).copied().unwrap_or(false);
+                    let row_icon = if fixture.is_laser { icon::COLOR } else { icon::FIXTURE };
+                    let resp = entity_row(
+                        ui,
+                        row_icon,
+                        &fixture.name,
+                        &fixture.profile,
+                        &patch_tag,
+                        conflicted[i],
+                        live,
+                        selection.contains_fixture(i),
+                        &ink,
+                        accent,
+                    );
+                    if resp.clicked() {
+                        let m = ui.input(|x| x.modifiers);
+                        click = Some((i, m.shift, m.command || m.ctrl));
+                    }
+                }
+            });
+        if let Some((i, shift, toggle)) = click {
+            apply_fixture_click(selection, anchor, i, shift, toggle, scene.fixtures.len());
+        }
+    });
 
-    ui.add_space(10.0);
+    // ---- ENVIRONMENT: fog boxes / world ----
+    folder_header(ui, icon::ENVIRONMENT, "Environment", scene.environments.len(), true, &ink).show(ui, |ui| {
+        if scene.environments.is_empty() {
+            ui.label(RichText::new("none — add a Fog Box from the Library").weak().small());
+        }
+        for (i, env) in scene.environments.iter().enumerate() {
+            let resp = entity_row(
+                ui,
+                icon::ENVIRONMENT,
+                env.name.as_str(),
+                "Fog volume",
+                "",
+                false,
+                false,
+                selection.environment == Some(i),
+                &ink,
+                accent,
+            );
+            if resp.clicked() {
+                *selection = Selection::environment(i);
+            }
+        }
+    });
+
+    ui.add_space(6.0);
     ui.separator();
-    ui.label(RichText::new(format!("{}  VIEW", icon::SETTINGS)).size(10.0).strong().color(ink.tertiary));
+    folder_header(ui, icon::SETTINGS, "View", 0, true, &ink).show(ui, |ui| {
     Grid::new("view-grid")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -182,11 +255,33 @@ pub fn scene_outliner(
             ui.checkbox(&mut settings.show_grid, "show");
             ui.end_row();
         });
-    ui.label(
-        RichText::new("Beam look also follows the Fog Box density / anisotropy / tint.")
-            .weak()
-            .small(),
-    );
+        ui.label(
+            RichText::new("Beam look also follows the Fog Box density / anisotropy / tint.")
+                .weak()
+                .small(),
+        );
+    });
+}
+
+/// A collapsible top-level Scene folder header: icon + title + count, styled as a
+/// quiet section. Returns the `CollapsingHeader` to `.show(...)` a body on.
+fn folder_header(
+    ui: &egui::Ui,
+    icon: &str,
+    title: &str,
+    count: usize,
+    default_open: bool,
+    ink: &theme::Ink,
+) -> egui::CollapsingHeader {
+    let label = if count > 0 {
+        format!("{icon}  {title}  ·  {count}")
+    } else {
+        format!("{icon}  {title}")
+    };
+    let _ = ui;
+    egui::CollapsingHeader::new(RichText::new(label).size(12.0).strong().color(ink.secondary))
+        .id_salt(title)
+        .default_open(default_open)
 }
 
 /// Left tab: the content library — categorized fixtures and environments you

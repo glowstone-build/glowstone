@@ -116,6 +116,8 @@ pub struct Ui {
     lib: panels::LibState,
     /// Anchor index for shift-range selection of scene fixtures (list + 3D).
     scene_anchor: Option<usize>,
+    /// Sort order for the Scene panel's Fixtures folder.
+    scene_sort: panels::SceneSort,
     /// The `s` quick-select palette is open.
     quick_select: bool,
 }
@@ -138,6 +140,7 @@ impl Ui {
             profile: None,
             lib: panels::LibState::default(),
             scene_anchor: None,
+            scene_sort: panels::SceneSort::Patch,
             quick_select: false,
         }
     }
@@ -209,6 +212,7 @@ impl Ui {
             profile: &mut self.profile,
             lib: &mut self.lib,
             scene_anchor: &mut self.scene_anchor,
+            scene_sort: &mut self.scene_sort,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
             dmx_status: dmxv.status,
@@ -680,6 +684,7 @@ struct PanelViewer<'a> {
     profile: &'a mut Option<ProfileEditor>,
     lib: &'a mut panels::LibState,
     scene_anchor: &'a mut Option<usize>,
+    scene_sort: &'a mut panels::SceneSort,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
     dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
@@ -724,6 +729,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.dmx_patch,
                 self.dmx_live_mask,
                 self.scene_anchor,
+                self.scene_sort,
             ),
             Tab::Library => panels::library_browser(
                 ui,
