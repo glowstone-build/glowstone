@@ -310,9 +310,13 @@ fn select_slot(f: &ChannelFunction, ch: &DmxChannel, idx: usize, v01: f32, slots
     // Profile slot links: the last ChannelSet whose DMXFrom <= v01 with a real
     // WheelSlotIndex (1-based) wins. (Index 0 = "no link" → skip.)
     if !f.sets.is_empty() {
+        // The active ChannelSet = the one with the HIGHEST dmx_from still ≤ v01
+        // (order-independent — the GDTF spec doesn't mandate ascending rows).
         let mut chosen: Option<i32> = None;
+        let mut best_from = f32::NEG_INFINITY;
         for cs in &f.sets {
-            if cs.dmx_from <= v01 + 1e-6 && cs.slot >= 1 {
+            if cs.slot >= 1 && cs.dmx_from <= v01 + 1e-6 && cs.dmx_from >= best_from {
+                best_from = cs.dmx_from;
                 chosen = Some(cs.slot - 1);
             }
         }

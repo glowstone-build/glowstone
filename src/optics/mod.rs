@@ -324,9 +324,9 @@ fn wheel_name(gdtf: &GdtfFixture, comp: &OpticalComponent) -> Option<String> {
 /// beam and overlap on a wide one (exactly like a real fixture). The GDTF facet
 /// offsets (whose scale varies by fixture) are normalised so the largest deflects
 /// by `MAX_DEFLECT`.
-/// The first integer 2..=16 in a name ("4 Prism", "8-Facet Circular Prism") — the
-/// facet count, since most GDTF prism slots encode it in the name and omit the
-/// `<Facet>` geometry.
+/// The first integer 2..=16 in a name ("8-Facet Circular Prism", "5-Circular") —
+/// the facet count, since most GDTF prism slots encode it in the name and omit
+/// the `<Facet>` geometry.
 fn facet_count_from_name(name: &str) -> Option<usize> {
     let mut num = String::new();
     for ch in name.chars() {
@@ -339,12 +339,33 @@ fn facet_count_from_name(name: &str) -> Option<usize> {
     num.parse::<usize>().ok().filter(|n| (2..=16).contains(n))
 }
 
+/// Facet count inferred from a WHEEL name, guarding against the component index
+/// ("Prism2" is the 2nd prism, NOT a 2-facet prism). Only a leading count
+/// ("4 Prism") or an explicit "…facet…" qualifier counts.
+fn facet_count_from_wheel(wheel: &str) -> Option<usize> {
+    let lw = wheel.to_lowercase();
+    if lw.contains("facet") {
+        return facet_count_from_name(wheel);
+    }
+    // A leading standalone number ("4 Prism") — not a trailing index ("Prism2").
+    wheel.split_whitespace().next().and_then(|t| t.parse::<usize>().ok()).filter(|n| (2..=16).contains(n))
+}
+
+/// Names that denote the "no prism" pass-through slot.
+fn is_open_name(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    n.is_empty()
+        || n == "-"
+        || ["open", "out", "empty", "closed", "off", "none", "no prism"].iter().any(|k| n.contains(k))
+}
+
 /// Whether a wheel slot is an engaged prism (has facet geometry or a facet-count
 /// name) rather than the "open" pass-through.
 fn is_prism_slot(slot: &crate::gdtf::WheelSlot, wheel: &str) -> bool {
-    !slot.facets.is_empty()
-        || facet_count_from_name(&slot.name).is_some()
-        || (!slot.name.to_lowercase().contains("open") && facet_count_from_name(wheel).is_some())
+    if is_open_name(&slot.name) {
+        return false;
+    }
+    !slot.facets.is_empty() || facet_count_from_name(&slot.name).is_some() || facet_count_from_wheel(wheel).is_some()
 }
 
 fn prism_beams(gdtf: &GdtfFixture, wheel: &str, slot_idx: usize, rot: f32) -> Vec<PrismBeam> {
@@ -362,7 +383,9 @@ fn prism_beams(gdtf: &GdtfFixture, wheel: &str, slot_idx: usize, rot: f32) -> Ve
     let n = if !slot.facets.is_empty() {
         slot.facets.len()
     } else {
-        facet_count_from_name(&slot.name).or_else(|| facet_count_from_name(wheel)).unwrap_or(3)
+        // Prefer the slot name ("4-Facet Circular Prism") over the wheel name; the
+        // wheel-name reader rejects a trailing component index ("Prism2").
+        facet_count_from_name(&slot.name).or_else(|| facet_count_from_wheel(wheel)).unwrap_or(3)
     }
     .max(2);
 
@@ -523,12 +546,14 @@ pub fn resolve(
                 }
             }
             WheelKind::Prism => {
-                if ctl.value > 0.01
-                    && let Some(w) = comp.wheel.clone().or_else(|| wheel_name(gdtf, comp))
-                {
-                    // Which prism slot the profile selected (3-facet vs 5-facet …).
+                // `value` is the selected slot (like gobo/colour): DMX maps it to the
+                // profile slot, the inspector slider selects it. Engagement is decided
+                // entirely by whether that slot is a prism slot (prism_beams returns
+                // empty on the "open" slot), so there's no separate insertion gate to
+                // fight the slot-fraction semantics.
+                if let Some(w) = comp.wheel.clone().or_else(|| wheel_name(gdtf, comp)) {
                     let slot_idx =
-                        if comp.slots > 1 { (ctl.value * (comp.slots as f32 - 1.0)).round() as usize } else { 0 };
+                        if comp.slots > 1 { (ctl.value.clamp(0.0, 1.0) * (comp.slots as f32 - 1.0)).round() as usize } else { 0 };
                     let set = prism_beams(gdtf, &w, slot_idx, m.phase(i) + ctl.index * TAU);
                     prism = compose_prisms(prism, set);
                 }
@@ -690,4 +715,43 @@ pub fn emitter_cone(
     let n_order = (type_n + (1.5 - type_n) * frost.clamp(0.0, 1.0)).max(1.2);
     let shaft = !matches!(beam.beam_type.as_str(), "None" | "Glow");
     EmitterCone { tan_half, brightness, face_gain, n_order, shaft }
+}
+
+#[cfg(test)]
+mod prism_tests {
+    use super::*;
+    use crate::gdtf::WheelSlot;
+
+    fn slot(name: &str, facets: Vec<[f32; 2]>) -> WheelSlot {
+        WheelSlot { name: name.to_string(), color: None, media: None, facets }
+    }
+
+    #[test]
+    fn facet_count_prefers_real_count_not_component_index() {
+        // Slot name carries the real count.
+        assert_eq!(facet_count_from_name("4-Facet Circular Prism"), Some(4));
+        assert_eq!(facet_count_from_name("8-Facet"), Some(8));
+        assert_eq!(facet_count_from_name("Open"), None);
+        // Wheel-name reader: leading count or "facet" qualifier only — NOT a
+        // trailing component index.
+        assert_eq!(facet_count_from_wheel("4 Prism"), Some(4));
+        assert_eq!(facet_count_from_wheel("8 Facet Prism"), Some(8));
+        assert_eq!(facet_count_from_wheel("Prism2"), None); // component index, not 2 facets
+        assert_eq!(facet_count_from_wheel("Prism1"), None);
+    }
+
+    #[test]
+    fn open_slot_is_not_a_prism() {
+        assert!(is_open_name("Open"));
+        assert!(is_open_name("Out"));
+        assert!(is_open_name("Empty"));
+        assert!(is_open_name("-"));
+        assert!(!is_open_name("4-Facet Circular Prism"));
+        // The open slot of a digit-named wheel must NOT synthesize a phantom prism.
+        assert!(!is_prism_slot(&slot("Out", vec![]), "Prism2"));
+        assert!(!is_prism_slot(&slot("Open", vec![]), "4 Prism"));
+        // A real prism slot engages (by name or by facet geometry).
+        assert!(is_prism_slot(&slot("4-Facet Circular Prism", vec![]), "4 Prism"));
+        assert!(is_prism_slot(&slot("Prism", vec![[0.1, 0.0]]), "Prism2"));
+    }
 }

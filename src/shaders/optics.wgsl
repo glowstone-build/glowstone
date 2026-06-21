@@ -116,13 +116,17 @@ fn opt_anim(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, scr
     if (layer < 0) {
         return 1.0;
     }
+    // The gate window sits OFF-CENTRE on the disc (at radius ~0.42 of the image)
+    // and the whole disc spins by `scroll` turns, so the pattern sweeps across the
+    // gate as a continuous radial motion. The sampled coords stay inside [0,1]
+    // (no fract / tiling) so a non-tiling glass image shows no wrap seam.
     let a = scroll * 6.2831853;            // one full disc revolution per phase wrap
     let ca = cos(a);
     let sa = sin(a);
     let g = uv - vec2<f32>(0.5, 0.5);      // gate-local coords (~[-0.5, 0.5])
-    let disk = vec2<f32>(1.55, 0.0) + g * 1.1; // window sits at radius 1.55 on the disc
+    let disk = vec2<f32>(0.42, 0.0) + g * 0.55; // window region on the disc
     let rp = vec2<f32>(ca * disk.x - sa * disk.y, sa * disk.x + ca * disk.y);
-    let auv = fract(rp * 0.5 + vec2<f32>(0.5, 0.5)); // tile the disc texture
+    let auv = clamp(rp + vec2<f32>(0.5, 0.5), vec2<f32>(0.0), vec2<f32>(1.0));
     return textureSampleLevel(t, s, auv, clamp(layer, 0, ATLAS_MAX_LAYER), lod).a;
 }
 
