@@ -138,14 +138,33 @@ persona both demand this: a believable render needs a believable environment, an
 the lighting in the room should come from the room, not a flat constant. Lives in
 **Scene › World** (it is scene context) with the controls a visualiser reaches for.
 
-## Deliberately deferred (and why)
+## Shipped in the follow-up pass
 
-- **Modal transforms (G/R/S grab-rotate-scale) + 3D gizmos.** The highest-value
-  remaining Blender-ism. Arrow-nudge + Inspector Transform cover the 80% today;
-  full modal/gizmo editing is a focused follow-up (it touches the viewport
-  interaction model and wants its own care).
-- **Selection groups / cues / timeline (Show Sequencer).** Real depence features,
-  but each is a project; this pass focused on the interaction surface + world
-  lighting the user asked for.
-- **Right-click context menus** in the viewport (select-same / edit-profile /
-  delete) — a quick natural next step on top of the existing selection model.
+These were the deferred items; they now exist:
+
+- **Modal transforms (G/R/S).** Grab / rotate / scale the selection in the
+  viewport with X/Y/Z axis locks, click·Enter confirm, Esc·right-click (or focus
+  loss) cancel, and an on-viewport status line. Rotate also turns each fixture's
+  orientation; scale spreads about the selection centroid. (`s` stays the
+  quick-select palette when there's nothing selected to scale.)
+- **Viewport right-click context menu.** Select same type · Frame · Duplicate ·
+  Deselect · Delete (and Select all on empty space).
+- **Selection groups.** Scene › Groups: save the current selection as a named
+  group, recall by click (highlighted when it matches), delete. Stored
+  sorted+deduped; remapped when fixtures are deleted.
+- **Cues (a cue list).** A Cues tab: Record the rig's look, Recall/Go with a
+  per-cue crossfade (shortest-path pan/tilt, intensity/colour fade), Prev/Go
+  transport + fade progress. The offline-previz look engine.
+
+One **deletion path** (`Ui::commit_delete`) remaps the patch, cues and groups in
+lock-step with the fixture removal, so deleting a fixture never corrupts
+addressing or saved selections/looks.
+
+## Still deferred (and why)
+
+- **3D drag gizmos** (translate/rotate handles grabbed with the mouse). Modal
+  G/R/S covers the editing need keyboard-first; interactive gizmo picking is a
+  separate viewport-interaction project.
+- **A full timeline / Show Sequencer** (cues on a time track with auto-follow,
+  multi-part fades, effects). The cue list is the foundation; the timeline editor
+  on top is its own piece of work.
