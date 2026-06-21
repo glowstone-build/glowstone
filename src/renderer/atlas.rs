@@ -1,15 +1,14 @@
 //! The gobo / animation-glass texture atlas.
 //!
-//! A single persistent `texture_2d_array` (one slot per layer, full mip chain)
-//! holds every projectable wheel image of every loaded GDTF fixture. Layer 0 is
-//! solid white ("open / no gobo"). Gobo and animation wheels are allocated a
-//! consecutive block of layers (one per slot, white for slots without media) so
-//! the shader can cross-fade between adjacent slots during a wheel move by
-//! sampling `floor(layer)` and `ceil(layer)`.
+//! A single persistent `texture_2d_array` (full mip chain) holds every
+//! projectable wheel of every loaded GDTF fixture. Layer 0 is solid white
+//! ("open / no gobo"). A **gobo / animation** wheel gets one image layer per
+//! slot (a consecutive block). A **colour** wheel is packed into ONE layer as
+//! vertical colour bands (one per slot) and sampled horizontally by slot — so a
+//! 60-slot virtual colour wheel costs a single layer, not 60.
 //!
-//! Color wheels (CPU-side tint) and prism wheels (CPU beam-expansion) are *not*
-//! allocated here. Mips are built on the CPU (box filter) so the focus/frost
-//! mip-LOD blur has something to read.
+//! Prism wheels (CPU beam-expansion) are *not* allocated here. Mips are built on
+//! the CPU (box filter) so the focus/frost mip-LOD blur has something to read.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,8 +19,11 @@ use crate::gdtf::GdtfFixture;
 /// angular resolution before the GPU mip chain takes over — and a real signal
 /// for the runtime CAS sharpener. (RGBA8 × LAYERS × full mips ≈ 192 MB @ 48.)
 const RES: u32 = 512;
-/// Total layers the array can hold (white + all wheels of all fixtures).
-const LAYERS: u32 = 48;
+/// Total layers the array can hold (white + every gobo SLOT + one strip layer
+/// per colour wheel, across all loaded fixture types). Colour wheels now cost a
+/// single layer each (see `color_strip`), so gobos dominate; 128 covers large
+/// multi-type rigs without exceeding the GPU's per-texture budget.
+const LAYERS: u32 = 128;
 
 pub struct GoboAtlas {
     texture: wgpu::Texture,
@@ -108,28 +110,36 @@ impl GoboAtlas {
             if self.base_of.contains_key(&k) {
                 continue;
             }
+            // A pure colour wheel (solid dichroic slots, no imagery) is packed
+            // into ONE layer as vertical colour bands — sampled horizontally by
+            // slot in the shader (`opt_color_strip`). A gobo/animation wheel still
+            // gets one image layer per slot. This keeps virtual colour wheels
+            // (often 60+ slots) from each eating 60+ of the 512² atlas layers.
+            let is_color_wheel = !has_media;
             let count = wheel.slots.len() as u32;
-            if self.next_layer + count > LAYERS {
+            let layers_needed = if is_color_wheel { 1 } else { count };
+            if self.next_layer + layers_needed > LAYERS {
                 log::warn!("gobo atlas full; skipping wheel '{}'", wheel.name);
                 continue;
             }
             let base = self.next_layer;
-            for (i, slot) in wheel.slots.iter().enumerate() {
-                let layer = base + i as u32;
-                let rgba = if let Some(bytes) = &slot.media {
-                    decode_gobo(bytes).unwrap_or_else(|| vec![255u8; (RES * RES * 4) as usize])
-                } else if has_media {
-                    // A media wheel's slot with no image = open (white).
-                    vec![255u8; (RES * RES * 4) as usize]
-                } else {
-                    // Colour wheel: a solid dichroic-transmittance slot.
-                    color_slot(slot.color)
-                };
-                self.write_with_mips(queue, layer, rgba);
+            if is_color_wheel {
+                self.write_with_mips(queue, base, color_strip(&wheel.slots));
+                self.next_layer += 1;
+            } else {
+                for (i, slot) in wheel.slots.iter().enumerate() {
+                    let rgba = slot
+                        .media
+                        .as_deref()
+                        .and_then(decode_gobo)
+                        // A media wheel's slot with no image = open (white).
+                        .unwrap_or_else(|| vec![255u8; (RES * RES * 4) as usize]);
+                    self.write_with_mips(queue, base + i as u32, rgba);
+                }
+                self.next_layer += count;
             }
-            self.next_layer += count;
             self.base_of.insert(k, base);
-            log::info!("atlas: wheel '{}' -> layers {base}..{}", wheel.name, base + count);
+            log::info!("atlas: wheel '{}' -> base {base} (+{layers_needed})", wheel.name);
         }
     }
 
@@ -170,22 +180,36 @@ impl GoboAtlas {
     }
 }
 
-/// A solid colour-wheel slot, filled with the dichroic **transmittance** triple
-/// (linear, stored raw in the Unorm atlas so the shader multiplies it into the
-/// beam). `None` = open / no filter (white, full transmittance). Saturated
-/// dichroics pass less light, so brightness is scaled down with saturation
-/// (deep blue ≈ 9 %, amber ≈ 60 %, pale ≈ 100 %) per research-dichroic.md.
-fn color_slot(color: Option<[f32; 3]>) -> Vec<u8> {
-    let t = crate::optics::color::dichroic_transmittance(color);
-    let px = [
-        (t[0] * 255.0).round() as u8,
-        (t[1] * 255.0).round() as u8,
-        (t[2] * 255.0).round() as u8,
-        255u8,
-    ];
+/// A whole colour wheel packed into one RES×RES layer as `n` vertical bands,
+/// one per slot, each the slot's dichroic **transmittance** triple (linear, raw
+/// in the Unorm atlas so the shader multiplies it into the beam). The shader
+/// samples band `slot` at horizontal `(slot+0.5)/n`. `None` slot = open/white.
+/// Saturated dichroics pass less light (deep blue ≈ 9 %, amber ≈ 60 %, pale ≈
+/// 100 %) per research-dichroic.md.
+fn color_strip(slots: &[crate::gdtf::WheelSlot]) -> Vec<u8> {
+    let n = slots.len().max(1);
+    // Precompute each band's RGBA8 once.
+    let bands: Vec<[u8; 4]> = slots
+        .iter()
+        .map(|s| {
+            let t = crate::optics::color::dichroic_transmittance(s.color);
+            [
+                (t[0] * 255.0).round() as u8,
+                (t[1] * 255.0).round() as u8,
+                (t[2] * 255.0).round() as u8,
+                255u8,
+            ]
+        })
+        .collect();
     let mut out = vec![0u8; (RES * RES * 4) as usize];
-    for chunk in out.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&px);
+    // One row of bands, then replicated down every row.
+    let mut row = vec![0u8; (RES * 4) as usize];
+    for x in 0..RES as usize {
+        let slot = (x * n) / RES as usize;
+        row[x * 4..x * 4 + 4].copy_from_slice(&bands[slot.min(n - 1)]);
+    }
+    for y in 0..RES as usize {
+        out[y * RES as usize * 4..(y + 1) * RES as usize * 4].copy_from_slice(&row);
     }
     out
 }

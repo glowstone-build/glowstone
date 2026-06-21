@@ -146,6 +146,31 @@ fn opt_wheel(
 // the CPU density model. `p` = beam cross-section in the unit disc = (guv-0.5)*2;
 // `cmy` = the three slewed insertions (0 = clear … 1 = full). Returns the
 // transmittance triple to multiply into the beam. (research-cmy.md)
+// A colour wheel packed as ONE atlas layer of vertical bands (see atlas.rs
+// `color_strip`): same physical-wheel slot maths as `opt_wheel` (split + gap as
+// the wheel moves), but the chosen slot is read as a horizontal band rather than
+// a whole image layer. Returns the slot's transmittance triple. `base < 0` = none.
+fn opt_color_strip(
+    tex: texture_2d_array<f32>, samp: sampler, guv: vec2<f32>,
+    base: f32, position: f32, n: f32, gap: f32,
+) -> vec3<f32> {
+    if (base < 0.0 || n < 1.0) {
+        return vec3<f32>(1.0, 1.0, 1.0);
+    }
+    const GATE_FRAC: f32 = 0.7;
+    let tcoord = guv.x - 0.5;
+    let u = position + tcoord * GATE_FRAC;
+    let cell = floor(u + 0.5);
+    let slot = cell - floor(cell / n) * n;
+    let frac = (u + 0.5) - cell;
+    let d = abs(frac - 0.5);
+    if (gap > 0.001 && d > (0.5 - gap * 0.5)) {
+        return vec3<f32>(0.0, 0.0, 0.0); // dark seam between colour slots
+    }
+    let su = (slot + 0.5) / n; // centre of the slot's band
+    return textureSampleLevel(tex, samp, vec2<f32>(su, 0.5), i32(base), 0.0).rgb;
+}
+
 fn opt_cmy_flag(u: f32, c: f32) -> f32 {
     const EDGE_SOFT: f32 = 0.22;       // soft sawtooth/halftone edge width
     let edge = 2.0 * c - 1.0;          // inserts from -axis (c=0) to +axis (c=1)
@@ -181,11 +206,11 @@ fn opt_cookie(
 ) -> vec3<f32> {
     let g1 = opt_wheel(tex, samp, guv, gw1.x, gw1.y, gw1.z, gw1.w, g1rot, lod);
     let g2 = opt_wheel(tex, samp, guv, gw2.x, gw2.y, gw2.z, gw2.w, g2rot, lod);
-    let col = opt_wheel(tex, samp, guv, cw.x, cw.y, cw.z, cw.w, 0.0, lod);
+    let col = opt_color_strip(tex, samp, guv, cw.x, cw.y, cw.z, cw.w);
     let anim = opt_anim(tex, samp, guv, i32(anim_layer), anim_scroll, lod);
     var out = vec3<f32>(g1.r * g1.a, g1.g * g1.a, g1.b * g1.a)
             * vec3<f32>(g2.r * g2.a, g2.g * g2.a, g2.b * g2.a)
-            * col.rgb
+            * col
             * anim;
     if (cmy.x + cmy.y + cmy.z > 0.001) {
         out = out * opt_cmy((guv - vec2<f32>(0.5)) * 2.0, cmy);
