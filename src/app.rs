@@ -813,6 +813,12 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
 /// visible window). Runs a few settle frames so the dock layout + viewport panel
 /// size stabilise, then captures the final frame.
 fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
+    if let Ok(title) = std::env::var("PREVIZ_UI_TAB") {
+        state.ui.focus_tab_by_title(&title);
+    }
+    if std::env::var("PREVIZ_UI_QS").is_ok() {
+        state.ui.debug_open_quick_select();
+    }
     let mut jobs: Vec<egui::ClippedPrimitive> = Vec::new();
     let mut sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
     for i in 0..3 {
@@ -858,12 +864,22 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         &empty,
         &sd,
     );
-    match image::RgbaImage::from_raw(rw, rh, px) {
-        Some(img) => match img.save(path) {
-            Ok(()) => log::info!("UI screenshot: {path} ({rw}x{rh})"),
-            Err(e) => log::error!("UI screenshot save {path}: {e}"),
-        },
-        None => log::error!("UI screenshot: bad buffer"),
+    let Some(mut img) = image::RgbaImage::from_raw(rw, rh, px) else {
+        log::error!("UI screenshot: bad buffer");
+        return;
+    };
+    // PREVIZ_UI_CROP="x,y,w,h" crops to a region (for inspecting one panel).
+    if let Ok(spec) = std::env::var("PREVIZ_UI_CROP") {
+        let nums: Vec<u32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if let [x, y, cw, ch] = nums[..] {
+            let cw = cw.min(rw.saturating_sub(x));
+            let ch = ch.min(rh.saturating_sub(y));
+            img = image::imageops::crop(&mut img, x, y, cw, ch).to_image();
+        }
+    }
+    match img.save(path) {
+        Ok(()) => log::info!("UI screenshot: {path} ({}x{})", img.width(), img.height()),
+        Err(e) => log::error!("UI screenshot save {path}: {e}"),
     }
 }
 

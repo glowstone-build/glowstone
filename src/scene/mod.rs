@@ -151,6 +151,36 @@ impl Selection {
             self.fixtures.push(i);
         }
     }
+
+    /// Select an inclusive contiguous fixture range (shift-range select).
+    pub fn set_fixture_range(&mut self, a: usize, b: usize) {
+        self.environment = None;
+        self.fixtures = (a.min(b)..=a.max(b)).collect();
+    }
+}
+
+/// Resolve a fixture click into a selection update given the keyboard modifiers
+/// and a shift-range `anchor`. Shared by the scene outliner and the 3D viewport
+/// so list-click and viewport-click behave identically: plain = replace,
+/// ⌘/Ctrl = toggle, Shift = range from the anchor.
+pub fn apply_fixture_click(
+    selection: &mut Selection,
+    anchor: &mut Option<usize>,
+    i: usize,
+    shift: bool,
+    toggle: bool,
+) {
+    if shift {
+        let a = anchor.unwrap_or(i);
+        selection.set_fixture_range(a, i);
+        // keep the anchor so chained shift-clicks grow/shrink from it
+    } else if toggle {
+        selection.toggle_fixture(i);
+        *anchor = Some(i);
+    } else {
+        *selection = Selection::fixture(i);
+        *anchor = Some(i);
+    }
 }
 
 /// Everything the renderer draws and the UI edits.

@@ -98,6 +98,12 @@ pub struct Ui {
     show_about: bool,
     show_shortcuts: bool,
     profile: Option<ProfileEditor>,
+    /// Library panel state (search / sort / multi-select).
+    lib: panels::LibState,
+    /// Anchor index for shift-range selection of scene fixtures (list + 3D).
+    scene_anchor: Option<usize>,
+    /// The `s` quick-select palette is open.
+    quick_select: bool,
 }
 
 impl Ui {
@@ -116,6 +122,9 @@ impl Ui {
             show_about: false,
             show_shortcuts: false,
             profile: None,
+            lib: panels::LibState::default(),
+            scene_anchor: None,
+            quick_select: false,
         }
     }
 
@@ -184,6 +193,8 @@ impl Ui {
             viewport_focused: &mut self.viewport_focused,
             duplicate: &mut self.duplicate,
             profile: &mut self.profile,
+            lib: &mut self.lib,
+            scene_anchor: &mut self.scene_anchor,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
             dmx_status: dmxv.status,
@@ -218,6 +229,34 @@ impl Ui {
         );
         windows::about_window(ctx, &mut self.show_about);
         windows::shortcuts_window(ctx, &mut self.show_shortcuts);
+        windows::quick_select_window(ctx, scene, &mut self.selection, &mut self.quick_select);
+    }
+
+    /// Force the quick-select palette open (headless screenshot hook).
+    pub fn debug_open_quick_select(&mut self) {
+        self.quick_select = true;
+    }
+
+    /// Make the named tab the active one in its leaf (used by the headless UI
+    /// screenshot path to capture a specific panel).
+    pub fn focus_tab_by_title(&mut self, title: &str) {
+        let tabs = [
+            Tab::Viewport,
+            Tab::Scene,
+            Tab::Library,
+            Tab::Inspector,
+            Tab::DmxMonitor,
+            Tab::Patch,
+            Tab::Connectivity,
+        ];
+        for tab in tabs {
+            if tab.title() == title
+                && let Some(path) = self.dock.find_tab(&tab)
+            {
+                let _ = self.dock.set_active_tab(path);
+                return;
+            }
+        }
     }
 
     /// Whether a dock tab is currently open.
@@ -272,6 +311,10 @@ impl Ui {
             }
             if i.modifiers.command && i.key_pressed(Key::Comma) {
                 self.show_prefs = true;
+            }
+            // `s` opens the quick-select palette (keyboard-driven thereafter).
+            if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl {
+                self.quick_select = true;
             }
             for (key, view) in [
                 (Key::Num5, CameraView::Perspective),
@@ -604,6 +647,8 @@ struct PanelViewer<'a> {
     viewport_focused: &'a mut bool,
     duplicate: &'a mut Option<DuplicateDialog>,
     profile: &'a mut Option<ProfileEditor>,
+    lib: &'a mut panels::LibState,
+    scene_anchor: &'a mut Option<usize>,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
     dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
@@ -632,6 +677,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.camera,
                 self.scene,
                 self.selection,
+                self.scene_anchor,
                 self.viewport_focused,
                 self.duplicate,
                 self.viewport_texture,
@@ -646,10 +692,16 @@ impl TabViewer for PanelViewer<'_> {
                 self.settings,
                 self.dmx_patch,
                 self.dmx_live_mask,
+                self.scene_anchor,
             ),
-            Tab::Library => {
-                panels::library_browser(ui, self.library, self.scene, self.selection, self.camera)
-            }
+            Tab::Library => panels::library_browser(
+                ui,
+                self.library,
+                self.scene,
+                self.selection,
+                self.camera,
+                self.lib,
+            ),
             Tab::Inspector => {
                 panels::inspector(ui, self.scene, self.selection, self.gdtf_textures, self.profile)
             }

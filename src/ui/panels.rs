@@ -7,6 +7,7 @@ use std::sync::Arc;
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
 use glam::{Vec2, Vec3};
 
+use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
 use super::{DuplicateDialog, GdtfTextures};
 use crate::dmx::patch::channel_map;
@@ -15,7 +16,7 @@ use crate::gdtf::{GdtfFixture, WheelKind};
 use crate::optics::{self, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
-use crate::scene::{Fixture, Library, RenderSettings, Scene, Selection, ViewportMode};
+use crate::scene::{apply_fixture_click, Fixture, Library, RenderSettings, Scene, Selection, ViewportMode};
 
 /// Universe is considered live if it updated within this window.
 const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -29,79 +30,100 @@ pub fn scene_outliner(
     settings: &mut RenderSettings,
     patch: &PatchTable,
     live_mask: &[bool],
+    anchor: &mut Option<usize>,
 ) {
-    ui.heading("Scene");
+    use theme::icon;
+    let ink = theme::ink(!ui.visuals().dark_mode);
+    let accent = ui.visuals().selection.stroke.color;
+
+    ui.horizontal(|ui| {
+        ui.heading("Scene");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let nsel = selection.fixtures.len();
+            if nsel > 0 {
+                ui.label(RichText::new(format!("{nsel} selected")).small().color(accent));
+            }
+        });
+    });
     ui.separator();
 
-    ui.label(RichText::new("FIXTURES").small().strong());
-    if scene.fixtures.is_empty() {
-        ui.label(RichText::new("none — add from the Library").weak().small());
-    }
     // Mark which fixtures are in an address conflict (computed once, not per row).
     let mut conflicted = vec![false; scene.fixtures.len()];
     for c in patch.conflicts() {
         conflicted[c.a] = true;
         conflicted[c.b] = true;
     }
-    // Click selects; ⌘/Ctrl/Shift-click toggles into a multi-selection.
-    for (i, fixture) in scene.fixtures.iter().enumerate() {
-        ui.horizontal(|ui| {
-            let resp = ui.selectable_label(
-                selection.contains_fixture(i),
-                format!("{}  ·  {}", fixture.name, fixture.profile),
-            );
-            if resp.clicked() {
-                if ui.input(|x| x.modifiers.command || x.modifiers.shift) {
-                    selection.toggle_fixture(i);
-                } else {
-                    *selection = Selection::fixture(i);
-                }
-            }
-            // Patch annotation: universe.address · FixtureID · mode, or "(unpatched)".
-            match patch.get(i).filter(|p| p.enabled) {
-                Some(p) => {
-                    let mut tag = format!("{}.{:03}", p.universe, p.address);
-                    if let Some(id) = fixture
-                        .mvr
-                        .as_deref()
-                        .map(|m| m.fixture_id.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        tag += &format!(" · ID {id}");
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("FIXTURES").size(10.0).strong().color(ink.tertiary));
+        ui.label(RichText::new(format!("{}", scene.fixtures.len())).small().color(ink.muted));
+    });
+    if scene.fixtures.is_empty() {
+        ui.label(RichText::new("none — add from the Library").weak().small());
+    }
+
+    // Bounded, scrollable fixture list so a big rig never pushes the View
+    // controls off-screen. Click selects; ⌘/Ctrl = toggle, Shift = range.
+    let mut click: Option<(usize, bool, bool)> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("scene-fixtures")
+        .max_height(260.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for (i, fixture) in scene.fixtures.iter().enumerate() {
+                let patch_tag = match patch.get(i).filter(|p| p.enabled) {
+                    Some(p) => {
+                        let mut tag = format!("{}.{:03}", p.universe, p.address);
+                        if let Some(mode) = fixture.gdtf.as_ref().and_then(|g| g.modes.get(p.mode_index)) {
+                            tag += &format!(" · {}", mode.name);
+                        }
+                        tag
                     }
-                    if let Some(mode) = fixture
-                        .gdtf
-                        .as_ref()
-                        .and_then(|g| g.modes.get(p.mode_index))
-                    {
-                        tag += &format!(" · {}", mode.name);
-                    }
-                    ui.label(RichText::new(tag).weak().small());
+                    None => "unpatched".into(),
+                };
+                let live = live_mask.get(i).copied().unwrap_or(false);
+                let row_icon = if fixture.is_laser { icon::COLOR } else { icon::FIXTURE };
+                let resp = entity_row(
+                    ui,
+                    row_icon,
+                    &fixture.name,
+                    &fixture.profile,
+                    &patch_tag,
+                    conflicted[i],
+                    live,
+                    selection.contains_fixture(i),
+                    &ink,
+                    accent,
+                );
+                if resp.clicked() {
+                    let m = ui.input(|x| x.modifiers);
+                    click = Some((i, m.shift, m.command || m.ctrl));
                 }
-                None => {
-                    ui.label(RichText::new("(unpatched)").weak().small());
-                }
-            }
-            if conflicted[i] {
-                ui.colored_label(Color32::from_rgb(230, 90, 90), "●")
-                    .on_hover_text("DMX address conflict");
-            }
-            if live_mask.get(i).copied().unwrap_or(false) {
-                ui.colored_label(Color32::from_rgb(120, 210, 120), RichText::new("LIVE").small());
             }
         });
+    if let Some((i, shift, toggle)) = click {
+        apply_fixture_click(selection, anchor, i, shift, toggle);
     }
 
     ui.add_space(8.0);
-    ui.label(RichText::new("ENVIRONMENTS").small().strong());
+    ui.label(RichText::new("ENVIRONMENTS").size(10.0).strong().color(ink.tertiary));
     if scene.environments.is_empty() {
         ui.label(RichText::new("none — add from the Library").weak().small());
     }
     for (i, env) in scene.environments.iter().enumerate() {
-        if ui
-            .selectable_label(selection.environment == Some(i), env.name.as_str())
-            .clicked()
-        {
+        let resp = entity_row(
+            ui,
+            icon::ENVIRONMENT,
+            env.name.as_str(),
+            "Fog volume",
+            "",
+            false,
+            false,
+            selection.environment == Some(i),
+            &ink,
+            accent,
+        );
+        if resp.clicked() {
             *selection = Selection::environment(i);
         }
     }
@@ -110,9 +132,10 @@ pub fn scene_outliner(
     if !scene.geometry.is_empty() {
         ui.add_space(8.0);
         egui::CollapsingHeader::new(
-            RichText::new(format!("GEOMETRY ({})", scene.geometry.len()))
-                .small()
-                .strong(),
+            RichText::new(format!("{}  GEOMETRY ({})", icon::GEOMETRY, scene.geometry.len()))
+                .size(10.0)
+                .strong()
+                .color(ink.tertiary),
         )
         .default_open(false)
         .show(ui, |ui| {
@@ -124,7 +147,7 @@ pub fn scene_outliner(
 
     ui.add_space(10.0);
     ui.separator();
-    ui.label(RichText::new("VIEW").small().strong());
+    ui.label(RichText::new(format!("{}  VIEW", icon::SETTINGS)).size(10.0).strong().color(ink.tertiary));
     Grid::new("view-grid")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -172,129 +195,410 @@ pub fn scene_outliner(
 
 /// Left tab: the content library — categorized fixtures and environments you
 /// can add to the scene.
+/// How the library list is ordered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LibSort {
+    Category,
+    Name,
+    Manufacturer,
+}
+
+impl LibSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Category => "Category",
+            Self::Name => "Name",
+            Self::Manufacturer => "Maker",
+        }
+    }
+}
+
+/// Library panel UI state (search/sort + multi-select with a range anchor).
+pub struct LibState {
+    pub search: String,
+    pub sort: LibSort,
+    /// Selected rows, as indices into the current filtered+sorted list.
+    pub selected: Vec<usize>,
+    pub anchor: Option<usize>,
+}
+
+impl Default for LibState {
+    fn default() -> Self {
+        Self { search: String::new(), sort: LibSort::Category, selected: Vec::new(), anchor: None }
+    }
+}
+
+/// One library entry — what it is, plus display metadata.
+enum LibKind {
+    Gdtf(usize),
+    Fixture(usize),
+    Env(usize),
+}
+
+struct LibRow {
+    kind: LibKind,
+    icon: &'static str,
+    name: String,
+    meta: String,
+    category: String,
+    accent: bool, // laser/colour entry → tint the icon
+}
+
+/// Build the flat row list from the library (Imported GDTF, then built-in
+/// fixtures, then environments), each with display metadata.
+fn library_rows(library: &Library) -> Vec<LibRow> {
+    use theme::icon;
+    let mut rows = Vec::new();
+    for (i, g) in library.gdtf.iter().enumerate() {
+        let beam = if g.beam.beam_type.is_empty() { "" } else { g.beam.beam_type.as_str() };
+        rows.push(LibRow {
+            kind: LibKind::Gdtf(i),
+            icon: icon::FIXTURE,
+            name: g.name.clone(),
+            meta: format!("{} · {} · {} mode{}", g.manufacturer, beam, g.modes.len(), if g.modes.len() == 1 { "" } else { "s" }),
+            category: if g.manufacturer.is_empty() { "Imported".into() } else { g.manufacturer.clone() },
+            accent: false,
+        });
+    }
+    for (i, p) in library.fixtures.iter().enumerate() {
+        rows.push(LibRow {
+            kind: LibKind::Fixture(i),
+            icon: if p.laser { icon::COLOR } else { icon::FIXTURE },
+            name: p.name.to_string(),
+            meta: if p.laser { "Laser engine".into() } else { format!("{:.0}° beam", p.default_beam_angle) },
+            category: p.category.to_string(),
+            accent: p.laser,
+        });
+    }
+    for (i, p) in library.environments.iter().enumerate() {
+        let [w, h, d] = p.default_size;
+        rows.push(LibRow {
+            kind: LibKind::Env(i),
+            icon: icon::ENVIRONMENT,
+            name: p.name.to_string(),
+            meta: format!("{w:.0} × {h:.0} × {d:.0} m"),
+            category: "Environment".into(),
+            accent: false,
+        });
+    }
+    rows
+}
+
+/// Instantiate a library row into the scene; returns the resulting selection.
+fn add_library_row(row: &LibRow, library: &Library, scene: &mut Scene) -> Selection {
+    match row.kind {
+        LibKind::Gdtf(i) => {
+            let arc = library.gdtf[i].clone();
+            Selection::fixture(scene.add_gdtf(arc, glam::Vec3::new(0.0, 4.0, 0.0)))
+        }
+        LibKind::Fixture(i) => Selection::fixture(scene.add_fixture(&library.fixtures[i])),
+        LibKind::Env(i) => Selection::environment(scene.add_environment(&library.environments[i])),
+    }
+}
+
+/// Left tab: the content library — a searchable, sortable list of fixture and
+/// environment templates with multi-select (shift = range) and batch add.
 pub fn library_browser(
     ui: &mut egui::Ui,
     library: &mut Library,
     scene: &mut Scene,
     selection: &mut Selection,
     camera: &mut OrbitCamera,
+    lib: &mut LibState,
 ) {
-    ui.heading("Library");
-    ui.separator();
+    use theme::icon;
 
-    // Import a GDTF fixture file from disk.
-    if ui
-        .button("📁  Import GDTF…")
-        .on_hover_text("Load a .gdtf fixture (real model, wheels, channels)")
-        .clicked()
-        && let Some(path) = rfd::FileDialog::new()
-            .add_filter("GDTF fixture", &["gdtf"])
-            .pick_file()
-    {
-        match library.import_gdtf(&path) {
-            Ok(idx) => {
-                let arc = library.gdtf[idx].clone();
-                let fidx = scene.add_gdtf(arc, glam::Vec3::new(0.0, 4.0, 0.0));
-                *selection = Selection::fixture(fidx);
-            }
-            Err(e) => log::error!("GDTF import failed: {e}"),
-        }
-    }
-
-    // Import / export a full MVR scene (fixtures + stage/truss geometry).
+    // --- header: import / export toolbar (icon buttons) ---
     ui.horizontal(|ui| {
-        if ui
-            .button("📦  Import MVR…")
-            .on_hover_text("Load an .mvr scene (fixtures + stage geometry) from a console or CAD tool")
-            .clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("MVR scene", &["mvr"])
-                .pick_file()
-        {
-            match crate::mvr::MvrImport::load_path(&path) {
-                Ok(import) => {
-                    scene.import_mvr(import);
-                    if let Some((center, radius)) = scene.scene_frame() {
-                        camera.frame(center, radius * 1.15);
-                    }
-                    *selection = Selection::default();
+        ui.heading("Library");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
+            if ui.add_enabled(can_export, egui::Button::new(theme::ico(icon::EXPORT)))
+                .on_hover_text("Export the scene to MVR")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new().add_filter("MVR scene", &["mvr"]).set_file_name("scene.mvr").save_file()
+            {
+                if let Err(e) = crate::mvr::export_path(scene, &path) {
+                    log::error!("MVR export failed: {e}");
                 }
-                Err(e) => log::error!("MVR import failed: {e}"),
             }
-        }
+            if ui.button(theme::ico(icon::IMPORT_MVR)).on_hover_text("Import an MVR scene").clicked()
+                && let Some(path) = rfd::FileDialog::new().add_filter("MVR scene", &["mvr"]).pick_file()
+            {
+                match crate::mvr::MvrImport::load_path(&path) {
+                    Ok(import) => {
+                        scene.import_mvr(import);
+                        if let Some((c, r)) = scene.scene_frame() {
+                            camera.frame(c, r * 1.15);
+                        }
+                        *selection = Selection::default();
+                    }
+                    Err(e) => log::error!("MVR import failed: {e}"),
+                }
+            }
+            if ui.button(theme::ico(icon::IMPORT_GDTF)).on_hover_text("Import a GDTF fixture into the library").clicked()
+                && let Some(path) = rfd::FileDialog::new().add_filter("GDTF fixture", &["gdtf"]).pick_file()
+            {
+                if let Err(e) = library.import_gdtf(&path) {
+                    log::error!("GDTF import failed: {e}");
+                }
+            }
+        });
+    });
 
-        // Export is only meaningful once there's something to write.
-        let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
-        if ui
-            .add_enabled(can_export, egui::Button::new("💾  Export MVR…"))
-            .on_hover_text("Write the current scene to an .mvr (fixtures, patch, placement, bundled GDTF + geometry)")
-            .clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("MVR scene", &["mvr"])
-                .set_file_name("scene.mvr")
-                .save_file()
-        {
-            match crate::mvr::export_path(scene, &path) {
-                Ok(()) => log::info!("exported MVR: {}", path.display()),
-                Err(e) => log::error!("MVR export failed: {e}"),
+    // --- search + sort row ---
+    ui.horizontal(|ui| {
+        ui.label(theme::ico(icon::SEARCH).weak());
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut lib.search)
+                .hint_text("Filter…")
+                .desired_width(f32::INFINITY),
+        );
+        if resp.changed() {
+            lib.selected.clear();
+            lib.anchor = None;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(theme::ico(icon::SORT).weak()).on_hover_text("Sort by");
+        for s in [LibSort::Category, LibSort::Name, LibSort::Manufacturer] {
+            if ui.selectable_label(lib.sort == s, s.label()).clicked() {
+                lib.sort = s;
+                lib.selected.clear();
+                lib.anchor = None;
             }
         }
     });
 
-    // Imported GDTF fixtures (click + to add another instance).
-    if !library.gdtf.is_empty() {
-        ui.add_space(6.0);
-        ui.label(RichText::new("IMPORTED").small().strong());
-        for i in 0..library.gdtf.len() {
-            let (manuf, name) = {
-                let g = &library.gdtf[i];
-                (g.manufacturer.clone(), g.name.clone())
-            };
-            ui.horizontal(|ui| {
-                if ui.button("+").on_hover_text("Add to scene").clicked() {
-                    let arc = library.gdtf[i].clone();
-                    let fidx = scene.add_gdtf(arc, glam::Vec3::new(0.0, 4.0, 0.0));
-                    *selection = Selection::fixture(fidx);
+    // --- build, filter, sort ---
+    let mut rows = library_rows(library);
+    let q = lib.search.trim().to_lowercase();
+    if !q.is_empty() {
+        rows.retain(|r| {
+            r.name.to_lowercase().contains(&q)
+                || r.meta.to_lowercase().contains(&q)
+                || r.category.to_lowercase().contains(&q)
+        });
+    }
+    match lib.sort {
+        LibSort::Name => rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        LibSort::Manufacturer => rows.sort_by(|a, b| {
+            a.category.to_lowercase().cmp(&b.category.to_lowercase()).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+        LibSort::Category => {} // keep build order (already category-grouped)
+    }
+    lib.selected.retain(|&i| i < rows.len());
+
+    // --- batch-add affordance ---
+    let n_sel = lib.selected.len();
+    ui.horizontal(|ui| {
+        let label = if n_sel > 1 { format!("{}  Add {n_sel}", icon::ADD) } else { format!("{}  Add", icon::ADD) };
+        if ui.add_enabled(n_sel > 0, egui::Button::new(label)).on_hover_text("Add the selected templates to the scene (Enter)").clicked()
+            || (n_sel > 0 && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+        {
+            let mut idxs = lib.selected.clone();
+            idxs.sort_unstable();
+            let mut last = None;
+            for &ri in &idxs {
+                if let Some(row) = rows.get(ri) {
+                    last = Some(add_library_row(row, library, scene));
                 }
-                ui.label(format!("{manuf} · {name}"));
-            });
+            }
+            if let Some(sel) = last {
+                *selection = sel;
+            }
         }
-    }
-
-    ui.add_space(10.0);
+        ui.label(RichText::new(format!("{} items", rows.len())).weak().small());
+    });
     ui.separator();
-    ui.label(RichText::new("FIXTURES").small().strong());
-    let mut last_category = "";
-    for profile in &library.fixtures {
-        if profile.category != last_category {
-            ui.label(RichText::new(profile.category).weak().small());
-            last_category = profile.category;
-        }
-        ui.horizontal(|ui| {
-            if ui.button("+").on_hover_text("Add to scene").clicked() {
-                let idx = scene.add_fixture(profile);
-                *selection = Selection::fixture(idx);
-            }
-            ui.label(profile.name);
-        });
-    }
 
-    ui.add_space(10.0);
-    ui.label(RichText::new("ENVIRONMENTS").small().strong());
-    last_category = "";
-    for profile in &library.environments {
-        if profile.category != last_category {
-            ui.label(RichText::new(profile.category).weak().small());
-            last_category = profile.category;
-        }
-        ui.horizontal(|ui| {
-            if ui.button("+").on_hover_text("Add to scene").clicked() {
-                let idx = scene.add_environment(profile);
-                *selection = Selection::environment(idx);
+    // --- the list (rich, selectable rows; shift = range, ⌘/Ctrl = toggle) ---
+    let ink = theme::ink(!ui.visuals().dark_mode);
+    let accent = ui.visuals().selection.stroke.color;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let mut last_cat = String::new();
+        let mut add_now: Option<usize> = None;
+        let mut clicked: Option<(usize, egui::Modifiers)> = None;
+        for (ri, row) in rows.iter().enumerate() {
+            if lib.sort == LibSort::Category && row.category != last_cat {
+                last_cat = row.category.clone();
+                ui.add_space(4.0);
+                ui.label(RichText::new(row.category.to_uppercase()).size(10.0).strong().color(ink.tertiary));
             }
-            ui.label(profile.name);
-        });
+            let selected = lib.selected.contains(&ri);
+            let row_resp = library_row_widget(ui, row, selected, &ink, accent);
+            if row_resp.clicked() {
+                clicked = Some((ri, ui.input(|i| i.modifiers)));
+            }
+            if row_resp.double_clicked() {
+                add_now = Some(ri);
+            }
+        }
+        // Apply a click (after the loop so we don't borrow rows mutably mid-iter).
+        if let Some((ri, mods)) = clicked {
+            apply_lib_click(lib, ri, &mods, rows.len());
+        }
+        if let Some(ri) = add_now
+            && let Some(row) = rows.get(ri)
+        {
+            *selection = add_library_row(row, library, scene);
+        }
+    });
+}
+
+/// Range/toggle/replace selection logic for the library list.
+fn apply_lib_click(lib: &mut LibState, ri: usize, mods: &egui::Modifiers, _len: usize) {
+    if mods.shift {
+        let a = lib.anchor.unwrap_or(ri);
+        let (lo, hi) = (a.min(ri), a.max(ri));
+        lib.selected = (lo..=hi).collect();
+        // keep the anchor for chained shift-clicks
+    } else if mods.command || mods.ctrl {
+        if let Some(p) = lib.selected.iter().position(|&x| x == ri) {
+            lib.selected.remove(p);
+        } else {
+            lib.selected.push(ri);
+        }
+        lib.anchor = Some(ri);
+    } else {
+        lib.selected = vec![ri];
+        lib.anchor = Some(ri);
     }
+}
+
+/// A scene-outliner row: icon + name + secondary line, with a right-aligned
+/// patch tag and conflict/live status badges. Full-width clickable with a
+/// selection highlight. Shared by fixtures and environments.
+#[allow(clippy::too_many_arguments)]
+fn entity_row(
+    ui: &mut egui::Ui,
+    icon: &str,
+    name: &str,
+    secondary: &str,
+    patch_tag: &str,
+    conflict: bool,
+    live: bool,
+    selected: bool,
+    ink: &theme::Ink,
+    accent: Color32,
+) -> egui::Response {
+    let h = 34.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+    if selected {
+        painter.rect_filled(rect, 4.0, visuals.selection.bg_fill);
+        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Inside);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+    }
+    painter.text(
+        rect.left_center() + egui::vec2(9.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        icon,
+        egui::FontId::proportional(15.0),
+        if selected { accent } else { ink.secondary },
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(30.0, 5.0),
+        egui::Align2::LEFT_TOP,
+        name,
+        egui::FontId::proportional(13.0),
+        ink.primary,
+    );
+    painter.text(
+        rect.left_bottom() + egui::vec2(30.0, -4.0),
+        egui::Align2::LEFT_BOTTOM,
+        secondary,
+        egui::FontId::proportional(10.5),
+        ink.tertiary,
+    );
+    // Right column: patch tag on top, status badges below.
+    if !patch_tag.is_empty() {
+        let unpatched = patch_tag == "unpatched";
+        painter.text(
+            rect.right_top() + egui::vec2(-9.0, 6.0),
+            egui::Align2::RIGHT_TOP,
+            patch_tag,
+            egui::FontId::monospace(10.0),
+            if unpatched { ink.muted } else { ink.tertiary },
+        );
+    }
+    let mut x = rect.right() - 9.0;
+    if live {
+        painter.text(
+            egui::pos2(x, rect.bottom() - 5.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "● LIVE",
+            egui::FontId::proportional(9.5),
+            theme::LIVE,
+        );
+        x -= 44.0;
+    }
+    if conflict {
+        painter.text(
+            egui::pos2(x, rect.bottom() - 5.0),
+            egui::Align2::RIGHT_BOTTOM,
+            theme::icon::WARNING,
+            egui::FontId::proportional(12.0),
+            theme::CONFLICT,
+        );
+    }
+    resp
+}
+
+/// One library row: icon + name (strong) + dim meta, full-width clickable, with
+/// selection highlight + hover. Returns the row response.
+fn library_row_widget(
+    ui: &mut egui::Ui,
+    row: &LibRow,
+    selected: bool,
+    ink: &theme::Ink,
+    accent: Color32,
+) -> egui::Response {
+    let h = 34.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+    if selected {
+        painter.rect_filled(rect, 4.0, visuals.selection.bg_fill);
+        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Inside);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+    }
+    let icon_color = if row.accent { accent } else { ink.secondary };
+    painter.text(
+        rect.left_center() + egui::vec2(9.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        row.icon,
+        egui::FontId::proportional(16.0),
+        icon_color,
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(30.0, 5.0),
+        egui::Align2::LEFT_TOP,
+        &row.name,
+        egui::FontId::proportional(13.0),
+        ink.primary,
+    );
+    painter.text(
+        rect.left_bottom() + egui::vec2(30.0, -4.0),
+        egui::Align2::LEFT_BOTTOM,
+        &row.meta,
+        egui::FontId::proportional(10.5),
+        ink.tertiary,
+    );
+    // A "+" affordance on hover, right-aligned.
+    if resp.hovered() {
+        painter.text(
+            rect.right_center() + egui::vec2(-9.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            theme::icon::ADD,
+            egui::FontId::proportional(15.0),
+            ink.secondary,
+        );
+    }
+    resp.on_hover_text("Click to select · double-click to add · Shift = range")
 }
 
 /// Right tab: editable parameters for the current selection. Edits flow
@@ -987,11 +1291,13 @@ fn decode_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui:
 /// Drag to orbit, shift+drag to pan, scroll to zoom, click to select, `d` to
 /// duplicate the selected fixture.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn viewport(
     ui: &mut egui::Ui,
     camera: &mut OrbitCamera,
     scene: &Scene,
     selection: &mut Selection,
+    scene_anchor: &mut Option<usize>,
     viewport_focused: &mut bool,
     duplicate: &mut Option<DuplicateDialog>,
     texture: egui::TextureId,
@@ -1039,7 +1345,9 @@ pub fn viewport(
     }
 
     // Click to select: cast a ray through the cursor and pick the nearest object.
-    // ⌘/Ctrl-click toggles a fixture into a multi-selection (shift is pan here).
+    // ⌘/Ctrl-click toggles into a multi-selection; Shift-click range-selects from
+    // the anchor (same as the outliner). A drag with Shift pans, so a stationary
+    // Shift-click still range-selects.
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
     {
@@ -1047,12 +1355,12 @@ pub fn viewport(
         let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
         let aspect = rect.width() / rect.height().max(1.0);
         let (ro, rd) = camera.ray(ndc, aspect);
-        let multi = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+        let m = ui.input(|i| i.modifiers);
+        let toggle = m.command || m.ctrl;
         match pick(scene, ro, rd) {
-            Some(Hit::Fixture(i)) if multi => selection.toggle_fixture(i),
-            Some(Hit::Fixture(i)) => *selection = Selection::fixture(i),
+            Some(Hit::Fixture(i)) => apply_fixture_click(selection, scene_anchor, i, m.shift, toggle),
             Some(Hit::Environment(i)) => *selection = Selection::environment(i),
-            None if !multi => *selection = Selection::default(),
+            None if !(toggle || m.shift) => *selection = Selection::default(),
             None => {}
         }
     }

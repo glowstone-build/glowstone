@@ -9,6 +9,10 @@
 //!
 //! `icon` re-exports the Phosphor glyphs we use under semantic names, so call
 //! sites read `icon::LIBRARY` and the icon set can be swapped in one place.
+//!
+//! This is the design-token vocabulary for the whole app; not every token is
+//! referenced at all times, so unused-API lint is silenced module-wide.
+#![allow(dead_code)]
 
 use egui::{Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Stroke, TextStyle};
 
