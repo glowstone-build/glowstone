@@ -9,7 +9,7 @@ use glam::{Quat, Vec2, Vec3};
 
 use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
-use super::{Axis, DuplicateDialog, GdtfTextures, TransformKind, TransformOp};
+use super::{Axis, DuplicateDialog, GdtfTextures, SelectionGroup, TransformKind, TransformOp};
 use crate::dmx::patch::channel_map;
 use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
 use crate::gdtf::{GdtfFixture, WheelKind};
@@ -85,6 +85,7 @@ fn fixture_order(scene: &Scene, patch: &PatchTable, sort: SceneSort) -> Vec<usiz
     order
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn scene_outliner(
     ui: &mut egui::Ui,
     scene: &mut Scene,
@@ -93,6 +94,8 @@ pub fn scene_outliner(
     live_mask: &[bool],
     anchor: &mut Option<usize>,
     sort: &mut SceneSort,
+    groups: &mut Vec<SelectionGroup>,
+    group_name: &mut String,
 ) {
     use theme::icon;
     let ink = theme::ink(!ui.visuals().dark_mode);
@@ -210,6 +213,64 @@ pub fn scene_outliner(
             } else {
                 apply_fixture_click(selection, anchor, i, false, toggle, scene.fixtures.len());
             }
+        }
+    });
+
+    // ---- GROUPS: saved named selections (console-style), recalled by click ----
+    folder_header(icon::CATEGORY, "Groups", groups.len(), true, &ink).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let hint = format!("Group {}", groups.len() + 1);
+            ui.add(
+                egui::TextEdit::singleline(group_name)
+                    .desired_width(110.0)
+                    .hint_text(&hint),
+            );
+            let can_save = !selection.fixtures.is_empty();
+            if ui
+                .add_enabled(can_save, egui::Button::new(format!("{}  Save", icon::ADD)))
+                .on_hover_text("Save the current fixture selection as a group")
+                .clicked()
+            {
+                let name = if group_name.trim().is_empty() { hint } else { group_name.trim().to_string() };
+                groups.push(SelectionGroup { name, fixtures: selection.fixtures.clone() });
+                group_name.clear();
+            }
+        });
+        if groups.is_empty() {
+            ui.label(RichText::new("none — select fixtures, then Save").weak().small());
+        }
+        let mut recall: Option<usize> = None;
+        let mut remove: Option<usize> = None;
+        for (gi, g) in groups.iter().enumerate() {
+            ui.horizontal(|ui| {
+                // Highlight the group if the current selection exactly matches it.
+                let mut want = g.fixtures.clone();
+                want.sort_unstable();
+                let mut have = selection.fixtures.clone();
+                have.sort_unstable();
+                let active = !want.is_empty() && want == have;
+                if ui
+                    .selectable_label(active, format!("{}  ({})", g.name, g.fixtures.len()))
+                    .on_hover_text("Recall this selection")
+                    .clicked()
+                {
+                    recall = Some(gi);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(icon::TRASH).on_hover_text("Delete group").clicked() {
+                        remove = Some(gi);
+                    }
+                });
+            });
+        }
+        if let Some(gi) = recall {
+            let n = scene.fixtures.len();
+            selection.fixtures = groups[gi].fixtures.iter().copied().filter(|&i| i < n).collect();
+            selection.environment = None;
+            *anchor = None;
+        }
+        if let Some(gi) = remove {
+            groups.remove(gi);
         }
     });
 

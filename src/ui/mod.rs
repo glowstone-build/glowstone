@@ -52,6 +52,15 @@ pub enum Tab {
     Patch,
 }
 
+/// A saved, named selection of fixtures (console-style "groups"). Recalled by
+/// click in the Scene › Groups folder. Indices are filtered to valid range on
+/// recall, so editing the rig afterwards can't crash a recall.
+#[derive(Clone)]
+pub struct SelectionGroup {
+    pub name: String,
+    pub fixtures: Vec<usize>,
+}
+
 /// An in-progress modal transform of the selected fixtures (Blender's G/R/S):
 /// grab / rotate / scale driven by mouse motion, optionally axis-constrained,
 /// confirmed by click/Enter or cancelled by Esc/right-click.
@@ -211,6 +220,9 @@ pub struct Ui {
     quick_select: bool,
     /// In-progress modal transform (G/R/S), if any.
     transform: Option<TransformOp>,
+    /// Saved fixture selection groups + the new-group name buffer.
+    groups: Vec<SelectionGroup>,
+    group_name: String,
 }
 
 impl Ui {
@@ -235,6 +247,8 @@ impl Ui {
             fm: panels::FmState::default(),
             quick_select: false,
             transform: None,
+            groups: Vec::new(),
+            group_name: String::new(),
         }
     }
 
@@ -326,6 +340,8 @@ impl Ui {
             scene_sort: &mut self.scene_sort,
             fm: &mut self.fm,
             transform: &mut self.transform,
+            groups: &mut self.groups,
+            group_name: &mut self.group_name,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
             dmx_status: dmxv.status,
@@ -868,6 +884,8 @@ struct PanelViewer<'a> {
     scene_sort: &'a mut panels::SceneSort,
     fm: &'a mut panels::FmState,
     transform: &'a mut Option<TransformOp>,
+    groups: &'a mut Vec<SelectionGroup>,
+    group_name: &'a mut String,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
     dmx_snapshot: &'a crate::dmx::UniverseSnapshot,
@@ -914,6 +932,8 @@ impl TabViewer for PanelViewer<'_> {
                 self.dmx_live_mask,
                 self.scene_anchor,
                 self.scene_sort,
+                self.groups,
+                self.group_name,
             ),
             Tab::Library => panels::library_browser(
                 ui,
