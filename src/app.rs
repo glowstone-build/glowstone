@@ -822,6 +822,9 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     if std::env::var("PREVIZ_UI_PROFILE").is_ok() {
         state.ui.debug_open_profile(&state.scene);
     }
+    if std::env::var("PREVIZ_UI_SELECT").is_ok() {
+        state.ui.debug_select_first_gdtf(&state.scene);
+    }
     let mut jobs: Vec<egui::ClippedPrimitive> = Vec::new();
     let mut sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
     for i in 0..3 {

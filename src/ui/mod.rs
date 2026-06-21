@@ -74,6 +74,20 @@ impl Tab {
             Tab::Patch => "Patch",
         }
     }
+
+    /// Leading icon glyph for the dock tab.
+    fn icon(self) -> &'static str {
+        use theme::icon;
+        match self {
+            Tab::Viewport => icon::VIEWPORT,
+            Tab::Scene => icon::SCENE,
+            Tab::Library => icon::LIBRARY,
+            Tab::Inspector => icon::INSPECTOR,
+            Tab::DmxMonitor => icon::DMX,
+            Tab::Connectivity => icon::CONNECT,
+            Tab::Patch => icon::PATCH,
+        }
+    }
 }
 
 /// Owns the dock layout and the cross-panel UI state (the content library,
@@ -245,6 +259,13 @@ impl Ui {
         }
     }
 
+    /// Select the first GDTF fixture (headless hook for inspector screenshots).
+    pub fn debug_select_first_gdtf(&mut self, scene: &Scene) {
+        if let Some(i) = scene.fixtures.iter().position(|f| f.is_gdtf()) {
+            self.selection = Selection::fixture(i);
+        }
+    }
+
     /// Make the named tab the active one in its leaf (used by the headless UI
     /// screenshot path to capture a specific panel).
     pub fn focus_tab_by_title(&mut self, title: &str) {
@@ -401,8 +422,9 @@ impl Ui {
     ) {
         egui::TopBottomPanel::top("menu-bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
+                use theme::icon;
                 ui.menu_button("File", |ui| {
-                    if ui.button("Import GDTF Fixture…").clicked() {
+                    if ui.button(format!("{}  Import GDTF Fixture…", icon::IMPORT_GDTF)).clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("GDTF", &["gdtf"]).pick_file() {
                             if let Ok(idx) = self.library.import_gdtf(&path) {
                                 let arc = self.library.gdtf[idx].clone();
@@ -412,7 +434,7 @@ impl Ui {
                         }
                         ui.close();
                     }
-                    if ui.button("Import MVR Scene…").clicked() {
+                    if ui.button(format!("{}  Import MVR Scene…", icon::IMPORT_MVR)).clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("MVR", &["mvr"]).pick_file() {
                             if let Ok(import) = crate::mvr::MvrImport::load_path(&path) {
                                 scene.import_mvr(import);
@@ -425,7 +447,7 @@ impl Ui {
                         ui.close();
                     }
                     let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
-                    if ui.add_enabled(can_export, egui::Button::new("Export MVR Scene…")).clicked() {
+                    if ui.add_enabled(can_export, egui::Button::new(format!("{}  Export MVR Scene…", icon::EXPORT))).clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("MVR", &["mvr"]).set_file_name("scene.mvr").save_file() {
                             if let Err(e) = crate::mvr::export_path(scene, &path) {
                                 log::error!("export MVR: {e}");
@@ -434,29 +456,29 @@ impl Ui {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Preferences…").clicked() {
+                    if ui.button(format!("{}  Preferences…", icon::SETTINGS)).clicked() {
                         self.show_prefs = true;
                         ui.close();
                     }
                 });
                 ui.menu_button("Edit", |ui| {
-                    if ui.add_enabled(self.selection.primary_fixture().is_some(), egui::Button::new("Duplicate / Array…")).clicked() {
+                    if ui.add_enabled(self.selection.primary_fixture().is_some(), egui::Button::new(format!("{}  Duplicate / Array…", icon::DUPLICATE))).clicked() {
                         if let Some(idx) = self.selection.primary_fixture() {
                             self.duplicate = Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
                         }
                         ui.close();
                     }
-                    if ui.add_enabled(!self.selection.fixtures.is_empty(), egui::Button::new("Delete Selected")).clicked() {
+                    if ui.add_enabled(!self.selection.fixtures.is_empty(), egui::Button::new(format!("{}  Delete Selected", icon::TRASH))).clicked() {
                         self.delete_selected(scene);
                         ui.close();
                     }
-                    if ui.button("Deselect All").clicked() {
+                    if ui.button(format!("{}  Deselect All", icon::DESELECT)).clicked() {
                         self.selection = Selection::default();
                         ui.close();
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    ui.menu_button("Camera", |ui| {
+                    ui.menu_button(format!("{}  Camera", icon::CAMERA), |ui| {
                         for v in CameraView::ALL {
                             if ui.button(v.label()).clicked() {
                                 camera.set_view(v);
@@ -464,13 +486,13 @@ impl Ui {
                             }
                         }
                     });
-                    if ui.button("Frame Selection  (F)").clicked() {
+                    if ui.button(format!("{}  Frame Selection  (F)", icon::FRAME)).clicked() {
                         if let Some((lo, hi)) = self.frame_bounds(scene, true) {
                             camera.frame_aabb(lo, hi);
                         }
                         ui.close();
                     }
-                    if ui.button("Frame All  (Shift+F)").clicked() {
+                    if ui.button(format!("{}  Frame All  (Shift+F)", icon::FRAME)).clicked() {
                         if let Some((lo, hi)) = self.frame_bounds(scene, false) {
                             camera.frame_aabb(lo, hi);
                         }
@@ -491,7 +513,7 @@ impl Ui {
                 });
                 ui.menu_button("Fixture", |ui| {
                     let has = self.selection.primary_fixture().map(|i| i < scene.fixtures.len() && scene.fixtures[i].is_gdtf()).unwrap_or(false);
-                    if ui.add_enabled(has, egui::Button::new("Edit Profile…")).clicked() {
+                    if ui.add_enabled(has, egui::Button::new(format!("{}  Edit Profile…", icon::PROFILE))).clicked() {
                         if let Some(i) = self.selection.primary_fixture() {
                             self.profile = Some(ProfileEditor::new(i));
                         }
@@ -501,22 +523,22 @@ impl Ui {
                 ui.menu_button("Window", |ui| {
                     for tab in Tab::TOGGLEABLE {
                         let mut open = self.is_tab_open(tab);
-                        if ui.checkbox(&mut open, tab.title()).changed() {
+                        if ui.checkbox(&mut open, format!("{}  {}", tab.icon(), tab.title())).changed() {
                             self.toggle_tab(tab);
                         }
                     }
                     ui.separator();
-                    if ui.button("Reset Panel Layout").clicked() {
+                    if ui.button(format!("{}  Reset Panel Layout", icon::LAYOUT)).clicked() {
                         self.dock = Self::default_dock();
                         ui.close();
                     }
                 });
                 ui.menu_button("Help", |ui| {
-                    if ui.button("Keyboard Shortcuts").clicked() {
+                    if ui.button(format!("{}  Keyboard Shortcuts", icon::KEYBOARD)).clicked() {
                         self.show_shortcuts = true;
                         ui.close();
                     }
-                    if ui.button("About previz").clicked() {
+                    if ui.button(format!("{}  About previz", icon::INFO)).clicked() {
                         self.show_about = true;
                         ui.close();
                     }
@@ -675,7 +697,7 @@ impl TabViewer for PanelViewer<'_> {
     type Tab = Tab;
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        tab.title().into()
+        format!("{}  {}", tab.icon(), tab.title()).into()
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {

@@ -51,6 +51,11 @@ pub mod icon {
     pub const COLOR: &str = p::PALETTE;
     pub const INFO: &str = p::INFO;
     pub const RESET: &str = p::ARROW_CLOCKWISE;
+    pub const DUPLICATE: &str = p::COPY;
+    pub const DESELECT: &str = p::X_CIRCLE;
+    pub const CAMERA: &str = p::VIDEO_CAMERA;
+    pub const LAYOUT: &str = p::SQUARES_FOUR;
+    pub const KEYBOARD: &str = p::KEYBOARD;
     // Status glyphs
     pub const LIVE: &str = p::CIRCLE; // filled-via-color
     pub const WARNING: &str = p::WARNING;

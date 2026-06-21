@@ -71,14 +71,10 @@ pub fn scene_outliner(
         .auto_shrink([false, true])
         .show(ui, |ui| {
             for (i, fixture) in scene.fixtures.iter().enumerate() {
+                // Keep the row tag short (universe.address); the mode is in the
+                // inspector. Long names would otherwise collide with it.
                 let patch_tag = match patch.get(i).filter(|p| p.enabled) {
-                    Some(p) => {
-                        let mut tag = format!("{}.{:03}", p.universe, p.address);
-                        if let Some(mode) = fixture.gdtf.as_ref().and_then(|g| g.modes.get(p.mode_index)) {
-                            tag += &format!(" · {}", mode.name);
-                        }
-                        tag
-                    }
+                    Some(p) => format!("{}.{:03}", p.universe, p.address),
                     None => "unpatched".into(),
                 };
                 let live = live_mask.get(i).copied().unwrap_or(false);
@@ -466,6 +462,31 @@ fn apply_lib_click(lib: &mut LibState, ri: usize, mods: &egui::Modifiers, _len: 
     }
 }
 
+/// Paint left-anchored text truncated with an ellipsis to `max_w` (single row) —
+/// used by the dense list rows so a long name can't run under the right column.
+fn paint_truncated(
+    painter: &egui::Painter,
+    top_left: egui::Pos2,
+    text: &str,
+    size: f32,
+    color: Color32,
+    max_w: f32,
+) {
+    use egui::text::{LayoutJob, TextFormat, TextWrapping};
+    let mut job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat { font_id: egui::FontId::proportional(size), color, ..Default::default() },
+    );
+    job.wrap = TextWrapping {
+        max_width: max_w.max(8.0),
+        max_rows: 1,
+        overflow_character: Some('…'),
+        ..Default::default()
+    };
+    let galley = painter.layout_job(job);
+    painter.galley(top_left, galley, color);
+}
+
 /// A scene-outliner row: icon + name + secondary line, with a right-aligned
 /// patch tag and conflict/live status badges. Full-width clickable with a
 /// selection highlight. Shared by fixtures and environments.
@@ -499,20 +520,10 @@ fn entity_row(
         egui::FontId::proportional(15.0),
         if selected { accent } else { ink.secondary },
     );
-    painter.text(
-        rect.left_top() + egui::vec2(30.0, 5.0),
-        egui::Align2::LEFT_TOP,
-        name,
-        egui::FontId::proportional(13.0),
-        ink.primary,
-    );
-    painter.text(
-        rect.left_bottom() + egui::vec2(30.0, -4.0),
-        egui::Align2::LEFT_BOTTOM,
-        secondary,
-        egui::FontId::proportional(10.5),
-        ink.tertiary,
-    );
+    // Left text zone is bounded so a long name can't run under the right column.
+    let text_w = (rect.width() - 30.0 - 64.0).max(40.0);
+    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), name, 13.0, ink.primary, text_w);
+    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), secondary, 10.5, ink.tertiary, text_w);
     // Right column: patch tag on top, status badges below.
     if !patch_tag.is_empty() {
         let unpatched = patch_tag == "unpatched";
@@ -574,20 +585,9 @@ fn library_row_widget(
         egui::FontId::proportional(16.0),
         icon_color,
     );
-    painter.text(
-        rect.left_top() + egui::vec2(30.0, 5.0),
-        egui::Align2::LEFT_TOP,
-        &row.name,
-        egui::FontId::proportional(13.0),
-        ink.primary,
-    );
-    painter.text(
-        rect.left_bottom() + egui::vec2(30.0, -4.0),
-        egui::Align2::LEFT_BOTTOM,
-        &row.meta,
-        egui::FontId::proportional(10.5),
-        ink.tertiary,
-    );
+    let text_w = (rect.width() - 30.0 - 22.0).max(40.0);
+    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), &row.name, 13.0, ink.primary, text_w);
+    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, text_w);
     // A "+" affordance on hover, right-aligned.
     if resp.hovered() {
         painter.text(
@@ -941,7 +941,11 @@ fn gdtf_inspector(
     ui.horizontal(|ui| {
         ui.heading(gdtf.name.as_str());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("⚙ Profile…").on_hover_text("Open the full fixture profile editor").clicked() {
+            if ui
+                .button(format!("{}  Profile…", theme::icon::PROFILE))
+                .on_hover_text("Open the full fixture profile editor")
+                .clicked()
+            {
                 *profile = Some(ProfileEditor::new(fixture_id));
             }
         });
