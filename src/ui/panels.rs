@@ -13,7 +13,7 @@ use super::{DuplicateDialog, GdtfTextures};
 use crate::dmx::patch::channel_map;
 use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
 use crate::gdtf::{GdtfFixture, WheelKind};
-use crate::optics::{self, OpticalControls};
+use crate::optics::{self, OpticField, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
 use crate::scene::{apply_fixture_click, Fixture, Library, RenderSettings, Scene, Selection, ViewportMode};
@@ -121,7 +121,7 @@ pub fn scene_outliner(
     // ---- OBJECTS: imported MVR static geometry (stage / truss / set) ----
     // Read-only; can be thousands of rows, so the body is virtualised and the
     // folder defaults closed.
-    folder_header(ui, icon::GEOMETRY, "Objects", scene.geometry.len(), false, &ink).show(ui, |ui| {
+    folder_header(icon::GEOMETRY, "Objects", scene.geometry.len(), false, &ink).show(ui, |ui| {
         if scene.geometry.is_empty() {
             ui.label(RichText::new("none — import an MVR scene").weak().small());
         } else {
@@ -140,7 +140,7 @@ pub fn scene_outliner(
     });
 
     // ---- FIXTURES: sortable, virtualised, patch-ordered ----
-    folder_header(ui, icon::FIXTURE, "Fixtures", scene.fixtures.len(), true, &ink).show(ui, |ui| {
+    folder_header(icon::FIXTURE, "Fixtures", scene.fixtures.len(), true, &ink).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(theme::ico(icon::SORT).weak()).on_hover_text("Sort fixtures by");
             for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type] {
@@ -191,7 +191,7 @@ pub fn scene_outliner(
     });
 
     // ---- ENVIRONMENT: fog boxes / world ----
-    folder_header(ui, icon::ENVIRONMENT, "Environment", scene.environments.len(), true, &ink).show(ui, |ui| {
+    folder_header(icon::ENVIRONMENT, "Environment", scene.environments.len(), true, &ink).show(ui, |ui| {
         if scene.environments.is_empty() {
             ui.label(RichText::new("none — add a Fog Box from the Library").weak().small());
         }
@@ -216,7 +216,7 @@ pub fn scene_outliner(
 
     ui.add_space(6.0);
     ui.separator();
-    folder_header(ui, icon::SETTINGS, "View", 0, true, &ink).show(ui, |ui| {
+    folder_header(icon::SETTINGS, "View", 0, true, &ink).show(ui, |ui| {
     Grid::new("view-grid")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -266,7 +266,6 @@ pub fn scene_outliner(
 /// A collapsible top-level Scene folder header: icon + title + count, styled as a
 /// quiet section. Returns the `CollapsingHeader` to `.show(...)` a body on.
 fn folder_header(
-    ui: &egui::Ui,
     icon: &str,
     title: &str,
     count: usize,
@@ -278,7 +277,6 @@ fn folder_header(
     } else {
         format!("{icon}  {title}")
     };
-    let _ = ui;
     egui::CollapsingHeader::new(RichText::new(label).size(12.0).strong().color(ink.secondary))
         .id_salt(title)
         .default_open(default_open)
@@ -744,113 +742,135 @@ pub fn inspector(
 
 /// Bulk editor shown when several fixtures are selected: edits a shared property
 /// on **all** of them at once (set-semantics, seeded from the first selected).
+/// Categories are collapsible and the Optics / Wheels rows are **dynamic** — they
+/// show the union of controls the selected fixtures actually expose, not a fixed
+/// hardcoded list.
 fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
     let primary = ids[0];
-    ui.label(
-        RichText::new(format!("{} fixtures selected — bulk edit", ids.len()))
-            .strong(),
-    );
-    ui.label(RichText::new("Edits apply to all selected.").weak().small());
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{}  {} fixtures", theme::icon::FIXTURE, ids.len())).strong());
+    });
+    ui.label(RichText::new("Bulk edit — changes apply to all selected.").weak().small());
     ui.separator();
 
-    Grid::new("bulk-grid")
-        .num_columns(2)
-        .spacing([12.0, 8.0])
-        .striped(true)
-        .show(ui, |ui| {
-            let mut pan = scene.fixtures[primary].pan;
-            ui.label("Pan");
-            if ui.add(DragValue::new(&mut pan).speed(0.5).range(-270.0..=270.0).suffix("°")).changed() {
-                for &i in ids {
-                    scene.fixtures[i].pan = pan;
-                }
-            }
-            ui.end_row();
-
-            let mut tilt = scene.fixtures[primary].tilt;
-            ui.label("Tilt");
-            if ui.add(DragValue::new(&mut tilt).speed(0.5).range(-180.0..=180.0).suffix("°")).changed() {
-                for &i in ids {
-                    scene.fixtures[i].tilt = tilt;
-                }
-            }
-            ui.end_row();
-
-            let mut intensity = scene.fixtures[primary].intensity;
-            ui.label("Intensity");
-            if ui.add(Slider::new(&mut intensity, 0.0..=1.0)).changed() {
-                for &i in ids {
-                    scene.fixtures[i].intensity = intensity;
-                }
-            }
-            ui.end_row();
-
-            let mut color = scene.fixtures[primary].color;
-            ui.label("Color");
-            if ui.color_edit_button_rgb(&mut color).changed() {
-                for &i in ids {
-                    scene.fixtures[i].color = color;
-                }
-            }
-            ui.end_row();
-        });
-
-    ui.add_space(6.0);
-    ui.label(RichText::new("Nudge position (all)").small().strong());
-    ui.horizontal(|ui| {
-        let mut delta = glam::Vec3::ZERO;
-        // Drag from zero applies a delta; the field snaps back each frame.
-        for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
-            let mut v = 0.0f32;
-            if ui.add(DragValue::new(&mut v).speed(0.05).prefix(format!("{label} "))).changed() {
-                delta[axis] += v;
-            }
-        }
-        if delta != glam::Vec3::ZERO {
-            for &i in ids {
-                scene.fixtures[i].position += delta;
-            }
-        }
-    });
-
-    // Shared optical controls (applied to every selected fixture). Wheel rows
-    // come from the PRIMARY fixture's component chain and apply to matching
-    // (kind, number) components on every selected fixture.
-    egui::CollapsingHeader::new("Optics (all selected)")
+    // --- TRANSFORM ---
+    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
         .default_open(true)
         .show(ui, |ui| {
-            Grid::new("bulk-optics")
-                .num_columns(2)
-                .spacing([10.0, 5.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    bulk_opt(ui, scene, ids, "Dimmer", |o| o.dimmer, |o, v| o.dimmer = v);
-                    bulk_opt(ui, scene, ids, "Zoom", |o| o.zoom, |o, v| o.zoom = v);
-                    bulk_opt(ui, scene, ids, "Focus", |o| o.focus, |o, v| o.focus = v);
-                    bulk_opt(ui, scene, ids, "Iris", |o| o.iris, |o, v| o.iris = v);
-                    bulk_opt(ui, scene, ids, "CTO", |o| o.cto, |o, v| o.cto = v);
-                    bulk_opt(ui, scene, ids, "Cyan", |o| o.cmy[0], |o, v| o.cmy[0] = v);
-                    bulk_opt(ui, scene, ids, "Magenta", |o| o.cmy[1], |o, v| o.cmy[1] = v);
-                    bulk_opt(ui, scene, ids, "Yellow", |o| o.cmy[2], |o, v| o.cmy[2] = v);
-                    bulk_opt(ui, scene, ids, "Shutter", |o| o.shutter, |o, v| o.shutter = v);
-                    bulk_opt(ui, scene, ids, "Chromatic ab.", |o| o.ca, |o, v| o.ca = v);
+            Grid::new("bulk-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                let mut pan = scene.fixtures[primary].pan;
+                ui.label("Pan");
+                if ui.add(DragValue::new(&mut pan).speed(0.5).range(-270.0..=270.0).suffix("°")).changed() {
+                    for &i in ids {
+                        scene.fixtures[i].pan = pan;
+                    }
+                }
+                ui.end_row();
+                let mut tilt = scene.fixtures[primary].tilt;
+                ui.label("Tilt");
+                if ui.add(DragValue::new(&mut tilt).speed(0.5).range(-180.0..=180.0).suffix("°")).changed() {
+                    for &i in ids {
+                        scene.fixtures[i].tilt = tilt;
+                    }
+                }
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("Nudge position (all)").small().strong());
+            ui.horizontal(|ui| {
+                let mut delta = glam::Vec3::ZERO;
+                // Drag from zero applies a delta; the field snaps back each frame.
+                for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
+                    let mut v = 0.0f32;
+                    if ui.add(DragValue::new(&mut v).speed(0.05).prefix(format!("{label} "))).changed() {
+                        delta[axis] += v;
+                    }
+                }
+                if delta != glam::Vec3::ZERO {
+                    for &i in ids {
+                        scene.fixtures[i].position += delta;
+                    }
+                }
+            });
+        });
 
-                    let comps: Vec<(WheelKind, u32, String)> = scene.fixtures[primary]
-                        .gdtf
-                        .as_ref()
-                        .and_then(|g| g.modes.get(scene.fixtures[primary].mode_index))
-                        .map(|m| {
-                            m.components
-                                .iter()
-                                .map(|c| (c.kind, c.number, c.attribute.clone()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    for (kind, number, label) in comps {
-                        bulk_wheel(ui, scene, ids, kind, number, &label);
+    // --- FIXTURE ---
+    egui::CollapsingHeader::new(format!("{}  Fixture", theme::icon::COLOR))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("bulk-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                let mut intensity = scene.fixtures[primary].intensity;
+                ui.label("Intensity");
+                if ui.add(Slider::new(&mut intensity, 0.0..=1.0)).changed() {
+                    for &i in ids {
+                        scene.fixtures[i].intensity = intensity;
+                    }
+                }
+                ui.end_row();
+                let mut color = scene.fixtures[primary].color;
+                ui.label("Color");
+                if ui.color_edit_button_rgb(&mut color).changed() {
+                    for &i in ids {
+                        scene.fixtures[i].color = color;
+                    }
+                }
+                ui.end_row();
+            });
+        });
+
+    // --- OPTICS (dynamic): only fields some selected fixture actually exposes ---
+    let supports = |f: OpticField| {
+        ids.iter().any(|&i| scene.fixtures[i].gdtf.as_ref().is_some_and(|g| f.supported(g)))
+    };
+    let beam: Vec<OpticField> = OpticField::BEAM.into_iter().filter(|&f| supports(f)).collect();
+    let color: Vec<OpticField> = OpticField::COLOR.into_iter().filter(|&f| supports(f)).collect();
+    if !beam.is_empty() || !color.is_empty() {
+        egui::CollapsingHeader::new(format!("{}  Optics", theme::icon::INSPECTOR))
+            .default_open(true)
+            .show(ui, |ui| {
+                if !beam.is_empty() {
+                    ui.label(RichText::new("BEAM SHAPING").small().strong());
+                    Grid::new("bulk-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                        for f in beam {
+                            bulk_opt_field(ui, scene, ids, f);
+                        }
+                    });
+                }
+                if !color.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("COLOR MIXING").small().strong());
+                    Grid::new("bulk-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                        for f in color {
+                            bulk_opt_field(ui, scene, ids, f);
+                        }
+                    });
+                }
+            });
+    }
+
+    // --- WHEELS (dynamic): the union of components across all selected fixtures ---
+    let mut wheels: Vec<(WheelKind, u32, String)> = Vec::new();
+    for &i in ids {
+        let f = &scene.fixtures[i];
+        if let Some(comps) = f.gdtf.as_ref().and_then(|g| g.modes.get(f.mode_index)).map(|m| &m.components) {
+            for c in comps {
+                if !wheels.iter().any(|(k, n, _)| *k == c.kind && *n == c.number) {
+                    wheels.push((c.kind, c.number, c.attribute.clone()));
+                }
+            }
+        }
+    }
+    if !wheels.is_empty() {
+        egui::CollapsingHeader::new(format!("{}  Wheels", theme::icon::COLOR))
+            .default_open(true)
+            .show(ui, |ui| {
+                Grid::new("bulk-wheels").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                    for (kind, number, label) in &wheels {
+                        bulk_wheel(ui, scene, ids, *kind, *number, label);
                     }
                 });
-        });
+            });
+    }
 }
 
 /// Bulk rows for one wheel component: value + spin sliders applied to the
@@ -863,8 +883,12 @@ fn bulk_wheel(
     number: u32,
     label: &str,
 ) {
-    let read = |f: &mut Fixture| f.wheel_control_mut(kind, number).map(|w| (w.value, w.spin));
-    let Some((mut value, mut spin)) = read(&mut scene.fixtures[ids[0]]) else {
+    // Seed from the first selected fixture that actually has this wheel (the
+    // union may include wheels the primary doesn't have).
+    let Some((mut value, mut spin)) = ids
+        .iter()
+        .find_map(|&i| scene.fixtures[i].wheel_control_mut(kind, number).map(|w| (w.value, w.spin)))
+    else {
         return;
     };
     ui.label(label);
@@ -887,134 +911,106 @@ fn bulk_wheel(
     ui.end_row();
 }
 
-/// One bulk optics slider (0..1) seeded from the primary, written to all `ids`.
-fn bulk_opt(
-    ui: &mut egui::Ui,
-    scene: &mut Scene,
-    ids: &[usize],
-    label: &str,
-    get: impl Fn(&OpticalControls) -> f32,
-    set: impl Fn(&mut OpticalControls, f32),
-) {
-    let mut v = get(&scene.fixtures[ids[0]].optics);
-    ui.label(label);
-    if ui.add(Slider::new(&mut v, 0.0..=1.0)).changed() {
+/// One bulk optics slider for an [`OpticField`], seeded from the primary and
+/// written to every selected fixture (range-aware: e.g. green tint is bipolar).
+fn bulk_opt_field(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], f: OpticField) {
+    let mut v = f.get(&scene.fixtures[ids[0]].optics);
+    ui.label(f.label());
+    if ui.add(Slider::new(&mut v, f.range())).changed() {
         for &i in ids {
-            set(&mut scene.fixtures[i].optics, v);
+            f.set(&mut scene.fixtures[i].optics, v);
         }
     }
     ui.end_row();
 }
 
 fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture) {
-    Grid::new("fixture-grid")
-        .num_columns(2)
-        .spacing([12.0, 8.0])
-        .striped(true)
+    ui.horizontal(|ui| {
+        ui.heading(fixture.name.as_str());
+    });
+    ui.label(RichText::new(format!("{} · {}", fixture.category, fixture.profile)).weak().small());
+    ui.separator();
+
+    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
+        .default_open(true)
         .show(ui, |ui| {
-            ui.label("Name");
-            ui.label(fixture.name.as_str());
-            ui.end_row();
-
-            ui.label("Profile");
-            ui.label(format!("{} · {}", fixture.category, fixture.profile));
-            ui.end_row();
-
-            ui.label("Pan");
-            ui.add(
-                DragValue::new(&mut fixture.pan)
-                    .speed(0.5)
-                    .range(-270.0..=270.0)
-                    .suffix("°"),
-            );
-            ui.end_row();
-
-            ui.label("Tilt");
-            ui.add(
-                DragValue::new(&mut fixture.tilt)
-                    .speed(0.5)
-                    .range(-180.0..=180.0)
-                    .suffix("°"),
-            );
-            ui.end_row();
-
-            ui.label("Intensity");
-            ui.add(
-                DragValue::new(&mut fixture.intensity)
-                    .speed(0.005)
-                    .range(0.0..=1.0),
-            );
-            ui.end_row();
-
-            ui.label("Beam");
-            ui.add(
-                DragValue::new(&mut fixture.beam_angle)
-                    .speed(0.2)
-                    .range(2.0..=90.0)
-                    .suffix("°"),
-            );
-            ui.end_row();
-
-            ui.label("Color");
-            ui.color_edit_button_rgb(&mut fixture.color);
-            ui.end_row();
-
-            ui.label("Position");
-            ui.horizontal(|ui| {
-                ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+            Grid::new("fx-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
+                    ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
+                    ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                });
+                ui.end_row();
+                ui.label("Pan");
+                ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"));
+                ui.end_row();
+                ui.label("Tilt");
+                ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-180.0..=180.0).suffix("°"));
+                ui.end_row();
             });
-            ui.end_row();
+        });
+
+    egui::CollapsingHeader::new(format!("{}  Fixture", theme::icon::COLOR))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("fx-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Intensity");
+                ui.add(DragValue::new(&mut fixture.intensity).speed(0.005).range(0.0..=1.0));
+                ui.end_row();
+                ui.label("Beam");
+                ui.add(DragValue::new(&mut fixture.beam_angle).speed(0.2).range(2.0..=90.0).suffix("°"));
+                ui.end_row();
+                ui.label("Color");
+                ui.color_edit_button_rgb(&mut fixture.color);
+                ui.end_row();
+            });
         });
 }
 
 fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment) {
-    Grid::new("environment-grid")
-        .num_columns(2)
-        .spacing([12.0, 8.0])
-        .striped(true)
+    ui.horizontal(|ui| {
+        ui.heading(env.name.as_str());
+    });
+    ui.label(RichText::new(format!("{:?}", env.kind)).weak().small());
+    ui.separator();
+
+    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
+        .default_open(true)
         .show(ui, |ui| {
-            ui.label("Name");
-            ui.label(env.name.as_str());
-            ui.end_row();
-
-            ui.label("Type");
-            ui.label(format!("{:?}", env.kind));
-            ui.end_row();
-
-            ui.label("Center");
-            ui.horizontal(|ui| {
-                ui.add(DragValue::new(&mut env.center.x).speed(0.1).prefix("x "));
-                ui.add(DragValue::new(&mut env.center.y).speed(0.1).prefix("y "));
-                ui.add(DragValue::new(&mut env.center.z).speed(0.1).prefix("z "));
+            Grid::new("env-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Center");
+                ui.horizontal(|ui| {
+                    ui.add(DragValue::new(&mut env.center.x).speed(0.1).prefix("x "));
+                    ui.add(DragValue::new(&mut env.center.y).speed(0.1).prefix("y "));
+                    ui.add(DragValue::new(&mut env.center.z).speed(0.1).prefix("z "));
+                });
+                ui.end_row();
+                ui.label("Size");
+                ui.horizontal(|ui| {
+                    ui.add(DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("w "));
+                    ui.add(DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("h "));
+                    ui.add(DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("d "));
+                });
+                ui.end_row();
             });
-            ui.end_row();
+        });
 
-            ui.label("Size");
-            ui.horizontal(|ui| {
-                ui.add(DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("w "));
-                ui.add(DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("h "));
-                ui.add(DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("d "));
+    egui::CollapsingHeader::new(format!("{}  Volume", theme::icon::ENVIRONMENT))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("env-volume").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Density");
+                ui.add(DragValue::new(&mut env.density).speed(0.005).range(0.0..=4.0));
+                ui.end_row();
+                ui.label("Anisotropy");
+                ui.add(DragValue::new(&mut env.anisotropy).speed(0.005).range(-0.95..=0.95))
+                    .on_hover_text("Henyey-Greenstein g (forward scattering > 0)");
+                ui.end_row();
+                ui.label("Tint");
+                ui.color_edit_button_rgb(&mut env.color);
+                ui.end_row();
             });
-            ui.end_row();
-
-            ui.label("Density");
-            ui.add(DragValue::new(&mut env.density).speed(0.005).range(0.0..=4.0));
-            ui.end_row();
-
-            ui.label("Anisotropy");
-            ui.add(
-                DragValue::new(&mut env.anisotropy)
-                    .speed(0.005)
-                    .range(-0.95..=0.95),
-            )
-            .on_hover_text("Henyey-Greenstein g (forward scattering > 0)");
-            ui.end_row();
-
-            ui.label("Tint");
-            ui.color_edit_button_rgb(&mut env.color);
-            ui.end_row();
         });
 }
 
@@ -1139,36 +1135,43 @@ fn gdtf_inspector(
     }
 
     ui.separator();
-    Grid::new("gdtf-params")
-        .num_columns(2)
-        .spacing([12.0, 8.0])
-        .striped(true)
+    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
+        .default_open(true)
         .show(ui, |ui| {
-            ui.label("Pan");
-            ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"))
-                .on_hover_text(format!("commanded · now {:.0}°", fixture.pan_actual));
-            ui.end_row();
-            ui.label("Tilt");
-            ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-135.0..=135.0).suffix("°"))
-                .on_hover_text(format!("commanded · now {:.0}°", fixture.tilt_actual));
-            ui.end_row();
-            ui.label("Move speed")
-                .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
-            ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0));
-            ui.end_row();
-            ui.label("Intensity");
-            ui.add(DragValue::new(&mut fixture.intensity).speed(0.005).range(0.0..=1.0));
-            ui.end_row();
-            ui.label("Color");
-            ui.color_edit_button_rgb(&mut fixture.color);
-            ui.end_row();
-            ui.label("Position");
-            ui.horizontal(|ui| {
-                ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+            Grid::new("gdtf-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
+                    ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
+                    ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                });
+                ui.end_row();
+                ui.label("Pan");
+                ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"))
+                    .on_hover_text(format!("commanded · now {:.0}°", fixture.pan_actual));
+                ui.end_row();
+                ui.label("Tilt");
+                ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-135.0..=135.0).suffix("°"))
+                    .on_hover_text(format!("commanded · now {:.0}°", fixture.tilt_actual));
+                ui.end_row();
+                ui.label("Move speed")
+                    .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
+                ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0));
+                ui.end_row();
             });
-            ui.end_row();
+        });
+
+    egui::CollapsingHeader::new(format!("{}  Fixture", theme::icon::COLOR))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("gdtf-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Intensity");
+                ui.add(DragValue::new(&mut fixture.intensity).speed(0.005).range(0.0..=1.0));
+                ui.end_row();
+                ui.label("Color");
+                ui.color_edit_button_rgb(&mut fixture.color);
+                ui.end_row();
+            });
         });
 
     optics_section(ui, fixture, &gdtf);
@@ -1244,9 +1247,32 @@ fn gdtf_inspector(
 /// The optical-chain control bank for a GDTF fixture: sliders for every stage
 /// the fixture actually exposes (disabled if the GDTF lacks that attribute).
 /// Drives `fixture.optics`, which the renderer resolves into the beam each frame.
+/// One data-driven optics slider row: label + range-aware slider (disabled when
+/// the fixture doesn't expose it), with optional trailing text (e.g. zoom °).
+fn optic_field_row(
+    ui: &mut egui::Ui,
+    o: &mut OpticalControls,
+    f: OpticField,
+    enabled: bool,
+    text: Option<String>,
+) {
+    let resp = ui.label(f.label());
+    if f == OpticField::Green {
+        resp.on_hover_text("Plus/minus-green (CC axis): −1 magenta … +1 green");
+    }
+    let mut v = f.get(o);
+    let mut slider = Slider::new(&mut v, f.range());
+    if let Some(t) = text {
+        slider = slider.text(t);
+    }
+    if ui.add_enabled(enabled, slider).changed() {
+        f.set(o, v);
+    }
+    ui.end_row();
+}
+
 fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) {
     let beam_angle = fixture.beam_angle;
-    let has = |a: &str| gdtf.has_attribute(a);
     // The dynamic wheel chain of the active mode (any number of color/gobo/
     // prism/animation/frost components).
     let components: Vec<crate::gdtf::OpticalComponent> = gdtf
@@ -1259,58 +1285,23 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
     egui::CollapsingHeader::new("Optics")
         .default_open(true)
         .show(ui, |ui| {
+            let zoom_deg = optics::map_attr(gdtf, "Zoom", fixture.optics.zoom, (beam_angle, beam_angle));
             let o = &mut fixture.optics;
+            // Data-driven rows (gated by the fixture's GDTF attributes) so single
+            // and bulk editing enumerate the SAME control set — see `OpticField`.
             ui.label(RichText::new("BEAM SHAPING").small().strong());
             Grid::new("optics-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                ui.label("Dimmer");
-                ui.add(Slider::new(&mut o.dimmer, 0.0..=1.0));
-                ui.end_row();
-
-                let zoom_deg = optics::map_attr(gdtf, "Zoom", o.zoom, (beam_angle, beam_angle));
-                ui.label("Zoom");
-                ui.add_enabled(has("Zoom"), Slider::new(&mut o.zoom, 0.0..=1.0).text(format!("{zoom_deg:.0}°")));
-                ui.end_row();
-
-                ui.label("Focus");
-                ui.add_enabled(has("Focus1"), Slider::new(&mut o.focus, 0.0..=1.0));
-                ui.end_row();
-
-                ui.label("Iris");
-                ui.add_enabled(has("Iris"), Slider::new(&mut o.iris, 0.0..=1.0));
-                ui.end_row();
-
-                ui.label("Chromatic ab.");
-                ui.add(Slider::new(&mut o.ca, 0.0..=1.0));
-                ui.end_row();
-
-                ui.label("Shutter");
-                ui.add_enabled(has("Shutter1"), Slider::new(&mut o.shutter, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Strobe");
-                ui.add_enabled(has("Shutter1"), Slider::new(&mut o.strobe, 0.0..=1.0));
-                ui.end_row();
+                for f in OpticField::BEAM {
+                    optic_field_row(ui, o, f, f.supported(gdtf), (f == OpticField::Zoom).then(|| format!("{zoom_deg:.0}°")));
+                }
             });
 
             ui.add_space(4.0);
             ui.label(RichText::new("COLOR MIXING").small().strong());
             Grid::new("optics-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                ui.label("CTO (warm)");
-                ui.add_enabled(has("CTO"), Slider::new(&mut o.cto, 0.0..=1.0));
-                ui.end_row();
-                ui.label("Tint ±green")
-                    .on_hover_text("Plus/minus-green (CC axis): −1 magenta … +1 green");
-                ui.add(Slider::new(&mut o.green, -1.0..=1.0));
-                ui.end_row();
-                let cmy = has("ColorSub_C") || has("ColorSub_M") || has("ColorSub_Y");
-                ui.label("Cyan");
-                ui.add_enabled(cmy, Slider::new(&mut o.cmy[0], 0.0..=1.0));
-                ui.end_row();
-                ui.label("Magenta");
-                ui.add_enabled(cmy, Slider::new(&mut o.cmy[1], 0.0..=1.0));
-                ui.end_row();
-                ui.label("Yellow");
-                ui.add_enabled(cmy, Slider::new(&mut o.cmy[2], 0.0..=1.0));
-                ui.end_row();
+                for f in OpticField::COLOR {
+                    optic_field_row(ui, o, f, f.supported(gdtf), None);
+                }
             });
 
             // One block per wheel component, generated from the GDTF chain.

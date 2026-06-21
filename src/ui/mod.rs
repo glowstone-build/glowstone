@@ -270,6 +270,35 @@ impl Ui {
         }
     }
 
+    /// Multi-select up to `n` fixtures sharing the profile of the first fixture
+    /// that has a wheel chain (so the bulk Wheels section is exercised); falls
+    /// back to the first `n` GDTF fixtures. Headless hook for bulk screenshots.
+    pub fn debug_select_n(&mut self, scene: &Scene, n: usize) {
+        let with_wheels = scene.fixtures.iter().position(|f| {
+            f.gdtf
+                .as_ref()
+                .and_then(|g| g.modes.get(f.mode_index))
+                .is_some_and(|m| !m.components.is_empty())
+        });
+        let pick: Vec<usize> = match with_wheels {
+            Some(seed) => {
+                let prof = scene.fixtures[seed].profile.clone();
+                scene
+                    .fixtures
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f.profile == prof)
+                    .map(|(i, _)| i)
+                    .take(n)
+                    .collect()
+            }
+            None => scene.fixtures.iter().enumerate().filter(|(_, f)| f.is_gdtf()).map(|(i, _)| i).take(n).collect(),
+        };
+        if !pick.is_empty() {
+            self.selection = Selection { fixtures: pick, environment: None };
+        }
+    }
+
     /// Make the named tab the active one in its leaf (used by the headless UI
     /// screenshot path to capture a specific panel).
     pub fn focus_tab_by_title(&mut self, title: &str) {

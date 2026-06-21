@@ -110,6 +110,124 @@ impl OpticalControls {
     }
 }
 
+/// A scalar optical control with the metadata the inspector needs to render it
+/// **data-driven** (single + bulk, instead of a hardcoded slider list): a label,
+/// the GDTF attribute that gates it, its value range, and get/set accessors.
+/// This is what lets group editing enumerate the controls a fixture actually has.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpticField {
+    Dimmer,
+    Zoom,
+    Focus,
+    Iris,
+    Ca,
+    Shutter,
+    Strobe,
+    Cto,
+    Green,
+    Cyan,
+    Magenta,
+    Yellow,
+}
+
+impl OpticField {
+    /// Beam-shaping controls, in display order.
+    pub const BEAM: [OpticField; 7] = [
+        OpticField::Dimmer,
+        OpticField::Zoom,
+        OpticField::Focus,
+        OpticField::Iris,
+        OpticField::Ca,
+        OpticField::Shutter,
+        OpticField::Strobe,
+    ];
+    /// Colour-mixing controls, in display order.
+    pub const COLOR: [OpticField; 5] = [
+        OpticField::Cto,
+        OpticField::Green,
+        OpticField::Cyan,
+        OpticField::Magenta,
+        OpticField::Yellow,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OpticField::Dimmer => "Dimmer",
+            OpticField::Zoom => "Zoom",
+            OpticField::Focus => "Focus",
+            OpticField::Iris => "Iris",
+            OpticField::Ca => "Chromatic ab.",
+            OpticField::Shutter => "Shutter",
+            OpticField::Strobe => "Strobe",
+            OpticField::Cto => "CTO (warm)",
+            OpticField::Green => "Tint ±green",
+            OpticField::Cyan => "Cyan",
+            OpticField::Magenta => "Magenta",
+            OpticField::Yellow => "Yellow",
+        }
+    }
+
+    /// The control's value range (most are 0..1; the green tint is bipolar).
+    pub fn range(self) -> std::ops::RangeInclusive<f32> {
+        match self {
+            OpticField::Green => -1.0..=1.0,
+            _ => 0.0..=1.0,
+        }
+    }
+
+    pub fn get(self, o: &OpticalControls) -> f32 {
+        match self {
+            OpticField::Dimmer => o.dimmer,
+            OpticField::Zoom => o.zoom,
+            OpticField::Focus => o.focus,
+            OpticField::Iris => o.iris,
+            OpticField::Ca => o.ca,
+            OpticField::Shutter => o.shutter,
+            OpticField::Strobe => o.strobe,
+            OpticField::Cto => o.cto,
+            OpticField::Green => o.green,
+            OpticField::Cyan => o.cmy[0],
+            OpticField::Magenta => o.cmy[1],
+            OpticField::Yellow => o.cmy[2],
+        }
+    }
+
+    pub fn set(self, o: &mut OpticalControls, v: f32) {
+        match self {
+            OpticField::Dimmer => o.dimmer = v,
+            OpticField::Zoom => o.zoom = v,
+            OpticField::Focus => o.focus = v,
+            OpticField::Iris => o.iris = v,
+            OpticField::Ca => o.ca = v,
+            OpticField::Shutter => o.shutter = v,
+            OpticField::Strobe => o.strobe = v,
+            OpticField::Cto => o.cto = v,
+            OpticField::Green => o.green = v,
+            OpticField::Cyan => o.cmy[0] = v,
+            OpticField::Magenta => o.cmy[1] = v,
+            OpticField::Yellow => o.cmy[2] = v,
+        }
+    }
+
+    /// Whether a GDTF fixture exposes this control. Dimmer / chromatic-aberration
+    /// / green-tint are synthesized by the renderer and always available; the rest
+    /// gate on the relevant GDTF attribute.
+    pub fn supported(self, gdtf: &crate::gdtf::GdtfFixture) -> bool {
+        let has = |a: &str| gdtf.has_attribute(a);
+        match self {
+            OpticField::Dimmer | OpticField::Ca | OpticField::Green => true,
+            OpticField::Zoom => has("Zoom"),
+            OpticField::Focus => has("Focus1"),
+            OpticField::Iris => has("Iris"),
+            OpticField::Shutter | OpticField::Strobe => has("Shutter1"),
+            OpticField::Cto => has("CTO"),
+            OpticField::Cyan | OpticField::Magenta | OpticField::Yellow => {
+                has("ColorSub_C") || has("ColorSub_M") || has("ColorSub_Y")
+            }
+        }
+    }
+}
+
 /// A physically-simulated wheel selection: which wheel, the continuous slewed
 /// **position** in slot units (the stepper's actual angle — wraps at `n_slots`),
 /// the slot count, the holder-gap fraction (gobo ≈ 0.18, colour ≈ 0.02), and the
