@@ -78,7 +78,8 @@ fn opt_lod(
     let diopter = abs(1.0 / max(focus_dist, 0.25) - 1.0 / max(depth, 0.25));
     let defocus = max(diopter - 0.003, 0.0);
     // Blur as a fraction of the cone radius (×~half the atlas width) + frost.
-    let sigma = k_ap * defocus * 230.0 + 1.2 * frost01;
+    // Frost is a strong diffuser — it blurs the gobo heavily.
+    let sigma = k_ap * defocus * 230.0 + 3.0 * frost01;
     return clamp(log2(1.0 + sigma * 64.0), 0.0, 8.0);
 }
 
@@ -293,18 +294,22 @@ fn opt_wheels(
 // partly-closed shutter shows the blade outline on the beam + floor pool.
 // `p` = beam cross-section in the unit disc = (guv-0.5)*2.
 fn opt_shutter(p: vec2<f32>, close: f32, kind: f32, soft: f32) -> f32 {
-    if (kind < 0.5 || close < 0.02) {
+    if (kind < 0.5 || close < 0.004) {
         return 1.0;
     }
-    let half = 1.0 - close;            // lit half-height (p.y in [-1, 1])
-    var edge = half;
-    if (kind > 1.5) {                  // sawtooth edge
-        let tri = abs(fract(p.x * 3.0) * 2.0 - 1.0); // 0..1 zigzag
-        edge = half + (tri - 0.5) * 0.16;
+    let hw = clamp(soft, 0.05, 1.3);   // blur half-width (heavy → near-uniform dim)
+    var axis = abs(p.x);               // blades close from left + right (rotated 90°)
+    // Threshold on |p.x|: close=0 → T past the rim (fully open); close=1 → T below
+    // 0 (fully shut, even after blur) → real blackout. Linear between.
+    var t = mix(1.0 + hw, -hw, close);
+    if (kind > 1.5) {                  // sawtooth: ripple the edge along the blade
+        let tri = abs(fract(p.y * 3.0) * 2.0 - 1.0);
+        t = t + (tri - 0.5) * 0.16;
     }
-    let s = clamp(soft, 0.02, 0.6);
-    let under = smoothstep(edge - s, edge + s, abs(p.y)); // 0 lit … 1 under blade
-    return 1.0 - 0.82 * under;
+    let under = smoothstep(t - hw, t + hw, axis);
+    // Blend a uniform dim (near-perfect dimming) with the blurred blade shape, so a
+    // dimmer-blade reads as smooth dimming with only a soft blade artifact.
+    return mix(1.0 - close, 1.0 - under, 0.45);
 }
 
 // the per-channel transmittance multiplying the beam colour. `sharpen` > 0 (floor

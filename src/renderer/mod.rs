@@ -1947,15 +1947,22 @@ fn build_beam_gpus(
         None => (-1.0, 0.0),
     };
 
-    // Commanded master level: intensity × dimmer × shutter. ~0 = blacked out →
-    // emit no beams so the raymarch / floor loop skips the fixture entirely.
-    let level = fixture.intensity.max(0.0) * fixture.optics.dimmer.max(0.0) * o.shutter_gain;
-    let lens_level = (fixture.intensity * fixture.optics.dimmer).max(0.0) * o.shutter_gain;
-    // Mechanical shutter blade: how far closed (tracks the shutter, not the dimmer)
-    // + the blade style. The blade's edge softness (cmyf.w, set per-beam from the
-    // beam's half-angle) makes it crisp on a narrow beam and soft on a wide one.
-    let shutter_close = (1.0 - o.shutter_gain).clamp(0.0, 1.0);
+    // "The dimmer IS the shutter." On a blade fixture the mechanical blade does
+    // the dim AND the strobe (one mechanism), so the blade close tracks dimmer ×
+    // shutter and the uniform `level` carries only the master intensity — the blade
+    // (in the cookie + on the lens) provides the actual attenuation. On a plain
+    // fixture the dimmer/shutter is a uniform multiply and there's no blade.
+    let master = fixture.intensity.max(0.0);
+    let open = (fixture.optics.dimmer.max(0.0) * o.shutter_gain).clamp(0.0, 1.0);
+    let effective = master * open; // true emitted brightness (used as the skip gate)
     let shutter_kind = fixture.shutter.code();
+    let blade = shutter_kind > 0.5;
+    let level = if blade { master } else { effective };
+    let lens_level = level;
+    let shutter_close = if blade { 1.0 - open } else { 0.0 };
+    // Blade edge blur: heavy by default (a real dimmer-blade is far out of focus →
+    // near-perfect smooth dimming), growing with focus error + frost. cmyf.w per beam.
+    let focus_defocus = (fixture.optics.focus - 0.5).abs() * 2.0;
 
     let make = |frame: &fixture_model::BeamFrame,
                 bdir: Vec3,
@@ -1975,7 +1982,7 @@ fn build_beam_gpus(
         misc: [ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
         // cmyf.w = shutter-blade edge softness: crisp on a narrow beam (the gate
         // images sharply on a beam fixture), blurred out on a wide wash.
-        cmyf: [cmyf[0], cmyf[1], cmyf[2], (tan_half * 1.1).clamp(0.03, 0.6)],
+        cmyf: [cmyf[0], cmyf[1], cmyf[2], (0.45 + 0.5 * focus_defocus + 0.7 * o.frost + tan_half * 0.4).clamp(0.2, 1.3)],
     };
 
     // ----- single-emitter path (classic moving head; prism expansion) -----
@@ -1996,7 +2003,7 @@ fn build_beam_gpus(
         let base_color = [tint[0] * scale, tint[1] * scale, tint[2] * scale];
         let cell_lit = cell.iter().fold(0.0_f32, |a, &b| a.max(b));
 
-        let beams = if level * cell_lit < 1e-4 || !cone.shaft {
+        let beams = if effective * cell_lit < 1e-4 || !cone.shaft {
             Vec::new()
         } else if o.prism.is_empty() {
             vec![make(&frame, frame.dir, frame.right, frame.up, base_color, cone.tan_half, cone.n_order, lens_radius)]
@@ -2026,8 +2033,13 @@ fn build_beam_gpus(
         // Physical front lens at the beam exit, tinted by the colour chain. The
         // shutter blade shows on the lens even when open (a thin parked sliver) —
         // the mechanism lives at the gate; crisp here (it's right at the glass).
-        let lens_shutter =
-            if shutter_kind > 0.5 { [shutter_close.max(0.08), shutter_kind, 0.05, 0.0] } else { [0.0; 4] };
+        let lens_shutter = if shutter_kind > 0.5 {
+            // Lens-face blade: a touch sharper than the projected beam (it's right
+            // at the glass) but still blurs with frost / focus error.
+            [shutter_close, shutter_kind, (0.12 + 0.4 * focus_defocus + 0.5 * o.frost).clamp(0.08, 1.0), 0.0]
+        } else {
+            [0.0; 4]
+        };
         let lenses = vec![lens_instance(
             frame.origin + frame.dir * 0.04,
             frame.dir,
@@ -2085,14 +2097,17 @@ fn build_beam_gpus(
             o.tint[1] * cell[1] * fixture.color[1],
             o.tint[2] * cell[2] * fixture.color[2],
         ];
-        let scale = level * cone.brightness;
+        // Multi-emitter cells carry no cookie blade, so they dim uniformly by the
+        // effective level (not the full master that the single-emitter blade path
+        // uses and then attenuates with the blade).
+        let scale = effective * cone.brightness;
         let cell_max = cell.iter().fold(0.0_f32, |a, &b| a.max(b));
         cells.push(Cell {
             frame,
             color: [tint[0] * scale, tint[1] * scale, tint[2] * scale],
             tint,
             cell_max,
-            lit: cell_max * level,
+            lit: cell_max * effective,
             cone,
             lens_r: em.beam.beam_radius.max(0.01),
         });
@@ -2107,7 +2122,7 @@ fn build_beam_gpus(
             c.frame.up,
             c.lens_r,
             c.tint,
-            (lens_level * c.cell_max).min(1.0),
+            (effective * c.cell_max).min(1.0), // no blade here → uniform dim
             c.cone.tan_half,
             c.cone.n_order,
             c.cone.face_gain,

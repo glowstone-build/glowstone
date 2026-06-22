@@ -135,14 +135,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // more as it closes). Two blades from top + bottom; sawtooth edge if kind 2.
     let sk = in.shutter.y;
     if (sk > 0.5) {
-        var bedge = 1.0 - in.shutter.x;
+        let bclose = in.shutter.x;
+        let hw = clamp(in.shutter.z, 0.05, 1.3);
+        var t = mix(1.0 + hw, -hw, bclose);     // open → past rim, shut → blackout
         if (sk > 1.5) {
-            let tri = abs(fract(in.local.x * 3.0) * 2.0 - 1.0);
-            bedge = bedge + (tri - 0.5) * 0.16;
+            let tri = abs(fract(in.local.y * 3.0) * 2.0 - 1.0);
+            t = t + (tri - 0.5) * 0.16;
         }
-        let bsoft = max(in.shutter.z, 0.02);
-        let under = smoothstep(bedge - bsoft, bedge + bsoft, abs(in.local.y));
-        rgb = rgb * (1.0 - 0.92 * under);
+        let under = smoothstep(t - hw, t + hw, abs(in.local.x)); // blades L+R (rotated)
+        // Dim the lens face with the dimmer (uniform) + the soft blade artifact.
+        rgb = rgb * mix(1.0 - bclose, 1.0 - under, 0.55);
     }
 
     return vec4<f32>(rgb * edge, 1.0);

@@ -750,7 +750,9 @@ pub fn emitter_cone(
 ) -> EmitterCone {
     let nominal = beam.beam_angle.max(1.0);
     let zoom_deg = map_attr(gdtf, "Zoom", c.zoom, (nominal, nominal)).clamp(1.0, 150.0);
-    let tan_half = (zoom_deg.to_radians() * 0.5).tan().max(1e-3);
+    // Frost is a diffuser: it spreads the beam wider as well as softening its edge.
+    let frost01 = frost.clamp(0.0, 1.0);
+    let tan_half = (zoom_deg.to_radians() * 0.5).tan().max(1e-3) * (1.0 + 0.4 * frost01);
 
     // Radiance ∝ flux / solid angle, in units of the reference head. This is
     // absolute (no per-emitter "nominal" anchor): a wide blinder pixel with a
@@ -772,7 +774,9 @@ pub fn emitter_cone(
         // Wash / Fresnel / PC (and the spec default): soft shoulder.
         _ => ratio_n.min(2.0),
     };
-    let n_order = (type_n + (1.5 - type_n) * frost.clamp(0.0, 1.0)).max(1.2);
+    // Frost drives the edge toward a very soft, diffuse shoulder (≈1.05), with a
+    // curve so even moderate frost reads as clearly diffused (not a crisp edge).
+    let n_order = (type_n + (1.05 - type_n) * frost01.powf(0.6)).max(1.05);
     let shaft = !matches!(beam.beam_type.as_str(), "None" | "Glow");
     EmitterCone { tan_half, brightness, face_gain, n_order, shaft }
 }
