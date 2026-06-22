@@ -223,7 +223,9 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             // every valid n_order (clamped ≥ 1.2 in optics::resolve), and +|ca|
             // keeps the chromatic side-samples in range — so this is a lossless
             // early-out, not a clip.
-            let cull = beam_r * (2.5 + abs(fx.misc.x));
+            // Widen the cull as the edge softens (low n_order = frost/wash has a
+            // long super-Gaussian tail) so it stays lossless.
+            let cull = beam_r * (2.5 + abs(fx.misc.x) + (2.0 - clamp(fx.shape.x, 1.0, 2.0)));
             if (pu * pu + pv * pv > cull * cull) {
                 continue;
             }

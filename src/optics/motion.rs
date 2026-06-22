@@ -71,7 +71,10 @@ impl WheelMotion {
         match kind {
             WheelKind::Frost => value.clamp(0.0, 1.0),
             WheelKind::Prism => {
-                if value > 0.5 {
+                // `value` is a slot fraction (slot/(slots-1)); the open slot is 0,
+                // so ANY non-open selection should insert. resolve() still gates the
+                // actual facets on whether the rounded slot is a real prism slot.
+                if value > 0.01 {
                     1.0
                 } else {
                     0.0

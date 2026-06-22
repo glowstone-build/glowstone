@@ -572,7 +572,10 @@ pub fn resolve(
                 if comp.slots >= 1
                     && let Some(w) = comp.wheel.clone()
                 {
-                    if ctl.value > 0.005 {
+                    // Engaged while a real gobo is selected OR the disc is still
+                    // slewing away from open (the gobo is physically still in the
+                    // gate), so CA damping doesn't flip mid-transition.
+                    if ctl.value > 0.005 || position.abs() > 0.02 {
                         gobo_engaged = true;
                     }
                     wheels.push(WheelSel {

@@ -1964,6 +1964,10 @@ fn build_beam_gpus(
     // near-perfect smooth dimming), growing with focus error + frost. cmyf.w per beam.
     let focus_defocus = (fixture.optics.focus - 0.5).abs() * 2.0;
 
+    // `sc`/`sk` = the blade close + kind for THIS beam. The single-emitter path
+    // passes the real blade (its `level` is undimmed master, so the blade does the
+    // dim); the multi-emitter path passes 0 (its colour is already pre-dimmed by
+    // `effective`, so a blade would double-dim).
     let make = |frame: &fixture_model::BeamFrame,
                 bdir: Vec3,
                 r: Vec3,
@@ -1971,13 +1975,15 @@ fn build_beam_gpus(
                 col: [f32; 3],
                 tan_half: f32,
                 n_order: f32,
-                lens_r: f32| FixtureGpu {
+                lens_r: f32,
+                sc: f32,
+                sk: f32| FixtureGpu {
         pos_range: [frame.origin.x, frame.origin.y, frame.origin.z, RANGE],
         dir_cos: [bdir.x, bdir.y, bdir.z, tan_half],
         color: [col[0], col[1], col[2], lens_r],
         cookie_r: [r.x, r.y, r.z, wheel_off],
         cookie_u: [u.x, u.y, u.z, wheel_count],
-        extra: [anim_layer, anim_scroll, shutter_close, shutter_kind],
+        extra: [anim_layer, anim_scroll, sc, sk],
         shape: [n_order, o.focus_dist, o.iris, o.frost],
         misc: [ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
         // cmyf.w = shutter-blade edge softness: crisp on a narrow beam (the gate
@@ -2006,7 +2012,7 @@ fn build_beam_gpus(
         let beams = if effective * cell_lit < 1e-4 || !cone.shaft {
             Vec::new()
         } else if o.prism.is_empty() {
-            vec![make(&frame, frame.dir, frame.right, frame.up, base_color, cone.tan_half, cone.n_order, lens_radius)]
+            vec![make(&frame, frame.dir, frame.right, frame.up, base_color, cone.tan_half, cone.n_order, lens_radius, shutter_close, shutter_kind)]
         } else {
             // Each facet is a separated aerial beam: deflect the axis, rebuild
             // its basis, split energy. While the prism is sliding in (prism_insert
@@ -2019,13 +2025,13 @@ fn build_beam_gpus(
                     let d = (frame.dir + frame.right * p.offset[0] + frame.up * p.offset[1]).normalize_or_zero();
                     let (r2, u2) = ortho_basis(d, frame.up);
                     let c = [base_color[0] * p.weight, base_color[1] * p.weight, base_color[2] * p.weight];
-                    make(&frame, d, r2, u2, c, cone.tan_half, cone.n_order, lens_radius)
+                    make(&frame, d, r2, u2, c, cone.tan_half, cone.n_order, lens_radius, shutter_close, shutter_kind)
                 })
                 .collect();
             let straight = (1.0 - o.prism_insert).clamp(0.0, 1.0);
             if straight > 0.01 {
                 let c = [base_color[0] * straight, base_color[1] * straight, base_color[2] * straight];
-                out.push(make(&frame, frame.dir, frame.right, frame.up, c, cone.tan_half, cone.n_order, lens_radius));
+                out.push(make(&frame, frame.dir, frame.right, frame.up, c, cone.tan_half, cone.n_order, lens_radius, shutter_close, shutter_kind));
             }
             out
         };
@@ -2190,7 +2196,7 @@ fn build_beam_gpus(
             cl[0].cone.n_order
         };
         let agg_frame = fixture_model::BeamFrame { origin: centroid, dir: mean_dir, right, up };
-        make(&agg_frame, mean_dir, right, up, color, tan_eff, n_order, spread_r.max(cl[0].lens_r))
+        make(&agg_frame, mean_dir, right, up, color, tan_eff, n_order, spread_r.max(cl[0].lens_r), 0.0, 0.0)
     };
 
     // Pass 1: exact direction clusters; uniform ones merge losslessly.
@@ -2231,6 +2237,8 @@ fn build_beam_gpus(
                 c.cone.tan_half,
                 c.cone.n_order,
                 c.lens_r,
+                0.0,
+                0.0,
             ));
         }
     }

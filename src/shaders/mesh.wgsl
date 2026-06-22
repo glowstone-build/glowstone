@@ -171,7 +171,8 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         // pool in lock-step with the beam shaft): skip the optics chain for samples
         // past where the radial falls under the 0.002 gate for any valid n_order
         // (≥ 1.2), with +|ca| margin for the chromatic side-samples.
-        let cull = beam_r * (2.5 + abs(lt.misc.x));
+        // Widen the cull as the edge softens (low n_order tail) so it stays lossless.
+        let cull = beam_r * (2.5 + abs(lt.misc.x) + (2.0 - clamp(lt.shape.x, 1.0, 2.0)));
         if (pu * pu + pv * pv > cull * cull) {
             continue;
         }

@@ -1415,16 +1415,22 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
         .show(ui, |ui| {
             let zoom_deg = optics::map_attr(gdtf, "Zoom", fixture.optics.zoom, (beam_angle, beam_angle));
             // Shutter blade style — OUR editable model (GDTF lacks blade geometry).
-            ui.horizontal(|ui| {
-                ui.label("Shutter blades");
-                egui::ComboBox::from_id_salt("shutter-kind")
-                    .selected_text(fixture.shutter.label())
-                    .show_ui(ui, |ui| {
-                        for k in crate::optics::ShutterKind::ALL {
-                            ui.selectable_value(&mut fixture.shutter, k, k.label());
-                        }
-                    });
-            });
+            // Only shown for fixtures that actually have a shutter (or already set
+            // one), so a plain PAR/wash isn't offered a blade it can't use.
+            if crate::optics::OpticField::Shutter.supported(gdtf)
+                || fixture.shutter != crate::optics::ShutterKind::None
+            {
+                ui.horizontal(|ui| {
+                    ui.label("Shutter blades");
+                    egui::ComboBox::from_id_salt("shutter-kind")
+                        .selected_text(fixture.shutter.label())
+                        .show_ui(ui, |ui| {
+                            for k in crate::optics::ShutterKind::ALL {
+                                ui.selectable_value(&mut fixture.shutter, k, k.label());
+                            }
+                        });
+                });
+            }
             let o = &mut fixture.optics;
             // Data-driven rows (gated by the fixture's GDTF attributes) so single
             // and bulk editing enumerate the SAME control set — see `OpticField`.

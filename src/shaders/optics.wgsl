@@ -149,13 +149,17 @@ fn opt_anim(t: texture_2d_array<f32>, s: sampler, uv: vec2<f32>, layer: i32, scr
 // the curved edges of both neighbours show with the holder metal between them.
 fn opt_disc(guv: vec2<f32>, position: f32, n: f32, gap: f32, rot: f32) -> vec4<f32> {
     let pitch = 6.2831853 / n;
-    let rg = 0.5;                      // slot radius (fills the beam when parked)
+    let rg = 0.5;                      // image radius: the slot fills the beam
+    let rim = 0.62;                    // holder boundary — SET PAST the beam radius
+                                       // (0.5) so a parked/open beam isn't radially
+                                       // clipped to a black-edged circle; the metal
+                                       // only shows in the angular gap between slots.
     // Hub distance SCALES with the slot count so adjacent slots keep a real metal
-    // gap (centre spacing = 2·R·sin(pitch/2) = gobo Ø·(1+gap_frac)) instead of
+    // gap (centre spacing = 2·R·sin(pitch/2) = slot Ø·(1+gap_frac)) instead of
     // crowding edge-to-edge as N grows. gap_frac comes from the `gap` param
     // (gobo wheels ~0.5, colour wheels ~0.06 so colours nearly abut).
     let gap_frac = clamp(gap * 2.0, 0.04, 0.9);
-    let R = clamp(rg * (1.0 + gap_frac) / sin(pitch * 0.5), 1.0, 4.0);
+    let R = clamp(rim * (1.0 + gap_frac) / sin(pitch * 0.5), 1.0, 4.0);
     let p = guv - vec2<f32>(0.5, 0.5); // beam-local (radius 0.5)
     let ang = position * pitch;        // disc rotation
     let ca = cos(ang);
@@ -168,9 +172,10 @@ fn opt_disc(guv: vec2<f32>, position: f32, n: f32, gap: f32, rot: f32) -> vec4<f
     let sth = slot * pitch;
     let w_s = vec2<f32>(R * sin(sth), R * cos(sth)); // slot centre on the disc
     let d = w - w_s;
-    // The slot fills the beam when parked; the metal gap between slots is now the
-    // geometric spacing (adaptive R), so the rim is just the slot aperture.
-    let inside = select(0.0, 1.0, length(d) <= rg);
+    // Soft holder mask: 1 inside the slot, fading to 0 (metal) past the rim. Soft
+    // so the gap reads as a real out-of-focus spoke, not a hard black line; the rim
+    // sits outside the beam so a parked/open slot stays a clean disc.
+    let inside = 1.0 - smoothstep(rim - 0.08, rim, length(d));
     // express the offset in the slot's image frame (upright when parked) + own spin
     let gth = -sth + rot;
     let gc = cos(gth);
@@ -191,10 +196,9 @@ fn opt_wheel(
         return opt_layer(tex, samp, guv, i32(base), rot, lod); // single slot
     }
     let disc = opt_disc(guv, position, n, gap, rot);
-    if (disc.w < 0.5) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // holder metal between gobos
-    }
-    return textureSampleLevel(tex, samp, disc.xy, clamp(i32(base + disc.z), 0, ATLAS_MAX_LAYER), lod);
+    let g = textureSampleLevel(tex, samp, disc.xy, clamp(i32(base + disc.z), 0, ATLAS_MAX_LAYER), lod);
+    // disc.w (soft holder) fades the slot out into the metal gap between gobos.
+    return vec4<f32>(g.rgb, g.a * disc.w);
 }
 
 // CMY: three graduated dichroic FLAGS sliding across the aperture on distinct
@@ -298,18 +302,20 @@ fn opt_shutter(p: vec2<f32>, close: f32, kind: f32, soft: f32) -> f32 {
         return 1.0;
     }
     let hw = clamp(soft, 0.05, 1.3);   // blur half-width (heavy → near-uniform dim)
-    var axis = abs(p.x);               // blades close from left + right (rotated 90°)
-    // Threshold on |p.x|: close=0 → T past the rim (fully open); close=1 → T below
-    // 0 (fully shut, even after blur) → real blackout. Linear between.
-    var t = mix(1.0 + hw, -hw, close);
+    // ONE blade sweeps across (rotated 90° → travels along x). It moves so its
+    // mid-edge is at the beam centre when close = 0.5, hence the LIT FRACTION ≈
+    // 1-close → the dimmer tracks brightness. close=0 → edge past +rim (all lit);
+    // close=1 → past -rim (all dark). Lit where x < edge.
+    var x = p.x;
     if (kind > 1.5) {                  // sawtooth: ripple the edge along the blade
         let tri = abs(fract(p.y * 3.0) * 2.0 - 1.0);
-        t = t + (tri - 0.5) * 0.16;
+        x = x + (tri - 0.5) * 0.16;
     }
-    let under = smoothstep(t - hw, t + hw, axis);
-    // Blend a uniform dim (near-perfect dimming) with the blurred blade shape, so a
-    // dimmer-blade reads as smooth dimming with only a soft blade artifact.
-    return mix(1.0 - close, 1.0 - under, 0.45);
+    let edge = mix(1.0 + hw, -1.0 - hw, close);
+    let blade = smoothstep(edge + hw, edge - hw, x); // 1 lit (x<edge) … 0 covered
+    // Blend the blade gradient with a uniform dim so it reads as near-perfect
+    // smooth dimming (centre = 1-close exactly) with only a soft blade artifact.
+    return mix(1.0 - close, blade, 0.4);
 }
 
 // the per-channel transmittance multiplying the beam colour. `sharpen` > 0 (floor
