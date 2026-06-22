@@ -88,6 +88,31 @@ impl ApplicationHandler for App {
             awake: true,
         });
 
+        // Profiling: PREVIZ_STEPS overrides the volumetric max step budget.
+        if let Some(s) = std::env::var("PREVIZ_STEPS").ok().and_then(|s| s.parse().ok()) {
+            self.state.as_mut().unwrap().ui.settings.steps = s;
+        }
+
+        // Optional .archie project load for profiling: PREVIZ_OPEN=show.archie
+        // loads a saved show (fixtures + geometry + bundled assets) and frames it.
+        if let Ok(path) = std::env::var("PREVIZ_OPEN") {
+            let state = self.state.as_mut().unwrap();
+            state.ui.open_project(
+                std::path::Path::new(&path),
+                &mut state.scene,
+                &mut state.camera,
+                &mut state.dmx,
+            );
+            if let Some((c, r)) = state.scene.scene_frame() {
+                state.camera.frame(c, r * 1.1);
+            }
+            log::info!(
+                "opened project: {} fixtures, {} geometry",
+                state.scene.fixtures.len(),
+                state.scene.geometry.len()
+            );
+        }
+
         // Optional GDTF auto-import for testing: PREVIZ_GDTF=path.gdtf loads a
         // fixture, clears the demo scene, and selects it.
         if let Ok(path) = std::env::var("PREVIZ_GDTF") {
@@ -118,6 +143,32 @@ impl ApplicationHandler for App {
                             log::info!("GDTF mode: [{}] {}", mi, gdtf.modes[mi].name);
                         } else {
                             log::warn!("PREVIZ_GDTF_MODE '{sel}' matched no mode");
+                        }
+                    }
+                    // PREVIZ_PIXMAP=N drives a pixel-mapped pattern (alternating
+                    // yellow + blue cells) and replicates the bar into a row of N,
+                    // so the per-cell shaft look + the many-bar perf can be checked
+                    // headlessly. Unpatched fixtures are skipped by the decode, so
+                    // these cells persist to render.
+                    if let Ok(v) = std::env::var("PREVIZ_PIXMAP") {
+                        let nbars: usize = v.parse().unwrap_or(1).max(1);
+                        let arc = state.scene.fixtures[idx].gdtf.clone().unwrap();
+                        let mi = state.scene.fixtures[idx].mode_index;
+                        let ncells = state.scene.fixtures[idx].emitters().len();
+                        let setup = |f: &mut crate::scene::Fixture| {
+                            f.cells = (0..ncells)
+                                .map(|i| if i % 2 == 0 { [1.0, 0.8, 0.0] } else { [0.0, 0.1, 1.0] })
+                                .collect();
+                            f.tilt = -90.0;
+                            f.snap_movement();
+                        };
+                        setup(&mut state.scene.fixtures[idx]);
+                        for k in 1..nbars {
+                            let pos = glam::Vec3::new(k as f32 * 1.4, 5.0, 0.0);
+                            let j = state.scene.add_gdtf(arc.clone(), pos);
+                            state.scene.fixtures[j].mode_index = mi;
+                            state.scene.fixtures[j].sync_mode();
+                            setup(&mut state.scene.fixtures[j]);
                         }
                     }
                     state.ui.selection = crate::scene::Selection::fixture(idx);
@@ -235,7 +286,9 @@ impl ApplicationHandler for App {
             let pan = std::env::var("PREVIZ_PAN").ok().and_then(|s| s.parse::<f32>().ok());
             for (i, f) in state.scene.fixtures.iter_mut().enumerate() {
                 if i % step == 0 {
-                    f.intensity = v;
+                    // The level lives in the dimmer (intensity is the master, =1);
+                    // imported fixtures start at dimmer 0, so set the dimmer here.
+                    f.optics.dimmer = v;
                     if let Some(t) = tilt {
                         f.tilt = t;
                     }
@@ -243,7 +296,7 @@ impl ApplicationHandler for App {
                         f.pan = p;
                     }
                 } else {
-                    f.intensity = 0.0;
+                    f.optics.dimmer = 0.0;
                 }
             }
         }
@@ -394,20 +447,41 @@ impl ApplicationHandler for App {
         if let Ok(n) = std::env::var("PREVIZ_BENCH") {
             let n: u32 = n.parse().unwrap_or(120);
             let state = self.state.as_mut().unwrap();
+            // Bench at an explicit resolution + camera (PREVIZ_RES / PREVIZ_CAM_*)
+            // so we can measure a realistic FOH shot, not just the auto far frame.
+            if let Some((w, h)) = std::env::var("PREVIZ_RES").ok().and_then(|r| {
+                let (w, h) = r.split_once('x')?;
+                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+            }) {
+                state.renderer.resize_viewport((w.max(1), h.max(1)));
+            }
+            apply_cam_env(&mut state.camera);
             state.scene.snap_movement();
+            // PREVIZ_BENCH_READBACK=1 keeps the full capture (incl. GPU→CPU copy);
+            // default times render-only (what the live presenting app actually pays).
+            let readback = std::env::var("PREVIZ_BENCH_READBACK").is_ok();
             for _ in 0..10 {
-                let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
+                if readback {
+                    let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
+                } else {
+                    state.renderer.bench_render(&state.scene, &state.camera, &state.ui.settings);
+                }
             }
             let t0 = Instant::now();
             for _ in 0..n {
-                let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
+                if readback {
+                    let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
+                } else {
+                    state.renderer.bench_render(&state.scene, &state.camera, &state.ui.settings);
+                }
             }
             let per = t0.elapsed().as_secs_f32() / n as f32;
             let (w, h) = state.renderer.viewport.size;
             log::info!(
-                "BENCH {w}x{h}: {:.2} ms/frame = {:.0} fps (incl. readback)",
+                "BENCH {w}x{h}: {:.2} ms/frame = {:.0} fps ({})",
                 per * 1000.0,
-                1.0 / per
+                1.0 / per,
+                if readback { "incl. readback" } else { "render-only" }
             );
             event_loop.exit();
             return;
@@ -842,7 +916,40 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
 /// visible window). Runs a few settle frames so the dock layout + viewport panel
 /// size stabilise, then captures the final frame.
 #[allow(deprecated)] // egui 0.34 Context::run — matches the live render() path
+/// Apply headless camera-override env knobs (shared by the screenshot + bench
+/// paths): PREVIZ_ZOOM, PREVIZ_CAM_Y, PREVIZ_CAM_TARGET=x,y,z, PREVIZ_CAM_YAW /
+/// _PITCH (radians), PREVIZ_CAM_DIST (metres).
+fn apply_cam_env(camera: &mut OrbitCamera) {
+    let envf = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
+    if let Some(z) = envf("PREVIZ_ZOOM") {
+        camera.distance *= z;
+    }
+    if let Some(dy) = envf("PREVIZ_CAM_Y") {
+        camera.target.y += dy;
+    }
+    if let Some(t) = std::env::var("PREVIZ_CAM_TARGET").ok().and_then(|s| {
+        let p: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (p.len() == 3).then(|| glam::Vec3::new(p[0], p[1], p[2]))
+    }) {
+        camera.target = t;
+    }
+    if let Some(y) = envf("PREVIZ_CAM_YAW") {
+        camera.yaw = y;
+    }
+    if let Some(p) = envf("PREVIZ_CAM_PITCH") {
+        camera.pitch = p;
+    }
+    if let Some(d) = envf("PREVIZ_CAM_DIST") {
+        camera.distance = d;
+    }
+}
+
 fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
+    // The welcome splash would otherwise cover every headless UI screenshot;
+    // PREVIZ_UI_SPLASH=1 keeps it up so the splash itself can be captured.
+    if std::env::var("PREVIZ_UI_SPLASH").is_err() {
+        state.ui.dismiss_splash();
+    }
     if let Ok(title) = std::env::var("PREVIZ_UI_TAB") {
         state.ui.focus_tab_by_title(&title);
     }
@@ -851,6 +958,12 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     }
     if std::env::var("PREVIZ_UI_PROFILE").is_ok() {
         state.ui.debug_open_profile(&state.scene);
+    }
+    if std::env::var("PREVIZ_UI_REPLACE").is_ok() {
+        state.ui.debug_open_replace(&state.scene);
+    }
+    if let Ok(v) = std::env::var("PREVIZ_UI_BULK") {
+        state.ui.debug_select_n(&state.scene, v.parse().unwrap_or(3));
     }
     // PREVIZ_UI_SHARE opens the online Fixture Library window; =demo injects rows.
     if let Ok(v) = std::env::var("PREVIZ_UI_SHARE") {
@@ -961,6 +1074,9 @@ impl State {
         // Advance time-based wheel motion once per real frame (not in the
         // renderer, which also runs for headless capture).
         self.scene.advance(dt);
+
+        // Crash-recovery autosave (debounced inside; writes to the cache dir).
+        self.ui.autosave_tick(&self.scene, &self.camera, &self.dmx, dt);
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let viewport_texture = self.renderer.viewport.texture_id;

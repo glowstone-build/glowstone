@@ -14,7 +14,7 @@ use crate::mvr::MvrFixtureMeta;
 use crate::optics::{OpticalControls, ShutterKind, WheelMotion};
 
 /// One controllable fixture.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Fixture {
     /// Instance name (e.g. "PAR Can 1").
     pub name: String,
@@ -25,6 +25,7 @@ pub struct Fixture {
     pub geometry: FixtureGeometry,
     /// When set, the renderer draws this GDTF fixture's real 3D model and the
     /// beam comes from its Beam geometry.
+    #[serde(skip)]
     pub gdtf: Option<Arc<GdtfFixture>>,
 
     /// World position of the fixture head, in metres. Y is up.
@@ -64,6 +65,14 @@ pub struct Fixture {
     /// A laser engine — rendered as a thin haze-only streak (no inverse-square
     /// cone falloff, razor edge), not a lamp cone.
     pub is_laser: bool,
+    /// Hidden in the viewport (the Scene outliner's eye toggle): the renderer
+    /// skips its body, beam, and lens. Still patchable/selectable in the lists.
+    pub hidden: bool,
+    /// Per-fixture volumetric beam intensity multiplier (0 = no beam/pool, 1 =
+    /// normal). Scales the projected beam shaft + floor pool only — the lens face
+    /// still shows the fixture is lit. Lets a designer tame or kill hazy beams on
+    /// specific fixtures without touching their colour or dimmer.
+    pub beam: f32,
     /// Mechanical shutter blade style (our editable model; defaulted on import) —
     /// simulated on the lens face + the projected beam.
     pub shutter: ShutterKind,
@@ -104,6 +113,8 @@ impl Fixture {
             geometry: profile.geometry,
             gdtf: None,
             is_laser: profile.laser,
+            hidden: false,
+            beam: 1.0,
             position,
             orientation: Quat::IDENTITY,
             pan: 0.0,
@@ -137,6 +148,8 @@ impl Fixture {
             geometry: FixtureGeometry::Cylinder,
             gdtf: Some(gdtf),
             is_laser,
+            hidden: false,
+            beam: 1.0,
             position,
             orientation: Quat::IDENTITY,
             pan: 0.0,
@@ -190,6 +203,8 @@ impl Fixture {
             geometry: FixtureGeometry::Cylinder,
             gdtf: imported.gdtf,
             is_laser,
+            hidden: false,
+            beam: 1.0,
             position,
             orientation,
             pan: 0.0,
@@ -200,11 +215,9 @@ impl Fixture {
             tilt_vel: 0.0,
             move_speed: 0.0,
             color: imported.color.unwrap_or([1.0, 1.0, 1.0]),
-            // Imported rigs start blacked out — with no DMX feeding levels, a
-            // real rig emits nothing. The user (or, later, live DMX) brings
-            // fixtures up; importing 100+ fixtures at full would white out the
-            // view. Edit intensity in the Inspector or bulk-select to bring up.
-            intensity: 0.0,
+            // Master is always full; the level lives in the dimmer (which DMX
+            // drives). See the `optics.dimmer = 0.0` below.
+            intensity: 1.0,
             beam_angle,
             mode_index,
             cells: Vec::new(),
@@ -213,6 +226,11 @@ impl Fixture {
             mvr: Some(Box::new(imported.meta)),
             shutter,
         };
+        // Imported rigs start blacked out — with no DMX feeding levels, a real
+        // rig emits nothing, and importing 100+ fixtures at full would white out
+        // the view. The dimmer (not the master) carries the level, so live DMX or
+        // the Inspector's Dimmer / bulk-select brings them up.
+        f.optics.dimmer = 0.0;
         f.sync_mode();
         f
     }

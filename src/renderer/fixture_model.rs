@@ -252,6 +252,20 @@ pub fn assemble(
     let pan_geom = fixture.geometry_for_attribute("Pan").map(str::to_string);
     let tilt_geom = fixture.geometry_for_attribute("Tilt").map(str::to_string);
 
+    // A static fixture (LED wash / cluster / bar / blinder) has NO articulated
+    // pan/tilt geometry, so `walk` would drop the user's pan/tilt entirely and the
+    // beams would fire in the GDTF rest direction forever (often +Z, horizontal) —
+    // the head can't be aimed and lights nothing. For each axis the GDTF doesn't
+    // articulate, bake the commanded angle into the root so the WHOLE fixture (its
+    // parts + every emitter beam) rotates. Pan is about the fixture's up (GDTF +Z),
+    // tilt about its +X — same axes/order `walk` uses, so an articulated moving head
+    // is byte-for-byte unchanged (its base angles are 0).
+    let base_pan = if pan_geom.is_none() { pan_deg } else { 0.0 };
+    let base_tilt = if tilt_geom.is_none() { tilt_deg } else { 0.0 };
+    let root = root
+        * Mat4::from_rotation_z(base_pan.to_radians())
+        * Mat4::from_rotation_x(base_tilt.to_radians());
+
     let mut parts = Vec::new();
     let mut beams = Vec::new();
     walk(

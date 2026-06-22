@@ -62,7 +62,19 @@ fn fs_blur_v(in: VsOut) -> @location(0) vec4<f32> {
 // pipeline blends it as  out = scatter + scene·transmittance  (One, SrcAlpha).
 @fragment
 fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(src_tex, src_samp, in.uv);
+    // Light 5-tap cross over the half-res raymarch before upsample. With the
+    // deterministic MIDPOINT march (volumetric.wgsl) the half-res buffer is already
+    // smooth (no per-pixel jitter noise), so this is centre-heavy (12:1) — just
+    // enough to take the edge off the half-res→full-res stair-step WITHOUT the wide
+    // bleed of a full Gaussian, which haloed the lit shaft past occluder silhouettes
+    // (the "outline on the far side of a solid object").
+    let t = 1.0 / vec2<f32>(textureDimensions(src_tex, 0));
+    var s = textureSample(src_tex, src_samp, in.uv) * 12.0;
+    s += textureSample(src_tex, src_samp, in.uv + vec2<f32>(t.x, 0.0));
+    s += textureSample(src_tex, src_samp, in.uv - vec2<f32>(t.x, 0.0));
+    s += textureSample(src_tex, src_samp, in.uv + vec2<f32>(0.0, t.y));
+    s += textureSample(src_tex, src_samp, in.uv - vec2<f32>(0.0, t.y));
+    return s / 16.0;
 }
 
 // --- tonemap/resolve: HDR scene + bloom + a small uniform ---

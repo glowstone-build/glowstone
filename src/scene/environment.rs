@@ -9,7 +9,7 @@ use glam::Vec3;
 
 use super::library::{EnvironmentKind, EnvironmentProfile};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Environment {
     pub name: String,
     pub kind: EnvironmentKind,

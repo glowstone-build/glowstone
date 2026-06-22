@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
-use glam::{Quat, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 
 use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
@@ -24,7 +24,7 @@ const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
 /// Left tab: the scene outliner — every fixture and environment, selectable —
 /// plus the global view/look controls.
 /// How the Scene panel's fixture list is ordered.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SceneSort {
     /// DMX patch (universe, address); unpatched fall to the end, by head number.
     Patch,
@@ -91,9 +91,9 @@ pub fn scene_outliner(
     scene: &mut Scene,
     selection: &mut Selection,
     patch: &PatchTable,
-    live_mask: &[bool],
     anchor: &mut Option<usize>,
     sort: &mut SceneSort,
+    search: &mut String,
     groups: &mut Vec<SelectionGroup>,
     group_name: &mut String,
 ) {
@@ -105,12 +105,28 @@ pub fn scene_outliner(
     ui.horizontal(|ui| {
         ui.heading("Scene");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let nsel = selection.fixtures.len();
-            if nsel > 0 {
-                ui.label(RichText::new(format!("{nsel} selected")).small().color(accent));
+            let n = selection.fixtures.len() + selection.geometry.len();
+            if n > 0 {
+                ui.label(RichText::new(format!("{n} selected")).small().color(accent));
             }
         });
     });
+
+    // Name filter (fixtures + objects), like Blender's outliner search.
+    ui.horizontal(|ui| {
+        let has = !search.is_empty();
+        let w = ui.available_width() - if has { 26.0 } else { 0.0 };
+        ui.add(
+            egui::TextEdit::singleline(search)
+                .hint_text(format!("{}  Filter…", icon::SEARCH))
+                .desired_width(w.max(40.0)),
+        );
+        if has && ui.small_button(icon::CLOSE).on_hover_text("Clear filter").clicked() {
+            search.clear();
+        }
+    });
+    let q = search.trim().to_lowercase();
+    let matches = |name: &str| q.is_empty() || name.to_lowercase().contains(q.as_str());
     ui.separator();
 
     // Mark which fixtures are in an address conflict (computed once, not per row).
@@ -127,23 +143,63 @@ pub fn scene_outliner(
     }
 
     // ---- OBJECTS: imported MVR static geometry (stage / truss / set) ----
-    // Read-only; can be thousands of rows, so the body is virtualised and the
-    // folder defaults closed.
+    // Selectable + transformable (G/R/S in the viewport); thousands of rows, so
+    // the body is virtualised and the folder defaults closed.
     folder_header(icon::GEOMETRY, "Objects", scene.geometry.len(), false, &ink).show(ui, |ui| {
         if scene.geometry.is_empty() {
             ui.label(RichText::new("none — import an MVR scene").weak().small());
-        } else {
-            egui::ScrollArea::vertical()
-                .id_salt("scene-objects")
-                .max_height(220.0)
-                .auto_shrink([false, true])
-                .show_rows(ui, ROW_H, scene.geometry.len(), |ui, range| {
-                    for i in range {
-                        let g = &scene.geometry[i];
-                        let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
-                        entity_row(ui, icon::GEOMETRY, &g.name, kind, "", false, false, false, &ink, accent);
+            return;
+        }
+        let order: Vec<usize> = (0..scene.geometry.len()).filter(|&i| matches(&scene.geometry[i].name)).collect();
+        if order.is_empty() {
+            ui.label(RichText::new("no match").weak().small());
+            return;
+        }
+        let mut click: Option<(usize, bool)> = None;
+        let mut vis: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("scene-objects")
+            .max_height(240.0)
+            .auto_shrink([false, true])
+            .show_rows(ui, ROW_H, order.len(), |ui, range| {
+                for di in range {
+                    let i = order[di];
+                    let g = &scene.geometry[i];
+                    let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
+                    let row = entity_row(
+                        ui,
+                        icon::GEOMETRY,
+                        &g.name,
+                        kind,
+                        "",
+                        false,
+                        selection.contains_geometry(i),
+                        selection.primary_geometry() == Some(i),
+                        g.hidden,
+                        true,
+                        &ink,
+                        accent,
+                    );
+                    if row.eye_clicked {
+                        vis = Some(i);
+                    } else if row.body.clicked() {
+                        let m = ui.input(|x| x.modifiers);
+                        click = Some((i, m.command || m.ctrl));
                     }
-                });
+                }
+            });
+        if let Some(i) = vis {
+            if let Some(g) = scene.geometry.get_mut(i) {
+                g.hidden = !g.hidden;
+            }
+        }
+        if let Some((i, toggle)) = click {
+            if toggle {
+                selection.toggle_geometry(i);
+            } else {
+                *selection = Selection::geometry(i);
+            }
+            *anchor = None;
         }
     });
 
@@ -159,8 +215,14 @@ pub fn scene_outliner(
             ui.label(RichText::new("none — add from the Library").weak().small());
             return;
         }
-        let order = fixture_order(scene, patch, *sort);
+        let order: Vec<usize> =
+            fixture_order(scene, patch, *sort).into_iter().filter(|&i| matches(&scene.fixtures[i].name)).collect();
+        if order.is_empty() {
+            ui.label(RichText::new("no match").weak().small());
+            return;
+        }
         let mut click: Option<(usize, bool, bool)> = None;
+        let mut vis: Option<usize> = None;
         egui::ScrollArea::vertical()
             .id_salt("scene-fixtures")
             .max_height(300.0)
@@ -173,26 +235,34 @@ pub fn scene_outliner(
                         Some(p) => format!("{}.{:03}", p.universe, p.address),
                         None => "unpatched".into(),
                     };
-                    let live = live_mask.get(i).copied().unwrap_or(false);
                     let row_icon = if fixture.is_laser { icon::COLOR } else { icon::FIXTURE };
-                    let resp = entity_row(
+                    let row = entity_row(
                         ui,
                         row_icon,
                         &fixture.name,
                         &fixture.profile,
                         &patch_tag,
                         conflicted[i],
-                        live,
                         selection.contains_fixture(i),
+                        selection.primary_fixture() == Some(i),
+                        fixture.hidden,
+                        true,
                         &ink,
                         accent,
                     );
-                    if resp.clicked() {
+                    if row.eye_clicked {
+                        vis = Some(i);
+                    } else if row.body.clicked() {
                         let m = ui.input(|x| x.modifiers);
                         click = Some((i, m.shift, m.command || m.ctrl));
                     }
                 }
             });
+        if let Some(i) = vis {
+            if let Some(f) = scene.fixtures.get_mut(i) {
+                f.hidden = !f.hidden;
+            }
+        }
         if let Some((i, shift, toggle)) = click {
             if shift {
                 // Range follows the VISIBLE (sorted) order, not raw scene indices:
@@ -205,6 +275,7 @@ pub fn scene_outliner(
                 let (lo, hi) = (anchor_pos.min(click_pos), anchor_pos.max(click_pos));
                 selection.fixtures = order[lo..=hi].to_vec();
                 selection.environment = None;
+                selection.geometry.clear();
                 // Establish an anchor if this was the first (anchorless) click, so
                 // subsequent shift-clicks grow the range from here.
                 if anchor.is_none() {
@@ -276,6 +347,7 @@ pub fn scene_outliner(
             let n = scene.fixtures.len();
             selection.fixtures = groups[gi].fixtures.iter().copied().filter(|&i| i < n).collect();
             selection.environment = None;
+            selection.geometry.clear();
             *anchor = None;
         }
         if let Some(gi) = remove {
@@ -289,19 +361,22 @@ pub fn scene_outliner(
             ui.label(RichText::new("none — add a Fog Box from the Library").weak().small());
         }
         for (i, env) in scene.environments.iter().enumerate() {
-            let resp = entity_row(
+            let sel = selection.environment == Some(i);
+            let row = entity_row(
                 ui,
                 icon::ENVIRONMENT,
                 env.name.as_str(),
                 "Fog volume",
                 "",
                 false,
+                sel,
+                sel,
                 false,
-                selection.environment == Some(i),
+                false,
                 &ink,
                 accent,
             );
-            if resp.clicked() {
+            if row.body.clicked() {
                 *selection = Selection::environment(i);
             }
         }
@@ -701,9 +776,18 @@ fn paint_truncated(
     painter.galley(top_left, galley, color);
 }
 
-/// A scene-outliner row: icon + name + secondary line, with a right-aligned
-/// patch tag and conflict/live status badges. Full-width clickable with a
-/// selection highlight. Shared by fixtures and environments.
+/// Outcome of one scene-outliner row: the body response (drives selection) plus
+/// whether the visibility eye was clicked this frame (toggles hide).
+struct RowOut {
+    body: egui::Response,
+    eye_clicked: bool,
+}
+
+/// A scene-outliner row, Blender-outliner style: an optional left **active** bar,
+/// a type icon, the name + secondary line, a right-aligned patch tag / conflict
+/// badge, and (when `show_eye`) a far-right **visibility eye** toggle. Full-width
+/// clickable; the active (primary) row reads brighter than merely-selected rows,
+/// and a hidden row is dimmed. Shared by fixtures, objects, and environments.
 #[allow(clippy::too_many_arguments)]
 fn entity_row(
     ui: &mut egui::Ui,
@@ -712,64 +796,93 @@ fn entity_row(
     secondary: &str,
     patch_tag: &str,
     conflict: bool,
-    live: bool,
     selected: bool,
+    active: bool,
+    hidden: bool,
+    show_eye: bool,
     ink: &theme::Ink,
     accent: Color32,
-) -> egui::Response {
+) -> RowOut {
     let h = 34.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
     if selected {
         painter.rect_filled(rect, 4.0, visuals.selection.bg_fill);
-        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Inside);
+        // The active (primary) item gets a full accent outline; passive
+        // multi-selection members get a quieter one.
+        let w = if active { 1.5 } else { 1.0 };
+        let col = if active { accent } else { accent.gamma_multiply(0.6) };
+        painter.rect_stroke(rect, 4.0, egui::Stroke::new(w, col), egui::StrokeKind::Inside);
     } else if resp.hovered() {
         painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
     }
+    // Active marker: a left accent bar (Blender's active-object emphasis).
+    if active {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.5, h)),
+            0.0,
+            accent,
+        );
+    }
+    // Dim hidden rows so the eye state reads at a glance.
+    let dim = if hidden { 0.45 } else { 1.0 };
+
+    // Far-right visibility eye (its own hit-test, so it doesn't trigger select).
+    let mut eye_clicked = false;
+    let mut right_edge = 9.0;
+    if show_eye {
+        let eye_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 27.0, rect.top()),
+            egui::vec2(24.0, h),
+        );
+        let eye = ui.interact(eye_rect, resp.id.with("eye"), Sense::click());
+        let glyph = if hidden { theme::icon::EYE_OFF } else { theme::icon::EYE };
+        let col = if hidden {
+            ink.muted
+        } else if eye.hovered() {
+            ink.primary
+        } else {
+            ink.tertiary
+        };
+        painter.text(eye_rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(14.0), col);
+        eye.clone().on_hover_text(if hidden { "Hidden — click to show" } else { "Visible — click to hide" });
+        eye_clicked = eye.clicked();
+        right_edge = 30.0;
+    }
+
     painter.text(
         rect.left_center() + egui::vec2(9.0, 0.0),
         egui::Align2::LEFT_CENTER,
         icon,
         egui::FontId::proportional(15.0),
-        if selected { accent } else { ink.secondary },
+        (if selected { accent } else { ink.secondary }).gamma_multiply(dim),
     );
     // Left text zone is bounded so a long name can't run under the right column.
-    let text_w = (rect.width() - 30.0 - 64.0).max(40.0);
-    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), name, 13.0, ink.primary, text_w);
-    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), secondary, 10.5, ink.tertiary, text_w);
-    // Right column: patch tag on top, status badges below.
+    let text_w = (rect.width() - 30.0 - 60.0 - (right_edge - 9.0)).max(40.0);
+    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), name, 13.0, ink.primary.gamma_multiply(dim), text_w);
+    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), secondary, 10.5, ink.tertiary.gamma_multiply(dim), text_w);
+    // Right column: patch tag on top, conflict badge below (left of the eye).
     if !patch_tag.is_empty() {
         let unpatched = patch_tag == "unpatched";
         painter.text(
-            rect.right_top() + egui::vec2(-9.0, 6.0),
+            egui::pos2(rect.right() - right_edge, rect.top() + 6.0),
             egui::Align2::RIGHT_TOP,
             patch_tag,
             egui::FontId::monospace(10.0),
             if unpatched { ink.muted } else { ink.tertiary },
         );
     }
-    let mut x = rect.right() - 9.0;
-    if live {
-        painter.text(
-            egui::pos2(x, rect.bottom() - 5.0),
-            egui::Align2::RIGHT_BOTTOM,
-            "● LIVE",
-            egui::FontId::proportional(9.5),
-            theme::LIVE,
-        );
-        x -= 44.0;
-    }
     if conflict {
         painter.text(
-            egui::pos2(x, rect.bottom() - 5.0),
+            egui::pos2(rect.right() - right_edge, rect.bottom() - 5.0),
             egui::Align2::RIGHT_BOTTOM,
             theme::icon::WARNING,
             egui::FontId::proportional(12.0),
             theme::CONFLICT,
         );
     }
-    resp
+    RowOut { body: resp, eye_clicked }
 }
 
 /// One library row: icon + name (strong) + dim meta, full-width clickable, with
@@ -821,6 +934,7 @@ pub fn inspector(
     ui: &mut egui::Ui,
     scene: &mut Scene,
     selection: &Selection,
+    patch: &mut PatchTable,
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
     profile: &mut Option<ProfileEditor>,
 ) {
@@ -834,6 +948,13 @@ pub fn inspector(
                 ui.label("Selection is no longer valid.");
             }
         }
+        return;
+    }
+
+    // Static geometry (Objects) takes the Inspector when selected.
+    let geo: Vec<usize> = selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
+    if !geo.is_empty() {
+        geometry_inspector(ui, scene, &geo);
         return;
     }
 
@@ -857,7 +978,7 @@ pub fn inspector(
                 fixture_inspector(ui, fixture);
             }
         }
-        many => bulk_inspector(ui, scene, many),
+        many => bulk_inspector(ui, scene, patch, many),
     }
 }
 
@@ -866,13 +987,54 @@ pub fn inspector(
 /// Categories are collapsible and the Optics / Wheels rows are **dynamic** — they
 /// show the union of controls the selected fixtures actually expose, not a fixed
 /// hardcoded list.
-fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
+fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, ids: &[usize]) {
     let primary = ids[0];
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{}  {} fixtures", theme::icon::FIXTURE, ids.len())).strong());
     });
     ui.label(RichText::new("Bulk edit — changes apply to all selected.").weak().small());
     ui.separator();
+
+    // --- DMX MODE (only when every selected fixture shares one profile, so a
+    // single mode list applies to all). Drives the patch footprint; decode syncs
+    // each fixture's active mode from the patch next frame.
+    let p0 = scene.fixtures[primary].profile.clone();
+    let same_profile = ids.iter().all(|&i| scene.fixtures[i].profile == p0);
+    let ref_modes: Vec<String> = if same_profile {
+        scene.fixtures[primary]
+            .gdtf
+            .as_ref()
+            .map(|g| g.modes.iter().map(|m| m.name.clone()).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if ref_modes.len() > 1 {
+        let cur = patch.get(primary).map(|p| p.mode_index).unwrap_or(0);
+        let cur_name = ref_modes.get(cur).cloned().unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label("DMX mode");
+            let mut pick = None;
+            egui::ComboBox::from_id_salt("bulk-mode")
+                .selected_text(RichText::new(cur_name).small())
+                .show_ui(ui, |ui| {
+                    for (mi, name) in ref_modes.iter().enumerate() {
+                        if ui.selectable_label(mi == cur, name).clicked() {
+                            pick = Some(mi);
+                        }
+                    }
+                });
+            if let Some(mi) = pick {
+                for &i in ids {
+                    let f = &scene.fixtures[i];
+                    if f.gdtf.as_ref().is_some_and(|g| mi < g.modes.len()) {
+                        patch.set_mode(f, i, mi);
+                    }
+                }
+            }
+        });
+        ui.separator();
+    }
 
     // --- TRANSFORM ---
     egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
@@ -920,11 +1082,23 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("bulk-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                let mut intensity = scene.fixtures[primary].intensity;
-                ui.label("Intensity");
-                if ui.add(Slider::new(&mut intensity, 0.0..=1.0)).changed() {
+                let mut dimmer = scene.fixtures[primary].optics.dimmer;
+                ui.label("Dimmer");
+                if ui.add(Slider::new(&mut dimmer, 0.0..=1.0)).changed() {
                     for &i in ids {
-                        scene.fixtures[i].intensity = intensity;
+                        scene.fixtures[i].optics.dimmer = dimmer;
+                    }
+                }
+                ui.end_row();
+                let mut beam = scene.fixtures[primary].beam;
+                ui.label("Beam");
+                if ui
+                    .add(Slider::new(&mut beam, 0.0..=4.0).text("vol"))
+                    .on_hover_text("Volumetric beam intensity (0 = off)")
+                    .changed()
+                {
+                    for &i in ids {
+                        scene.fixtures[i].beam = beam;
                     }
                 }
                 ui.end_row();
@@ -1083,10 +1257,14 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture) {
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("fx-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Intensity");
-                ui.add(DragValue::new(&mut fixture.intensity).speed(0.005).range(0.0..=1.0));
+                ui.label("Dimmer");
+                ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
                 ui.end_row();
                 ui.label("Beam");
+                ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
+                    .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
+                ui.end_row();
+                ui.label("Beam angle");
                 ui.add(DragValue::new(&mut fixture.beam_angle).speed(0.2).range(2.0..=90.0).suffix("°"));
                 ui.end_row();
                 ui.label("Color");
@@ -1140,6 +1318,87 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment) {
                 ui.end_row();
             });
         });
+}
+
+/// Inspector for a selected static-geometry object (an imported stage deck,
+/// truss, or set piece): identity, visibility, and an editable world transform
+/// (position / rotation / uniform scale), decomposed from its 4×4 and recomposed
+/// only when a field changes (so a one-off non-uniform import isn't flattened).
+fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
+    let primary = ids[0];
+    let Some(g) = scene.geometry.get_mut(primary) else {
+        ui.label("Selection is no longer valid.");
+        return;
+    };
+    ui.heading(g.name.as_str());
+    let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
+    ui.label(
+        RichText::new(format!("{kind} · {} model{}", g.models.len(), if g.models.len() == 1 { "" } else { "s" }))
+            .weak()
+            .small(),
+    );
+    if ids.len() > 1 {
+        ui.label(RichText::new(format!("{} objects — editing the active one", ids.len())).weak().small());
+    }
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        let mut visible = !g.hidden;
+        if ui.checkbox(&mut visible, "Visible").changed() {
+            g.hidden = !visible;
+        }
+    });
+
+    // Position is read/written via the translation column directly (lossless), so
+    // a pure move never disturbs a non-uniform/sheared import. Rotation + scale
+    // are decomposed for display and only re-composed (to a clean uniform basis)
+    // when the user actually edits one of them.
+    let (scale0, rot0, _trans0) = g.transform.to_scale_rotation_translation();
+    let mut pos = g.transform.w_axis.truncate();
+    let mut uscale = ((scale0.x + scale0.y + scale0.z) / 3.0).max(1e-3);
+    let (ry, rx, rz) = rot0.to_euler(glam::EulerRot::YXZ);
+    let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
+    let mut pos_changed = false;
+    let mut rs_changed = false;
+
+    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("geo-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
+                    pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
+                    pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                });
+                ui.end_row();
+                ui.label("Rotation");
+                ui.horizontal(|ui| {
+                    rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                    rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                    rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                });
+                ui.end_row();
+                ui.label("Scale");
+                rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
+                ui.end_row();
+            });
+            if let Some((lo, hi)) = g.world_bounds() {
+                let s = hi - lo;
+                ui.label(
+                    RichText::new(format!("size  {:.2} × {:.2} × {:.2} m", s.x, s.y, s.z)).weak().small(),
+                );
+            }
+        });
+
+    if rs_changed {
+        let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
+        g.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
+    } else if pos_changed {
+        // Pure move: rewrite only the translation column, keeping the original
+        // (possibly non-uniform) basis intact.
+        g.transform.w_axis = pos.extend(1.0);
+    }
 }
 
 /// Inspector for an imported GDTF fixture: identity + thumbnail, editable
@@ -1226,7 +1485,7 @@ fn gdtf_inspector(
                     continue;
                 }
                 let c = fixture.cells.get(i).copied().unwrap_or([1.0, 1.0, 1.0]);
-                let level = fixture.intensity.clamp(0.0, 1.0);
+                let level = (fixture.intensity * fixture.optics.dimmer).clamp(0.0, 1.0);
                 let col = egui::Color32::from_rgb(
                     ((c[0].min(1.0) * level).powf(1.0 / 2.2) * 255.0) as u8,
                     ((c[1].min(1.0) * level).powf(1.0 / 2.2) * 255.0) as u8,
@@ -1293,8 +1552,12 @@ fn gdtf_inspector(
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("gdtf-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Intensity");
-                ui.add(DragValue::new(&mut fixture.intensity).speed(0.005).range(0.0..=1.0));
+                ui.label("Dimmer");
+                ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
+                ui.end_row();
+                ui.label("Beam");
+                ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
+                    .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
                 ui.end_row();
                 ui.label("Color");
                 ui.color_edit_button_rgb(&mut fixture.color);
@@ -1579,6 +1842,11 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
                     f.position = *p0 + world;
                 }
             }
+            for (i, m0) in &op.geo_start {
+                if let Some(g) = scene.geometry.get_mut(*i) {
+                    g.transform = Mat4::from_translation(world) * *m0;
+                }
+            }
         }
         TransformKind::Rotate => {
             let angle = d.x * 0.01;
@@ -1588,6 +1856,16 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     f.position = op.pivot + rot * (*p0 - op.pivot);
                     f.orientation = rot * *q0;
+                }
+            }
+            if !op.geo_start.is_empty() {
+                let about = Mat4::from_translation(op.pivot)
+                    * Mat4::from_quat(rot)
+                    * Mat4::from_translation(-op.pivot);
+                for (i, m0) in &op.geo_start {
+                    if let Some(g) = scene.geometry.get_mut(*i) {
+                        g.transform = about * *m0;
+                    }
                 }
             }
         }
@@ -1604,6 +1882,22 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
                         off * factor
                     };
                     f.position = op.pivot + new;
+                }
+            }
+            if !op.geo_start.is_empty() {
+                // Scale about the pivot in world space — uniform, or only the
+                // locked axis.
+                let s = match op.axis {
+                    Some(ax) => Vec3::ONE + ax.vec() * (factor - 1.0),
+                    None => Vec3::splat(factor),
+                };
+                let about = Mat4::from_translation(op.pivot)
+                    * Mat4::from_scale(s)
+                    * Mat4::from_translation(-op.pivot);
+                for (i, m0) in &op.geo_start {
+                    if let Some(g) = scene.geometry.get_mut(*i) {
+                        g.transform = about * *m0;
+                    }
                 }
             }
         }
@@ -1629,6 +1923,7 @@ pub fn viewport(
     settings: &mut RenderSettings,
     transform: &mut Option<TransformOp>,
     delete_requested: &mut bool,
+    replace_requested: &mut bool,
 ) {
     let available = ui.available_size();
     let ppp = ui.pixels_per_point();
@@ -1681,6 +1976,11 @@ pub fn viewport(
                     f.orientation = *q0;
                 }
             }
+            for (i, m0) in &op.geo_start {
+                if let Some(g) = scene.geometry.get_mut(*i) {
+                    g.transform = *m0;
+                }
+            }
             *transform = None;
         } else {
             if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
@@ -1698,13 +1998,15 @@ pub fn viewport(
                 *transform = None;
             }
         }
-    } else if *viewport_focused && !selection.fixtures.is_empty() {
-        // Start a transform on G / R / S.
+    } else if *viewport_focused && (!selection.fixtures.is_empty() || !selection.geometry.is_empty()) {
+        // Start a transform on G / R / S (over fixtures and/or static geometry).
         let kind = ui.input(|i| {
             use egui::Key;
             if i.key_pressed(Key::G) {
                 Some(TransformKind::Move)
-            } else if i.key_pressed(Key::R) {
+            } else if i.key_pressed(Key::R) && !i.modifiers.shift {
+                // Shift+R is "Replace fixtures" (handled in handle_shortcuts), so
+                // plain R = Rotate only.
                 Some(TransformKind::Rotate)
             } else if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl {
                 Some(TransformKind::Scale)
@@ -1715,15 +2017,38 @@ pub fn viewport(
         if let Some(kind) = kind
             && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
         {
-            let ids: Vec<usize> =
+            let fids: Vec<usize> =
                 selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
-            if !ids.is_empty() {
-                let pivot = ids.iter().map(|&i| scene.fixtures[i].position).sum::<Vec3>() / ids.len() as f32;
-                let start = ids
+            let gids: Vec<usize> =
+                selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
+            if !fids.is_empty() || !gids.is_empty() {
+                // Pivot = centroid of every selected target (fixture origins +
+                // geometry bbox centres).
+                let mut sum = Vec3::ZERO;
+                let mut n = 0.0_f32;
+                let start: Vec<(usize, Vec3, Quat)> = fids
                     .iter()
-                    .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
+                    .map(|&i| {
+                        sum += scene.fixtures[i].position;
+                        n += 1.0;
+                        (i, scene.fixtures[i].position, scene.fixtures[i].orientation)
+                    })
                     .collect();
-                *transform = Some(TransformOp { kind, axis: None, start_screen: cur, pivot, start });
+                let geo_start: Vec<(usize, Mat4)> = gids
+                    .iter()
+                    .map(|&i| {
+                        let g = &scene.geometry[i];
+                        let c = g
+                            .world_bounds()
+                            .map(|(lo, hi)| (lo + hi) * 0.5)
+                            .unwrap_or_else(|| g.transform.w_axis.truncate());
+                        sum += c;
+                        n += 1.0;
+                        (i, g.transform)
+                    })
+                    .collect();
+                let pivot = if n > 0.0 { sum / n } else { Vec3::ZERO };
+                *transform = Some(TransformOp { kind, axis: None, start_screen: cur, pivot, start, geo_start });
                 consumed = true;
             }
         }
@@ -1760,6 +2085,14 @@ pub fn viewport(
         let toggle = m.command || m.ctrl;
         match pick(scene, ro, rd) {
             Some(Hit::Fixture(i)) => apply_fixture_click(selection, scene_anchor, i, m.shift, toggle, scene.fixtures.len()),
+            Some(Hit::Geometry(i)) => {
+                if toggle {
+                    selection.toggle_geometry(i);
+                } else {
+                    *selection = Selection::geometry(i);
+                }
+                *scene_anchor = None;
+            }
             Some(Hit::Environment(i)) => *selection = Selection::environment(i),
             None if !(toggle || m.shift) => *selection = Selection::default(),
             None => {}
@@ -1776,19 +2109,63 @@ pub fn viewport(
             let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
             let aspect = rect.width() / rect.height().max(1.0);
             let (ro, rd) = camera.ray(ndc, aspect);
-            if let Some(Hit::Fixture(i)) = pick(scene, ro, rd)
-                && !selection.contains_fixture(i)
-            {
-                *selection = Selection::fixture(i);
-                *scene_anchor = Some(i);
+            match pick(scene, ro, rd) {
+                Some(Hit::Fixture(i)) if !selection.contains_fixture(i) => {
+                    *selection = Selection::fixture(i);
+                    *scene_anchor = Some(i);
+                }
+                Some(Hit::Geometry(i)) if !selection.contains_geometry(i) => {
+                    *selection = Selection::geometry(i);
+                    *scene_anchor = None;
+                }
+                _ => {}
             }
         }
         response.context_menu(|ui| {
             ui.set_min_width(170.0);
-            if selection.fixtures.is_empty() {
+            if !selection.geometry.is_empty() {
+                // Static-geometry (Objects) selection menu.
+                let n = selection.geometry.len();
+                ui.label(egui::RichText::new(format!("{n} object{}", if n == 1 { "" } else { "s" })).small().weak());
+                if ui.button(format!("{}  Frame selection", theme::icon::FRAME)).clicked() {
+                    let mut lo = Vec3::splat(f32::INFINITY);
+                    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                    for &i in &selection.geometry {
+                        if let Some((l, h)) = scene.geometry.get(i).and_then(|g| g.world_bounds()) {
+                            lo = lo.min(l);
+                            hi = hi.max(h);
+                        }
+                    }
+                    if lo.is_finite() {
+                        camera.frame_aabb(lo, hi);
+                    }
+                    ui.close();
+                }
+                if ui.button(format!("{}  Hide", theme::icon::EYE_OFF)).clicked() {
+                    for &i in &selection.geometry {
+                        if let Some(g) = scene.geometry.get_mut(i) {
+                            g.hidden = true;
+                        }
+                    }
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Deselect").clicked() {
+                    *selection = Selection::default();
+                    ui.close();
+                }
+                if ui
+                    .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
+                    .clicked()
+                {
+                    *delete_requested = true;
+                    ui.close();
+                }
+            } else if selection.fixtures.is_empty() {
                 if ui.button(format!("{}  Select all", theme::icon::FIXTURE)).clicked() {
                     selection.fixtures = (0..scene.fixtures.len()).collect();
                     selection.environment = None;
+                    selection.geometry.clear();
                     ui.close();
                 }
             } else {
@@ -1808,6 +2185,14 @@ pub fn viewport(
                         *duplicate =
                             Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
                     }
+                    ui.close();
+                }
+                if ui
+                    .button(format!("{}  Replace…", theme::icon::RESET))
+                    .on_hover_text("Swap these fixtures for another project profile (Shift+R)")
+                    .clicked()
+                {
+                    *replace_requested = true;
                     ui.close();
                 }
                 ui.separator();
@@ -1861,6 +2246,38 @@ pub fn viewport(
         egui::FontId::proportional(11.0),
         egui::Color32::from_white_alpha(110),
     );
+
+    // Active selection label (top-right corner, like Blender's active-object
+    // header): the primary selected object's name + how many more are selected.
+    let sel_text: Option<String> = if let Some(ei) = selection.environment {
+        scene.environments.get(ei).map(|e| e.name.clone())
+    } else if !selection.geometry.is_empty() {
+        let extra = selection.geometry.len().saturating_sub(1);
+        selection.primary_geometry().and_then(|i| scene.geometry.get(i)).map(|g| {
+            if extra > 0 { format!("{}  +{extra}", g.name) } else { g.name.clone() }
+        })
+    } else if !selection.fixtures.is_empty() {
+        let extra = selection.fixtures.len().saturating_sub(1);
+        selection.primary_fixture().and_then(|i| scene.fixtures.get(i)).map(|f| {
+            if extra > 0 { format!("{}  +{extra}", f.name) } else { f.name.clone() }
+        })
+    } else {
+        None
+    };
+    if let Some(text) = sel_text {
+        let painter = ui.painter_at(rect);
+        let font = egui::FontId::proportional(12.5);
+        let galley = painter.layout_no_wrap(text, font, egui::Color32::from_gray(238));
+        let pad = egui::vec2(9.0, 5.0);
+        let size = galley.size() + pad * 2.0;
+        let anchor = rect.right_top() + egui::vec2(-10.0, 10.0);
+        let bg = egui::Rect::from_min_max(
+            egui::pos2(anchor.x - size.x, anchor.y),
+            egui::pos2(anchor.x, anchor.y + size.y),
+        );
+        painter.rect_filled(bg, 5.0, egui::Color32::from_black_alpha(150));
+        painter.galley(bg.min + pad, galley, egui::Color32::from_gray(238));
+    }
 
     // Fixture labels, projected to screen (name / ID / DMX address).
     if prefs.show_labels {
@@ -2179,7 +2596,7 @@ pub fn dmx_universe_grid(
             }
             if live {
                 let n = snapshot.frames.get(&u).map(|f| f.sources).unwrap_or(0);
-                ui.colored_label(theme::LIVE, format!("● LIVE · {n} src"));
+                ui.colored_label(theme::OK, format!("● {n} src"));
             } else {
                 ui.colored_label(ink.muted, "○ idle");
             }
@@ -2386,7 +2803,6 @@ pub fn fixture_manager(
     patch: &mut PatchTable,
     selection: &mut Selection,
     anchor: &mut Option<usize>,
-    live_mask: &[bool],
     fm: &mut FmState,
 ) {
     use theme::icon;
@@ -2484,6 +2900,42 @@ pub fn fixture_manager(
                     }
                 }
             }
+            // Bulk DMX mode — only when every selected fixture is the same profile
+            // (so one mode list applies to all). Drives the patch footprint; decode
+            // syncs each fixture's active mode from the patch.
+            let p0 = scene.fixtures[sel[0]].profile.clone();
+            let same_profile = sel.iter().all(|&i| scene.fixtures[i].profile == p0);
+            let ref_modes: Vec<String> = if same_profile {
+                scene.fixtures[sel[0]]
+                    .gdtf
+                    .as_ref()
+                    .map(|g| g.modes.iter().map(|m| m.name.clone()).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !ref_modes.is_empty() {
+                let cur = patch.get(sel[0]).map(|p| p.mode_index).unwrap_or(0);
+                let cur_name = ref_modes.get(cur).cloned().unwrap_or_default();
+                let mut pick = None;
+                egui::ComboBox::from_id_salt("fm-bulk-mode")
+                    .selected_text(RichText::new(format!("Mode: {cur_name}")).small())
+                    .show_ui(ui, |ui| {
+                        for (mi, name) in ref_modes.iter().enumerate() {
+                            if ui.selectable_label(mi == cur, name).clicked() {
+                                pick = Some(mi);
+                            }
+                        }
+                    });
+                if let Some(mi) = pick {
+                    for &i in &sel {
+                        let f = &scene.fixtures[i];
+                        if f.gdtf.as_ref().is_some_and(|g| mi < g.modes.len()) {
+                            patch.set_mode(f, i, mi);
+                        }
+                    }
+                }
+            }
         });
     }
     ui.separator();
@@ -2523,11 +2975,9 @@ pub fn fixture_manager(
             for &i in &order {
                 let fixture = &scene.fixtures[i];
                 // Name cell: selects the row (syncs the 3D/Inspector selection);
-                // shift = range, ⌘/Ctrl = toggle. Live fixtures get a green dot.
+                // shift = range, ⌘/Ctrl = toggle.
                 let selected = selection.contains_fixture(i);
-                let live = live_mask.get(i).copied().unwrap_or(false);
-                let dot = if live { "● " } else { "" };
-                let resp = ui.selectable_label(selected, RichText::new(format!("{dot}{}", fixture.name)).small());
+                let resp = ui.selectable_label(selected, RichText::new(fixture.name.as_str()).small());
                 if resp.clicked() {
                     let m = ui.input(|x| x.modifiers);
                     click = Some((i, m.shift, m.command || m.ctrl));
@@ -2610,15 +3060,19 @@ fn format_universes(us: &[u16]) -> String {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Hit {
     Fixture(usize),
+    Geometry(usize),
     Environment(usize),
 }
 
-/// Pick the object a world-space ray hits. Fixtures take priority (so you can
-/// always click a head even when it sits inside the fog box); only if none is
-/// hit do we test the environment volumes.
+/// Pick the object a world-space ray hits. Priority: **fixtures** (so you can
+/// always click a head even when it sits inside set geometry or the fog box),
+/// then **static geometry** (its world AABB), then the **environment** volumes.
 fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
     let mut best: Option<(f32, usize)> = None;
     for (i, f) in scene.fixtures.iter().enumerate() {
+        if f.hidden {
+            continue;
+        }
         // Bounding sphere around the head; a bit generous so it's easy to click.
         if let Some(t) = ray_sphere(ro, rd, f.position, 0.5)
             && best.is_none_or(|(bt, _)| t < bt)
@@ -2628,6 +3082,22 @@ fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
     }
     if let Some((_, i)) = best {
         return Some(Hit::Fixture(i));
+    }
+    // Static geometry: ray vs each object's world-space AABB.
+    let mut geo: Option<(f32, usize)> = None;
+    for (i, g) in scene.geometry.iter().enumerate() {
+        if g.hidden {
+            continue;
+        }
+        if let Some((lo, hi)) = g.world_bounds()
+            && let Some(t) = ray_aabb(ro, rd, lo, hi)
+            && geo.is_none_or(|(bt, _)| t < bt)
+        {
+            geo = Some((t, i));
+        }
+    }
+    if let Some((_, i)) = geo {
+        return Some(Hit::Geometry(i));
     }
     let mut env: Option<(f32, usize)> = None;
     for (i, e) in scene.environments.iter().enumerate() {
@@ -2720,7 +3190,7 @@ mod transform_tests {
     use super::*;
 
     fn make_op(kind: TransformKind, axis: Option<Axis>, pivot: Vec3, idx: usize, p0: Vec3) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)] }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)], geo_start: Vec::new() }
     }
 
     #[test]

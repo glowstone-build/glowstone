@@ -33,7 +33,7 @@ pub use patch::{PatchSource, PatchTable};
 pub use universe::UniverseSnapshot;
 
 /// How multiple sources contributing to one universe are combined.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum MergePolicy {
     /// Highest priority wins; HTP (per-channel max) among equal-priority sources.
     #[default]
@@ -56,7 +56,7 @@ impl MergePolicy {
 }
 
 /// Connectivity configuration, edited in the panel and pushed to the worker.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DmxConfig {
     pub artnet: bool,
     pub sacn: bool,
@@ -258,6 +258,11 @@ impl DmxIo {
         self.worker.is_some()
     }
 
+    /// The UI-facing config (read for project save).
+    pub fn config(&self) -> &DmxConfig {
+        &self.config
+    }
+
     /// The UI-facing config (mutated by the Preferences window).
     pub fn config_mut(&mut self) -> &mut DmxConfig {
         &mut self.config
@@ -276,7 +281,6 @@ impl DmxIo {
             snapshot: &self.snapshot,
             status: &self.status,
             config: &mut self.config,
-            live_mask: &self.live_mask,
             selected_universe: &mut self.selected_universe,
             bind_ip_text: &mut self.bind_ip_text,
             universes_text: &mut self.universes_text,
@@ -304,7 +308,6 @@ pub struct DmxView<'a> {
     pub snapshot: &'a UniverseSnapshot,
     pub status: &'a DmxStatus,
     pub config: &'a mut DmxConfig,
-    pub live_mask: &'a [bool],
     pub selected_universe: &'a mut u16,
     pub bind_ip_text: &'a mut String,
     pub universes_text: &'a mut String,

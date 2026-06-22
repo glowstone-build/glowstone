@@ -181,17 +181,25 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         if (rad_max <= 0.002) {
             continue;
         }
-        let guv = opt_project(rel, depth, lt.cookie_r.xyz, lt.cookie_u.xyz, cone_r);
-        // Aperture-dependent DoF LOD (tan_half, iris, lens_r). The floor pool is
-        // a stable surface projection, so sharpen the in-focus cookie fully.
-        let lod = opt_lod(depth, lt.shape.y, lt.shape.w, lt.dir_cos.w, lt.shape.z, lt.color.w);
-        let trans = opt_cookie(
-            gobo_tex, gobo_samp, guv,
-            lt.cookie_r.w, lt.cookie_u.w,
-            lt.extra.x, lt.extra.y, lt.cmyf.xyz, lod, camera.render_mode.y,
-        ) * opt_shutter((guv - vec2<f32>(0.5)) * 2.0, lt.extra.z, lt.extra.w, lt.cmyf.w);
-        if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
-            continue;
+        // Plain-beam fast-path (kept in lock-step with volumetric.wgsl): a plain
+        // wash / pixel-bar cell (extra.z = -1 sentinel — never a real shutter_close
+        // ≥ 0) has no gobo/anim/CMY/blade, so the projected-cookie chain returns
+        // identity. Skip it for the floor pool too.
+        let plain = lt.extra.z < -0.5;
+        var trans = vec3<f32>(1.0, 1.0, 1.0);
+        if (!plain) {
+            let guv = opt_project(rel, depth, lt.cookie_r.xyz, lt.cookie_u.xyz, cone_r);
+            // Aperture-dependent DoF LOD (tan_half, iris, lens_r). The floor pool is
+            // a stable surface projection, so sharpen the in-focus cookie fully.
+            let lod = opt_lod(depth, lt.shape.y, lt.shape.w, lt.dir_cos.w, lt.shape.z, lt.color.w);
+            trans = opt_cookie(
+                gobo_tex, gobo_samp, guv,
+                lt.cookie_r.w, lt.cookie_u.w,
+                lt.extra.x, lt.extra.y, lt.cmyf.xyz, lod, camera.render_mode.y,
+            ) * opt_shutter((guv - vec2<f32>(0.5)) * 2.0, lt.extra.z, lt.extra.w, lt.cmyf.w);
+            if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
+                continue;
+            }
         }
         let l = normalize(lpos - in.world_pos);
         // Half-Lambert wrap (not hard N·L): a surface edge-on to the beam (a wall or
@@ -207,7 +215,13 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         if (sidx >= 0) {
             vis = opt_shadow(in.world_pos, shadow_mats[sidx], shadow_atlas, shadow_samp, sidx);
         }
-        fixture_light += lt.color.rgb * trans * (rad3 * (ndl * atten * 9.0 * vis));
+        // Per-cell HDR whiten + boost (accuracy) — same as the shaft, so the floor
+        // pool agrees: bright pixel cells read brighter/whiter, coloured stay saturated.
+        let white01 = select(0.0, lt.extra.w, plain);
+        let lum = max(lt.color.r, max(lt.color.g, lt.color.b));
+        let whitened = mix(lt.color.rgb, vec3<f32>(lum), white01 * white01 * 0.6);
+        let boost = 1.0 + white01 * white01 * 0.6;
+        fixture_light += whitened * trans * (rad3 * (ndl * atten * 9.0 * vis * boost));
     }
 
     let albedo = in.color;

@@ -39,7 +39,7 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// The controllable look of one fixture, captured into / restored from a cue.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct FixtureLook {
     pub pan: f32,
     pub tilt: f32,
@@ -66,6 +66,9 @@ impl FixtureLook {
         f.pan = lerp_angle(self.pan, to.pan, a);
         f.tilt = lerp_angle(self.tilt, to.tilt, a);
         f.intensity = lerp(self.intensity, to.intensity, a);
+        // The dimmer is the fixture's level (continuous), so it crossfades — the
+        // rest of the optics (wheel slots / prism) are discrete and snapped.
+        f.optics.dimmer = lerp(self.optics.dimmer, to.optics.dimmer, a);
         f.beam_angle = lerp(self.beam_angle, to.beam_angle, a);
         for c in 0..3 {
             f.color[c] = lerp(self.color[c], to.color[c], a);
@@ -82,6 +85,7 @@ impl FixtureLook {
 
 /// A saved look: one [`FixtureLook`] per fixture (aligned to fixture index at
 /// capture time), plus a fade time.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Cue {
     pub name: String,
     pub looks: Vec<FixtureLook>,
@@ -96,10 +100,13 @@ struct Fade {
     dur: f32,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CueEngine {
     pub cues: Vec<Cue>,
     /// The last cue fully reached (for Go / highlight).
     pub current: Option<usize>,
+    /// An in-progress fade is transient and need not persist; restored as `None`.
+    #[serde(skip)]
     fade: Option<Fade>,
     name_buf: String,
     fade_buf: f32,
@@ -127,7 +134,12 @@ impl CueEngine {
     /// Start recalling cue `idx`: snap the discrete optics now, crossfade the rest.
     fn recall(&mut self, idx: usize, scene: &mut Scene) {
         let Some(cue) = self.cues.get(idx) else { return };
-        // Snap optics immediately (wheel slots don't interpolate).
+        // Capture the CURRENT look first — the crossfade's starting point — BEFORE
+        // we snap the discrete optics, so the dimmer fades from where it actually
+        // is (snapping would otherwise overwrite the starting dimmer).
+        let from: Vec<FixtureLook> = scene.fixtures.iter().map(FixtureLook::capture).collect();
+        // Snap the discrete optics immediately (wheel slots don't interpolate); the
+        // continuous dimmer is re-faded by `apply_lerp` below / in `tick`.
         for (i, f) in scene.fixtures.iter_mut().enumerate() {
             if let Some(look) = cue.looks.get(i) {
                 f.optics = look.optics.clone();
@@ -144,7 +156,15 @@ impl CueEngine {
             self.fade = None;
             return;
         }
-        let from = scene.fixtures.iter().map(FixtureLook::capture).collect();
+        // Seed the crossfade's first frame (t=0) NOW so the click frame already
+        // shows the `from` look — the snap above set the dimmer to the *target*,
+        // and the fade tick only runs next frame, so without this the rig flashes
+        // to the target dimmer for one frame before fading.
+        for (i, f) in scene.fixtures.iter_mut().enumerate() {
+            if let (Some(a), Some(b)) = (from.get(i), cue.looks.get(i)) {
+                a.apply_lerp(b, 0.0, f);
+            }
+        }
         self.fade = Some(Fade { from, to: idx, t: 0.0, dur: cue.fade });
     }
 

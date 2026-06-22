@@ -85,49 +85,52 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var rgb = vec3<f32>(0.015 + 0.06 * fres);
 
     let level = in.color.w;
-    if (level > 1e-4 && cosv > 0.0) {
-        let tan_half = max(in.params.x, 1e-3);
-        let n_order = max(in.params.y, 1.2);
-        let candela = clamp(in.params.z, 0.25, 16.0);
+    if (level > 1e-4) {
+        // Omnidirectional "this emitter is ON" glow. A real diffuse LED front
+        // reads as lit across its whole front hemisphere (brightest head-on,
+        // fading to grazing) and even hints from behind — NOT only when the eye
+        // sits inside the fixture's narrow beam cone. Candela-independent, so a
+        // wash/bar/LED-array shows its colour from any angle; the concentrated
+        // in-beam blast below adds on top for spots. Pushed well into HDR (≫1) so
+        // the source disc CLIPS to a hot core and BLOOMS into a visible halo —
+        // not a dim disc lost against the background.
+        var face = 3.0 + 34.0 * smoothstep(0.0, 0.3, cosv);
 
-        // Reciprocity gate: the face is at full luminance exactly where the
-        // beam would reach the eye — the beam's own super-Gaussian profile
-        // evaluated at the view angle.
-        let sinv = sqrt(max(1.0 - cosv * cosv, 0.0));
-        let x = (sinv / max(cosv, 1e-3)) / tan_half;
-        let gate = exp(-LN2 * pow(x, 2.0 * n_order));
+        if (cosv > 0.0) {
+            let tan_half = max(in.params.x, 1e-3);
+            let n_order = max(in.params.y, 1.2);
+            let candela = clamp(in.params.z, 0.25, 16.0);
 
-        // Die image: parallax-shifted hotspot, magnifying to fill the
-        // aperture on-axis. View direction projected into the lens plane
-        // drives the shift (die sits behind the lens → image moves opposite).
-        let v_lens = vec2<f32>(dot(view, in.right), dot(view, in.up));
-        let die_c = -v_lens * 0.55 * (1.0 - 0.6 * gate);
-        let die_r = mix(0.28, 1.15, gate);
-        let die_d = length(in.local - die_c) / die_r;
-        let die = exp(-LN2 * pow(die_d, 4.0));
+            // Reciprocity gate: the face hits FULL luminance exactly where the
+            // beam would reach the eye — the beam's own super-Gaussian profile
+            // evaluated at the view angle.
+            let sinv = sqrt(max(1.0 - cosv * cosv, 0.0));
+            let x = (sinv / max(cosv, 1e-3)) / tan_half;
+            let gate = exp(-LN2 * pow(x, 2.0 * n_order));
 
-        // Close-up structure: limb darkening toward the rim and a faint dark
-        // ring where the collimator's central lenslet meets the TIR annulus.
-        let limb = 1.0 - 0.22 * r * r;
-        let ring = 1.0 - 0.08 * smoothstep(0.32, 0.44, r) * (1.0 - smoothstep(0.5, 0.68, r));
+            // Die image: parallax-shifted hotspot, magnifying to fill the
+            // aperture on-axis. View direction projected into the lens plane
+            // drives the shift (die sits behind the lens → image moves opposite).
+            let v_lens = vec2<f32>(dot(view, in.right), dot(view, in.up));
+            let die_c = -v_lens * 0.55 * (1.0 - 0.6 * gate);
+            let die_r = mix(0.28, 1.15, gate);
+            let die_d = length(in.local - die_c) / die_r;
+            let die = exp(-LN2 * pow(die_d, 4.0));
 
-        // Scatter floor: TIR/Fresnel leakage lights the whole lens body a few
-        // percent of full even far off-axis.
-        let floor_g = 0.028 * (0.4 + 0.6 * cosv);
+            // Close-up structure: limb darkening toward the rim and a faint dark
+            // ring where the collimator's central lenslet meets the TIR annulus.
+            let limb = 1.0 - 0.22 * r * r;
+            let ring = 1.0 - 0.08 * smoothstep(0.32, 0.44, r) * (1.0 - smoothstep(0.5, 0.68, r));
+            let profile = max(gate * limb, die * mix(0.3, 1.0, gate) * limb) * ring;
 
-        // Aperture radiance profile: in-beam blast, else the brighter of the
-        // die image (at ~30% die luminance off-axis) and the body glow.
-        let profile = max(gate * limb, max(die * mix(0.3, 1.0, gate) * limb, floor_g)) * ring;
-
-        // HDR anchor: a key-lit stage surface sits near 1; an in-beam lens
-        // face is orders of magnitude above it and must clip to white through
-        // the tonemap (that clip + bloom IS the "light source" look). Tighter
-        // zoom concentrates the same flux → brighter face (∝ candela).
-        let l0 = 60.0 * candela;
-        rgb += in.color.rgb * (level * l0 * profile);
-    } else if (level > 1e-4) {
-        // Back side of a lit cell: the lens body still glows faintly.
-        rgb += in.color.rgb * (level * 0.4);
+            // HDR anchor: a key-lit stage surface sits near 1; an in-beam lens
+            // face is orders of magnitude above it and must clip to white through
+            // the tonemap (that clip + bloom IS the "light source" look). Tighter
+            // zoom concentrates the same flux → brighter face (∝ candela).
+            let l0 = 60.0 * candela;
+            face += l0 * profile;
+        }
+        rgb += in.color.rgb * (level * face);
     }
 
     // Mechanical shutter blade(s) across the lens face — the mechanism lives at
@@ -138,11 +141,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let bclose = in.shutter.x;
         let hw = clamp(in.shutter.z, 0.05, 1.3);
         var t = mix(1.0 + hw, -hw, bclose);     // open → past rim, shut → blackout
-        if (sk > 1.5) {
-            let tri = abs(fract(in.local.y * 3.0) * 2.0 - 1.0);
-            t = t + (tri - 0.5) * 0.16;
+        if (sk > 1.5) {                              // sawtooth: a few BIG teeth
+            let tri = abs(fract(in.local.y * 2.0) * 2.0 - 1.0);
+            t = t + (tri - 0.5) * 0.30;
         }
-        let under = smoothstep(t - hw, t + hw, abs(in.local.x)); // blades L+R (rotated)
+        let under = smoothstep(t - hw, t + hw, abs(in.local.x)); // two blades, L+R, pinch to centre
         // Dim the lens face with the dimmer (uniform) + the soft blade artifact.
         rgb = rgb * mix(1.0 - bclose, 1.0 - under, 0.55);
     }

@@ -58,7 +58,10 @@ struct FixtureGpu {
     color: [f32; 4],       // rgb = tint*intensity*candela*shutter, w = lens radius (m)
     cookie_r: [f32; 4],    // xyz = lens-plane right basis, w = wheel-buffer offset
     cookie_u: [f32; 4],    // xyz = lens-plane up basis,    w = wheel count (dynamic chain)
-    extra: [f32; 4],       // x = anim layer (<0 none), y = anim scroll, z/w = unused
+    // x = anim layer (<0 none), y = anim scroll. z/w are shutter (close, kind) on
+    // single-emitter beams; on a PLAIN multi-emitter cell they are repurposed:
+    // z = -1 plain-beam sentinel (skip the cookie chain), w = per-cell HDR whiteness.
+    extra: [f32; 4],
     shape: [f32; 4],       // x = super-Gaussian order, y = focus dist (m), z = iris frac, w = frost 0..1
     misc: [f32; 4],        // x = CA strength, y = laser flag, z = atlas layer count, w = shadow layer
     cmyf: [f32; 4],        // CMY flag insertions: c, m, y, unused (spatial sliding dichroic flags)
@@ -141,6 +144,10 @@ pub struct Renderer {
     // `None` = a model that failed to bake (unsupported/empty); cached so it is
     // not re-parsed (and re-warned) every frame.
     scene_geom_cache: HashMap<usize, Option<GpuMesh>>,
+    /// Local-space vertex AABB per baked scene mesh (keyed like `scene_geom_cache`),
+    /// for frustum-culling shadow casters: a narrow hero beam sees almost none of a
+    /// 5000-object crowd, so culling cuts the shadow-pass draw count ~100×.
+    scene_geom_bounds: HashMap<usize, ([f32; 3], [f32; 3])>,
     scene_geom_instances: GrowBuffer,
 
     // Placeholder cone bodies for GDTF fixtures whose 3D models didn't bake
@@ -501,6 +508,7 @@ impl Renderer {
             gdtf_cache: HashMap::new(),
             gdtf_instances,
             scene_geom_cache: HashMap::new(),
+            scene_geom_bounds: HashMap::new(),
             scene_geom_instances,
             gdtf_placeholder_instances,
             sky_pipeline,
@@ -631,6 +639,16 @@ impl Renderer {
                 log::warn!("mvr: model '{}' produced no geometry (unsupported/empty)", model.file);
                 None
             } else {
+                // Local-space AABB of the raw vertices (the up-flip + transforms are
+                // applied at draw time), cached for shadow-caster frustum culling.
+                let mut lo = Vec3::splat(f32::INFINITY);
+                let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                for v in &verts {
+                    let p = Vec3::from(v.position);
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+                self.scene_geom_bounds.insert(key, (lo.to_array(), hi.to_array()));
                 Some(GpuMesh::new(&self.device, &model.file, &verts))
             };
             self.scene_geom_cache.insert(key, entry);
@@ -737,6 +755,20 @@ impl Renderer {
     /// no egui) and read it back as RGBA8 pixels. Used by the headless
     /// `--screenshot` path so the render can be verified without a visible
     /// window. Returns (width, height, rgba8 pixels).
+    /// Render-only bench: record + submit the full offscreen 3D render and block
+    /// until the GPU finishes — WITHOUT the capture readback (no buffer alloc, no
+    /// GPU→CPU copy, no map). This is the honest per-frame render cost (the live
+    /// app presents to screen and never reads back), so profiling with it isn't
+    /// dominated by the ~16 MB readback `capture` pays.
+    pub fn bench_render(&mut self, scene: &Scene, camera: &OrbitCamera, settings: &RenderSettings) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench-encoder") });
+        self.record_scene(&mut encoder, scene, camera, &Selection::default(), settings);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
     pub fn capture(
         &mut self,
         scene: &Scene,
@@ -990,7 +1022,7 @@ impl Renderer {
         for geometry in [FixtureGeometry::Cylinder, FixtureGeometry::Cone] {
             let start = fixture_instances.len() as u32;
             for (i, fixture) in scene.fixtures.iter().enumerate() {
-                if fixture.is_gdtf() || fixture.geometry != geometry {
+                if fixture.hidden || fixture.is_gdtf() || fixture.geometry != geometry {
                     continue;
                 }
                 fixture_instances.push(MeshInstance {
@@ -1021,6 +1053,9 @@ impl Renderer {
             let Some(gdtf) = fixture.gdtf.clone() else {
                 continue;
             };
+            if fixture.hidden {
+                continue;
+            }
             let key = Arc::as_ptr(&gdtf) as usize;
             self.ensure_gdtf_loaded(key, &gdtf);
             // Place the fixture: translate, then the MVR hang orientation (identity
@@ -1073,9 +1108,16 @@ impl Renderer {
         // is flipped into the object's geometry frame before its world transform.
         let glb_flip = crate::mvr::glb_yup_to_zup();
         let mut scene_geom_instances: Vec<MeshInstance> = Vec::new();
-        let mut scene_geom_draws: Vec<(usize, u32)> = Vec::new();
+        // (mesh key, instance index, world-space AABB) — the AABB frustum-culls the
+        // draw out of shadow passes (and the camera-frustum forward pass).
+        let mut scene_geom_draws: Vec<(usize, u32, Vec3, Vec3)> = Vec::new();
         let mut total_models = 0usize;
-        for obj in &scene.geometry {
+        for (oi, obj) in scene.geometry.iter().enumerate() {
+            if obj.hidden {
+                total_models += obj.models.len();
+                continue;
+            }
+            let selected = if selection.contains_geometry(oi) { 1.0 } else { 0.0 };
             for model in &obj.models {
                 total_models += 1;
                 if let Some(key) = self.ensure_scene_geom_loaded(model) {
@@ -1087,15 +1129,46 @@ impl Renderer {
                         Mat4::IDENTITY
                     };
                     let idx = scene_geom_instances.len() as u32;
+                    let m = obj.transform * model.matrix * flip;
                     scene_geom_instances.push(MeshInstance {
-                        model: (obj.transform * flip).to_cols_array_2d(),
+                        // object placement · per-Geometry3D transform · up-flip.
+                        model: m.to_cols_array_2d(),
                         color: [0.13, 0.13, 0.15],
                         intensity: 1.0,
-                        selected: 0.0,
+                        selected,
                     });
-                    scene_geom_draws.push((key, idx));
+                    // World AABB = local mesh bounds transformed by the full instance
+                    // matrix (exact, so it accounts for model.matrix + flip too).
+                    let (wlo, whi) = match self.scene_geom_bounds.get(&key) {
+                        Some(&(lo, hi)) => transform_aabb(&m, Vec3::from(lo), Vec3::from(hi)),
+                        None => (Vec3::splat(f32::NEG_INFINITY), Vec3::splat(f32::INFINITY)),
+                    };
+                    scene_geom_draws.push((key, idx, wlo, whi));
                 }
             }
+        }
+        if std::env::var("PREVIZ_GEOM_STATS").is_ok() {
+            let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for (k, _, _, _) in &scene_geom_draws {
+                *keys.entry(*k).or_default() += 1;
+            }
+            let mut counts: Vec<usize> = keys.values().copied().collect();
+            counts.sort_unstable_by(|a, b| b.cmp(a));
+            let mut diags: Vec<f32> =
+                scene_geom_draws.iter().map(|(_, _, lo, hi)| (*hi - *lo).length()).collect();
+            diags.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let n_ge = |t: f32| diags.iter().filter(|&&d| d >= t).count();
+            log::info!(
+                "GEOM: {} draws, {} meshes; diag max={:.1} | #≥0.5m={} #≥1m={} #≥1.5m={} #≥2m={} #≥3m={}",
+                scene_geom_draws.len(),
+                keys.len(),
+                diags.first().copied().unwrap_or(0.0),
+                n_ge(0.5),
+                n_ge(1.0),
+                n_ge(1.5),
+                n_ge(2.0),
+                n_ge(3.0),
+            );
         }
         self.scene_geom_instances
             .upload(&self.device, &self.queue, &scene_geom_instances);
@@ -1110,6 +1183,7 @@ impl Renderer {
                 .flat_map(|o| o.models.iter().map(|m| Arc::as_ptr(&m.glb) as usize))
                 .collect();
             self.scene_geom_cache.retain(|k, _| live.contains(k));
+            self.scene_geom_bounds.retain(|k, _| live.contains(k));
         }
 
         // --- dynamic lines: fog-box wireframes + beam indicators ---
@@ -1124,13 +1198,25 @@ impl Renderer {
         }
         if settings.show_beam_wireframes {
             for (i, fixture) in scene.fixtures.iter().enumerate() {
+                if fixture.hidden {
+                    continue;
+                }
                 push_beam_indicator(&mut lines, &beam_spec(fixture, beam_frames[i].first().copied()));
             }
         }
-        // Selection gizmo for every selected fixture (RGB axes + marker box).
+        // Selection gizmo for every selected fixture (RGB axes + marker box) —
+        // not for hidden ones (a hidden fixture draws nothing, gizmo included).
         for &sel in &selection.fixtures {
-            if let Some(f) = scene.fixtures.get(sel) {
+            if let Some(f) = scene.fixtures.get(sel).filter(|f| !f.hidden) {
                 push_selection_gizmo(&mut lines, f.position);
+            }
+        }
+        // Selection gizmo at the centre of every selected (visible) geometry object.
+        for &sel in &selection.geometry {
+            if let Some((lo, hi)) =
+                scene.geometry.get(sel).filter(|g| !g.hidden).and_then(|g| g.world_bounds())
+            {
+                push_selection_gizmo(&mut lines, (lo + hi) * 0.5);
             }
         }
         let line_count = self.dynamic_lines.upload(&self.device, &self.queue, &lines);
@@ -1151,6 +1237,9 @@ impl Renderer {
         let mut gpu_wheels: Vec<WheelGpu> = Vec::new();
         let beam_dump = std::env::var("PREVIZ_BEAM_DUMP").is_ok();
         for (i, f) in scene.fixtures.iter().enumerate() {
+            if f.hidden {
+                continue;
+            }
             let key = f.gdtf.as_ref().map(|g| Arc::as_ptr(g) as usize).unwrap_or(0);
             let built = build_beam_gpus(f, &beam_frames[i], key, &self.gobo_atlas, time, &mut gpu_wheels);
             if beam_dump && !built.beams.is_empty() {
@@ -1161,12 +1250,15 @@ impl Renderer {
                     .fold(0.0_f32, f32::max);
                 let b0 = &built.beams[0];
                 log::info!(
-                    "beams #{i} {}: n={} cmax={cmax:.3} tan_half={:.3} lens_r={:.3} n_ord={:.2}",
+                    "beams #{i} {}: n={} cmax={cmax:.3} tan_half={:.3} lens_r={:.3} n_ord={:.2} plain={} white={:.2} dir=[{:.2},{:.2},{:.2}]",
                     f.name,
                     built.beams.len(),
                     b0.dir_cos[3],
                     b0.color[3],
                     b0.shape[0],
+                    b0.extra[2] < -0.5,
+                    b0.extra[3],
+                    b0.dir_cos[0], b0.dir_cos[1], b0.dir_cos[2],
                 );
             }
             beam_fixture.resize(beam_fixture.len() + built.beams.len(), i);
@@ -1194,7 +1286,9 @@ impl Renderer {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         // Shadows only matter in the lit Beauty view (unlit/wireframe skip lighting).
-        let max_shadows = if settings.mode == ViewportMode::Beauty {
+        let max_shadows = if settings.mode == ViewportMode::Beauty
+            && std::env::var("PREVIZ_NOSHADOW").is_err()
+        {
             shadow::MAX
         } else {
             0
@@ -1218,7 +1312,14 @@ impl Renderer {
             // Perspective from the lens, FOV = full cone angle (clamped so a wide
             // wash doesn't make a degenerate near-180° projection).
             let fov = (2.0 * tan_half.atan()).clamp(0.05, 2.4);
-            let vp = Mat4::perspective_rh(fov, 1.0, 0.1, range) * Mat4::look_to_rh(origin, bdir, up);
+            // Push the near plane well off the lens. A near:far of 0.1:40 crams the
+            // whole depth range into ndc.z ≈ 0.95–1.0, so the bias swamps the tiny
+            // depth deltas and the beam LEAKS THROUGH occluders that aren't right at
+            // the lens (worse the further out they are). A near ~3% of range (the
+            // beam never hits anything that close to its own lens) restores precision
+            // so partial / distant occluders block correctly.
+            let near = (range * 0.03).clamp(0.4, 3.0);
+            let vp = Mat4::perspective_rh(fov, 1.0, near, range) * Mat4::look_to_rh(origin, bdir, up);
             let cols = vp.to_cols_array_2d();
             self.queue.write_buffer(
                 &self.shadow.render_matrices,
@@ -1252,8 +1353,17 @@ impl Renderer {
             // Constant-dt target for the raymarch: a full-diagonal ray spends the
             // whole `steps` budget; shorter clipped rays scale their step count down
             // to keep per-metre sampling (dt) roughly constant. See volumetric.wgsl.
-            let steps = settings.steps.max(1);
-            let target_dt = (fog.max() - fog.min()).length() / steps as f32;
+            // Adaptive step budget. The raymarch is O(pixels·steps·beams), so spread
+            // a fixed step×beam budget over however many beams there are: a FEW hero
+            // beams (the shaft you scrutinise) get MANY steps — which is what makes
+            // deterministic midpoint integration SMOOTH (enough samples to resolve the
+            // haze density, so no dither and no banding) — while a busy many-beam rig
+            // floors out for frame rate. `target_dt` is derived from the cap so the
+            // extra steps actually apply (a full-box ray then takes `step_cap` samples).
+            let nbeams = gpu_fixtures.len().max(1);
+            let budget = settings.steps.max(64) as f32 * 6.0;
+            let step_cap = (budget / nbeams as f32).clamp(64.0, 176.0);
+            let target_dt = (fog.max() - fog.min()).length() / step_cap;
             let vol = VolumetricUniform {
                 inv_view_proj: inv_vp.to_cols_array_2d(),
                 eye_time: [eye.x, eye.y, eye.z, time],
@@ -1265,7 +1375,12 @@ impl Renderer {
                     fog.color[2],
                     settings.beam_intensity,
                 ],
-                counts: [gpu_fixtures.len() as f32, steps as f32, target_dt, 0.0],
+                counts: [
+                    nbeams as f32,
+                    step_cap,
+                    target_dt,
+                    if std::env::var("PREVIZ_JITTER").is_ok() { 1.0 } else { 0.0 },
+                ],
             };
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
@@ -1412,6 +1527,18 @@ impl Renderer {
             ],
         });
 
+        // Shadow-caster LOD (projected-size, NOT absolute size — so a 1.8 m
+        // performer standing in a beam still casts its silhouette while the festival's
+        // thousands of distant/tiny audience meshes, which would only cast sub-pixel
+        // shadows, are skipped). Per hero beam: keep casters whose shadow-map
+        // projection is at least SHADOW_MIN_PX, capped to the SHADOW_MAX_CASTERS
+        // largest (bounds the worst case — a beam aimed at a dense mass). The forward
+        // pass still draws + lights every object, so the crowd stays fully visible;
+        // it just doesn't all CAST hero shadows.
+        const SHADOW_MIN_PX: f32 = 3.0;
+        const SHADOW_MAX_CASTERS: usize = 96;
+        let mut casters: Vec<(usize, f32)> = Vec::new();
+
         // Pass 0: hero-beam shadow maps — one depth-only pass per selected beam,
         // rendering the solid occluders (floor + MVR geometry + fixture models)
         // from that beam's point of view into its atlas layer.
@@ -1435,8 +1562,28 @@ impl Renderer {
             spass.set_vertex_buffer(1, self.floor_instances.buffer.slice(..));
             spass.draw(0..self.floor_mesh.vertex_count, 0..1);
             if !scene_geom_draws.is_empty() {
+                // Gather casters visible to this beam, sized by shadow-map projection;
+                // drop the sub-pixel ones (frustum cull is implicit in clip_proj_px).
+                let svp = Mat4::from_cols_array_2d(&sample_mats[layer]);
+                casters.clear();
+                for (di, (_, _, lo, hi)) in scene_geom_draws.iter().enumerate() {
+                    if let Some(px) = clip_proj_px(&svp, *lo, *hi, shadow::RES as f32) {
+                        if px >= SHADOW_MIN_PX {
+                            casters.push((di, px));
+                        }
+                    }
+                }
+                // Cap to the biggest N (the visible silhouettes); bounds a beam aimed
+                // at a dense mass without dropping the prominent occluders.
+                if casters.len() > SHADOW_MAX_CASTERS {
+                    casters.select_nth_unstable_by(SHADOW_MAX_CASTERS, |a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    casters.truncate(SHADOW_MAX_CASTERS);
+                }
                 spass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
-                for (key, idx) in &scene_geom_draws {
+                for &(di, _) in &casters {
+                    let (key, idx, _, _) = &scene_geom_draws[di];
                     if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         spass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         spass.draw(0..mesh.vertex_count, *idx..*idx + 1);
@@ -1527,10 +1674,16 @@ impl Renderer {
                 }
             }
 
-            // Imported MVR static geometry (each model is one instance).
+            // Imported MVR static geometry (each model is one instance). Camera-
+            // frustum culled: off-screen crowd/set objects are skipped (lossless),
+            // so orbiting/zooming into part of a big rig doesn't pay for the rest.
             if !scene_geom_draws.is_empty() {
+                let cam_vp = camera.view_proj(aspect);
                 pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
-                for (key, idx) in &scene_geom_draws {
+                for (key, idx, lo, hi) in &scene_geom_draws {
+                    if aabb_outside_clip(&cam_vp, *lo, *hi) {
+                        continue;
+                    }
                     if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
@@ -1871,7 +2024,7 @@ fn build_beam_gpus(
 
     let Some(gdtf) = &fixture.gdtf else {
         let f = fallback_frame();
-        let i = fixture.intensity.max(0.0);
+        let i = (fixture.intensity * fixture.optics.dimmer).max(0.0);
         // Placeholder (non-GDTF) fixture: a plain super-Gaussian cone, no cookie.
         let tan_half = (fixture.beam_angle * 0.5).to_radians().tan().max(1e-3);
         return BeamBuild {
@@ -2005,7 +2158,9 @@ fn build_beam_gpus(
             o.tint[1] * cell[1] * fixture.color[1],
             o.tint[2] * cell[2] * fixture.color[2],
         ];
-        let scale = level * cone.brightness;
+        // Per-fixture volumetric beam intensity scales the projected shaft + pool
+        // (the beam colour), NOT the lens face (which still shows the source lit).
+        let scale = level * cone.brightness * fixture.beam.max(0.0);
         let base_color = [tint[0] * scale, tint[1] * scale, tint[2] * scale];
         let cell_lit = cell.iter().fold(0.0_f32, |a, &b| a.max(b));
 
@@ -2046,13 +2201,18 @@ fn build_beam_gpus(
         } else {
             [0.0; 4]
         };
+        // The beam applies the CMY flags spatially, so `tint` excludes them; the
+        // lens face is a single small disc, so fold the average CMY transmittance
+        // into its colour here (otherwise the glass would read un-tinted).
+        let cmy_t = optics::color::cmy_transmittance(o.cmy);
+        let lens_tint = [tint[0] * cmy_t[0], tint[1] * cmy_t[1], tint[2] * cmy_t[2]];
         let lenses = vec![lens_instance(
             frame.origin + frame.dir * 0.04,
             frame.dir,
             frame.right,
             frame.up,
             lens_radius * 1.25,
-            tint,
+            lens_tint,
             lens_level * cell_lit.min(1.0),
             cone.tan_half,
             cone.n_order,
@@ -2072,6 +2232,11 @@ fn build_beam_gpus(
         tint: [f32; 3],  // lens face color (unscaled chain tint × cell)
         /// Brightest channel of the raw cell value (0 = cell commanded dark).
         cell_max: f32,
+        /// Achromatic-white level = the cell's MIN raw channel (white = 1, any
+        /// saturated colour = 0). Drives the HDR shaft whiten/boost so a bright
+        /// WHITE cell punches a brighter, whiter shaft while a saturated blue cell
+        /// stays blue. (Min, not max: a full blue [0,0,1] has max 1 but is NOT white.)
+        white: f32,
         lit: f32,
         cone: optics::EmitterCone,
         lens_r: f32,
@@ -2106,13 +2271,15 @@ fn build_beam_gpus(
         // Multi-emitter cells carry no cookie blade, so they dim uniformly by the
         // effective level (not the full master that the single-emitter blade path
         // uses and then attenuates with the blade).
-        let scale = effective * cone.brightness;
+        let scale = effective * cone.brightness * fixture.beam.max(0.0);
         let cell_max = cell.iter().fold(0.0_f32, |a, &b| a.max(b));
+        let cell_white = cell.iter().fold(f32::INFINITY, |a, &b| a.min(b)).max(0.0);
         cells.push(Cell {
             frame,
             color: [tint[0] * scale, tint[1] * scale, tint[2] * scale],
             tint,
             cell_max,
+            white: cell_white,
             lit: cell_max * effective,
             cone,
             lens_r: em.beam.beam_radius.max(0.01),
@@ -2152,6 +2319,31 @@ fn build_beam_gpus(
         && anim_layer < 0.0
         && o.cmy.iter().all(|&v| v < 0.005)
         && o.prism.is_empty();
+    // A "plain" cell beam carries no gobo/animation/CMY/shutter-blade, so the GPU
+    // can skip the whole projected-cookie chain (the dominant cost for dense pixel
+    // bars). Flagged on the GPU beam with extra.z = -1 (a sentinel that can't
+    // collide with a real shutter_close ≥ 0). extra.w then carries the cell's peak
+    // raw level so the shader whitens + boosts bright cells (accuracy: bright cells
+    // punch distinct brighter/whiter shafts, dim coloured cells stay saturated).
+    // Multi-emitter cells never apply the shutter BLADE (they pass sc/sk = 0 to
+    // `make` and dim uniformly via `effective`), so the blade is moot here and
+    // `plain` keys only on the cookie chain — a pixel bar with an electronic strobe
+    // is still plain.
+    let plain = no_cookie;
+    // The cluster's whiteness = the whitest member (so a merged group containing a
+    // bright white cell still punches a white shaft).
+    let cluster_white = |cl: &[&Cell]| cl.iter().map(|c| c.white).fold(0.0_f32, f32::max);
+    // Stamp the plain flag + whiteness, and zero CA (a wash cell has no lens
+    // chromatic aberration — and dropping it collapses opt_radial_ca's 3 pow()s to
+    // 1), on every multi-emitter beam before it goes to the GPU.
+    let finish = |mut b: FixtureGpu, white: f32| -> FixtureGpu {
+        if plain {
+            b.extra[2] = -1.0;
+            b.extra[3] = white.clamp(0.0, 1.0);
+        }
+        b.misc[0] = 0.0;
+        b
+    };
     let cluster_by = |lit: &[&'_ Cell], min_dot: f32| -> Vec<Vec<usize>> {
         let mut out: Vec<(Vec3, Vec<usize>)> = Vec::new();
         for (i, c) in lit.iter().enumerate() {
@@ -2199,50 +2391,162 @@ fn build_beam_gpus(
         make(&agg_frame, mean_dir, right, up, color, tan_eff, n_order, spread_r.max(cl[0].lens_r), 0.0, 0.0)
     };
 
-    // Pass 1: exact direction clusters; uniform ones merge losslessly.
-    let exact = cluster_by(&lit, 0.9999);
-    let mut planned: Vec<Vec<&Cell>> = Vec::new(); // clusters to merge
-    let mut single: Vec<&Cell> = Vec::new(); // cells to emit individually
-    for cl in &exact {
-        let cs: Vec<&Cell> = cl.iter().map(|&i| lit[i]).collect();
-        let uniform = cs.iter().all(|c| {
-            (0..3).all(|k| (c.color[k] - cs[0].color[k]).abs() < 0.02 * cs[0].color[k].max(0.05))
-        });
-        if cs.len() >= 4 && uniform && no_cookie {
-            planned.push(cs);
-        } else {
-            single.extend(cs);
-        }
-    }
-    const MAX_FIXTURE_BEAMS: usize = 16;
-    if planned.len() + single.len() > MAX_FIXTURE_BEAMS {
-        // Pass 2 (LOD): coarse 25° direction cones, merged unconditionally —
-        // bounded cost, slightly soft/averaged but faithful in aggregate. The
-        // per-cell lens faces above still carry the pixel-mapped detail.
+    // Per-cell SHAFT cone: a real LED cell images far tighter than its broad
+    // scatter wash, so for the volumetric shaft (NOT the lens face, which keeps the
+    // soft wide source disc) tighten the beam angle and force a crisp super-Gaussian
+    // shoulder. This is what makes a pixel map read as DISTINCT coloured beams
+    // (yellow vs blue, on vs off) instead of a merged grey blob — and, decisively,
+    // the tighter/crisper cone lets the radial pre-cull actually reject the other
+    // cells at each ray sample (the old soft 42°-field spill is exactly why every
+    // sample fell inside every cell's cone → O(all cells) → the 4 fps wall).
+    // Narrow the shaft to ~70% of the cell's beam angle (the user's bars read a
+    // touch too wide) and floor the shoulder at a crisp n=3 (≥2 also zeroes the
+    // cull-widening term, so this is where the per-cell cull speed-up comes from).
+    const SHAFT_NARROW: f32 = 0.72;
+    const SHAFT_N_ORDER: f32 = 3.0;
+    let shaft_cone = |c: &Cell| -> (f32, f32) {
+        (c.cone.tan_half * SHAFT_NARROW, c.cone.n_order.max(SHAFT_N_ORDER))
+    };
+
+    const MAX_FIXTURE_BEAMS: usize = 24;
+    if lit.len() > MAX_FIXTURE_BEAMS {
+        // Bounded-cost LOD for a huge array (e.g. a 72-cell blinder / LED wall):
+        // coarse direction-cone merge so the raymarch can't pay for hundreds of
+        // beams. Loses per-cell colour in the shaft, but the per-cell lens faces
+        // above still carry the pixel-mapped detail on the source.
         let coarse = cluster_by(&lit, 0.906);
         for cl in &coarse {
-            beams.push(aggregate(&cl.iter().map(|&i| lit[i]).collect::<Vec<_>>()));
+            let cs: Vec<&Cell> = cl.iter().map(|&i| lit[i]).collect();
+            beams.push(finish(aggregate(&cs), cluster_white(&cs)));
         }
     } else {
-        for cs in &planned {
-            beams.push(aggregate(cs));
-        }
-        for c in single {
-            beams.push(make(
+        // The common case (bars, washes, clusters ≤ 24 lit cells): every lit cell
+        // is its OWN crisp shaft, so the pixel map is faithful and each beam culls
+        // tightly. No merging — merging co-located cells into one wide cone was
+        // both the blob look AND a perf trap (the wide cone never culls).
+        for c in &lit {
+            let (tan_half, n_order) = shaft_cone(c);
+            let b = make(
                 &c.frame,
                 c.frame.dir,
                 c.frame.right,
                 c.frame.up,
                 c.color,
-                c.cone.tan_half,
-                c.cone.n_order,
+                tan_half,
+                n_order,
                 c.lens_r,
                 0.0,
                 0.0,
-            ));
+            );
+            beams.push(finish(b, c.white));
         }
     }
     BeamBuild { beams, lenses }
+}
+
+/// World-space AABB of a local AABB transformed by `m` (8-corner bound).
+fn transform_aabb(m: &Mat4, lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
+    let mut wlo = Vec3::splat(f32::INFINITY);
+    let mut whi = Vec3::splat(f32::NEG_INFINITY);
+    for i in 0..8u32 {
+        let c = Vec3::new(
+            if i & 1 == 0 { lo.x } else { hi.x },
+            if i & 2 == 0 { lo.y } else { hi.y },
+            if i & 4 == 0 { lo.z } else { hi.z },
+        );
+        let w = m.transform_point3(c);
+        wlo = wlo.min(w);
+        whi = whi.max(w);
+    }
+    (wlo, whi)
+}
+
+/// True if the world AABB is fully outside `vp`'s clip volume (conservative;
+/// wgpu clip z ∈ [0, w]) — i.e. the draw can be skipped for this view. Used to
+/// frustum-cull shadow casters (narrow hero cone) and off-screen forward draws.
+fn aabb_outside_clip(vp: &Mat4, lo: Vec3, hi: Vec3) -> bool {
+    let (mut nx, mut px, mut ny, mut py, mut nz, mut pz) = (true, true, true, true, true, true);
+    for i in 0..8u32 {
+        let c = Vec3::new(
+            if i & 1 == 0 { lo.x } else { hi.x },
+            if i & 2 == 0 { lo.y } else { hi.y },
+            if i & 4 == 0 { lo.z } else { hi.z },
+        );
+        let p = *vp * c.extend(1.0);
+        if p.x >= -p.w {
+            nx = false;
+        }
+        if p.x <= p.w {
+            px = false;
+        }
+        if p.y >= -p.w {
+            ny = false;
+        }
+        if p.y <= p.w {
+            py = false;
+        }
+        if p.z >= 0.0 {
+            nz = false;
+        }
+        if p.z <= p.w {
+            pz = false;
+        }
+    }
+    nx || px || ny || py || nz || pz
+}
+
+/// Projected size (in pixels) of a world AABB under `vp` rendered to a `res`²
+/// target, or `None` if fully outside the clip volume. Drives the shadow-caster
+/// LOD: a big silhouette (a performer filling the beam) projects large and casts;
+/// a distant / tiny audience mesh projects sub-pixel and is skipped (its shadow
+/// would be invisible). An object spanning the near plane returns `res` (always
+/// cast) so we never wrongly drop a close occluder.
+fn clip_proj_px(vp: &Mat4, lo: Vec3, hi: Vec3, res: f32) -> Option<f32> {
+    let (mut nx, mut px, mut ny, mut py, mut nz, mut pz) = (true, true, true, true, true, true);
+    let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let mut spans_near = false;
+    for i in 0..8u32 {
+        let c = Vec3::new(
+            if i & 1 == 0 { lo.x } else { hi.x },
+            if i & 2 == 0 { lo.y } else { hi.y },
+            if i & 4 == 0 { lo.z } else { hi.z },
+        );
+        let p = *vp * c.extend(1.0);
+        if p.x >= -p.w {
+            nx = false;
+        }
+        if p.x <= p.w {
+            px = false;
+        }
+        if p.y >= -p.w {
+            ny = false;
+        }
+        if p.y <= p.w {
+            py = false;
+        }
+        if p.z >= 0.0 {
+            nz = false;
+        }
+        if p.z <= p.w {
+            pz = false;
+        }
+        if p.w <= 1e-4 {
+            spans_near = true;
+        } else {
+            let (ndx, ndy) = (p.x / p.w, p.y / p.w);
+            minx = minx.min(ndx);
+            maxx = maxx.max(ndx);
+            miny = miny.min(ndy);
+            maxy = maxy.max(ndy);
+        }
+    }
+    if nx || px || ny || py || nz || pz {
+        return None;
+    }
+    if spans_near {
+        return Some(res);
+    }
+    Some((maxx - minx).max(maxy - miny) * 0.5 * res)
 }
 
 /// Append a selection gizmo at `p`: RGB world axes plus a small amber marker

@@ -55,11 +55,12 @@ pub mod icon {
     pub const RESET: &str = p::ARROW_CLOCKWISE;
     pub const DUPLICATE: &str = p::COPY;
     pub const DESELECT: &str = p::X_CIRCLE;
+    pub const EYE: &str = p::EYE;
+    pub const EYE_OFF: &str = p::EYE_SLASH;
     pub const CAMERA: &str = p::VIDEO_CAMERA;
     pub const LAYOUT: &str = p::SQUARES_FOUR;
     pub const KEYBOARD: &str = p::KEYBOARD;
     // Status glyphs
-    pub const LIVE: &str = p::CIRCLE; // filled-via-color
     pub const WARNING: &str = p::WARNING;
     // Online fixture library (GDTF Share)
     pub const ONLINE: &str = p::GLOBE_SIMPLE;
@@ -74,7 +75,9 @@ pub mod icon {
 }
 
 // --- semantic status colours (consistent across every panel) ---
-pub const LIVE: Color32 = Color32::from_rgb(120, 210, 120);
+/// "Good / ready / receiving" green (a data-flow + sign-in accent, not a
+/// per-fixture "live" badge — those were removed).
+pub const OK: Color32 = Color32::from_rgb(120, 210, 120);
 pub const IDLE: Color32 = Color32::from_rgb(120, 120, 128);
 pub const CONFLICT: Color32 = Color32::from_rgb(232, 92, 92);
 pub const WARN: Color32 = Color32::from_rgb(232, 184, 96);

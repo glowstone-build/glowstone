@@ -25,7 +25,7 @@ struct Fixture {
     color: vec4<f32>,     // rgb = tint*intensity*candela*shutter, w = lens radius (m)
     cookie_r: vec4<f32>,  // xyz = lens-plane right, w = wheel buffer offset
     cookie_u: vec4<f32>,  // xyz = lens-plane up,    w = wheel count (dynamic chain)
-    extra: vec4<f32>,     // x = anim layer (<0 none), y = anim scroll, z/w = unused
+    extra: vec4<f32>,     // x = anim layer (<0 none), y = anim scroll; z/w = shutter (close,kind) — or, on a PLAIN cell, z = -1 sentinel + w = HDR whiteness
     shape: vec4<f32>,     // x = super-Gaussian order, y = focus dist, z = iris frac, w = frost
     misc: vec4<f32>,      // x = CA strength, y = laser flag, z = atlas count, w = shadow layer
     cmyf: vec4<f32>,      // CMY flag insertions c,m,y, unused
@@ -179,7 +179,13 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     // Equal spacing + per-pixel jitter is the robust choice; the count reduction
     // (and the constant-dt cap above) is where the speed comes from.
     let dt = seg / fn_steps;
-    let jitter = ign(in.pos.xy + time * 60.0);
+    // Ray-start offset. Per-pixel jitter (counts.w > 0.5) breaks depth banding but
+    // IS the dotted/dithered look on thin beams (each pixel integrates a different
+    // offset → high-freq variance the upsample can't hide). Default is a fixed
+    // MIDPOINT (0.5): every pixel integrates identically, so neighbours agree and
+    // the beam is smooth — residual longitudinal banding is low-frequency and the
+    // composite's Gaussian + the smooth super-Gaussian falloff absorb it.
+    let jitter = select(0.5, ign(in.pos.xy), u.counts.w > 0.5);
 
     var transmittance = 1.0;
     var scatter = vec3<f32>(0.0);
@@ -235,22 +241,30 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
                 continue;
             }
 
-            // Projected optical cookie: gobo wheel 1 × wheel 2 × animation glass,
-            // blurred by focus error + frost (mip LOD), with per-channel chromatic
-            // aberration so the gobo's pattern edges fringe too. Skip if occluded.
-            let guv = opt_project(rel, depth, fx.cookie_r.xyz, fx.cookie_u.xyz, cone_r);
-            // Aperture-dependent DoF LOD. The aerial shaft has no surface
-            // footprint, so DON'T sharpen it (would alias gobo cross-sections
-            // into longitudinal stripes) — the 512² Lanczos atlas carries the
-            // detail; pass sharpen = 0.
-            let lod = opt_lod(depth, fx.shape.y, frost, tan_half, iris, lens_r);
-            let trans = opt_cookie(
-                gobo_tex, gobo_samp, guv,
-                fx.cookie_r.w, fx.cookie_u.w,
-                fx.extra.x, fx.extra.y, fx.cmyf.xyz, lod, 0.0,
-            ) * opt_shutter((guv - vec2<f32>(0.5)) * 2.0, fx.extra.z, fx.extra.w, fx.cmyf.w);
-            if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
-                continue;
+            // Plain-beam fast-path: multi-emitter wash / pixel-bar cells carry no
+            // gobo / animation / CMY / shutter-blade, so the whole projected-cookie
+            // chain (opt_project → opt_cookie → opt_shutter) returns identity. Such
+            // a cell is flagged at build time with extra.z = -1 — a sentinel that
+            // CANNOT collide with a real shutter_close (always ≥ 0). Skipping that
+            // chain is the dominant per-step saving for dense pixel bars (the lit
+            // cells are co-located, so every sample falls inside many cell cones).
+            let plain = fx.extra.z < -0.5;
+            var trans = vec3<f32>(1.0);
+            if (!plain) {
+                // Projected optical cookie: gobo wheel 1 × wheel 2 × animation glass,
+                // blurred by focus error + frost (mip LOD), with per-channel chromatic
+                // aberration so the gobo's pattern edges fringe too. The aerial shaft
+                // has no surface footprint, so DON'T sharpen it (sharpen = 0).
+                let guv = opt_project(rel, depth, fx.cookie_r.xyz, fx.cookie_u.xyz, cone_r);
+                let lod = opt_lod(depth, fx.shape.y, frost, tan_half, iris, lens_r);
+                trans = opt_cookie(
+                    gobo_tex, gobo_samp, guv,
+                    fx.cookie_r.w, fx.cookie_u.w,
+                    fx.extra.x, fx.extra.y, fx.cmyf.xyz, lod, 0.0,
+                ) * opt_shutter((guv - vec2<f32>(0.5)) * 2.0, fx.extra.z, fx.extra.w, fx.cmyf.w);
+                if (max(trans.r, max(trans.g, trans.b)) <= 0.001) {
+                    continue;
+                }
             }
 
             // Laser (misc.y): a coherent collimated beam is visible ONLY via
@@ -267,7 +281,17 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             if (sidx >= 0) {
                 vis = opt_shadow(p, shadow_mats[sidx], shadow_atlas, shadow_samp, sidx);
             }
-            lin += fx.color.rgb * trans * (rad3 * (atten * phase * beam * vis * tyndall));
+            // Per-cell HDR whiten + boost (accuracy): for a plain pixel cell,
+            // extra.w carries its peak raw DMX level. A bright/white cell pulls its
+            // shaft core toward neutral luminance (so it clips WHITE through the
+            // tonemap, matching the lens face) and lifts its radiance, so bright
+            // cells punch distinct brighter/whiter shafts while dim coloured cells
+            // stay saturated. Quadratic → only genuinely bright cells whiten.
+            let white01 = select(0.0, fx.extra.w, plain);
+            let lum = max(fx.color.r, max(fx.color.g, fx.color.b));
+            let whitened = mix(fx.color.rgb, vec3<f32>(lum), white01 * white01 * 0.6);
+            let boost = 1.0 + white01 * white01 * 0.6;
+            lin += whitened * trans * (rad3 * (atten * phase * beam * vis * tyndall * boost));
         }
 
         let step_tr = exp(-sigma_t * dt);

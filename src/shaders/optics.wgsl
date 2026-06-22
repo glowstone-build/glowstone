@@ -233,13 +233,15 @@ fn opt_color_strip(
     return col * (1.0 - 0.4 * edge);
 }
 
+// One graduated dichroic CMY flag's coating density at axis-position `u` (−1..1)
+// for insertion `c` (0 clear … 1 full). A real CMY flag is a GRADUATED dichroic —
+// a smooth clear→saturated coating, not a hard slot. So this is a continuous ramp
+// with NO `cover` step: at a partial insertion the beam sees a gradient across its
+// width (denser toward the deep edge); at c=1 the dense end covers the whole
+// aperture (uniform full). `G` sets the gradient span (smaller = longer, softer).
 fn opt_cmy_flag(u: f32, c: f32) -> f32 {
-    const EDGE_SOFT: f32 = 0.22;       // soft sawtooth/halftone edge width
-    let edge = 2.0 * c - 1.0;          // inserts from -axis (c=0) to +axis (c=1)
-    let depth = (edge - u) * 0.5;      // >0 ⇒ covered; magnitude ⇒ how deep
-    let cover = smoothstep(-EDGE_SOFT, EDGE_SOFT, depth);
-    let ramp = clamp(depth + 0.5, 0.0, 1.0); // graduated: denser deeper under the flag
-    return cover * ramp;
+    const G: f32 = 0.62;
+    return clamp((1.0 + 2.0 * G) * c - G * u - G, 0.0, 1.0);
 }
 fn opt_cmy(p: vec2<f32>, cmy: vec3<f32>) -> vec3<f32> {
     const D_PEAK: f32 = 1.8;
@@ -302,20 +304,18 @@ fn opt_shutter(p: vec2<f32>, close: f32, kind: f32, soft: f32) -> f32 {
         return 1.0;
     }
     let hw = clamp(soft, 0.05, 1.3);   // blur half-width (heavy → near-uniform dim)
-    // ONE blade sweeps across (rotated 90° → travels along x). It moves so its
-    // mid-edge is at the beam centre when close = 0.5, hence the LIT FRACTION ≈
-    // 1-close → the dimmer tracks brightness. close=0 → edge past +rim (all lit);
-    // close=1 → past -rim (all dark). Lit where x < edge.
-    var x = p.x;
-    if (kind > 1.5) {                  // sawtooth: ripple the edge along the blade
-        let tri = abs(fract(p.y * 3.0) * 2.0 - 1.0);
-        x = x + (tri - 0.5) * 0.16;
+    // TWO blades close symmetrically toward the centre (rotated 90° → along x),
+    // like the real two-blade dimmer/shutter: the LIT band is |x| < t, with t
+    // shrinking 1→0 as close 0→1, so the aperture pinches in from both edges.
+    var t = mix(1.0 + hw, -hw, close);
+    if (kind > 1.5) {                  // sawtooth: a few BIG teeth on the blade edge
+        let tri = abs(fract(p.y * 2.0) * 2.0 - 1.0); // ~2 teeth across the beam
+        t = t + (tri - 0.5) * 0.30;                   // big amplitude (few, big teeth)
     }
-    let edge = mix(1.0 + hw, -1.0 - hw, close);
-    let blade = smoothstep(edge + hw, edge - hw, x); // 1 lit (x<edge) … 0 covered
-    // Blend the blade gradient with a uniform dim so it reads as near-perfect
-    // smooth dimming (centre = 1-close exactly) with only a soft blade artifact.
-    return mix(1.0 - close, blade, 0.4);
+    let under = smoothstep(t - hw, t + hw, abs(p.x)); // 0 lit centre … 1 covered edge
+    // Blend with a uniform dim so it reads as near-perfect smooth dimming with a
+    // soft two-blade artifact (centre lit, both edges pinching in symmetrically).
+    return mix(1.0 - close, 1.0 - under, 0.4);
 }
 
 // the per-channel transmittance multiplying the beam colour. `sharpen` > 0 (floor

@@ -12,10 +12,15 @@
 use super::mesh::{MeshInstance, MeshVertex};
 
 /// Maximum simultaneously-shadowed beams (= atlas layers). The N sharpest lit
-/// beams are chosen each frame; the rest go unshadowed.
+/// beams are chosen each frame; the rest go unshadowed (and so leak through
+/// occluders). Kept at 8 — each shadowed beam is a full depth pass over the
+/// occluders, so 16 roughly halved the FOH frame rate; broader occlusion coverage
+/// needs a cheaper shared method (froxel / screen-space), not more atlas layers.
 pub const MAX: usize = 8;
-/// Per-map resolution (square).
-pub const RES: u32 = 1024;
+/// Per-map resolution (square). 768 (down from 1024) roughly halves the shadow
+/// fill cost for a barely-perceptible softening — beam shadows are viewed through
+/// haze + a half-res volumetric, so sub-1k crispness isn't visible anyway.
+pub const RES: u32 = 768;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 pub struct ShadowMaps {
@@ -149,9 +154,12 @@ impl ShadowMaps {
                 stencil: wgpu::StencilState::default(),
                 // Slope-scaled + constant bias to keep the receiver off its own
                 // occluder depth (kills shadow acne); the shader adds a tiny bias too.
+                // Kept modest — the raised near plane (see the shadow VP) gives enough
+                // depth precision that a heavy bias (which peter-pans the shadow off
+                // the occluder → beam leaks past it) is no longer needed.
                 bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 2.0,
+                    constant: 1,
+                    slope_scale: 1.0,
                     clamp: 0.0,
                 },
             }),

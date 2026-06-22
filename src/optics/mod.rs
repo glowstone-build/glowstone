@@ -27,7 +27,7 @@ use crate::gdtf::{GdtfFixture, OpticalComponent, WheelKind};
 /// not GDTF (GDTF doesn't describe blade geometry). Defaulted on import (a fixture
 /// with a Shutter1 channel gets `Blade`) and editable in the inspector. Drives the
 /// physical blade simulated on the lens + projected beam.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum ShutterKind {
     /// No mechanical blade (electronic dimming only) — uniform gate.
     #[default]
@@ -62,7 +62,7 @@ impl ShutterKind {
 
 /// Controls for one wheel component, aligned with the GDTF mode's
 /// [`components`](crate::gdtf::DmxMode::components) list.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WheelControl {
     /// Slot selection (gobo/color wheels) or insertion amount
     /// (prism/frost/animation), `0..1`. 0 = open / removed.
@@ -85,7 +85,7 @@ impl Default for WheelControl {
 /// The "console faders" for one fixture — normalised `0..1` control values,
 /// edited in the UI and fed by DMX. Defaults are neutral (open white beam,
 /// dimmer up, wheels open, prisms out, no strobe).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OpticalControls {
     pub dimmer: f32,
     /// Beam angle: 0 = narrow end of the GDTF Zoom range, 1 = wide.
@@ -153,7 +153,6 @@ impl OpticalControls {
 /// This is what lets group editing enumerate the controls a fixture actually has.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OpticField {
-    Dimmer,
     Zoom,
     Focus,
     Iris,
@@ -168,9 +167,9 @@ pub enum OpticField {
 }
 
 impl OpticField {
-    /// Beam-shaping controls, in display order.
-    pub const BEAM: [OpticField; 7] = [
-        OpticField::Dimmer,
+    /// Beam-shaping controls, in display order. (Dimmer is shown in the
+    /// Inspector's Fixture section as the fixture level — not duplicated here.)
+    pub const BEAM: [OpticField; 6] = [
         OpticField::Zoom,
         OpticField::Focus,
         OpticField::Iris,
@@ -189,7 +188,6 @@ impl OpticField {
 
     pub fn label(self) -> &'static str {
         match self {
-            OpticField::Dimmer => "Dimmer",
             OpticField::Zoom => "Zoom",
             OpticField::Focus => "Focus",
             OpticField::Iris => "Iris",
@@ -214,7 +212,6 @@ impl OpticField {
 
     pub fn get(self, o: &OpticalControls) -> f32 {
         match self {
-            OpticField::Dimmer => o.dimmer,
             OpticField::Zoom => o.zoom,
             OpticField::Focus => o.focus,
             OpticField::Iris => o.iris,
@@ -231,7 +228,6 @@ impl OpticField {
 
     pub fn set(self, o: &mut OpticalControls, v: f32) {
         match self {
-            OpticField::Dimmer => o.dimmer = v,
             OpticField::Zoom => o.zoom = v,
             OpticField::Focus => o.focus = v,
             OpticField::Iris => o.iris = v,
@@ -252,7 +248,7 @@ impl OpticField {
     pub fn supported(self, gdtf: &crate::gdtf::GdtfFixture) -> bool {
         let has = |a: &str| gdtf.has_attribute(a);
         match self {
-            OpticField::Dimmer | OpticField::Ca | OpticField::Green => true,
+            OpticField::Ca | OpticField::Green => true,
             OpticField::Zoom => has("Zoom"),
             OpticField::Focus => has("Focus1"),
             OpticField::Iris => has("Iris"),
@@ -642,9 +638,11 @@ pub fn resolve(
         }
     };
     let focus_defocus = (c.focus - 0.5).abs() * 2.0;
-    // Lens dispersion: a tunable base plus extra fringing when out of focus
-    // (longitudinal CA grows with focus error).
-    let ca_strength = 0.02 + 0.12 * c.ca.clamp(0.0, 1.0) + 0.05 * focus_defocus;
+    // Lens dispersion: a SUBTLE warm/cool edge, not a rainbow. The old strength
+    // (~0.05 + on a crisp spot edge) read as a distracting prismatic fringe on
+    // every beam; keep it to a hint unless the user cranks the CA control or the
+    // beam is badly out of focus.
+    let ca_strength = 0.004 + 0.04 * c.ca.clamp(0.0, 1.0) + 0.03 * focus_defocus;
 
     // --- shutter / strobe ---
     let shutter_gain = if c.strobe > 0.01 {
@@ -669,18 +667,13 @@ pub fn resolve(
         source[2] * t_cto[2] * color_fold[2],
     ];
 
-    // CMY: render the sliding flags PER-FRAGMENT only while they're actually
-    // moving (the visible sweep); once settled they're spatially uniform, so
-    // fold them into the tint on the CPU — free per fragment, and the common
-    // case (held colour). `m.cmy` is the slewed insertion; `c.cmy` the target.
-    let cmy_sliding = (0..3).any(|k| (m.cmy[k] - c.cmy[k]).abs() > 0.01);
-    let cmy_spatial = if cmy_sliding {
-        [m.cmy[0], m.cmy[1], m.cmy[2]]
-    } else {
-        let t = color::cmy_transmittance(m.cmy);
-        tint = [tint[0] * t[0], tint[1] * t[1], tint[2] * t[2]];
-        [0.0, 0.0, 0.0]
-    };
+    // CMY: ALWAYS render the graduated dichroic flags per-fragment. A graduated
+    // flag held partway is a genuine colour gradient across the beam (not a flat
+    // tint), and rendering it every frame removes the pop/flicker the old
+    // "fold-to-uniform once settled" handoff caused at the end of a colour move.
+    // The flag colour stays OUT of `tint`: the beam applies it spatially via the
+    // cookie, and the lens face folds it in CPU-side (see `build_beam_gpus`).
+    let cmy_spatial = [m.cmy[0], m.cmy[1], m.cmy[2]];
 
     // Plus/minus-green correction (orthogonal CC axis).
     if c.green.abs() > 1e-3 {

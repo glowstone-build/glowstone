@@ -53,7 +53,7 @@ pub fn glb_yup_to_zup() -> Mat4 {
 /// One DMX patch entry: a DMX `break` plus the absolute address. MVR stores the
 /// address as a single integer spanning universes (`(addr-1)/512` = universe,
 /// `(addr-1)%512` = channel, both effectively 1-based for display).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MvrAddress {
     pub break_id: u32,
     pub absolute: u32,
@@ -74,7 +74,7 @@ impl MvrAddress {
 /// doesn't otherwise model. Kept so an imported scene round-trips on export.
 ///
 /// [`Fixture`]: crate::scene::Fixture
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct MvrFixtureMeta {
     pub uuid: String,
     pub fixture_id: String,
@@ -102,7 +102,7 @@ pub struct MvrFixtureMeta {
 }
 
 /// The MVR-specific fields of a static `<SceneObject>` / `<GroupObject>`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct MvrObjectMeta {
     pub uuid: String,
     pub classing: Option<String>,
@@ -113,7 +113,7 @@ pub struct MvrObjectMeta {
 }
 
 /// A named UUID entry (a Class or a Position in `<AUXData>`, or a `<Layer>`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MvrNamed {
     pub uuid: String,
     pub name: String,
@@ -122,7 +122,7 @@ pub struct MvrNamed {
 /// Document-level metadata (header + the layer/class/position tables) retained
 /// so export can reproduce the `<Scene>` scaffolding. Object membership is
 /// driven by the per-object `layer` UUID, not by this table.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MvrHeader {
     pub ver_major: u32,
     pub ver_minor: u32,
@@ -155,10 +155,24 @@ impl Default for MvrHeader {
 /// One 3D model reference: the archive file name (also the export reference and
 /// the renderer's cache key) plus its raw bytes (a glTF/GLB blob in metres,
 /// authored +Y-up).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct GeometryModel {
     pub file: String,
     pub glb: Arc<Vec<u8>>,
+    /// The per-`<Geometry3D>` local transform (file frame → the object frame),
+    /// or identity if the element carried no `<Matrix>`. This is frequently a
+    /// unit-conversion *scale* (e.g. inch-authored models at `0.0254`, or
+    /// `0.025` model-units) that MUST be applied — dropping it renders the model
+    /// grossly mis-sized (Key Arena's helicopter at ~40× / its PAR cans at ~40×).
+    /// Translation is already scaled mm → m (via [`parse_matrix`]); the
+    /// rotation/scale part is unitless. Applied as `object.world * matrix * flip`.
+    #[serde(default = "mat4_identity")]
+    pub matrix: Mat4,
+}
+
+/// Serde default for [`GeometryModel::matrix`] (no const fn for `Mat4::IDENTITY`).
+fn mat4_identity() -> Mat4 {
+    Mat4::IDENTITY
 }
 
 /// A parsed, placed fixture: its world-space base transform plus the resolved
@@ -434,7 +448,16 @@ fn parse_object(
                 return None;
             }
             let glb = resolve_resource(&file, resources)?;
-            Some(GeometryModel { file, glb })
+            // The `<Geometry3D>` may carry its own `<Matrix>` (a file→object
+            // transform, usually a unit-conversion scale). Honour it — ignoring
+            // it is what made oversized models trigger the old auto-downscale.
+            let matrix = g
+                .children()
+                .find(|n| n.has_tag_name("Matrix"))
+                .and_then(|m| m.text())
+                .and_then(parse_matrix)
+                .unwrap_or(Mat4::IDENTITY);
+            Some(GeometryModel { file, glb, matrix })
         })
         .collect();
 
@@ -615,6 +638,25 @@ pub fn format_matrix(world: Mat4) -> String {
     const M_TO_MM: f32 = 1000.0;
     let mvr = mvr_to_world().inverse() * world;
     let c = mvr.to_cols_array_2d(); // c[col][row]
+    let v = |col: usize| format!("{{{:.6},{:.6},{:.6}}}", c[col][0], c[col][1], c[col][2]);
+    format!(
+        "{}{}{}{{{:.6},{:.6},{:.6}}}",
+        v(0),
+        v(1),
+        v(2),
+        c[3][0] * M_TO_MM,
+        c[3][1] * M_TO_MM,
+        c[3][2] * M_TO_MM,
+    )
+}
+
+/// Format a per-`<Geometry3D>` local matrix back to an MVR `<Matrix>` string.
+/// Unlike [`format_matrix`] there is **no** world↔MVR basis change (this matrix
+/// lives in the object's own frame); only the metre→millimetre translation
+/// scaling is undone — the inverse of how [`parse_matrix`] read it.
+fn format_geo_matrix(m: Mat4) -> String {
+    const M_TO_MM: f32 = 1000.0;
+    let c = m.to_cols_array_2d(); // c[col][row]
     let v = |col: usize| format!("{{{:.6},{:.6},{:.6}}}", c[col][0], c[col][1], c[col][2]);
     format!(
         "{}{}{}{{{:.6},{:.6},{:.6}}}",
@@ -953,10 +995,20 @@ fn write_object(s: &mut String, o: &crate::scene::SceneGeometry, idx: usize) {
     ));
     s.push_str("            <Geometries>\n");
     for m in &o.models {
-        s.push_str(&format!(
-            "              <Geometry3D fileName=\"{}\"/>\n",
-            xml_escape(&m.file)
-        ));
+        // Re-emit the per-Geometry3D matrix when it isn't identity (so the
+        // unit-conversion scale we honoured on import round-trips).
+        if m.matrix == Mat4::IDENTITY {
+            s.push_str(&format!(
+                "              <Geometry3D fileName=\"{}\"/>\n",
+                xml_escape(&m.file)
+            ));
+        } else {
+            s.push_str(&format!(
+                "              <Geometry3D fileName=\"{}\">\n                <Matrix>{}</Matrix>\n              </Geometry3D>\n",
+                xml_escape(&m.file),
+                format_geo_matrix(m.matrix),
+            ));
+        }
     }
     s.push_str("            </Geometries>\n");
     if let Some(cls) = meta.and_then(|m| m.classing.as_ref()) {
@@ -1036,6 +1088,42 @@ mod tests {
     fn malformed_matrix_is_none() {
         assert!(parse_matrix("{1,2,3}{4,5,6}").is_none());
         assert!(parse_matrix("garbage").is_none());
+    }
+
+    /// A `<Geometry3D>`'s nested `<Matrix>` (here Key Arena's inch→metre `0.0254`
+    /// scale on the helicopter prop) must be parsed onto the model and round-trip
+    /// through export — dropping it rendered such models ~40× oversized.
+    #[test]
+    fn geometry3d_nested_matrix_parsed_applied_and_round_trips() {
+        let xml = r#"<R>
+          <SceneObject uuid="u" name="heli">
+            <Matrix>{1,0,0}{0,1,0}{0,0,1}{0,0,0}</Matrix>
+            <Geometries>
+              <Geometry3D fileName="scaled.3ds">
+                <Matrix>{0.0254,0,0}{0,0.0254,0}{0,0,0.0254}{0,0,0}</Matrix>
+              </Geometry3D>
+              <Geometry3D fileName="plain.3ds"/>
+            </Geometries>
+          </SceneObject></R>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let node = doc.descendants().find(|n| n.has_tag_name("SceneObject")).unwrap();
+        let mut resources: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
+        resources.insert("scaled.3ds".into(), Arc::new(vec![0u8; 4]));
+        resources.insert("plain.3ds".into(), Arc::new(vec![0u8; 4]));
+
+        let obj = parse_object(&node, Mat4::IDENTITY, "layer", &resources).expect("object");
+        assert_eq!(obj.models.len(), 2);
+        // Model with the matrix carries the uniform 0.0254 scale…
+        let scaled = obj.models.iter().find(|m| m.file == "scaled.3ds").unwrap();
+        let p = scaled.matrix.transform_point3(Vec3::new(1000.0, 0.0, 0.0));
+        assert!((p.x - 25.4).abs() < 1e-3, "0.0254 scale applied: {p:?}");
+        // …a self-closing `<Geometry3D>` defaults to identity.
+        let plain = obj.models.iter().find(|m| m.file == "plain.3ds").unwrap();
+        assert_eq!(plain.matrix, Mat4::IDENTITY);
+
+        // Export re-emits the matrix and a re-parse recovers the same scale.
+        let re = parse_matrix(&format_geo_matrix(scaled.matrix)).expect("reparse");
+        assert!((re.transform_point3(Vec3::X).x - 0.0254).abs() < 1e-6, "round-trip");
     }
 
     /// Regression guard for the renderer's fixture root composition: the importer

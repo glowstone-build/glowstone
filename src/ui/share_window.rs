@@ -57,7 +57,7 @@ pub fn fixture_library_window(
                         if ui.button(format!("{}  Sign out", theme::icon::SIGN_OUT)).clicked() {
                             share.logout();
                         }
-                        ui.label(RichText::new(format!("{}  signed in", theme::icon::USER)).small().color(theme::LIVE));
+                        ui.label(RichText::new(format!("{}  signed in", theme::icon::USER)).small().color(theme::OK));
                     } else if !share.user.is_empty() {
                         ui.label(RichText::new("signed out").small().weak());
                     }
@@ -240,7 +240,7 @@ fn catalogue(ui: &mut egui::Ui, share: &Share, add_clicks: &mut Vec<i64>, accent
                 ui.set_height(ROW_H - 6.0);
                 // status glyph
                 let (glyph, color) = match status {
-                    RowStatus::Cached => (theme::icon::CACHED, theme::LIVE),
+                    RowStatus::Cached => (theme::icon::CACHED, theme::OK),
                     RowStatus::Update => (theme::icon::CLOUD, theme::WARN),
                     RowStatus::Downloading => (theme::icon::DOWNLOAD, accent),
                     RowStatus::Cloud => (theme::icon::CLOUD, ui.visuals().weak_text_color()),

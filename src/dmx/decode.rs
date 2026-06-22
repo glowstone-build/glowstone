@@ -162,8 +162,13 @@ fn decode_gdtf(
                 continue;
             }
             match ch.attribute.as_str() {
-                "Dimmer" => group.dimmer = Some(v01),
-                "Shutter1" => group.shutter = Some((rc.channel, v01)),
+                // A VIRTUAL (no DMX footprint) per-cell Dimmer is not DMX-controlled;
+                // its GDTF default is often 0, which would scale the cell's colour to
+                // black even at RGB 100% (the Astera AX2-100 "RGB RGB" pixel modes do
+                // exactly this). The RGB IS the level there, so ignore a virtual cell
+                // dimmer (treat it as full); only a real DMX dimmer gates the cell.
+                "Dimmer" if !rc.offsets.is_empty() => group.dimmer = Some(v01),
+                "Shutter1" if !rc.offsets.is_empty() => group.shutter = Some((rc.channel, v01)),
                 _ => {}
             }
             continue;
@@ -196,13 +201,25 @@ fn decode_gdtf(
     // Master = dimmer/shutter-only group covering every cell. The LAST such
     // group in channel order wins (Robe puts the master after zone dimmers);
     // its shutter keeps the full strobe sub-range decode.
+    let mut master_dimmer = false;
     for g in groups.iter().filter(|g| all(g) && !has_color(g)) {
         if let Some(d) = g.dimmer {
-            fixture.intensity = d;
+            // The DMX Dimmer drives the fixture's dimmer (the level); `intensity`
+            // is a UI-only master (left at 1.0). See `apply_gdtf_channel`.
+            fixture.optics.dimmer = d;
+            master_dimmer = true;
         }
         if let Some((ci, v)) = g.shutter {
             apply_shutter(fixture, &mode.channels[ci], v);
         }
+    }
+    // A pixel fixture (e.g. an LED bar in a 3-ch-per-cell RGB mode) carries its
+    // whole level in the per-cell colour — there's NO fixture-master Dimmer
+    // channel. So drive `optics.dimmer` to full here; otherwise the import
+    // default (0, to keep an un-driven rig dark) would gate every lit cell to
+    // black even at RGB 100%. (Fixtures WITH a master dimmer set it above.)
+    if !master_dimmer {
+        fixture.optics.dimmer = 1.0;
     }
 
     // Color layers, HTP per channel; each scaled by its own dimmer/shutter.
@@ -377,7 +394,9 @@ fn apply_gdtf_channel(
         "PositionMSpeed" => fixture.move_speed = v01,
         // CMY flag motor speed (0 = fastest); drives the colour-flag slide.
         "ColorMixMSpeed" => fixture.optics.color_mix_speed = v01,
-        "Dimmer" => fixture.intensity = v01,
+        // The Dimmer channel IS the fixture's dimmer/level (the Inspector's Dimmer
+        // and the renderer's `intensity × dimmer`). `intensity` is a UI-only master.
+        "Dimmer" => fixture.optics.dimmer = v01,
         // Subtractive colour mixing drives the beam tint directly.
         "ColorSub_C" => fixture.optics.cmy[0] = v01,
         "ColorSub_M" => fixture.optics.cmy[1] = v01,
@@ -428,7 +447,7 @@ fn apply_synthetic(fixture: &mut Fixture, buf: &[u8; 512], address: u16) {
     for &(attr, off, width) in SYNTH {
         let Some(v01) = read_chan(buf, address + off, width) else { continue };
         match attr {
-            "Dimmer" => fixture.intensity = v01,
+            "Dimmer" => fixture.optics.dimmer = v01,
             "ColorAdd_R" => fixture.color[0] = v01,
             "ColorAdd_G" => fixture.color[1] = v01,
             "ColorAdd_B" => fixture.color[2] = v01,
@@ -556,7 +575,8 @@ mod tests {
         apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
 
         let f = &fixtures[0];
-        assert!((f.intensity - 128.0 / 255.0).abs() < 1e-4);
+        // Synthetic Dimmer drives the fixture dimmer (level), not the master.
+        assert!((f.optics.dimmer - 128.0 / 255.0).abs() < 1e-4);
         assert_eq!(f.color, [1.0, 0.0, 0.0]);
         assert!((f.pan - 270.0).abs() < 1e-3, "pan {}", f.pan);
         assert!((f.tilt + 135.0).abs() < 1e-3, "tilt {}", f.tilt);
@@ -740,7 +760,7 @@ mod tests {
 
         let f = &fixtures[0];
         assert!((f.pan - 270.0).abs() < 1e-3, "pan {}", f.pan);
-        assert!((f.intensity - 128.0 / 255.0).abs() < 1e-4);
+        assert!((f.optics.dimmer - 128.0 / 255.0).abs() < 1e-4);
         assert!((f.optics.cmy[0] - 1.0).abs() < 1e-4);
         assert!((f.optics.shutter - 1.0).abs() < 1e-4, "open during strobe");
         assert!(f.optics.strobe > 0.0, "strobe engaged, got {}", f.optics.strobe);
@@ -829,7 +849,7 @@ mod tests {
         assert_eq!(live, vec![true]);
 
         let f = &fixtures[0];
-        assert!((f.intensity - 1.0).abs() < 1e-3, "master dimmer up, got {}", f.intensity);
+        assert!((f.optics.dimmer - 1.0).abs() < 1e-3, "master dimmer up, got {}", f.optics.dimmer);
         assert!(f.optics.shutter > 0.5, "shutter open");
 
         // Cell order: P1 Zone1, P2..P7 Zone2, P8..P19 Zone3, then the flower.
@@ -857,4 +877,70 @@ mod tests {
 
         eprintln!("Spiider per-cell decode OK: {:?}…", &f.cells[..3]);
     }
+
+    /// Load a GDTF member from the Basic Festival MVR (repo `.context` copy first,
+    /// then the user's Downloads). `None` if neither is present.
+    fn load_gdtf_from_mvr(member: &str) -> Option<GdtfFixture> {
+        let candidates = [
+            format!("{}/.context/attachments/05W1Dh/Basic Festival.mvr", env!("CARGO_MANIFEST_DIR")),
+            format!("{}/Downloads/Basic Festival/Basic Festival.mvr", std::env::var("HOME").unwrap_or_default()),
+        ];
+        for path in candidates {
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())) else { continue };
+            let Ok(mut f) = zip.by_name(member) else { continue };
+            let mut buf = Vec::new();
+            if std::io::Read::read_to_end(&mut f, &mut buf).is_ok()
+                && let Ok(g) = GdtfFixture::load_bytes(&buf)
+            {
+                return Some(g);
+            }
+        }
+        None
+    }
+
+    /// The Astera AX2-100 "RGB RGB" pixel modes give each cell a per-cell RGB plus
+    /// a VIRTUAL `Dimmer` (no DMX footprint, GDTF default 0). Driving the RGB to full
+    /// must light every cell — the virtual dimmer's 0 default must NOT scale the cell
+    /// colour to black. (Regression for the "all RGB at 100% but the bar is black"
+    /// bug.) Skips when the test MVR is absent.
+    #[test]
+    fn pixelbar_virtual_cell_dimmer_lights() {
+        let Some(gdtf) = load_gdtf_from_mvr("Astera LED Technology@AX2-100 PixelBar.gdtf") else {
+            eprintln!("skip: Basic Festival MVR not found");
+            return;
+        };
+        // A many-cell ColorAdd mode whose per-cell Dimmer is virtual (no offset).
+        let Some(mode_i) = gdtf.modes.iter().position(|m| {
+            m.emitters.len() >= 8
+                && m.channels.iter().any(|c| c.attribute == "ColorAdd_R")
+                && m.resolved.iter().any(|rc| {
+                    m.channels[rc.channel].attribute == "Dimmer" && rc.offsets.is_empty()
+                })
+        }) else {
+            eprintln!("skip: no pixel mode with a virtual cell dimmer");
+            return;
+        };
+        let fp = gdtf.modes[mode_i].footprint as u16;
+
+        let mut fixture = Fixture::from_gdtf(Arc::new(gdtf), "Bar", Vec3::ZERO);
+        fixture.mode_index = mode_i;
+        fixture.sync_mode();
+        fixture.optics.dimmer = 0.0; // MVR-import "dark until driven" default.
+        let n_cells = fixture.cells.len();
+
+        let snap = snapshot_with(1, [255u8; 512]); // all channels full
+        let patch = one_patch(1, 1, fp, mode_i);
+        let mut fixtures = vec![fixture];
+        let mut live = Vec::new();
+        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        assert_eq!(live, vec![true]);
+
+        let f = &fixtures[0];
+        let lit = f.cells.iter().filter(|c| c.iter().all(|&v| v > 0.9)).count();
+        assert_eq!(lit, n_cells, "every cell lit white at RGB full, got {lit}/{n_cells}: {:?}", &f.cells[..n_cells.min(3)]);
+        // No master dimmer in these modes → decode drives the level to full too.
+        assert!((f.optics.dimmer - 1.0).abs() < 1e-3, "dimmer raised, got {}", f.optics.dimmer);
+    }
+
 }

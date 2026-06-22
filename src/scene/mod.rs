@@ -20,6 +20,7 @@ use crate::mvr::{GeometryModel, MvrHeader, MvrImport, MvrObjectMeta};
 /// A static, non-fixture object placed in the scene — a stage deck, truss,
 /// set piece, or screen imported from MVR. Drawn as lit geometry that occludes
 /// beams; not a light source.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SceneGeometry {
     pub name: String,
     /// World-space placement (Y-up, metres) of the object's frame. The renderer
@@ -29,19 +30,75 @@ pub struct SceneGeometry {
     pub models: Vec<GeometryModel>,
     /// MVR round-trip metadata (UUID, class, layer). `None` for app-created.
     pub mvr: Option<MvrObjectMeta>,
+    /// Object-local AABB of all models (post yup-flip, pre `transform`), computed
+    /// once at import. Drives viewport ray-picking + the framing bounds. `None`
+    /// if no model parsed.
+    pub bounds: Option<(Vec3, Vec3)>,
+    /// Hidden in the viewport (the Scene outliner's eye toggle): not drawn, not
+    /// pickable. Still listed in the outliner.
+    pub hidden: bool,
+}
+
+impl SceneGeometry {
+    /// World-space AABB (`transform` applied to the local [`bounds`]), if known.
+    ///
+    /// [`bounds`]: Self::bounds
+    pub fn world_bounds(&self) -> Option<(Vec3, Vec3)> {
+        let (lo, hi) = self.bounds?;
+        let mut wlo = Vec3::splat(f32::INFINITY);
+        let mut whi = Vec3::splat(f32::NEG_INFINITY);
+        for cx in [lo.x, hi.x] {
+            for cy in [lo.y, hi.y] {
+                for cz in [lo.z, hi.z] {
+                    let p = self.transform.transform_point3(Vec3::new(cx, cy, cz));
+                    wlo = wlo.min(p);
+                    whi = whi.max(p);
+                }
+            }
+        }
+        Some((wlo, whi))
+    }
+}
+
+/// Object-local AABB of an imported object's models, in the same frame the
+/// renderer draws them (the +Y-up → +Z-up flip is baked into glTF verts here so
+/// it matches `obj.transform * flip`). `None` if nothing parsed.
+fn model_local_bounds(models: &[GeometryModel]) -> Option<(Vec3, Vec3)> {
+    let flip = crate::mvr::glb_yup_to_zup();
+    let mut lo = Vec3::splat(f32::INFINITY);
+    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+    let mut any = false;
+    for m in models {
+        let needs_flip = crate::renderer::fixture_model::model_needs_yup_flip(&m.file);
+        for v in crate::renderer::fixture_model::load_model(&m.file, &m.glb) {
+            let mut p = Vec3::from(v.position);
+            if needs_flip {
+                p = flip.transform_point3(p);
+            }
+            // Mirror the renderer's per-model placement (`world * matrix * flip`):
+            // the per-Geometry3D matrix is part of the local frame, so bounds /
+            // ray-picking / framing must include it.
+            p = m.matrix.transform_point3(p);
+            lo = lo.min(p);
+            hi = hi.max(p);
+            any = true;
+        }
+    }
+    any.then_some((lo, hi))
 }
 
 /// Document-level MVR data retained from an import so the scene can be written
 /// back out: the header (version/provider, layer/class/position tables) and
 /// every original resource blob (the `.gdtf`/`.glb`/texture bytes), keyed by
 /// archive file name.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MvrSceneData {
     pub header: MvrHeader,
     pub resources: HashMap<String, Arc<Vec<u8>>>,
 }
 
 /// How the 3D viewport draws the scene.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum ViewportMode {
     /// Full render: lit surfaces + volumetric beams + bloom/tonemap.
     #[default]
@@ -75,7 +132,7 @@ impl ViewportMode {
 
 /// Global look/post-processing controls, edited in the UI and read by the
 /// renderer each frame (exposure/bloom tonemapping + the volumetric beam look).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RenderSettings {
     pub exposure: f32,
     pub bloom: f32,
@@ -118,6 +175,11 @@ impl Default for RenderSettings {
 pub struct Selection {
     /// Selected fixture indices; the first is the "primary" (drives single-edit).
     pub fixtures: Vec<usize>,
+    /// Selected static-geometry (Objects) indices; the first is the "primary".
+    /// A scene has at most one *kind* of selection active at a time (selecting
+    /// geometry clears fixtures/environment and vice-versa) so the Inspector and
+    /// transform tools have a single, unambiguous target.
+    pub geometry: Vec<usize>,
     /// Selected environment volume, if any.
     pub environment: Option<usize>,
 }
@@ -125,16 +187,25 @@ pub struct Selection {
 impl Selection {
     /// Select a single fixture (clearing any other selection).
     pub fn fixture(i: usize) -> Self {
-        Self { fixtures: vec![i], environment: None }
+        Self { fixtures: vec![i], geometry: Vec::new(), environment: None }
+    }
+
+    /// Select a single static-geometry object (clearing any other selection).
+    pub fn geometry(i: usize) -> Self {
+        Self { fixtures: Vec::new(), geometry: vec![i], environment: None }
     }
 
     /// Select a single environment.
     pub fn environment(i: usize) -> Self {
-        Self { fixtures: Vec::new(), environment: Some(i) }
+        Self { fixtures: Vec::new(), geometry: Vec::new(), environment: Some(i) }
     }
 
     pub fn contains_fixture(&self, i: usize) -> bool {
         self.fixtures.contains(&i)
+    }
+
+    pub fn contains_geometry(&self, i: usize) -> bool {
+        self.geometry.contains(&i)
     }
 
     /// The primary (first) selected fixture, if any.
@@ -142,9 +213,15 @@ impl Selection {
         self.fixtures.first().copied()
     }
 
+    /// The primary (first) selected geometry object, if any.
+    pub fn primary_geometry(&self) -> Option<usize> {
+        self.geometry.first().copied()
+    }
+
     /// Toggle a fixture in/out of the selection (for ctrl/cmd-click multi-select).
     pub fn toggle_fixture(&mut self, i: usize) {
         self.environment = None;
+        self.geometry.clear();
         if let Some(p) = self.fixtures.iter().position(|&x| x == i) {
             self.fixtures.remove(p);
         } else {
@@ -152,9 +229,21 @@ impl Selection {
         }
     }
 
+    /// Toggle a geometry object in/out of the selection (ctrl/cmd-click).
+    pub fn toggle_geometry(&mut self, i: usize) {
+        self.environment = None;
+        self.fixtures.clear();
+        if let Some(p) = self.geometry.iter().position(|&x| x == i) {
+            self.geometry.remove(p);
+        } else {
+            self.geometry.push(i);
+        }
+    }
+
     /// Select an inclusive contiguous fixture range (shift-range select).
     pub fn set_fixture_range(&mut self, a: usize, b: usize) {
         self.environment = None;
+        self.geometry.clear();
         self.fixtures = (a.min(b)..=a.max(b)).collect();
     }
 }
@@ -194,7 +283,7 @@ pub fn apply_fixture_click(
 /// scene (a sky) and lights the geometry (image-based ambient), with overall
 /// brightness, a yaw rotation, and an ambient-fill strength. When no map is
 /// loaded the renderer keeps the dark void + a faint flat fill.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct World {
     /// Equirectangular map file bytes (`.hdr` / `.png` / `.jpg`), if loaded.
     pub hdri: Option<std::sync::Arc<Vec<u8>>>,
@@ -223,6 +312,7 @@ impl Default for World {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Scene {
     pub fixtures: Vec<Fixture>,
     pub environments: Vec<Environment>,
@@ -338,11 +428,21 @@ impl Scene {
             self.fixtures.push(Fixture::from_mvr(f));
         }
         for o in import.objects {
+            // Each model's own `<Geometry3D>` matrix (e.g. an inch→metre scale)
+            // is honoured at import — see [`GeometryModel::matrix`]. A previous
+            // build instead post-hoc downscaled any object whose world AABB
+            // exceeded ~120 m, but that band-aid scaled about the bbox centre,
+            // which corrupted placement (objects drifted / detached) and inflated
+            // origins; honouring the source transform is the correct fix, so the
+            // heuristic is gone.
+            let bounds = model_local_bounds(&o.models);
             self.geometry.push(SceneGeometry {
                 name: o.name,
                 transform: o.world,
                 models: o.models,
                 mvr: Some(o.meta),
+                bounds,
+                hidden: false,
             });
         }
         self.mvr = Some(MvrSceneData {

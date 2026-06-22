@@ -14,7 +14,7 @@ use std::hash::{Hash, Hasher};
 use crate::scene::{Fixture, Scene};
 
 /// Where a fixture's patch entry came from (display + auto-assign policy).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum PatchSource {
     /// Imported from an MVR scene's `<Addresses>`.
     Mvr,
@@ -39,7 +39,7 @@ impl PatchSource {
 }
 
 /// One fixture's DMX patch entry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Patch {
     /// 1-based universe.
     pub universe: u16,
@@ -156,6 +156,7 @@ pub fn channel_map(fixture: &Fixture, mode_index: usize) -> ChannelMap {
 /// Internal: one fixture's patch plus a fingerprint of the fixture it was built
 /// for, so [`PatchTable::sync`] can tell an *append* (keep entries) from a
 /// *wholesale replacement* like an MVR import (rebuild entries).
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Entry {
     fp: u64,
     patch: Option<Patch>,
@@ -163,7 +164,7 @@ struct Entry {
 
 /// The scene's patch: one optional entry per fixture, index-parallel to
 /// `scene.fixtures`.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct PatchTable {
     entries: Vec<Entry>,
 }
@@ -189,6 +190,25 @@ impl PatchTable {
     pub fn remove_at(&mut self, i: usize) {
         if i < self.entries.len() {
             self.entries.remove(i);
+        }
+    }
+
+    /// Re-fit the entry for fixture `i` after it was REPLACED in place with a new
+    /// fixture type (the Shift+R replace tool). Keeps its universe/address/enabled
+    /// (so the rig's patch survives the swap) but refreshes the footprint, mode,
+    /// and fingerprint so a later [`sync`](Self::sync) doesn't see a misalignment
+    /// and rebuild the whole table. A larger new footprint may now overlap a
+    /// neighbour → surfaced as a conflict for the user to re-patch.
+    pub fn replace_at(&mut self, i: usize, fixture: &Fixture) {
+        let Some(entry) = self.entries.get_mut(i) else { return };
+        entry.fp = fingerprint(fixture);
+        let fp = footprint_for(fixture, fixture.mode_index);
+        match entry.patch.as_mut() {
+            Some(p) => {
+                p.footprint = fp;
+                p.mode_index = fixture.mode_index;
+            }
+            None => entry.patch = reconcile_one(fixture),
         }
     }
 

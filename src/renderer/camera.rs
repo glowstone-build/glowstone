@@ -25,6 +25,7 @@ pub struct CameraUniform {
 
 /// A camera that orbits a target point: drag to rotate, scroll to dolly.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct OrbitCamera {
     /// Point the camera looks at and orbits around (world space).
     pub target: Vec3,

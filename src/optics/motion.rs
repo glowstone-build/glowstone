@@ -21,7 +21,7 @@ use crate::gdtf::{OpticalComponent, WheelKind};
 use super::OpticalControls;
 
 /// Per-component motion state for one fixture.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct WheelMotion {
     /// Gobo image / prism / animation rotation+scroll (radians or wrapping 0..1).
     pub phases: Vec<f32>,

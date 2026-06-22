@@ -6,7 +6,7 @@
 //! carry default geometry/params — is what those importers will populate.
 
 /// How a fixture body is drawn. Maps to a mesh the renderer holds.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum FixtureGeometry {
     /// A PAR-can-style cylinder with a glowing lens.
     Cylinder,
@@ -30,7 +30,7 @@ pub struct FixtureProfile {
 }
 
 /// What kind of environment volume this is.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum EnvironmentKind {
     /// A box of participating media (haze/fog) the beams will scatter through.
     FogBox,
