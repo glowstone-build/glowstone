@@ -138,6 +138,23 @@ pub struct RenderSettings {
     pub bloom: f32,
     pub beam_intensity: f32,
     pub steps: u32,
+    /// Froxel volumetric: a compute fog grid for the wide "mass" beams. OFF BY
+    /// DEFAULT — the per-pixel RAYMARCH is the default renderer because its beams
+    /// are far cleaner (the froxel's coarse 160×90×64 grid produces blocky/
+    /// duplicated "fog circle" artifacts near the camera, flicker, and mushy gobos
+    /// in the masses). Kept as an opt-in toggle for the perf win on huge rigs only.
+    /// `skip`-ped from (de)serialization: the .archie format is bincode (positional,
+    /// NOT self-describing), so a newly-added serialized field misaligns every older
+    /// save. Kept out of the byte stream entirely and defaulted on each load.
+    #[serde(skip, default = "default_false")]
+    pub froxel_volumetric: bool,
+    /// Chroma read-up of saturated beams in haze (Helmholtz–Kohlrausch): lifts
+    /// dim-saturated hues (blue/deep-red/magenta) so they read in fog without
+    /// flattening to neon; white/pastel and bright-whitened cells are untouched.
+    /// 0 = off (exact pre-feature look). `skip`-ped like [froxel_volumetric] —
+    /// bincode .archie is positional, so a new serialized field corrupts old saves.
+    #[serde(skip, default = "default_chroma_haze")]
+    pub chroma_haze: f32,
     /// Floor-pool gobo edge sharpening amount (0 = off). Drives the contour
     /// steepening in mesh.wgsl via `camera.render_mode.y`.
     pub gobo_sharpness: f32,
@@ -146,6 +163,14 @@ pub struct RenderSettings {
     pub show_grid: bool,
     /// How the viewport draws the scene (beauty / unlit / wireframe).
     pub mode: ViewportMode,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_chroma_haze() -> f32 {
+    1.2
 }
 
 impl Default for RenderSettings {
@@ -160,6 +185,8 @@ impl Default for RenderSettings {
             // longitudinal stripes below ~64 samples — the speed-up comes from the
             // lossless per-fixture pre-cull, not from marching fewer steps.
             steps: 80,
+            froxel_volumetric: false,
+            chroma_haze: 1.2,
             gobo_sharpness: 0.6,
             show_beam_wireframes: false,
             show_grid: true,

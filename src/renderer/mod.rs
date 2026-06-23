@@ -45,6 +45,99 @@ struct VolumetricUniform {
     fog_max_g: [f32; 4],
     albedo_beam: [f32; 4],
     counts: [f32; 4],
+    /// x = Helmholtz–Kohlrausch chroma read-up strength (saturated beams read more
+    /// strongly in haze); yzw reserved. Mirrors `chroma` in volumetric.wgsl.
+    chroma: [f32; 4],
+}
+
+/// Froxel volumetric uniform (mirrors `Froxel` in froxel.wgsl / `FroxelU` in
+/// post.wgsl). `dims.w` = shared shadow layer; `planes` = near/far ray distance.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FroxelUniform {
+    inv_view_proj: [[f32; 4]; 4],
+    eye_time: [f32; 4],
+    fog_min_density: [f32; 4],
+    fog_max_g: [f32; 4],
+    albedo_beam: [f32; 4],
+    dims: [f32; 4],
+    planes: [f32; 4],
+}
+
+/// Froxel-volumetric resources (PREVIZ_FROXEL). A frustum-aligned 3D grid:
+/// `inject` (compute) writes per-cell scatter+extinction into `inject_tex`,
+/// `integrate` (compute) marches +Z into `result_tex`, and a fragment composite
+/// trilinearly samples `result_tex`. Created only when the adapter supports
+/// rgba16float storage textures.
+struct FroxelState {
+    dims: (u32, u32, u32),
+    inject_view: wgpu::TextureView,
+    result_view: wgpu::TextureView,
+    compute_layout: wgpu::BindGroupLayout,
+    inject_pipeline: wgpu::ComputePipeline,
+    integrate_pipeline: wgpu::ComputePipeline,
+    uniform: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    composite_layout: wgpu::BindGroupLayout,
+    composite_pipeline: wgpu::RenderPipeline,
+}
+
+impl FroxelState {
+    fn new(device: &wgpu::Device) -> Self {
+        let dims = (160u32, 90u32, 64u32);
+        let tex = |label| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: dims.0,
+                        height: dims.1,
+                        depth_or_array_layers: dims.2,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D3,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let inject_view = tex("froxel-inject");
+        let result_view = tex("froxel-result");
+        let compute_layout = pipeline::froxel_compute_layout(device);
+        let (inject_pipeline, integrate_pipeline) =
+            pipeline::froxel_compute_pipelines(device, &compute_layout);
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("froxel-uniform"),
+            size: std::mem::size_of::<FroxelUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("froxel-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let composite_layout = pipeline::froxel_composite_layout(device);
+        let composite_pipeline = pipeline::froxel_composite_pipeline(device, &composite_layout);
+        Self {
+            dims,
+            inject_view,
+            result_view,
+            compute_layout,
+            inject_pipeline,
+            integrate_pipeline,
+            uniform,
+            sampler,
+            composite_layout,
+            composite_pipeline,
+        }
+    }
 }
 
 /// One beam as the GPU sees it — a disc spotlight plus its full optical state
@@ -171,6 +264,9 @@ pub struct Renderer {
 
     // Per-beam shadow maps for the hero (sharp moving-head) beams.
     shadow: shadow::ShadowMaps,
+    /// Froxel volumetric (PREVIZ_FROXEL); `None` if the adapter lacks rgba16float
+    /// storage textures.
+    froxel: Option<FroxelState>,
 
     // Volumetric raymarch (rendered at half resolution, then upsampled).
     volumetric_pipeline: wgpu::RenderPipeline,
@@ -230,11 +326,20 @@ impl Renderer {
         let wireframe_supported = adapter
             .features()
             .contains(wgpu::Features::POLYGON_MODE_LINE);
-        let required_features = if wireframe_supported {
-            wgpu::Features::POLYGON_MODE_LINE
-        } else {
-            wgpu::Features::empty()
-        };
+        // The froxel volumetric writes HDR scatter into a 3D rgba16float STORAGE
+        // texture from compute; that needs the adapter-specific-format feature
+        // (rgba16float isn't storage-capable in core WebGPU). Confirmed present on
+        // Apple Silicon — when absent we just keep the fragment raymarch.
+        let froxel_supported = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+        let mut required_features = wgpu::Features::empty();
+        if wireframe_supported {
+            required_features |= wgpu::Features::POLYGON_MODE_LINE;
+        }
+        if froxel_supported {
+            required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -482,6 +587,7 @@ impl Renderer {
 
         let gobo_atlas = atlas::GoboAtlas::new(&device, &queue);
         let shadow = shadow::ShadowMaps::new(&device);
+        let froxel = froxel_supported.then(|| FroxelState::new(&device));
 
         Self {
             surface,
@@ -519,6 +625,7 @@ impl Renderer {
             world_loaded: false,
             gobo_atlas,
             shadow,
+            froxel,
             volumetric_pipeline,
             volumetric_layout,
             volumetric_uniform,
@@ -1224,6 +1331,14 @@ impl Renderer {
         // --- volumetric uniforms + fixtures (use the first fog box, if any) ---
         let fog = scene.environments.first();
         let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
+        // Hybrid froxel volumetric — DEFAULT ON when the adapter supports it and the
+        // user hasn't disabled it (settings toggle, or PREVIZ_NOFROXEL to force the
+        // pure raymarch). The froxel carries the masses; the raymarch overlays the
+        // sharp hero beams.
+        let use_froxel = has_fog
+            && self.froxel.is_some()
+            && settings.froxel_volumetric
+            && std::env::var("PREVIZ_NOFROXEL").is_err();
         // Resolve each fixture's optics → its GPU beams (per lit emitter, per
         // prism facet; uniform LED arrays collapse to one aggregate). The
         // shaders loop `arrayLength(&fixtures)`, so the expansion is
@@ -1293,16 +1408,20 @@ impl Renderer {
         } else {
             0
         };
-        let mut sample_mats: Vec<[[f32; 4]; 4]> = Vec::with_capacity(max_shadows);
+        // sample_mats holds ALL atlas layers (heroes 0..n_shadows + the shared
+        // occluder at shadow::SHARED); identity for the unused middle slots.
+        let mut sample_mats: Vec<[[f32; 4]; 4]> =
+            vec![Mat4::IDENTITY.to_cols_array_2d(); shadow::LAYERS];
         let mut shadowed_fixtures: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut n_shadows = 0usize;
         for fi in shadow_order {
-            if sample_mats.len() >= max_shadows {
+            if n_shadows >= max_shadows {
                 break;
             }
             if !shadowed_fixtures.insert(beam_fixture[fi]) {
                 continue;
             }
-            let layer = sample_mats.len();
+            let layer = n_shadows;
             let f = &gpu_fixtures[fi];
             let origin = Vec3::new(f.pos_range[0], f.pos_range[1], f.pos_range[2]);
             let bdir = Vec3::new(f.dir_cos[0], f.dir_cos[1], f.dir_cos[2]);
@@ -1326,11 +1445,58 @@ impl Renderer {
                 layer as u64 * self.shadow.align,
                 bytemuck::bytes_of(&cols),
             );
-            sample_mats.push(cols);
+            sample_mats[layer] = cols;
             gpu_fixtures[fi].misc[3] = layer as f32;
+            n_shadows += 1;
         }
-        let n_shadows = sample_mats.len();
-        if !sample_mats.is_empty() {
+
+        // SHARED occluder: ONE ortho depth pass fit to the union of every lit beam's
+        // volume, used as the fallback occluder for every NON-hero beam — so beams
+        // beyond the 8 heroes still get mid-air occlusion (no more leaking straight
+        // through solid geometry) at O(1) cost instead of one pass per beam. Look
+        // along the mean beam direction so a typical downward/forward rig captures
+        // the truss / set / performers between the lights and the floor.
+        let mut shared_layer = -1i32;
+        if max_shadows > 0 && std::env::var("PREVIZ_NOSHARED").is_err() {
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            let mut mean_dir = Vec3::ZERO;
+            let mut any = false;
+            for f in &gpu_fixtures {
+                if f.dir_cos[3] <= 1e-4 {
+                    continue;
+                }
+                let o = Vec3::new(f.pos_range[0], f.pos_range[1], f.pos_range[2]);
+                let d = Vec3::new(f.dir_cos[0], f.dir_cos[1], f.dir_cos[2]);
+                let r = f.pos_range[3].min(50.0);
+                lo = lo.min(o).min(o + d * r);
+                hi = hi.max(o).max(o + d * r);
+                mean_dir += d;
+                any = true;
+            }
+            if any {
+                let dir = if mean_dir.length_squared() > 1e-6 {
+                    mean_dir.normalize()
+                } else {
+                    Vec3::NEG_Y
+                };
+                let center = (lo + hi) * 0.5;
+                let radius = ((hi - lo).length() * 0.5).max(1.0);
+                let eye = center - dir * (radius + 5.0);
+                let up = if dir.y.abs() > 0.95 { Vec3::Z } else { Vec3::Y };
+                let vp = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 2.0 + 10.0)
+                    * Mat4::look_to_rh(eye, dir, up);
+                let cols = vp.to_cols_array_2d();
+                self.queue.write_buffer(
+                    &self.shadow.render_matrices,
+                    shadow::SHARED as u64 * self.shadow.align,
+                    bytemuck::bytes_of(&cols),
+                );
+                sample_mats[shadow::SHARED] = cols;
+                shared_layer = shadow::SHARED as i32;
+            }
+        }
+        if n_shadows > 0 || shared_layer >= 0 {
             self.queue
                 .write_buffer(&self.shadow.sample_matrices, 0, bytemuck::cast_slice(&sample_mats));
         }
@@ -1360,9 +1526,16 @@ impl Renderer {
             // haze density, so no dither and no banding) — while a busy many-beam rig
             // floors out for frame rate. `target_dt` is derived from the cap so the
             // extra steps actually apply (a full-box ray then takes `step_cap` samples).
-            let nbeams = gpu_fixtures.len().max(1);
+            // In HYBRID mode the raymarch only marches the few hero beams (the froxel
+            // carries the rest), so divide the step budget by the hero count, not all
+            // beams → each hero gets MANY steps = crisp, smooth shafts.
+            let march_beams = if use_froxel {
+                n_shadows.max(1)
+            } else {
+                gpu_fixtures.len().max(1)
+            };
             let budget = settings.steps.max(64) as f32 * 6.0;
-            let step_cap = (budget / nbeams as f32).clamp(64.0, 176.0);
+            let step_cap = (budget / march_beams as f32).clamp(64.0, 176.0);
             let target_dt = (fog.max() - fog.min()).length() / step_cap;
             let vol = VolumetricUniform {
                 inv_view_proj: inv_vp.to_cols_array_2d(),
@@ -1376,14 +1549,51 @@ impl Renderer {
                     settings.beam_intensity,
                 ],
                 counts: [
-                    nbeams as f32,
+                    // x: HYBRID sentinel -2 = raymarch heroes only (froxel does the
+                    // masses); otherwise the shared-occluder atlas layer (-1 = none).
+                    if use_froxel { -2.0 } else { shared_layer as f32 },
                     step_cap,
                     target_dt,
                     if std::env::var("PREVIZ_JITTER").is_ok() { 1.0 } else { 0.0 },
                 ],
+                // Same chroma read-up strength as the froxel pass (below) so the
+                // hybrid masses/heroes seam lifts saturated colours identically.
+                chroma: [settings.chroma_haze, 0.0, 0.0, 0.0],
             };
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
+
+            if use_froxel {
+                if let Some(fx) = &self.froxel {
+                    let (lo, hi) = (fog.min(), fog.max());
+                    let near = 0.3_f32;
+                    // Far = distance to the farthest fog-box corner, so the grid
+                    // spans the whole box along every ray.
+                    let mut far = near + 1.0;
+                    for cx in [lo.x, hi.x] {
+                        for cy in [lo.y, hi.y] {
+                            for cz in [lo.z, hi.z] {
+                                far = far.max((Vec3::new(cx, cy, cz) - eye).length());
+                            }
+                        }
+                    }
+                    let fu = FroxelUniform {
+                        inv_view_proj: inv_vp.to_cols_array_2d(),
+                        eye_time: [eye.x, eye.y, eye.z, time],
+                        fog_min_density: [lo.x, lo.y, lo.z, fog.density],
+                        fog_max_g: [hi.x, hi.y, hi.z, fog.anisotropy],
+                        albedo_beam: [fog.color[0], fog.color[1], fog.color[2], settings.beam_intensity],
+                        dims: [
+                            fx.dims.0 as f32,
+                            fx.dims.1 as f32,
+                            fx.dims.2 as f32,
+                            shared_layer as f32,
+                        ],
+                        planes: [near, far, settings.chroma_haze, 0.0],
+                    };
+                    self.queue.write_buffer(&fx.uniform, 0, bytemuck::bytes_of(&fu));
+                }
+            }
         }
 
         let post = PostUniform {
@@ -1500,6 +1710,49 @@ impl Renderer {
                 },
             ],
         });
+        // Froxel compute + composite bind groups (only when the froxel path runs).
+        // inject writes inject_view + reads result_view (dummy); integrate writes
+        // result_view + reads inject_view.
+        let froxel_bgs = if use_froxel {
+            self.froxel.as_ref().map(|fx| {
+                let compute_bg = |out: &wgpu::TextureView, inp: &wgpu::TextureView| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("froxel-compute-bg"),
+                        layout: &fx.compute_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: fx.uniform.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: fixtures_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.noise_view) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.noise_sampler) },
+                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.gobo_atlas.view) },
+                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.gobo_atlas.sampler) },
+                            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.shadow.array_view) },
+                            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.shadow.sampler) },
+                            wgpu::BindGroupEntry { binding: 8, resource: self.shadow.sample_matrices.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 9, resource: wheels_binding() },
+                            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(out) },
+                            wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(inp) },
+                        ],
+                    })
+                };
+                let inject_bg = compute_bg(&fx.inject_view, &fx.result_view);
+                let integrate_bg = compute_bg(&fx.result_view, &fx.inject_view);
+                let comp_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("froxel-composite-bg"),
+                    layout: &fx.composite_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: fx.uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&fx.result_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&fx.sampler) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+                    ],
+                });
+                (inject_bg, integrate_bg, comp_bg)
+            })
+        } else {
+            None
+        };
+
         let composite_bg = self.single_tex_bg(self.viewport.vol_view());
         let bright_bg = self.single_tex_bg(self.viewport.hdr_view());
         let blur_h_bg = self.single_tex_bg(self.viewport.bloom_view(0));
@@ -1539,10 +1792,15 @@ impl Renderer {
         const SHADOW_MAX_CASTERS: usize = 96;
         let mut casters: Vec<(usize, f32)> = Vec::new();
 
-        // Pass 0: hero-beam shadow maps — one depth-only pass per selected beam,
-        // rendering the solid occluders (floor + MVR geometry + fixture models)
-        // from that beam's point of view into its atlas layer.
-        for layer in 0..n_shadows {
+        // Pass 0: shadow maps — one depth-only pass per hero beam (layers 0..n)
+        // plus the ONE shared occluder (layer shadow::SHARED), each rendering the
+        // solid occluders (floor + MVR geometry + fixture models) from that layer's
+        // viewpoint into its atlas layer.
+        let mut render_layers: Vec<usize> = (0..n_shadows).collect();
+        if shared_layer >= 0 {
+            render_layers.push(shadow::SHARED);
+        }
+        for &layer in &render_layers {
             let mut spass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-pass"),
                 color_attachments: &[],
@@ -1764,48 +2022,90 @@ impl Renderer {
         // Pass 2a: volumetric raymarch -> half-res vol target (scatter, transmit).
         // Pass 2b: upsample + composite into the HDR scene.
         if has_fog && settings.mode == ViewportMode::Beauty {
+            // HYBRID stage 1 — the froxel volume carries the wide/dim "masses"
+            // (all non-hero beams) at a cost decoupled from beam count, with no
+            // dither/banding and full mid-air occlusion. inject → integrate →
+            // trilinear composite into HDR.
+            if let (Some((inject_bg, integrate_bg, comp_bg)), Some(fx)) =
+                (&froxel_bgs, self.froxel.as_ref())
             {
+                let gx = fx.dims.0.div_ceil(8);
+                let gy = fx.dims.1.div_ceil(8);
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("froxel-inject"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&fx.inject_pipeline);
+                    cpass.set_bind_group(0, inject_bg, &[]);
+                    cpass.dispatch_workgroups(gx, gy, fx.dims.2);
+                }
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("froxel-integrate"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&fx.integrate_pipeline);
+                    cpass.set_bind_group(0, integrate_bg, &[]);
+                    cpass.dispatch_workgroups(gx, gy, 1);
+                }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("volumetric-pass"),
+                    label: Some("froxel-composite-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: self.viewport.vol_view(),
+                        view: self.viewport.hdr_view(),
                         depth_slice: None,
                         resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: None,
                     ..Default::default()
                 });
-                pass.set_pipeline(&self.volumetric_pipeline);
-                pass.set_bind_group(0, &volumetric_bg, &[]);
+                pass.set_pipeline(&fx.composite_pipeline);
+                pass.set_bind_group(0, comp_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
-            // Composite (blend One/SrcAlpha) is configured on the pipeline.
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("composite-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self.viewport.hdr_view(),
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.composite_pipeline);
-            pass.set_bind_group(0, &composite_bg, &[]);
-            pass.draw(0..3, 0..1);
+
+            // HYBRID stage 2 — the per-pixel raymarch lays the SHARP hero shafts
+            // over the froxel masses (in hybrid mode the shader skips non-heroes,
+            // so it only marches the few sharpest beams = crisp gobo/CA/prism
+            // detail at low cost). In raymarch-only mode this marches every beam.
+            // Skipped entirely in hybrid when there are no hero beams.
+            if !use_froxel || n_shadows > 0 {
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("volumetric-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: self.viewport.vol_view(),
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.volumetric_pipeline);
+                    pass.set_bind_group(0, &volumetric_bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                // Composite (blend One/SrcAlpha) is configured on the pipeline.
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("composite-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: self.viewport.hdr_view(),
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.composite_pipeline);
+                pass.set_bind_group(0, &composite_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
         }
 
         // Pass 3: bloom bright-pass (HDR -> bloom[0]).

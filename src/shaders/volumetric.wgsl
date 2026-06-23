@@ -17,6 +17,7 @@ struct Volumetric {
     fog_max_g: vec4<f32>,       // xyz = box max, w = anisotropy g
     albedo_beam: vec4<f32>,     // rgb = scattering tint, w = beam intensity
     counts: vec4<f32>,          // y = max step count, z = constant-dt target (world m)
+    chroma: vec4<f32>,          // x = Helmholtz–Kohlrausch chroma read-up strength; yzw reserved
 };
 
 struct Fixture {
@@ -155,7 +156,10 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     let albedo = u.albedo_beam.rgb;
     let beam = u.albedo_beam.w;
     let time = u.eye_time.w;
-    let ambient = albedo * 0.012; // very dim ambient haze; beams do the lighting
+    // Very dim ambient haze; beams do the lighting. In hybrid mode the froxel
+    // volume already supplies the ambient term, so the hero-only raymarch omits it
+    // (else it double-counts where the two composites overlap).
+    let ambient = select(albedo * 0.012, vec3<f32>(0.0), u.counts.x < -1.5);
 
     let seg = t_far - t_near;
 
@@ -187,6 +191,13 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     // composite's Gaussian + the smooth super-Gaussian falloff absorb it.
     let jitter = select(0.5, ign(in.pos.xy), u.counts.w > 0.5);
 
+    // HYBRID mode (counts.x = -2 sentinel): the froxel volume carries the wide/dim
+    // "masses", so the raymarch renders ONLY the sharp hero beams (those with a
+    // dedicated shadow map, misc.w >= 0) — preserving their crisp gobo/CA/prism
+    // detail at a few-beam cost. In raymarch-only mode counts.x is the shared
+    // occluder layer (>= 0) or -1, so this stays false and every beam is marched.
+    let hero_only = u.counts.x < -1.5;
+
     var transmittance = 1.0;
     var scatter = vec3<f32>(0.0);
 
@@ -200,6 +211,9 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
         var lin = ambient;
         for (var f = 0; f < count; f = f + 1) {
             let fx = fixtures[f];
+            if (hero_only && fx.misc.w < 0.0) {
+                continue; // mass beam → handled by the froxel volume
+            }
             let lpos = fx.pos_range.xyz;
             let range = fx.pos_range.w;
             let bdir = fx.dir_cos.xyz;
@@ -275,11 +289,17 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             let tyndall = select(1.0, 3.0, laser);
             let phase = max(hg(dot(bdir, -rd), g), 0.05);
             // Hero beams cast shadows into the haze: darken the shaft where geometry
-            // occludes the light at this sample point (beam blocked mid-air).
+            // occludes the light at this sample point (beam blocked mid-air). A hero
+            // beam (sidx >= 0) uses its own crisp per-beam map; every OTHER beam falls
+            // back to the ONE shared occluder map (counts.x), so it still can't shine
+            // straight through a solid object — just with a coarser shared depth.
             var vis = 1.0;
             let sidx = i32(fx.misc.w);
+            let shared_idx = i32(u.counts.x);
             if (sidx >= 0) {
                 vis = opt_shadow(p, shadow_mats[sidx], shadow_atlas, shadow_samp, sidx);
+            } else if (shared_idx >= 0) {
+                vis = opt_shadow(p, shadow_mats[shared_idx], shadow_atlas, shadow_samp, shared_idx);
             }
             // Per-cell HDR whiten + boost (accuracy): for a plain pixel cell,
             // extra.w carries its peak raw DMX level. A bright/white cell pulls its
@@ -291,7 +311,24 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             let lum = max(fx.color.r, max(fx.color.g, fx.color.b));
             let whitened = mix(fx.color.rgb, vec3<f32>(lum), white01 * white01 * 0.6);
             let boost = 1.0 + white01 * white01 * 0.6;
-            lin += whitened * trans * (rad3 * (atten * phase * beam * vis * tyndall * boost));
+            // --- Helmholtz–Kohlrausch chroma read-up of saturated beams in haze ---
+            // A saturated beam (blue/deep-red/magenta) reads brighter than its Rec709
+            // luma on a dark stage; per-channel ACES + over-1.0 bloom otherwise crush
+            // its tiny luma toward black while neutral/warm beams saturate to white. ONE
+            // chroma-preserving SCALAR gain lifts saturated hues only; white/pastel (and
+            // the already-whitened bright cells) self-gate to 1. `whitened` is HDR-scaled,
+            // so saturation comes from the PEAK-NORMALISED hue (scale-invariant): a dim
+            // blue and a blazing blue lift identically, each keeping its own intensity.
+            // hk_strength == 0 → hk == 1.0 (today's look, bit-for-bit).
+            let hk_strength = u.chroma.x;
+            let hk_mx = max(whitened.r, max(whitened.g, whitened.b));
+            let hk_hue = whitened * (1.0 / max(hk_mx, 1e-4));
+            let hk_sat = clamp(1.0 - dot(hk_hue, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+            // sat² gates the lift to genuinely saturated hues (white/pastel ≈ 1) while
+            // `strength` scales DIRECTLY — no asymptote, so it can actually push a deep
+            // blue/red to read in haze — capped so it can't blow out to flat neon.
+            let hk = clamp(1.0 + hk_strength * hk_sat * hk_sat, 1.0, 3.5);
+            lin += (whitened * hk) * trans * (rad3 * (atten * phase * beam * vis * tyndall * boost));
         }
 
         let step_tr = exp(-sigma_t * dt);
@@ -303,5 +340,11 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(scatter, transmittance);
+    // In HYBRID mode the froxel volume already attenuated the background by the full
+    // medium transmittance; this hero-only pass composites over that result, so it
+    // must NOT re-attenuate it (else the scene behind fog is darkened twice, ≈ T²).
+    // The hero scatter is still correctly attenuated by `transmittance` internally
+    // above — we only force the OUTPUT alpha (the background multiplier) to 1.0.
+    let out_t = select(transmittance, 1.0, hero_only);
+    return vec4<f32>(scatter, out_t);
 }

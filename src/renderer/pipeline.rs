@@ -36,6 +36,18 @@ fn depth_stencil() -> wgpu::DepthStencilState {
     }
 }
 
+/// Depth state for the emissive lens discs: still depth-TESTS (so a lens behind a
+/// wall is hidden) but does NOT WRITE depth. Writing it (the old behaviour) put the
+/// small ~lens-radius disc into `depth_tex`, and the half-res volumetric pass then
+/// clipped its march `t_far` to that disc — erasing the beam shaft right behind the
+/// lens, i.e. the dark gap between the lens face and where the beam "starts".
+fn depth_stencil_no_write() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        depth_write_enabled: Some(false),
+        ..depth_stencil()
+    }
+}
+
 fn hdr_target() -> Option<wgpu::ColorTargetState> {
     Some(wgpu::ColorTargetState {
         format: Viewport::HDR_FORMAT,
@@ -95,7 +107,9 @@ pub fn lens_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
             cull_mode: None,
             ..Default::default()
         },
-        depth_stencil: Some(depth_stencil()),
+        // Test (hide behind nearer geometry) but DON'T write depth, so the lens disc
+        // doesn't clip the volumetric beam shaft behind it (the lens-gap bug).
+        depth_stencil: Some(depth_stencil_no_write()),
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
@@ -623,5 +637,188 @@ pub fn tonemap_pipeline(
     let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
     fullscreen_pipeline(
         device, "tonemap-pipeline", layout, &shader, "fs_tonemap", Viewport::LDR_FORMAT, None,
+    )
+}
+
+// ---- froxel volumetric (PREVIZ_FROXEL): two compute passes + a composite ----
+
+/// Bind-group layout shared by the froxel `inject` + `integrate` compute passes.
+/// Mirrors froxel.wgsl bindings, all COMPUTE-visible. 10 = froxel_out (storage
+/// write), 11 = froxel_in (read texture).
+pub fn froxel_compute_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let c = wgpu::ShaderStages::COMPUTE;
+    let buf = |binding, read_only| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: c,
+        ty: wgpu::BindingType::Buffer {
+            ty: if read_only {
+                wgpu::BufferBindingType::Storage { read_only: true }
+            } else {
+                wgpu::BufferBindingType::Uniform
+            },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let tex3 = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: c,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let tex_arr = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: c,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let samp = |binding, ty| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: c,
+        ty: wgpu::BindingType::Sampler(ty),
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("froxel-compute-bgl"),
+        entries: &[
+            buf(0, false),                                   // Froxel uniform
+            buf(1, true),                                    // fixtures
+            tex3(2),                                         // noise 3d
+            samp(3, wgpu::SamplerBindingType::Filtering),    // noise samp
+            tex_arr(4),                                      // gobo atlas
+            samp(5, wgpu::SamplerBindingType::Filtering),    // gobo samp
+            wgpu::BindGroupLayoutEntry {                     // shadow atlas
+                binding: 6,
+                visibility: c,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            samp(7, wgpu::SamplerBindingType::Comparison),   // shadow comparison samp
+            buf(8, true),                                    // shadow matrices
+            buf(9, true),                                    // wheels
+            wgpu::BindGroupLayoutEntry {                     // froxel_out (write storage)
+                binding: 10,
+                visibility: c,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                },
+                count: None,
+            },
+            tex3(11), // froxel_in (read)
+        ],
+    })
+}
+
+pub fn froxel_compute_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> (wgpu::ComputePipeline, wgpu::ComputePipeline) {
+    let shader = load_with_optics(device, "froxel.wgsl", include_str!("../shaders/froxel.wgsl"));
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("froxel-compute-pl"),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    let make = |entry: &str, label: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl),
+            module: &shader,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        })
+    };
+    (make("inject", "froxel-inject"), make("integrate", "froxel-integrate"))
+}
+
+/// Bind-group layout for the froxel composite (fragment): Froxel uniform, the
+/// integrated result 3D texture, a linear sampler, and the scene depth.
+pub fn froxel_composite_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let f = wgpu::ShaderStages::FRAGMENT;
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("froxel-composite-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: f,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: f,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: f,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: f,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+pub fn froxel_composite_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
+    // Same additive blend as the raymarch composite: out = scatter + scene*transmittance.
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::SrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    fullscreen_pipeline(
+        device,
+        "froxel-composite",
+        layout,
+        &shader,
+        "fs_froxel_composite",
+        Viewport::HDR_FORMAT,
+        Some(blend),
     )
 }

@@ -11,12 +11,17 @@
 
 use super::mesh::{MeshInstance, MeshVertex};
 
-/// Maximum simultaneously-shadowed beams (= atlas layers). The N sharpest lit
-/// beams are chosen each frame; the rest go unshadowed (and so leak through
-/// occluders). Kept at 8 — each shadowed beam is a full depth pass over the
-/// occluders, so 16 roughly halved the FOH frame rate; broader occlusion coverage
-/// needs a cheaper shared method (froxel / screen-space), not more atlas layers.
+/// Maximum simultaneously-shadowed HERO beams. The N sharpest lit beams get a
+/// dedicated per-beam map (crisp shadows). Kept at 8 — each is a full depth pass,
+/// so 16 ~halved FOH fps.
 pub const MAX: usize = 8;
+/// Index of the SHARED occluder layer (one extra depth pass, fit to the whole
+/// lit-beam volume) that EVERY non-hero beam samples as a fallback — so beams
+/// beyond the 8 heroes still get mid-air occlusion at O(1) cost instead of leaking
+/// straight through solid geometry.
+pub const SHARED: usize = MAX;
+/// Total atlas layers = hero maps + the one shared occluder.
+pub const LAYERS: usize = MAX + 1;
 /// Per-map resolution (square). 768 (down from 1024) roughly halves the shadow
 /// fill cost for a barely-perceptible softening — beam shadows are viewed through
 /// haze + a half-res volumetric, so sub-1k crispness isn't visible anyway.
@@ -48,7 +53,7 @@ impl ShadowMaps {
             size: wgpu::Extent3d {
                 width: RES,
                 height: RES,
-                depth_or_array_layers: MAX as u32,
+                depth_or_array_layers: LAYERS as u32,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -62,7 +67,7 @@ impl ShadowMaps {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let layer_views = (0..MAX as u32)
+        let layer_views = (0..LAYERS as u32)
             .map(|i| {
                 atlas.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow-layer"),
@@ -87,13 +92,13 @@ impl ShadowMaps {
         let align = (device.limits().min_uniform_buffer_offset_alignment as u64).max(64);
         let render_matrices = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow-render-matrices"),
-            size: align * MAX as u64,
+            size: align * LAYERS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let sample_matrices = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow-sample-matrices"),
-            size: 64 * MAX as u64,
+            size: 64 * LAYERS as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

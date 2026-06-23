@@ -174,12 +174,23 @@ pub fn preferences_window(
                             ui.add(Slider::new(&mut settings.beam_intensity, 0.0..=4000.0));
                             ui.end_row();
 
+                            ui.label("Chroma in haze");
+                            ui.add(Slider::new(&mut settings.chroma_haze, 0.0..=3.0));
+                            ui.end_row();
+
                             ui.label("Volumetric steps");
                             ui.add(Slider::new(&mut settings.steps, 8..=192));
                             ui.end_row();
 
                             ui.label("Gobo sharpen");
                             ui.add(Slider::new(&mut settings.gobo_sharpness, 0.0..=2.0));
+                            ui.end_row();
+
+                            ui.label("Volumetric fog");
+                            ui.checkbox(
+                                &mut settings.froxel_volumetric,
+                                "Hybrid froxel (smooth masses + sharp beams)",
+                            );
                             ui.end_row();
 
                             ui.label("Display mode");
@@ -191,6 +202,8 @@ pub fn preferences_window(
                             ui.end_row();
                         });
                     hint(ui, "Higher volumetric step counts sharpen fog at a frame-rate cost.");
+                    hint(ui, "Chroma in haze lifts saturated beam colours (blue/red) so they read in fog; 0 = off.");
+                    hint(ui, "Hybrid froxel: a compute fog grid (no banding, every beam casts shadows, cost decoupled from beam count) carries the wide beams; the sharp moving-head shafts stay crisp. Off = pure raymarch.");
                 });
 
             egui::CollapsingHeader::new(format!("{}  {}", theme::icon::CONNECT, "DMX / Network"))

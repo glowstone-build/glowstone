@@ -117,3 +117,42 @@ fn fs_tonemap(in: VsOut) -> @location(0) vec4<f32> {
     col = to_srgb(col);
     return vec4<f32>(col, 1.0);
 }
+
+// --- froxel volumetric composite (PREVIZ_FROXEL path) ---
+// Upsamples the integrated froxel volume (accumulated scatter + transmittance,
+// distributed exponentially along each pixel's ray) with ONE trilinear lookup at
+// the opaque-surface depth, then blends scatter + scene·transmittance (the same
+// One,SrcAlpha blend the half-res raymarch composite uses).
+struct FroxelU {
+    inv_view_proj: mat4x4<f32>,
+    eye_time: vec4<f32>,
+    fog_min_density: vec4<f32>,
+    fog_max_g: vec4<f32>,
+    albedo_beam: vec4<f32>,
+    dims: vec4<f32>,
+    planes: vec4<f32>, // x = near, y = far (distance along ray, m)
+};
+@group(0) @binding(0) var<uniform> fxu: FroxelU;
+@group(0) @binding(1) var froxel_result: texture_3d<f32>;
+@group(0) @binding(2) var froxel_samp: sampler;
+@group(0) @binding(3) var fx_depth: texture_depth_2d;
+
+@fragment
+fn fs_froxel_composite(in: VsOut) -> @location(0) vec4<f32> {
+    let near = fxu.planes.x;
+    let far = fxu.planes.y;
+    // Distance from eye to the opaque surface (or `far` if the sky/no surface).
+    let dims = vec2<f32>(textureDimensions(fx_depth));
+    let dpix = clamp(vec2<i32>(in.uv * dims), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
+    let d = textureLoad(fx_depth, dpix, 0);
+    var t = far;
+    if (d < 0.999999) {
+        let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
+        let wh = fxu.inv_view_proj * vec4<f32>(ndc, d, 1.0);
+        t = length(wh.xyz / wh.w - fxu.eye_time.xyz);
+    }
+    // Inverse of the exponential slice distribution → normalised froxel Z.
+    let zf = clamp(log(max(t, near) / near) / log(far / near), 0.0, 1.0);
+    let r = textureSampleLevel(froxel_result, froxel_samp, vec3<f32>(in.uv, zf), 0.0);
+    return r; // rgb = accumulated scatter, a = transmittance
+}

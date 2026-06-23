@@ -92,6 +92,10 @@ impl ApplicationHandler for App {
         if let Some(s) = std::env::var("PREVIZ_STEPS").ok().and_then(|s| s.parse().ok()) {
             self.state.as_mut().unwrap().ui.settings.steps = s;
         }
+        // PREVIZ_CHROMA overrides the haze chroma read-up strength (0 = off) for A/B.
+        if let Some(c) = std::env::var("PREVIZ_CHROMA").ok().and_then(|s| s.parse().ok()) {
+            self.state.as_mut().unwrap().ui.settings.chroma_haze = c;
+        }
 
         // Optional .archie project load for profiling: PREVIZ_OPEN=show.archie
         // loads a saved show (fixtures + geometry + bundled assets) and frames it.
@@ -155,20 +159,40 @@ impl ApplicationHandler for App {
                         let arc = state.scene.fixtures[idx].gdtf.clone().unwrap();
                         let mi = state.scene.fixtures[idx].mode_index;
                         let ncells = state.scene.fixtures[idx].emitters().len();
-                        let setup = |f: &mut crate::scene::Fixture| {
+                        // PREVIZ_PALETTE: each bar a distinct SOLID saturated colour
+                        // (blue/red/green/magenta/cyan/amber) so the chroma read-up can
+                        // be judged per-hue, side by side. Else the yellow/blue pixel map.
+                        let palette = std::env::var("PREVIZ_PALETTE").is_ok();
+                        let pal: [[f32; 3]; 6] = [
+                            [0.0, 0.1, 1.0],
+                            [1.0, 0.0, 0.05],
+                            [0.0, 1.0, 0.1],
+                            [1.0, 0.0, 0.9],
+                            [0.0, 0.9, 1.0],
+                            [1.0, 0.55, 0.0],
+                        ];
+                        let setup = |f: &mut crate::scene::Fixture, k: usize| {
                             f.cells = (0..ncells)
-                                .map(|i| if i % 2 == 0 { [1.0, 0.8, 0.0] } else { [0.0, 0.1, 1.0] })
+                                .map(|i| {
+                                    if palette {
+                                        pal[k % pal.len()]
+                                    } else if i % 2 == 0 {
+                                        [1.0, 0.8, 0.0]
+                                    } else {
+                                        [0.0, 0.1, 1.0]
+                                    }
+                                })
                                 .collect();
                             f.tilt = -90.0;
                             f.snap_movement();
                         };
-                        setup(&mut state.scene.fixtures[idx]);
+                        setup(&mut state.scene.fixtures[idx], 0);
                         for k in 1..nbars {
-                            let pos = glam::Vec3::new(k as f32 * 1.4, 5.0, 0.0);
+                            let pos = glam::Vec3::new(k as f32 * 1.6, 5.0, 0.0);
                             let j = state.scene.add_gdtf(arc.clone(), pos);
                             state.scene.fixtures[j].mode_index = mi;
                             state.scene.fixtures[j].sync_mode();
-                            setup(&mut state.scene.fixtures[j]);
+                            setup(&mut state.scene.fixtures[j], k);
                         }
                     }
                     state.ui.selection = crate::scene::Selection::fixture(idx);
