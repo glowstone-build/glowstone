@@ -94,14 +94,29 @@ fn density_at(p: vec3<f32>, t: f32) -> f32 {
     let wind1 = vec3<f32>(0.10, 0.020, 0.06) * t;
     let wind2 = vec3<f32>(-0.06, 0.015, 0.05) * t;
     let wind3 = vec3<f32>(0.04, -0.03, 0.08) * t;
-    // Three scrolling scales: large billows, medium wisps, fine turbulence.
+    // FINE scales (2–5 m) are what actually READ as smoke structure — this is the original
+    // high-contrast haze field that showed strong wisps. (Biasing to coarse scales to hide
+    // the old "beads" also hid all the structure; the right answer is to keep the fine field
+    // and let UNIFORMITY collapse its contrast instead.)
     let n1 = textureSampleLevel(noise_tex, noise_samp, p * 0.08 + wind1, 0.0).r;
     let n2 = textureSampleLevel(noise_tex, noise_samp, p * 0.21 + wind2, 0.0).r;
     let n3 = textureSampleLevel(noise_tex, noise_samp, p * 0.46 + wind3, 0.0).r;
     let n = n1 * 0.5 + n2 * 0.32 + n3 * 0.18;
-    // Thin base haze + strong high-contrast variation so the beam shows clear
-    // air gaps and dense smoke wisps drifting through it.
-    return 0.16 + smoothstep(0.26, 0.64, n) * 2.1;
+    // Cluster mask (0 clear … 1 dense pocket).
+    let cluster = smoothstep(0.26, 0.64, n);
+    // Cluster CONTRAST (chroma.w, 0..1) is an OPTIONAL push: at 0 it reproduces the liked
+    // baseline look exactly (0.16 + cluster·2.1); higher widens the dense-vs-clear ratio so
+    // pockets read brighter against the haze (near-clear gaps + much denser, sparser pockets).
+    let contrast = clamp(u.chroma.w, 0.0, 1.0);
+    let lo = mix(0.16, 0.015, contrast); // gaps thin toward near-clear
+    let hi = mix(2.26, 22.0, contrast);  // pockets get DENSE → genuinely bright wisps
+    let pk = pow(cluster, mix(1.0, 2.2, contrast)); // higher contrast → sparser, discrete pockets
+    let structured = mix(lo, hi, pk);
+    // Uniformity (chroma.z): 1 = perfectly smooth even haze; 0 = full clustered smoke.
+    // Crossfade flat↔structured. The temporal history cap (mod.rs) also drops with
+    // uniformity so the clusters stay crisp + drifting instead of being averaged away.
+    let clump = 1.0 - clamp(u.chroma.z, 0.0, 1.0);
+    return mix(1.0, structured, clump);
 }
 
 @fragment
@@ -151,7 +166,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
 
     let max_steps = max(i32(u.counts.y), 1);
     let count = i32(arrayLength(&fixtures));
-    let g = u.fog_max_g.w;
+    let g = clamp(u.fog_max_g.w, -0.95, 0.95); // keep HG well-conditioned at extremes
     let base = u.fog_min_density.w;
     let albedo = u.albedo_beam.rgb;
     let beam = u.albedo_beam.w;
@@ -183,13 +198,15 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     // Equal spacing + per-pixel jitter is the robust choice; the count reduction
     // (and the constant-dt cap above) is where the speed comes from.
     let dt = seg / fn_steps;
-    // Ray-start offset. Per-pixel jitter (counts.w > 0.5) breaks depth banding but
-    // IS the dotted/dithered look on thin beams (each pixel integrates a different
-    // offset → high-freq variance the upsample can't hide). Default is a fixed
-    // MIDPOINT (0.5): every pixel integrates identically, so neighbours agree and
-    // the beam is smooth — residual longitudinal banding is low-frequency and the
-    // composite's Gaussian + the smooth super-Gaussian falloff absorb it.
-    let jitter = select(0.5, ign(in.pos.xy), u.counts.w > 0.5);
+    // Ray-start offset: a PER-FRAME golden-ratio phase (chroma.y), the SAME for every
+    // pixel this frame. Crucially NOT per-pixel — a per-pixel offset makes neighbouring
+    // rays sample the haze at different depths, which BLURS the smoke-cluster structure
+    // into mush (that's what hid the clusters). With a uniform per-frame offset, all rays
+    // sample coherently (clusters read), and the temporal-accumulation resolve
+    // (vol_temporal.wgsl) averages successive frames' offsets to dissolve the step
+    // banding — coherent clusters AND smooth shafts. A tiny per-pixel dither is added
+    // only as a fallback for the first frame / fast motion before history converges.
+    let jitter = fract(u.chroma.y + ign(in.pos.xy) * 0.06);
 
     // HYBRID mode (counts.x = -2 sentinel): the froxel volume carries the wide/dim
     // "masses", so the raymarch renders ONLY the sharp hero beams (those with a
@@ -286,6 +303,13 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             // streak, strong forward single-scatter. Lamps keep the cone atten.
             let laser = fx.misc.y > 0.5;
             let atten = select(1.0 / (1.0 + depth * depth * 0.015), 1.0, laser);
+            // Lens hotspot: a real beam — especially a narrow one / complex optics — is
+            // brightest right at the lens, blooming over the first ~1-2 m before settling
+            // into the cone (see the reference). Scales with narrowness (a tight beam
+            // concentrates flux into a sharper near-field hotspot). Lasers are already
+            // collimated/uniform, so no hotspot for them.
+            let narrow = clamp(1.0 - tan_half * 5.0, 0.0, 1.0);
+            let hotspot = select(1.0 + narrow * 1.6 * exp(-depth * 0.9), 1.0, laser);
             let tyndall = select(1.0, 3.0, laser);
             let phase = max(hg(dot(bdir, -rd), g), 0.05);
             // Hero beams cast shadows into the haze: darken the shaft where geometry
@@ -300,6 +324,20 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
                 vis = opt_shadow(p, shadow_mats[sidx], shadow_atlas, shadow_samp, sidx);
             } else if (shared_idx >= 0) {
                 vis = opt_shadow(p, shadow_mats[shared_idx], shadow_atlas, shadow_samp, shared_idx);
+            }
+            // Fog SELF-shadowing — THE thing that makes clustered smoke read: dense haze
+            // BETWEEN the lens and this sample dims the beam here, so a dense pocket casts a
+            // soft shadow into the fog behind it (god-ray / cloud-shaft structure). Density
+            // modulation alone washes out in the airlight integral; structured OCCLUSION
+            // does not. Crude 2-tap proxy of the optical depth from lens→sample along the
+            // light ray. Gated by clumpiness so SMOOTH fog (uniform → uniform → no structure)
+            // is left exactly as-is.
+            let clump_s = 1.0 - clamp(u.chroma.z, 0.0, 1.0);
+            if (clump_s > 0.001 && !laser) {
+                let s1 = density_at(mix(lpos, p, 0.34), time);
+                let s2 = density_at(mix(lpos, p, 0.7), time);
+                let self_od = (s1 + s2) * 0.5 * base * depth;
+                vis = vis * exp(-self_od * 0.07 * clump_s);
             }
             // Per-cell HDR whiten + boost (accuracy): for a plain pixel cell,
             // extra.w carries its peak raw DMX level. A bright/white cell pulls its
@@ -328,7 +366,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             // `strength` scales DIRECTLY — no asymptote, so it can actually push a deep
             // blue/red to read in haze — capped so it can't blow out to flat neon.
             let hk = clamp(1.0 + hk_strength * hk_sat * hk_sat, 1.0, 3.5);
-            lin += (whitened * hk) * trans * (rad3 * (atten * phase * beam * vis * tyndall * boost));
+            lin += (whitened * hk) * trans * (rad3 * (atten * hotspot * phase * beam * vis * tyndall * boost));
         }
 
         let step_tr = exp(-sigma_t * dt);

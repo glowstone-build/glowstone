@@ -186,13 +186,6 @@ pub fn preferences_window(
                             ui.add(Slider::new(&mut settings.gobo_sharpness, 0.0..=2.0));
                             ui.end_row();
 
-                            ui.label("Volumetric fog");
-                            ui.checkbox(
-                                &mut settings.froxel_volumetric,
-                                "Hybrid froxel (smooth masses + sharp beams)",
-                            );
-                            ui.end_row();
-
                             ui.label("Display mode");
                             ui.horizontal(|ui| {
                                 for m in ViewportMode::ALL {

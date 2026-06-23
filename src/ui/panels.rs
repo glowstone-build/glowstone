@@ -1412,6 +1412,20 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment) {
                 ui.add(DragValue::new(&mut env.anisotropy).speed(0.005).range(-0.95..=0.95))
                     .on_hover_text("Henyey-Greenstein g (forward scattering > 0)");
                 ui.end_row();
+                ui.label("Uniformity");
+                ui.add(egui::Slider::new(&mut env.uniformity, 0.0..=1.0))
+                    .on_hover_text(
+                        "1 = smooth even haze · 0 = clusters of smoke/clouds (dense \
+                         pockets scatter brighter, with clear gaps between)",
+                    );
+                ui.end_row();
+                ui.label("Cluster contrast");
+                ui.add(egui::Slider::new(&mut env.cluster_contrast, 0.0..=1.0))
+                    .on_hover_text(
+                        "How much brighter/denser the clusters are vs the haze (and how \
+                         clear the gaps). Higher = pockets pop harder. Pairs with low density.",
+                    );
+                ui.end_row();
                 ui.label("Tint");
                 ui.color_edit_button_rgb(&mut env.color);
                 ui.end_row();

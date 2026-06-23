@@ -30,7 +30,9 @@ const MAGIC: &[u8] = b"ARCHIE\0";
 /// v2: `mvr::GeometryModel` gained a per-`<Geometry3D>` `matrix` field.
 /// v3: `Scene` gained `screens: Vec<LedScreen>` (LED walls).
 /// v4: `LedScreen` gained content sources (Image/NDI/CITP/PixelMap) + `pixel_shape`.
-pub const FORMAT: u32 = 4;
+/// v5: `Environment` gained `uniformity` (haze cluster control).
+/// v6: `Environment` gained `cluster_contrast`.
+pub const FORMAT: u32 = 6;
 /// The project file extension (no dot).
 pub const EXT: &str = "archie";
 

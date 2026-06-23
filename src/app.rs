@@ -136,6 +136,11 @@ impl ApplicationHandler for App {
                         .scene
                         .add_gdtf(std::sync::Arc::new(fixture), glam::Vec3::new(0.0, 4.0, 0.0));
                     state.scene.fixtures[idx].tilt = 20.0;
+                    // PREVIZ_OPTZOOM=<0..1> forces the optics zoom (narrow→wide) for
+                    // testing narrow-beam haze rendering headlessly.
+                    if let Some(z) = std::env::var("PREVIZ_OPTZOOM").ok().and_then(|s| s.parse().ok()) {
+                        state.scene.fixtures[idx].optics.zoom = z;
+                    }
                     // PREVIZ_GDTF_MODE=<index or name substring> selects the DMX
                     // mode (emitter layout + channel map) for the test fixture.
                     if let Ok(sel) = std::env::var("PREVIZ_GDTF_MODE") {
@@ -431,6 +436,20 @@ impl ApplicationHandler for App {
             && let Some(env) = self.state.as_mut().unwrap().scene.environments.first_mut()
         {
             env.density = d;
+        }
+        // PREVIZ_UNIFORMITY=0..1 overrides the first fog box's haze uniformity for A/B.
+        if let Ok(v) = std::env::var("PREVIZ_UNIFORMITY")
+            && let Ok(v) = v.parse::<f32>()
+            && let Some(env) = self.state.as_mut().unwrap().scene.environments.first_mut()
+        {
+            env.uniformity = v;
+        }
+        // PREVIZ_CONTRAST=0..1 overrides the first fog box's cluster contrast for A/B.
+        if let Ok(v) = std::env::var("PREVIZ_CONTRAST")
+            && let Ok(v) = v.parse::<f32>()
+            && let Some(env) = self.state.as_mut().unwrap().scene.environments.first_mut()
+        {
+            env.cluster_contrast = v;
         }
 
         // PREVIZ_MODE=beauty|unlit|wireframe selects the viewport display mode

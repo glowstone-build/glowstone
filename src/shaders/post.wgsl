@@ -24,6 +24,8 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> VsOut {
 // --- bloom: single source texture + sampler ---
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_samp: sampler;
+// Scene depth (full-res) for the depth-aware volumetric composite (fs_composite only).
+@group(0) @binding(2) var comp_depth: texture_depth_2d;
 
 // Bright pass: keep only the over-1.0 HDR energy (so only beams/lenses bloom).
 @fragment
@@ -60,21 +62,33 @@ fn fs_blur_v(in: VsOut) -> @location(0) vec4<f32> {
 
 // Upsample the half-res volumetric target (scatter.rgb, transmittance.a). The
 // pipeline blends it as  out = scatter + scene·transmittance  (One, SrcAlpha).
+// DEPTH-AWARE upsample of the (temporally-accumulated) half-res volumetric. A 5-tap
+// cross, but each side tap is weighted by how close its scene depth is to the centre
+// pixel's: on the smooth beam interior all taps share a depth → full blend (softens the
+// half-res→full-res stair-step); across a geometry silhouette the far-side taps get ~0
+// weight → the beam edge stays CRISP against set/truss instead of haloing past it
+// (joint-bilateral upsample, c0de517e/BO3). Depth is non-linear, so equal surfaces read
+// near-identical while a near-vs-far jump reads large — exactly the discriminator wanted.
 @fragment
 fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
-    // Light 5-tap cross over the half-res raymarch before upsample. With the
-    // deterministic MIDPOINT march (volumetric.wgsl) the half-res buffer is already
-    // smooth (no per-pixel jitter noise), so this is centre-heavy (12:1) — just
-    // enough to take the edge off the half-res→full-res stair-step WITHOUT the wide
-    // bleed of a full Gaussian, which haloed the lit shaft past occluder silhouettes
-    // (the "outline on the far side of a solid object").
     let t = 1.0 / vec2<f32>(textureDimensions(src_tex, 0));
+    let dd = vec2<f32>(textureDimensions(comp_depth));
+    let hi = vec2<i32>(dd) - vec2<i32>(1);
+    let dc = textureLoad(comp_depth, clamp(vec2<i32>(in.uv * dd), vec2<i32>(0), hi), 0);
     var s = textureSample(src_tex, src_samp, in.uv) * 12.0;
-    s += textureSample(src_tex, src_samp, in.uv + vec2<f32>(t.x, 0.0));
-    s += textureSample(src_tex, src_samp, in.uv - vec2<f32>(t.x, 0.0));
-    s += textureSample(src_tex, src_samp, in.uv + vec2<f32>(0.0, t.y));
-    s += textureSample(src_tex, src_samp, in.uv - vec2<f32>(0.0, t.y));
-    return s / 16.0;
+    var wsum = 12.0;
+    let offs = array<vec2<f32>, 4>(
+        vec2<f32>(t.x, 0.0), vec2<f32>(-t.x, 0.0),
+        vec2<f32>(0.0, t.y), vec2<f32>(0.0, -t.y),
+    );
+    for (var i = 0; i < 4; i = i + 1) {
+        let uv = in.uv + offs[i];
+        let dt = textureLoad(comp_depth, clamp(vec2<i32>(uv * dd), vec2<i32>(0), hi), 0);
+        let w = exp(-abs(dt - dc) * 300.0); // ~1 same surface, →0 across a depth edge
+        s += textureSample(src_tex, src_samp, uv) * w;
+        wsum += w;
+    }
+    return s / wsum;
 }
 
 // --- tonemap/resolve: HDR scene + bloom + a small uniform ---

@@ -51,6 +51,17 @@ struct VolumetricUniform {
     chroma: [f32; 4],
 }
 
+/// Temporal-accumulation uniform (mirrors `TemporalU` in vol_temporal.wgsl). Drives
+/// the EMA reproject-resolve that smooths the jittered half-res volumetric.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TemporalUniform {
+    cur_inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],    // xyz = eye, w = far distance
+    params: [f32; 4], // x = history opacity; yzw reserved
+}
+
 /// Froxel volumetric uniform (mirrors `Froxel` in froxel.wgsl / `FroxelU` in
 /// post.wgsl). `dims.w` = shared shadow layer; `planes` = near/far ray distance.
 #[repr(C)]
@@ -362,10 +373,33 @@ pub struct Renderer {
     volumetric_pipeline: wgpu::RenderPipeline,
     volumetric_layout: wgpu::BindGroupLayout,
     volumetric_uniform: wgpu::Buffer,
+
+    // Temporal accumulation (EMA) of the half-res volumetric — smooths the per-frame
+    // jittered raymarch into a stable, super-sampled beam (no banding/dither).
+    vol_temporal_layout: wgpu::BindGroupLayout,
+    vol_temporal_pipeline: wgpu::RenderPipeline,
+    temporal_uniform: wgpu::Buffer,
+    vol_linear_sampler: wgpu::Sampler,
+    /// Previous frame's camera view-proj (for reprojection) + the accumulation state.
+    prev_view_proj: glam::Mat4,
+    frame_index: u32,
+    /// How many consecutive static frames have accumulated (resets on motion); ramps
+    /// the history weight n/(n+1) up to a cap.
+    accum_frames: u32,
+    /// Hash of last frame's full beam + wheel state — ANY change (pan/tilt, colour,
+    /// dimmer, gobo/prism rotation, scroll) → drop history so moving beams don't ghost.
+    prev_beam_sig: u64,
+    /// Whether last frame actually wrote a valid EMA we can reproject from (false on
+    /// the first frame, after a resize, or a froxel-only frame with no hero raymarch).
+    ema_valid: bool,
+    /// Viewport size last frame; a change recreates the EMA targets (history reset).
+    prev_size: (u32, u32),
     fixtures_storage: GrowBuffer,
     /// Flattened per-fixture wheel chains (shared by the volumetric + mesh passes).
     wheels_storage: GrowBuffer,
     composite_pipeline: wgpu::RenderPipeline,
+    /// Layout for the depth-aware volumetric composite (vol + sampler + scene depth).
+    composite_upsample_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
     noise_texture: wgpu::Texture,
     noise_view: wgpu::TextureView,
@@ -617,6 +651,23 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let vol_temporal_layout = pipeline::vol_temporal_layout(&device);
+        let vol_temporal_pipeline = pipeline::vol_temporal_pipeline(&device, &vol_temporal_layout);
+        let temporal_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("temporal-uniform"),
+            size: std::mem::size_of::<TemporalUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let vol_linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("vol-linear-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let fixtures_storage = GrowBuffer::new(
             &device,
             "fixtures-gpu",
@@ -693,7 +744,8 @@ impl Renderer {
 
         // --- post (bloom + tonemap) ---
         let single_tex_layout = pipeline::single_tex_bind_group_layout(&device);
-        let composite_pipeline = pipeline::composite_pipeline(&device, &single_tex_layout);
+        let composite_upsample_layout = pipeline::composite_upsample_layout(&device);
+        let composite_pipeline = pipeline::composite_pipeline(&device, &composite_upsample_layout);
         let tonemap_layout = pipeline::tonemap_bind_group_layout(&device);
         let (bloom_bright, bloom_blur_h, bloom_blur_v) =
             pipeline::bloom_pipelines(&device, &single_tex_layout);
@@ -780,9 +832,20 @@ impl Renderer {
             volumetric_pipeline,
             volumetric_layout,
             volumetric_uniform,
+            vol_temporal_layout,
+            vol_temporal_pipeline,
+            temporal_uniform,
+            vol_linear_sampler,
+            prev_view_proj: glam::Mat4::IDENTITY,
+            frame_index: 0,
+            accum_frames: 0,
+            prev_beam_sig: 0,
+            ema_valid: false,
+            prev_size: (0, 0),
             fixtures_storage,
             wheels_storage,
             composite_pipeline,
+            composite_upsample_layout,
             ssao_pipeline,
             ssao_layout,
             ao_uniform,
@@ -1034,6 +1097,17 @@ impl Renderer {
         settings: &RenderSettings,
     ) -> (u32, u32, Vec<u8>) {
         let (width, height) = self.viewport.size;
+
+        // Warm up the temporal accumulation: a single headless frame would show the raw
+        // jittered (dithered) raymarch, so render several static frames first to let the
+        // EMA converge to the same smooth result the interactive viewport reaches.
+        for _ in 0..28 {
+            let mut warm = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("warm") });
+            self.record_scene(&mut warm, scene, camera, &Selection::default(), settings);
+            self.queue.submit(std::iter::once(warm.finish()));
+        }
 
         let mut encoder = self
             .device
@@ -1581,6 +1655,11 @@ impl Renderer {
         // --- volumetric uniforms + fixtures (use the first fog box, if any) ---
         let fog = scene.environments.first();
         let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
+        // Haze uniformity (1 smooth … 0 clustered). Drives the density-noise contrast
+        // AND the temporal history cap below: at low uniformity the user WANTS to see the
+        // moving smoke clusters, so we hold less history (let them live) instead of
+        // smearing them into a smooth average.
+        let fog_uniformity = fog.map(|f| f.uniformity).unwrap_or(1.0);
         // Hybrid froxel volumetric — opt-in (off by default; the per-pixel raymarch
         // is the default renderer). Enabled only when the adapter supports it and the
         // user turns it on (settings toggle), or PREVIZ_NOFROXEL is unset.
@@ -1884,8 +1963,14 @@ impl Renderer {
             } else {
                 gpu_fixtures.len().max(1)
             };
-            let budget = settings.steps.max(64) as f32 * 6.0;
-            let step_cap = (budget / march_beams as f32).clamp(64.0, 176.0);
+            // Temporal accumulation (vol_temporal.wgsl) averages MANY jittered frames,
+            // so the smooth STATIC look no longer depends on a high per-frame step count
+            // — that buys back the step budget (Wronski/Heckel: jitter+accumulation lets
+            // you march far fewer steps). Lowered floor 64→40 + multiplier 6→4: a few
+            // hero beams still get up to 176 (crisp while moving, before history builds),
+            // a busy rig floors at 40 (≈37% fewer rays) and converges smooth over frames.
+            let budget = settings.steps.max(40) as f32 * 4.0;
+            let step_cap = (budget / march_beams as f32).clamp(40.0, 176.0);
             let target_dt = (fog.max() - fog.min()).length() / step_cap;
             let vol = VolumetricUniform {
                 inv_view_proj: inv_vp.to_cols_array_2d(),
@@ -1908,7 +1993,15 @@ impl Renderer {
                 ],
                 // Same chroma read-up strength as the froxel pass (below) so the
                 // hybrid masses/heroes seam lifts saturated colours identically.
-                chroma: [settings.chroma_haze, 0.0, 0.0, 0.0],
+                // y = per-frame jitter phase (golden-ratio sequence). The temporal
+                // resolve averages these jittered frames, so the ray-start jitter is
+                // SAFE here (it converges instead of showing as dither).
+                chroma: [
+                    settings.chroma_haze,
+                    (self.frame_index as f32 * 0.61803398875).fract(),
+                    fog.uniformity, // z = haze uniformity (1 smooth … 0 clustered)
+                    fog.cluster_contrast, // w = cluster vs haze density contrast
+                ],
             };
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
@@ -2103,7 +2196,93 @@ impl Renderer {
             None
         };
 
-        let composite_bg = self.single_tex_bg(self.viewport.vol_view());
+        // --- temporal accumulation (EMA) state for the half-res volumetric ---
+        // The raymarch jitters per-frame; this resolve reprojects the previous EMA and
+        // blends it in, converging the jitter into a smooth beam. History weight ramps
+        // up while STATIC and drops when the camera or any beam moves (so moving beams
+        // don't ghost). Runs whenever the raymarch path renders fog.
+        let temporal_on = has_fog && settings.mode == ViewportMode::Beauty;
+        // The raymarch (and thus the temporal pass) actually runs unless we're in
+        // froxel-only mode with no hero beams (mirrors the pass gate below).
+        let raymarch_ran = temporal_on && (!use_froxel || n_shadows > 0);
+        let cur_view_proj = camera.view_proj(aspect);
+        let cur_ema = (self.frame_index & 1) as usize;
+        let prev_ema = cur_ema ^ 1;
+        if temporal_on {
+            // Hash the FULL per-beam + per-wheel GPU state (position, direction, colour,
+            // dimmer, gobo/prism/wheel rotation + scroll, CMY) so ANY in-beam motion —
+            // not just pan/tilt — invalidates history and avoids ghosting a moving look.
+            let mut sig: u64 = 0xcbf2_9ce4_8422_2325;
+            for &w in bytemuck::cast_slice::<FixtureGpu, u32>(&gpu_fixtures) {
+                sig = (sig ^ w as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            for &w in bytemuck::cast_slice::<WheelGpu, u32>(&gpu_wheels) {
+                sig = (sig ^ w as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            // History is trustworthy only if last frame wrote the EMA at this size.
+            let resized = self.viewport.size != self.prev_size;
+            let history_valid = self.ema_valid
+                && !resized
+                && self.frame_index != 0
+                && std::env::var("PREVIZ_NOTEMPORAL").is_err();
+            let moving = cur_view_proj != self.prev_view_proj || sig != self.prev_beam_sig;
+            if moving || !history_valid {
+                self.accum_frames = 0;
+            } else {
+                self.accum_frames = (self.accum_frames + 1).min(64);
+            }
+            // History cap scales with uniformity: smooth fog accumulates hard (0.92) for
+            // glass-smooth beams; clustered fog holds little (down to ~0.55) so the moving
+            // smoke pockets stay crisp and alive instead of averaging into a smear.
+            let hist_cap = 0.55 + 0.37 * fog_uniformity;
+            let opacity = if !history_valid {
+                0.0 // first frame / resize / froxel-skip → trust this frame fully
+            } else if moving {
+                (0.35_f32).min(hist_cap)
+            } else {
+                (self.accum_frames as f32 / (self.accum_frames as f32 + 1.0)).min(hist_cap)
+            };
+            let eye = camera.eye();
+            let tu = TemporalUniform {
+                cur_inv_view_proj: cur_view_proj.inverse().to_cols_array_2d(),
+                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                eye: [eye.x, eye.y, eye.z, 250.0],
+                params: [opacity, 0.0, 0.0, 0.0],
+            };
+            self.queue.write_buffer(&self.temporal_uniform, 0, bytemuck::bytes_of(&tu));
+            self.prev_beam_sig = sig;
+        }
+        let temporal_bg = if temporal_on {
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vol-temporal-bg"),
+                layout: &self.vol_temporal_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.temporal_uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(self.viewport.vol_view()) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(self.viewport.vol_ema_view(prev_ema)) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.vol_linear_sampler) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+                ],
+            }))
+        } else {
+            None
+        };
+        // The composite reads the temporally-resolved EMA when temporal ran, else the raw
+        // vol — plus the scene depth, for the depth-aware (edge-preserving) upsample.
+        let composite_src = if temporal_on {
+            self.viewport.vol_ema_view(cur_ema)
+        } else {
+            self.viewport.vol_view()
+        };
+        let composite_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite-bg"),
+            layout: &self.composite_upsample_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(composite_src) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+            ],
+        });
         let bright_bg = self.single_tex_bg(self.viewport.hdr_view());
         let blur_h_bg = self.single_tex_bg(self.viewport.bloom_view(0));
         let blur_v_bg = self.single_tex_bg(self.viewport.bloom_view(1));
@@ -2472,6 +2651,25 @@ impl Renderer {
                     pass.set_bind_group(0, &volumetric_bg, &[]);
                     pass.draw(0..3, 0..1);
                 }
+                // Temporal resolve: blend the raw raymarch (vol) with the reprojected
+                // previous EMA into vol_ema[cur]; the composite then reads that. This is
+                // what converges the per-frame jitter into a smooth, uniform beam.
+                if let Some(temporal_bg) = &temporal_bg {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("vol-temporal-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: self.viewport.vol_ema_view(cur_ema),
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.vol_temporal_pipeline);
+                    pass.set_bind_group(0, temporal_bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
                 // Composite (blend One/SrcAlpha) is configured on the pipeline.
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("composite-pass"),
@@ -2497,6 +2695,14 @@ impl Renderer {
         self.fullscreen(encoder, "bloom-blur-v", &self.bloom_blur_v, self.viewport.bloom_view(0), &blur_v_bg);
         // Pass 5: tonemap/resolve (HDR + bloom -> LDR, sRGB-encoded).
         self.fullscreen(encoder, "tonemap", &self.tonemap_pipeline, self.viewport.ldr_view(), &tonemap_bg);
+
+        // Advance temporal-accumulation state for next frame. `ema_valid` reflects
+        // whether the EMA was actually written this frame (so next frame knows whether
+        // its `prev_ema` target holds real history or stale/zeroed content).
+        self.prev_view_proj = cur_view_proj;
+        self.prev_size = self.viewport.size;
+        self.ema_valid = raymarch_ran;
+        self.frame_index = self.frame_index.wrapping_add(1);
     }
 
     fn single_tex_bg(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {

@@ -568,6 +568,42 @@ pub fn single_tex_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
     })
 }
 
+/// Volumetric composite upsample: the half-res vol texture (0) + filtering sampler (1)
+/// + the full-res scene depth (2) for the depth-aware (joint-bilateral) blend.
+pub fn composite_upsample_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite-upsample-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
 /// Two sampled textures + sampler + a small uniform (tonemap/resolve).
 pub fn tonemap_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let tex = |binding| wgpu::BindGroupLayoutEntry {
@@ -907,5 +943,68 @@ pub fn froxel_composite_pipeline(
         "fs_froxel_composite",
         Viewport::HDR_FORMAT,
         Some(blend),
+    )
+}
+
+// ---- temporal volumetric accumulation (EMA reproject resolve) ----
+
+/// Bind-group layout for the temporal volumetric resolve: TemporalU uniform,
+/// the raw raymarch (current), the previous accumulated EMA, a linear sampler,
+/// and the scene depth (for reprojection).
+pub fn vol_temporal_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let f = wgpu::ShaderStages::FRAGMENT;
+    let tex = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: f,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("vol-temporal-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: f,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            tex(1),
+            tex(2),
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: f,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: f,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+pub fn vol_temporal_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "vol_temporal.wgsl", include_str!("../shaders/vol_temporal.wgsl"));
+    // No blend: writes the accumulated result directly into the EMA target.
+    fullscreen_pipeline(
+        device, "vol-temporal", layout, &shader, "fs_main", Viewport::VOL_FORMAT, None,
     )
 }

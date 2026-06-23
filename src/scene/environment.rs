@@ -25,6 +25,15 @@ pub struct Environment {
     pub color: [f32; 3],
     /// Henyey-Greenstein anisotropy `g` in `-1..=1` (forward scattering > 0).
     pub anisotropy: f32,
+    /// Haze uniformity in `0..=1`: 1 = smooth even fog; 0 = strong clusters of
+    /// smoke/clouds (dense pockets scatter more → brighter wisps with clear gaps
+    /// between). Drives the density-noise contrast in volumetric.wgsl. (Serialized;
+    /// the .archie FORMAT was bumped to 5 when this was added.)
+    pub uniformity: f32,
+    /// Cluster contrast in `0..=1`: how much DENSER (brighter) the smoke clusters are
+    /// vs the surrounding haze, and how clear the gaps. Higher = pockets pop harder.
+    /// Only matters as `uniformity` drops below 1. (Serialized; .archie FORMAT 6.)
+    pub cluster_contrast: f32,
 }
 
 impl Environment {
@@ -41,6 +50,8 @@ impl Environment {
             density: profile.default_density,
             color: [0.7, 0.72, 0.78],
             anisotropy: 0.25,
+            uniformity: 0.6,
+            cluster_contrast: 0.0,
         }
     }
 

@@ -49,6 +49,10 @@ pub struct Viewport {
     ldr: Target,
     bloom: [Target; 2],
     vol: Target,
+    /// Ping-pong half-res targets holding the TEMPORALLY-ACCUMULATED (EMA) volumetric
+    /// — the raymarch writes `vol` (raw, jittered), the temporal resolve blends it with
+    /// the reprojected previous EMA into the current one, and the composite reads that.
+    vol_ema: [Target; 2],
     pub size: (u32, u32),
     /// The egui handle for the LDR target, stable across resizes.
     pub texture_id: TextureId,
@@ -69,7 +73,7 @@ impl Viewport {
         size: (u32, u32),
     ) -> Self {
         let size = clamp_size(size);
-        let (hdr, depth, ldr, bloom, vol) = Self::create_targets(device, size);
+        let (hdr, depth, ldr, bloom, vol, vol_ema) = Self::create_targets(device, size);
         let texture_id =
             egui_renderer.register_native_texture(device, &ldr.view, wgpu::FilterMode::Linear);
         Self {
@@ -78,6 +82,7 @@ impl Viewport {
             ldr,
             bloom,
             vol,
+            vol_ema,
             size,
             texture_id,
         }
@@ -94,12 +99,13 @@ impl Viewport {
         if size == self.size {
             return;
         }
-        let (hdr, depth, ldr, bloom, vol) = Self::create_targets(device, size);
+        let (hdr, depth, ldr, bloom, vol, vol_ema) = Self::create_targets(device, size);
         self.hdr = hdr;
         self.depth = depth;
         self.ldr = ldr;
         self.bloom = bloom;
         self.vol = vol;
+        self.vol_ema = vol_ema;
         self.size = size;
         egui_renderer.update_egui_texture_from_wgpu_texture(
             device,
@@ -127,6 +133,10 @@ impl Viewport {
     pub fn vol_view(&self) -> &wgpu::TextureView {
         &self.vol.view
     }
+    /// One of the two ping-pong temporally-accumulated volumetric targets.
+    pub fn vol_ema_view(&self, i: usize) -> &wgpu::TextureView {
+        &self.vol_ema[i & 1].view
+    }
 
     pub fn aspect(&self) -> f32 {
         self.size.0 as f32 / self.size.1.max(1) as f32
@@ -136,7 +146,7 @@ impl Viewport {
     fn create_targets(
         device: &wgpu::Device,
         size: (u32, u32),
-    ) -> (Target, Target, Target, [Target; 2], Target) {
+    ) -> (Target, Target, Target, [Target; 2], Target, [Target; 2]) {
         let attach_sample =
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
 
@@ -165,8 +175,12 @@ impl Viewport {
         // opaque depth over each ray's footprint so the beam still stops
         // cleanly at edges (no bleeding past the floor).
         let vol = Target::new(device, "viewport-vol", half, Self::VOL_FORMAT, attach_sample);
+        let vol_ema = [
+            Target::new(device, "viewport-vol-ema0", half, Self::VOL_FORMAT, attach_sample),
+            Target::new(device, "viewport-vol-ema1", half, Self::VOL_FORMAT, attach_sample),
+        ];
 
-        (hdr, depth, ldr, bloom, vol)
+        (hdr, depth, ldr, bloom, vol, vol_ema)
     }
 }
 
