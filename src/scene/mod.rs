@@ -5,10 +5,12 @@
 pub mod environment;
 pub mod fixture;
 pub mod library;
+pub mod screen;
 
 pub use environment::Environment;
 pub use fixture::Fixture;
-pub use library::{EnvironmentProfile, FixtureProfile, Library};
+pub use library::{EnvironmentProfile, FixtureProfile, Library, ScreenProfile};
+pub use screen::LedScreen;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -207,6 +209,8 @@ pub struct Selection {
     /// geometry clears fixtures/environment and vice-versa) so the Inspector and
     /// transform tools have a single, unambiguous target.
     pub geometry: Vec<usize>,
+    /// Selected LED-screen (Screens) indices; the first is the "primary".
+    pub screens: Vec<usize>,
     /// Selected environment volume, if any.
     pub environment: Option<usize>,
 }
@@ -214,17 +218,22 @@ pub struct Selection {
 impl Selection {
     /// Select a single fixture (clearing any other selection).
     pub fn fixture(i: usize) -> Self {
-        Self { fixtures: vec![i], geometry: Vec::new(), environment: None }
+        Self { fixtures: vec![i], geometry: Vec::new(), screens: Vec::new(), environment: None }
     }
 
     /// Select a single static-geometry object (clearing any other selection).
     pub fn geometry(i: usize) -> Self {
-        Self { fixtures: Vec::new(), geometry: vec![i], environment: None }
+        Self { fixtures: Vec::new(), geometry: vec![i], screens: Vec::new(), environment: None }
+    }
+
+    /// Select a single LED screen (clearing any other selection).
+    pub fn screen(i: usize) -> Self {
+        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: vec![i], environment: None }
     }
 
     /// Select a single environment.
     pub fn environment(i: usize) -> Self {
-        Self { fixtures: Vec::new(), geometry: Vec::new(), environment: Some(i) }
+        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: Vec::new(), environment: Some(i) }
     }
 
     pub fn contains_fixture(&self, i: usize) -> bool {
@@ -233,6 +242,10 @@ impl Selection {
 
     pub fn contains_geometry(&self, i: usize) -> bool {
         self.geometry.contains(&i)
+    }
+
+    pub fn contains_screen(&self, i: usize) -> bool {
+        self.screens.contains(&i)
     }
 
     /// The primary (first) selected fixture, if any.
@@ -245,10 +258,16 @@ impl Selection {
         self.geometry.first().copied()
     }
 
+    /// The primary (first) selected LED screen, if any.
+    pub fn primary_screen(&self) -> Option<usize> {
+        self.screens.first().copied()
+    }
+
     /// Toggle a fixture in/out of the selection (for ctrl/cmd-click multi-select).
     pub fn toggle_fixture(&mut self, i: usize) {
         self.environment = None;
         self.geometry.clear();
+        self.screens.clear();
         if let Some(p) = self.fixtures.iter().position(|&x| x == i) {
             self.fixtures.remove(p);
         } else {
@@ -260,6 +279,7 @@ impl Selection {
     pub fn toggle_geometry(&mut self, i: usize) {
         self.environment = None;
         self.fixtures.clear();
+        self.screens.clear();
         if let Some(p) = self.geometry.iter().position(|&x| x == i) {
             self.geometry.remove(p);
         } else {
@@ -267,10 +287,23 @@ impl Selection {
         }
     }
 
+    /// Toggle an LED screen in/out of the selection (ctrl/cmd-click).
+    pub fn toggle_screen(&mut self, i: usize) {
+        self.environment = None;
+        self.fixtures.clear();
+        self.geometry.clear();
+        if let Some(p) = self.screens.iter().position(|&x| x == i) {
+            self.screens.remove(p);
+        } else {
+            self.screens.push(i);
+        }
+    }
+
     /// Select an inclusive contiguous fixture range (shift-range select).
     pub fn set_fixture_range(&mut self, a: usize, b: usize) {
         self.environment = None;
         self.geometry.clear();
+        self.screens.clear();
         self.fixtures = (a.min(b)..=a.max(b)).collect();
     }
 }
@@ -347,6 +380,9 @@ pub struct Scene {
     pub world: World,
     /// Static imported geometry (stage, truss, set) — drawn but not a light.
     pub geometry: Vec<SceneGeometry>,
+    /// LED video walls / screens — drawn as emissive surfaces (a single content
+    /// texture each), contributing a cheap, blurred light to the scene/haze.
+    pub screens: Vec<LedScreen>,
     /// Retained MVR document data, present when the scene came from an MVR
     /// import, so it can be exported back out faithfully.
     pub mvr: Option<MvrSceneData>,
@@ -376,6 +412,7 @@ impl Scene {
             environments: vec![environment],
             world: World::default(),
             geometry: Vec::new(),
+            screens: Vec::new(),
             mvr: None,
         }
     }
@@ -451,6 +488,7 @@ impl Scene {
     pub fn import_mvr(&mut self, import: MvrImport) {
         self.fixtures.clear();
         self.geometry.clear();
+        self.screens.clear();
         for f in import.fixtures {
             self.fixtures.push(Fixture::from_mvr(f));
         }
@@ -472,6 +510,9 @@ impl Scene {
                 hidden: false,
             });
         }
+        for s in import.screens {
+            self.screens.push(s);
+        }
         self.mvr = Some(MvrSceneData {
             header: import.header,
             resources: import.resources,
@@ -489,6 +530,7 @@ impl Scene {
     pub fn scene_frame(&self) -> Option<(Vec3, f32)> {
         let mut pts = self.fixtures.iter().map(|f| f.position).collect::<Vec<_>>();
         pts.extend(self.geometry.iter().map(|g| g.transform.w_axis.truncate()));
+        pts.extend(self.screens.iter().map(|s| s.world_center()));
         let first = *pts.first()?;
         let (mut lo, mut hi) = (first, first);
         for p in &pts {
@@ -510,6 +552,22 @@ impl Scene {
         let name = format!("{} {}", gdtf.name, n);
         self.fixtures.push(Fixture::from_gdtf(gdtf, name, position));
         self.fixtures.len() - 1
+    }
+
+    /// Add an LED screen from a library component; returns its new index. The
+    /// wall stands upright at the back of the stage, facing +Z toward the
+    /// audience, lifted so its base sits on the floor.
+    pub fn add_screen(&mut self, profile: &ScreenProfile) -> usize {
+        let n = self.screens.len() + 1;
+        let name = format!("LED Wall {n}");
+        // A default 4×2 array; lift it so the bottom edge rests near the floor and
+        // push it a few metres upstage (−Z) of the origin.
+        let proto = LedScreen::from_profile(profile, name.clone(), Mat4::IDENTITY);
+        let [_, h] = proto.size_m();
+        let transform = Mat4::from_translation(Vec3::new(0.0, h * 0.5 + 0.2, -4.0));
+        let screen = LedScreen::from_profile(profile, name, transform);
+        self.screens.push(screen);
+        self.screens.len() - 1
     }
 
     /// Add an environment from a library profile; returns its new index.

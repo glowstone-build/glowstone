@@ -29,9 +29,10 @@ use winit::window::Window;
 
 use crate::optics;
 use crate::scene::library::FixtureGeometry;
+use crate::scene::screen::{LedScreen, ScreenContent};
 use crate::scene::{Fixture, RenderSettings, Scene, Selection, ViewportMode};
 use camera::{CameraUniform, OrbitCamera};
-use mesh::{GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance};
+use mesh::{GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance, WallInstance};
 use viewport::Viewport;
 
 /// Camera + scene data for the volumetric raymarch (mirrors `Volumetric` in
@@ -199,6 +200,78 @@ struct PostUniform {
     _pad: [f32; 2],
 }
 
+/// Per-screen GPU content (image / NDI / CITP / pixel-map), cached by screen
+/// index. Procedural walls (solid / test pattern) have no entry and bind the
+/// shared placeholder. `content_key` detects when to re-upload.
+struct ScreenRuntime {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    content_key: u64,
+    size: (u32, u32),
+    /// A small `SUMMARY_W × SUMMARY_H` per-region average of the content (linear
+    /// RGB, texture order: row 0 = top), driving the per-region area-light samples.
+    summary: Vec<[f32; 3]>,
+}
+
+const SUMMARY_W: usize = 8;
+const SUMMARY_H: usize = 4;
+
+/// Box-downsample an RGBA8 (sRGB) frame to a `SUMMARY_W × SUMMARY_H` grid of
+/// linear-RGB averages (row 0 = top) for the per-region area-light samples.
+fn summarize_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<[f32; 3]> {
+    let (w, h) = (w as usize, h as usize);
+    let mut out = vec![[0.0f32; 3]; SUMMARY_W * SUMMARY_H];
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return out;
+    }
+    let lin = |c: u8| {
+        let f = c as f32 / 255.0;
+        f * f // cheap sRGB → ~linear
+    };
+    for gy in 0..SUMMARY_H {
+        let y0 = gy * h / SUMMARY_H;
+        let y1 = (((gy + 1) * h / SUMMARY_H).max(y0 + 1)).min(h);
+        for gx in 0..SUMMARY_W {
+            let x0 = gx * w / SUMMARY_W;
+            let x1 = (((gx + 1) * w / SUMMARY_W).max(x0 + 1)).min(w);
+            let (mut r, mut g, mut b, mut n) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let sy = ((y1 - y0) / 4).max(1);
+            let sx = ((x1 - x0) / 4).max(1);
+            let mut yy = y0;
+            while yy < y1 {
+                let mut xx = x0;
+                while xx < x1 {
+                    let o = (yy * w + xx) * 4;
+                    r += lin(rgba[o]);
+                    g += lin(rgba[o + 1]);
+                    b += lin(rgba[o + 2]);
+                    n += 1.0;
+                    xx += sx;
+                }
+                yy += sy;
+            }
+            let inv = 1.0 / n.max(1.0);
+            out[gy * SUMMARY_W + gx] = [r * inv, g * inv, b * inv];
+        }
+    }
+    out
+}
+
+/// Linear-RGB content colour at surface UV `(u, v)` for the area-light samples:
+/// a live/decoded frame uses its downsampled summary; procedural content is
+/// evaluated directly.
+fn screen_light_color(s: &LedScreen, rt: Option<&ScreenRuntime>, u: f32, v: f32) -> [f32; 3] {
+    if let Some(rt) = rt
+        && rt.summary.len() == SUMMARY_W * SUMMARY_H
+    {
+        let gx = (u.clamp(0.0, 0.999) * SUMMARY_W as f32) as usize;
+        // Texture order has row 0 = top, but wall v = 0 is the bottom edge.
+        let gy = ((1.0 - v).clamp(0.0, 0.999) * SUMMARY_H as f32) as usize;
+        return rt.summary[gy * SUMMARY_W + gx];
+    }
+    s.sample_content(u, v)
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -214,6 +287,20 @@ pub struct Renderer {
     /// Wireframe variant of the mesh pipeline (None if the GPU lacks line polygon mode).
     mesh_wire_pipeline: Option<wgpu::RenderPipeline>,
     lens_pipeline: wgpu::RenderPipeline,
+    /// LED-wall surfaces (emissive textured quads; camera + content bind groups).
+    wall_pipeline: wgpu::RenderPipeline,
+    /// Transparent / mesh LED walls (premultiplied alpha, no depth write).
+    wall_alpha_pipeline: wgpu::RenderPipeline,
+    /// Bind-group layout for a wall's content texture (group 1).
+    wall_content_layout: wgpu::BindGroupLayout,
+    /// 1×1 placeholder content bound for procedural (solid/test-pattern) walls.
+    wall_placeholder_bg: wgpu::BindGroup,
+    #[allow(dead_code)]
+    wall_placeholder_tex: wgpu::Texture,
+    /// Sampler for wall content textures (linear, clamp).
+    content_sampler: wgpu::Sampler,
+    /// Per-screen content texture cache (image / live frames), keyed by screen index.
+    screen_runtime: HashMap<usize, ScreenRuntime>,
     light_layout: wgpu::BindGroupLayout,
 
     grid_mesh: GpuMesh,
@@ -221,10 +308,13 @@ pub struct Renderer {
     cylinder_mesh: GpuMesh,
     cone_mesh: GpuMesh,
     disc_mesh: GpuMesh,
+    /// Unit quad for LED-wall surfaces.
+    quad_mesh: GpuMesh,
 
     floor_instances: GrowBuffer,
     fixture_instances: GrowBuffer,
     lens_instances: GrowBuffer,
+    wall_instances: GrowBuffer,
     dynamic_lines: GrowBuffer,
 
     // Imported GDTF fixture models: per-fixture-type (Arc ptr) cache of part
@@ -427,6 +517,55 @@ impl Renderer {
         let mesh_wire_pipeline =
             wireframe_supported.then(|| pipeline::mesh_wire_pipeline(&device, &mesh_layout));
         let lens_pipeline = pipeline::lens_pipeline(&device, &line_layout);
+        // LED walls: camera (group 0) + a per-wall content texture (group 1).
+        let wall_content_layout = pipeline::single_tex_bind_group_layout(&device);
+        let wall_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("wall-pipeline-layout"),
+            bind_group_layouts: &[Some(&camera_bgl), Some(&wall_content_layout)],
+            immediate_size: 0,
+        });
+        let wall_pipeline = pipeline::wall_pipeline(&device, &wall_layout);
+        let wall_alpha_pipeline = pipeline::wall_alpha_pipeline(&device, &wall_layout);
+        let content_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("content-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // 1×1 white placeholder content (procedural walls ignore it in-shader).
+        let wall_placeholder_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("wall-placeholder"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &wall_placeholder_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let wall_placeholder_view = wall_placeholder_tex.create_view(&Default::default());
+        let wall_placeholder_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wall-placeholder-bg"),
+            layout: &wall_content_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&wall_placeholder_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&content_sampler) },
+            ],
+        });
         let sky_pipeline = pipeline::sky_pipeline(&device, &sky_layout);
 
         let world_tex = world::WorldTexture::placeholder(&device, &queue);
@@ -453,12 +592,15 @@ impl Renderer {
             &mesh::cone(0.45, 0.45 * 12.0_f32.to_radians().tan(), 28),
         );
         let disc_mesh = GpuMesh::new(&device, "lens-disc", &mesh::disc(48));
+        let quad_mesh = GpuMesh::new(&device, "led-wall-quad", &mesh::unit_quad(64, 24));
 
         let vertex = wgpu::BufferUsages::VERTEX;
         let inst = std::mem::size_of::<MeshInstance>() as u64;
         let floor_instances = GrowBuffer::new(&device, "floor-instances", vertex, inst);
         let fixture_instances = GrowBuffer::new(&device, "fixture-instances", vertex, inst * 64);
         let lens_instances = GrowBuffer::new(&device, "lens-instances", vertex, inst * 64);
+        let wall_inst = std::mem::size_of::<WallInstance>() as u64;
+        let wall_instances = GrowBuffer::new(&device, "wall-instances", vertex, wall_inst * 8);
         let dynamic_lines = GrowBuffer::new(&device, "dynamic-lines", vertex, 8192);
         let gdtf_instances = GrowBuffer::new(&device, "gdtf-instances", vertex, inst * 32);
         let scene_geom_instances =
@@ -601,15 +743,24 @@ impl Renderer {
             mesh_pipeline,
             mesh_wire_pipeline,
             lens_pipeline,
+            wall_pipeline,
+            wall_alpha_pipeline,
+            wall_content_layout,
+            wall_placeholder_bg,
+            wall_placeholder_tex,
+            content_sampler,
+            screen_runtime: HashMap::new(),
             light_layout,
             grid_mesh,
             floor_mesh,
             cylinder_mesh,
             cone_mesh,
             disc_mesh,
+            quad_mesh,
             floor_instances,
             fixture_instances,
             lens_instances,
+            wall_instances,
             dynamic_lines,
             gdtf_cache: HashMap::new(),
             gdtf_instances,
@@ -1086,6 +1237,105 @@ impl Renderer {
     /// Record the full offscreen 3D frame into `encoder`: forward scene ->
     /// volumetric beams -> bloom -> tonemap into the LDR target. Shared by
     /// [`render`](Self::render) and [`capture`](Self::capture).
+    /// Ensure screen `idx`'s content texture is current. Returns true if a real
+    /// content texture is bound (image / live frame), false for procedural walls
+    /// (solid / test pattern), which bind the placeholder instead.
+    fn ensure_screen_content(&mut self, idx: usize, s: &LedScreen) -> bool {
+        // A live frame (set by the app for pixel-map / NDI / CITP) wins; else
+        // decode an `Image`'s bytes once (cached by the Arc pointer).
+        if let Some(f) = &s.frame {
+            let key = (Arc::as_ptr(f) as usize as u64)
+                ^ f.generation.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.upload_screen_rgba(idx, key, f.width, f.height, &f.rgba);
+            return self.screen_runtime.contains_key(&idx);
+        }
+        if let ScreenContent::Image { bytes, .. } = &s.content {
+            let key = Arc::as_ptr(bytes) as usize as u64;
+            if self.screen_runtime.get(&idx).map(|r| r.content_key) != Some(key) {
+                match image::load_from_memory(bytes) {
+                    Ok(img) => {
+                        let rgba = img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        self.upload_screen_rgba(idx, key, w, h, &rgba);
+                    }
+                    Err(e) => {
+                        log::warn!("LED screen image decode failed: {e}");
+                        self.screen_runtime.remove(&idx);
+                    }
+                }
+            }
+            return self.screen_runtime.contains_key(&idx);
+        }
+        // Procedural (solid / test pattern): no content texture.
+        self.screen_runtime.remove(&idx);
+        false
+    }
+
+    /// Create-or-reuse screen `idx`'s content texture and upload `rgba` (tightly
+    /// packed RGBA8, `w*h*4` bytes) when the content key changes.
+    fn upload_screen_rgba(&mut self, idx: usize, key: u64, w: u32, h: u32, rgba: &[u8]) {
+        let w = w.max(1);
+        let h = h.max(1);
+        let expected = (w as usize) * (h as usize) * 4;
+        if rgba.len() < expected {
+            return; // malformed frame — keep whatever was there
+        }
+        let need_new = self.screen_runtime.get(&idx).map(|r| r.size != (w, h)).unwrap_or(true);
+        if need_new {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("screen-content"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("screen-content-bg"),
+                layout: &self.wall_content_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.content_sampler) },
+                ],
+            });
+            self.screen_runtime.insert(
+                idx,
+                ScreenRuntime {
+                    texture,
+                    bind_group,
+                    content_key: u64::MAX,
+                    size: (w, h),
+                    summary: Vec::new(),
+                },
+            );
+        }
+        let rt = self.screen_runtime.get_mut(&idx).unwrap();
+        // Always upload when the texture was just (re)created, even if `key` happens
+        // to collide with the `u64::MAX` force-upload sentinel.
+        if need_new || rt.content_key != key {
+            rt.summary = summarize_rgba(rgba, w, h);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &rt.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rgba[..expected],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            rt.content_key = key;
+        }
+    }
+
     fn record_scene(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1331,14 +1581,54 @@ impl Renderer {
         // --- volumetric uniforms + fixtures (use the first fog box, if any) ---
         let fog = scene.environments.first();
         let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
-        // Hybrid froxel volumetric — DEFAULT ON when the adapter supports it and the
-        // user hasn't disabled it (settings toggle, or PREVIZ_NOFROXEL to force the
-        // pure raymarch). The froxel carries the masses; the raymarch overlays the
-        // sharp hero beams.
+        // Hybrid froxel volumetric — opt-in (off by default; the per-pixel raymarch
+        // is the default renderer). Enabled only when the adapter supports it and the
+        // user turns it on (settings toggle), or PREVIZ_NOFROXEL is unset.
         let use_froxel = has_fog
             && self.froxel.is_some()
             && settings.froxel_volumetric
             && std::env::var("PREVIZ_NOFROXEL").is_err();
+
+        // --- LED-wall surfaces: prepare each wall's content texture (image / live
+        // frame), then build ONE emissive quad instance per visible screen (the
+        // whole wall, never per-pixel). `wall_draws[j]` = the screen index for
+        // instance j, so the forward pass can bind the right content texture. ---
+        self.screen_runtime.retain(|&k, _| k < scene.screens.len());
+        let mut wall_instances: Vec<WallInstance> = Vec::with_capacity(scene.screens.len());
+        // (screen index, is_transparent) per drawn wall instance.
+        let mut wall_draws: Vec<(usize, bool)> = Vec::new();
+        for (i, s) in scene.screens.iter().enumerate() {
+            if s.hidden {
+                continue;
+            }
+            let res = s.resolution();
+            let textured = self.ensure_screen_content(i, s);
+            let (kind, tp, solid) = if textured {
+                (2.0, 0.0, [0.0; 3]) // sample the content texture
+            } else {
+                match &s.content {
+                    ScreenContent::SolidColor(c) => (0.0, 0.0, *c),
+                    ScreenContent::TestPattern(p) => (1.0, p.code(), [0.0; 3]),
+                    // Live/image content with no frame yet → a "no signal" grid.
+                    _ => (1.0, 0.0, [0.0; 3]),
+                }
+            };
+            // nits → HDR scale (1500 nits ≈ reference white): white content sits
+            // near paper-white and only bright/over-driven walls bloom — a screen
+            // displays its content tones, it is not a beam.
+            let nits_scale = (s.nits / 1500.0).clamp(0.05, 6.0) * 1.25;
+            let seam = if s.gap_mm > 0.0 { 0.06 } else { 0.015 };
+            wall_instances.push(WallInstance {
+                model: s.surface_matrix().to_cols_array_2d(),
+                grid: [res[0] as f32, res[1] as f32, s.panels_wide as f32, s.panels_high as f32],
+                color: [solid[0], solid[1], solid[2], nits_scale],
+                look: [kind, tp, s.opacity, if selection.contains_screen(i) { 1.0 } else { 0.0 }],
+                extra: [s.gamma, seam, s.curvature_deg.to_radians(), s.pixel_shape.code()],
+            });
+            wall_draws.push((i, s.opacity < 0.99));
+        }
+        self.wall_instances.upload(&self.device, &self.queue, &wall_instances);
+
         // Resolve each fixture's optics → its GPU beams (per lit emitter, per
         // prism facet; uniform LED arrays collapse to one aggregate). The
         // shaders loop `arrayLength(&fixtures)`, so the expansion is
@@ -1499,6 +1789,66 @@ impl Renderer {
         if n_shadows > 0 || shared_layer >= 0 {
             self.queue
                 .write_buffer(&self.shadow.sample_matrices, 0, bytemuck::cast_slice(&sample_mats));
+        }
+
+        // --- LED walls as cheap, blurred area lights. One wide, soft "beam" per
+        // screen coloured by the wall's AVERAGE (summary) colour — the wall's
+        // entire contribution to surface lighting + volumetric haze, never
+        // per-pixel (docs/RESEARCH-led-ndi.md). Appended AFTER shadow selection so
+        // a wall never consumes a hero shadow map; the wide cone + plain sentinel
+        // keep it nearly free (the radial pre-cull rejects off-axis samples). ---
+        for (si, s) in scene.screens.iter().enumerate() {
+            if s.hidden || s.emit <= 0.0 {
+                continue;
+            }
+            let nits_gain = (s.nits / 1500.0).clamp(0.05, 6.0);
+            let total = s.emit * 0.45 * nits_gain;
+            let normal = s.world_normal();
+            if total <= 1e-4 || normal.length_squared() < 1e-6 {
+                continue;
+            }
+            let right = s.transform.x_axis.truncate().normalize_or_zero();
+            let up_axis = s.transform.y_axis.truncate().normalize_or_zero();
+            // Aim the wash forward AND slightly down so it lights the floor + haze
+            // IN FRONT of the wall (a flat normal alone never reaches the floor).
+            let dir = (normal - up_axis * 0.35).normalize_or_zero();
+            let up = right.cross(dir).normalize_or_zero();
+            let [w, h] = s.size_m();
+            let surf = s.surface_matrix();
+            // Sample a small grid of emitters ACROSS the screen face, each coloured
+            // by the content at that region — so a gradient/bars wall throws the
+            // RIGHT COLOURS into the haze and reads as a broad AREA source, not one
+            // point. More horizontal samples on wider walls. (`emit` scales it.)
+            // More, tighter emitters so each region's colour stays LOCALISED in
+            // front of it (wide overlapping cones would blend red+green+blue → white).
+            let aspect = (w / h.max(1e-3)).max(0.2);
+            let nx = ((aspect * 3.0).round() as i32).clamp(3, 10);
+            let ny: i32 = 2;
+            let per = total / (nx * ny) as f32;
+            let lens_r = (0.5 * w / nx as f32).clamp(0.15, 0.7);
+            // Narrow cone so adjacent colours don't all overlap into a white wash.
+            let tan_half = (1.4 * w / nx as f32 / (h * 2.0)).clamp(0.18, 0.45);
+            let range = (h * 2.0).max(4.0);
+            let rt = self.screen_runtime.get(&si);
+            for j in 0..ny {
+                for i in 0..nx {
+                    let u = (i as f32 + 0.5) / nx as f32;
+                    let v = (j as f32 + 0.5) / ny as f32;
+                    let c = screen_light_color(s, rt, u, v);
+                    let p = surf.transform_point3(Vec3::new(u - 0.5, v - 0.5, 0.0));
+                    gpu_fixtures.push(FixtureGpu {
+                        pos_range: [p.x, p.y, p.z, range],
+                        dir_cos: [dir.x, dir.y, dir.z, tan_half], // localized forward cone
+                        color: [c[0] * per, c[1] * per, c[2] * per, lens_r],
+                        cookie_r: [right.x, right.y, right.z, 0.0], // no wheel chain
+                        cookie_u: [up.x, up.y, up.z, 0.0],
+                        extra: [-1.0, 0.0, -1.0, 0.0], // no anim; plain; NO white wash
+                        shape: [1.0, 0.0, 1.0, 0.0],   // n_order, focus, IRIS OPEN, frost
+                        misc: [0.0, 0.0, 0.0, -1.0],   // no CA/laser/atlas; no shadow
+                        cmyf: [0.0, 0.0, 0.0, 1.2],    // wash → blurred
+                    });
+                }
+            }
         }
 
         self.fixtures_storage
@@ -1954,6 +2304,38 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.cone_mesh.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, self.gdtf_placeholder_instances.buffer.slice(..));
                 pass.draw(0..self.cone_mesh.vertex_count, 0..gdtf_placeholder_count);
+            }
+
+            // LED video-wall surfaces: one emissive quad per screen, each binding
+            // its own content texture (procedural walls bind the placeholder).
+            // Opaque walls draw first (REPLACE, write depth) so beams behind them
+            // are occluded; transparent / mesh walls draw after with premultiplied
+            // alpha + NO depth write, so the scene shows through their gaps.
+            if !wall_draws.is_empty() {
+                pass.set_vertex_buffer(0, self.quad_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.wall_instances.buffer.slice(..));
+                // Pass A: opaque walls (REPLACE, write depth).
+                pass.set_pipeline(&self.wall_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                for (j, &(si, transparent)) in wall_draws.iter().enumerate() {
+                    if transparent {
+                        continue;
+                    }
+                    let bg = self.screen_runtime.get(&si).map(|r| &r.bind_group).unwrap_or(&self.wall_placeholder_bg);
+                    pass.set_bind_group(1, bg, &[]);
+                    pass.draw(0..self.quad_mesh.vertex_count, j as u32..j as u32 + 1);
+                }
+                // Pass B: transparent / mesh walls (premultiplied alpha, no depth write).
+                pass.set_pipeline(&self.wall_alpha_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                for (j, &(si, transparent)) in wall_draws.iter().enumerate() {
+                    if !transparent {
+                        continue;
+                    }
+                    let bg = self.screen_runtime.get(&si).map(|r| &r.bind_group).unwrap_or(&self.wall_placeholder_bg);
+                    pass.set_bind_group(1, bg, &[]);
+                    pass.draw(0..self.quad_mesh.vertex_count, j as u32..j as u32 + 1);
+                }
             }
 
             // Glass/dust front lenses (one disc per fixture, camera-only pipeline).

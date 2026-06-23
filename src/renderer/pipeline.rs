@@ -4,7 +4,7 @@
 //! **HDR** [`Viewport`] target. The post pipelines (volumetric raymarch, bloom,
 //! tonemap) are fullscreen passes that consume/produce those targets.
 
-use super::mesh::{LensInstance, LineVertex, MeshInstance, MeshVertex};
+use super::mesh::{LensInstance, LineVertex, MeshInstance, MeshVertex, WallInstance};
 use super::viewport::Viewport;
 
 fn load(device: &wgpu::Device, label: &str, source: &'static str) -> wgpu::ShaderModule {
@@ -116,6 +116,93 @@ pub fn lens_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
             entry_point: Some("fs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Pipeline for LED-wall surfaces: an instanced unit quad (camera-only bind
+/// group, like the lens pipeline) that writes emissive HDR colour with a
+/// distance-aware LED pixel mask. No backface cull (read from either side).
+pub fn wall_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let shader = load(device, "wall.wgsl", include_str!("../shaders/wall.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wall-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), WallInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Transparent / see-through LED walls: same as [`wall_pipeline`] but with
+/// PREMULTIPLIED-alpha blending (`One` / `OneMinusSrcAlpha`) and **no depth
+/// write** (depth-test still on), drawn after the opaque scene so it shows
+/// through the gaps between lit LEDs.
+pub fn wall_alpha_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let shader = load(device, "wall.wgsl", include_str!("../shaders/wall.wgsl"));
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wall-alpha-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), WallInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: Viewport::DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: Viewport::HDR_FORMAT,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
         }),
         multiview_mask: None,
         cache: None,

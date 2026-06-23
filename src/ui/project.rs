@@ -28,7 +28,9 @@ use crate::scene::{RenderSettings, Scene};
 const MAGIC: &[u8] = b"ARCHIE\0";
 /// On-disk format version. Bumped on an incompatible layout change.
 /// v2: `mvr::GeometryModel` gained a per-`<Geometry3D>` `matrix` field.
-pub const FORMAT: u32 = 2;
+/// v3: `Scene` gained `screens: Vec<LedScreen>` (LED walls).
+/// v4: `LedScreen` gained content sources (Image/NDI/CITP/PixelMap) + `pixel_shape`.
+pub const FORMAT: u32 = 4;
 /// The project file extension (no dot).
 pub const EXT: &str = "archie";
 

@@ -16,6 +16,7 @@ use crate::gdtf::{GdtfFixture, WheelKind};
 use crate::optics::{self, OpticField, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
+use crate::scene::screen::{LedScreen, PixelShape, ScreenContent, TestPattern};
 use crate::scene::{apply_fixture_click, Fixture, Library, RenderSettings, Scene, Selection, ViewportMode};
 
 /// Universe is considered live if it updated within this window.
@@ -23,6 +24,18 @@ const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// Left tab: the scene outliner — every fixture and environment, selectable —
 /// plus the global view/look controls.
+/// Discovered live video sources for the LED-screen content pickers, refreshed
+/// by the app each frame from the NDI + CITP clients.
+#[derive(Default, Clone)]
+pub struct ScreenSources {
+    /// NDI source names (empty unless built with the `ndi` feature + a runtime).
+    pub ndi: Vec<String>,
+    /// Whether NDI receive is compiled in AND a runtime is present.
+    pub ndi_available: bool,
+    /// Discovered CITP media-server names.
+    pub citp: Vec<String>,
+}
+
 /// How the Scene panel's fixture list is ordered.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SceneSort {
@@ -105,7 +118,7 @@ pub fn scene_outliner(
     ui.horizontal(|ui| {
         ui.heading("Scene");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let n = selection.fixtures.len() + selection.geometry.len();
+            let n = selection.fixtures.len() + selection.geometry.len() + selection.screens.len();
             if n > 0 {
                 ui.label(RichText::new(format!("{n} selected")).small().color(accent));
             }
@@ -198,6 +211,67 @@ pub fn scene_outliner(
                 selection.toggle_geometry(i);
             } else {
                 *selection = Selection::geometry(i);
+            }
+            *anchor = None;
+        }
+    });
+
+    // ---- SCREENS: LED video walls (emissive surfaces) ----
+    folder_header(icon::SCREEN, "Screens", scene.screens.len(), false, &ink).show(ui, |ui| {
+        if scene.screens.is_empty() {
+            ui.label(RichText::new("none — add an LED Wall from the Library").weak().small());
+            return;
+        }
+        let order: Vec<usize> =
+            (0..scene.screens.len()).filter(|&i| matches(&scene.screens[i].name)).collect();
+        if order.is_empty() {
+            ui.label(RichText::new("no match").weak().small());
+            return;
+        }
+        let mut click: Option<(usize, bool)> = None;
+        let mut vis: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("scene-screens")
+            .max_height(200.0)
+            .auto_shrink([false, true])
+            .show_rows(ui, ROW_H, order.len(), |ui, range| {
+                for di in range {
+                    let i = order[di];
+                    let s = &scene.screens[i];
+                    let [rx, ry] = s.resolution();
+                    let sub = format!("{rx}×{ry} · {}", s.content.label());
+                    let row = entity_row(
+                        ui,
+                        icon::SCREEN,
+                        &s.name,
+                        &sub,
+                        "",
+                        false,
+                        selection.contains_screen(i),
+                        selection.primary_screen() == Some(i),
+                        s.hidden,
+                        true,
+                        &ink,
+                        accent,
+                    );
+                    if row.eye_clicked {
+                        vis = Some(i);
+                    } else if row.body.clicked() {
+                        let m = ui.input(|x| x.modifiers);
+                        click = Some((i, m.command || m.ctrl));
+                    }
+                }
+            });
+        if let Some(i) = vis {
+            if let Some(s) = scene.screens.get_mut(i) {
+                s.hidden = !s.hidden;
+            }
+        }
+        if let Some((i, toggle)) = click {
+            if toggle {
+                selection.toggle_screen(i);
+            } else {
+                *selection = Selection::screen(i);
             }
             *anchor = None;
         }
@@ -508,6 +582,7 @@ enum LibKind {
     Gdtf(usize),
     Fixture(usize),
     Env(usize),
+    Screen(usize),
 }
 
 struct LibRow {
@@ -556,6 +631,20 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             accent: false,
         });
     }
+    for (i, p) in library.screens.iter().enumerate() {
+        let pitch = p.cabinet_mm[0] / p.cabinet_px[0].max(1) as f32;
+        rows.push(LibRow {
+            kind: LibKind::Screen(i),
+            icon: icon::SCREEN,
+            name: p.name.to_string(),
+            meta: format!(
+                "{:.1}mm · {:.0}×{:.0}mm{}",
+                pitch, p.cabinet_mm[0], p.cabinet_mm[1], if p.transparent { " · mesh" } else { "" }
+            ),
+            category: p.category.to_string(),
+            accent: p.transparent,
+        });
+    }
     rows
 }
 
@@ -568,6 +657,7 @@ fn add_library_row(row: &LibRow, library: &Library, scene: &mut Scene) -> Select
         }
         LibKind::Fixture(i) => Selection::fixture(scene.add_fixture(&library.fixtures[i])),
         LibKind::Env(i) => Selection::environment(scene.add_environment(&library.environments[i])),
+        LibKind::Screen(i) => Selection::screen(scene.add_screen(&library.screens[i])),
     }
 }
 
@@ -930,6 +1020,7 @@ fn library_row_widget(
 
 /// Right tab: editable parameters for the current selection. Edits flow
 /// straight into the scene, so the viewport updates on the next frame.
+#[allow(clippy::too_many_arguments)]
 pub fn inspector(
     ui: &mut egui::Ui,
     scene: &mut Scene,
@@ -937,6 +1028,7 @@ pub fn inspector(
     patch: &mut PatchTable,
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
     profile: &mut Option<ProfileEditor>,
+    sources: &ScreenSources,
 ) {
     ui.heading("Inspector");
     ui.separator();
@@ -955,6 +1047,13 @@ pub fn inspector(
     let geo: Vec<usize> = selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
     if !geo.is_empty() {
         geometry_inspector(ui, scene, &geo);
+        return;
+    }
+
+    // LED screens take the Inspector when selected.
+    let scr: Vec<usize> = selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+    if let Some(&primary) = scr.first() {
+        led_screen_inspector(ui, &mut scene.screens[primary], scr.len(), sources);
         return;
     }
 
@@ -1399,6 +1498,337 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
         // (possibly non-uniform) basis intact.
         g.transform.w_axis = pos.extend(1.0);
     }
+}
+
+/// Inspector for a selected LED screen: identity, transform, the parametric
+/// cabinet grid (with a live derived-resolution readout), surface photometry,
+/// and the content source. Phase 1 covers Test Pattern + Solid Colour content;
+/// the cabinet is editable directly (the panel TYPE is set from the Library).
+fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sources: &ScreenSources) {
+    ui.heading(s.name.as_str());
+    let [rx, ry] = s.resolution();
+    let [mw, mh] = s.size_m();
+    ui.label(
+        RichText::new(format!("{} · {} × {} px · {:.2} × {:.2} m", s.panel_type, rx, ry, mw, mh))
+            .weak()
+            .small(),
+    );
+    if count > 1 {
+        ui.label(RichText::new(format!("{count} screens — editing the active one")).weak().small());
+    }
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        let mut visible = !s.hidden;
+        if ui.checkbox(&mut visible, "Visible").changed() {
+            s.hidden = !visible;
+        }
+    });
+
+    // --- Transform (position / rotation / uniform scale, lossless like geometry) ---
+    let (scale0, rot0, _t0) = s.transform.to_scale_rotation_translation();
+    let mut pos = s.transform.w_axis.truncate();
+    let mut uscale = ((scale0.x + scale0.y + scale0.z) / 3.0).max(1e-3);
+    let (ryr, rxr, rzr) = rot0.to_euler(glam::EulerRot::YXZ);
+    let (mut ey, mut ex, mut ez) = (ryr.to_degrees(), rxr.to_degrees(), rzr.to_degrees());
+    let mut pos_changed = false;
+    let mut rs_changed = false;
+    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("led-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
+                    pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
+                    pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                });
+                ui.end_row();
+                ui.label("Rotation");
+                ui.horizontal(|ui| {
+                    rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                    rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                    rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                });
+                ui.end_row();
+                ui.label("Scale");
+                rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
+                ui.end_row();
+            });
+        });
+    if rs_changed {
+        let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
+        s.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
+    } else if pos_changed {
+        s.transform.w_axis = pos.extend(1.0);
+    }
+
+    // --- Panel: one cabinet's size + native pixels (pitch is derived) ---
+    egui::CollapsingHeader::new(format!("{}  Panel", theme::icon::SCREEN))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("led-panel").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Cabinet (mm)");
+                ui.horizontal(|ui| {
+                    ui.add(DragValue::new(&mut s.cabinet_mm[0]).speed(1.0).range(50.0..=2000.0).prefix("w "));
+                    ui.add(DragValue::new(&mut s.cabinet_mm[1]).speed(1.0).range(50.0..=2000.0).prefix("h "));
+                });
+                ui.end_row();
+                ui.label("Pixels / cabinet");
+                ui.horizontal(|ui| {
+                    let mut px = s.cabinet_px[0] as i32;
+                    let mut py = s.cabinet_px[1] as i32;
+                    if ui.add(DragValue::new(&mut px).speed(1.0).range(8..=1024).prefix("x ")).changed() {
+                        s.cabinet_px[0] = px.max(1) as u32;
+                    }
+                    if ui.add(DragValue::new(&mut py).speed(1.0).range(8..=1024).prefix("y ")).changed() {
+                        s.cabinet_px[1] = py.max(1) as u32;
+                    }
+                });
+                ui.end_row();
+                ui.label("Pitch");
+                ui.label(RichText::new(format!("{:.2} mm", s.pitch_mm())).weak());
+                ui.end_row();
+            });
+        });
+
+    // --- Array: panels wide × high → live derived total resolution + size ---
+    egui::CollapsingHeader::new(format!("{}  Array", theme::icon::PATCH))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("led-array").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Panels");
+                ui.horizontal(|ui| {
+                    let mut w = s.panels_wide as i32;
+                    let mut h = s.panels_high as i32;
+                    if ui.add(DragValue::new(&mut w).speed(0.1).range(1..=64).prefix("w ")).changed() {
+                        s.panels_wide = w.max(1) as u32;
+                    }
+                    if ui.add(DragValue::new(&mut h).speed(0.1).range(1..=64).prefix("h ")).changed() {
+                        s.panels_high = h.max(1) as u32;
+                    }
+                });
+                ui.end_row();
+                ui.label("Gap");
+                ui.add(DragValue::new(&mut s.gap_mm).speed(0.1).range(0.0..=50.0).suffix(" mm"));
+                ui.end_row();
+            });
+            let [rx, ry] = s.resolution();
+            let [mw, mh] = s.size_m();
+            let mpx = (rx as f64 * ry as f64) / 1_000_000.0;
+            ui.label(
+                RichText::new(format!("{rx} × {ry} px  ·  {mpx:.2} Mpx  ·  {mw:.2} × {mh:.2} m"))
+                    .strong()
+                    .small(),
+            );
+        });
+
+    // --- Surface: photometry + transparency + curvature ---
+    egui::CollapsingHeader::new(format!("{}  Surface", theme::icon::COLOR))
+        .default_open(true)
+        .show(ui, |ui| {
+            Grid::new("led-surface").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                ui.label("Brightness");
+                ui.add(DragValue::new(&mut s.nits).speed(10.0).range(50.0..=8000.0).suffix(" nits"));
+                ui.end_row();
+                ui.label("Light emit");
+                ui.add(DragValue::new(&mut s.emit).speed(0.02).range(0.0..=4.0))
+                    .on_hover_text("How much the wall lights the scene + haze (0 = none)");
+                ui.end_row();
+                ui.label("Gamma");
+                ui.add(DragValue::new(&mut s.gamma).speed(0.01).range(1.0..=3.0));
+                ui.end_row();
+                ui.label("Transparency");
+                let mut transp = 1.0 - s.opacity;
+                if ui.add(Slider::new(&mut transp, 0.0..=1.0)).on_hover_text("See-through / mesh LED").changed() {
+                    s.opacity = (1.0 - transp).clamp(0.0, 1.0);
+                }
+                ui.end_row();
+                ui.label("Curvature");
+                ui.add(DragValue::new(&mut s.curvature_deg).speed(0.5).range(-60.0..=60.0).suffix("°"))
+                    .on_hover_text("Horizontal arc subtended across the wall");
+                ui.end_row();
+                ui.label("Pixel");
+                egui::ComboBox::from_id_salt("led-pixel-shape")
+                    .selected_text(s.pixel_shape.label())
+                    .show_ui(ui, |ui| {
+                        for sh in PixelShape::ALL {
+                            ui.selectable_value(&mut s.pixel_shape, sh, sh.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("LED package shape seen up close (SMD round/square, or discrete RGB sub-pixels)");
+                ui.end_row();
+            });
+        });
+
+    // --- Content: the source shown on the surface ---
+    egui::CollapsingHeader::new(format!("{}  Content", theme::icon::IMAGE))
+        .default_open(true)
+        .show(ui, |ui| {
+            #[derive(PartialEq, Clone, Copy)]
+            enum Kind {
+                Test,
+                Solid,
+                Image,
+                Ndi,
+                Citp,
+                Dmx,
+            }
+            let cur = match &s.content {
+                ScreenContent::TestPattern(_) => Kind::Test,
+                ScreenContent::SolidColor(_) => Kind::Solid,
+                ScreenContent::Image { .. } => Kind::Image,
+                ScreenContent::Ndi { .. } => Kind::Ndi,
+                ScreenContent::Citp { .. } => Kind::Citp,
+                ScreenContent::PixelMapDmx(_) => Kind::Dmx,
+            };
+            let mut sel = cur;
+            ui.horizontal(|ui| {
+                ui.label("Source");
+                egui::ComboBox::from_id_salt("led-source").selected_text(s.content.label()).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut sel, Kind::Test, "Test Pattern");
+                    ui.selectable_value(&mut sel, Kind::Solid, "Solid Colour");
+                    ui.selectable_value(&mut sel, Kind::Image, "Image…");
+                    ui.selectable_value(&mut sel, Kind::Ndi, "NDI");
+                    ui.selectable_value(&mut sel, Kind::Citp, "CITP");
+                    ui.selectable_value(&mut sel, Kind::Dmx, "Pixel-map DMX");
+                });
+            });
+            if sel != cur {
+                s.frame = None; // drop any live frame from the previous source
+                s.content = match sel {
+                    Kind::Test => ScreenContent::TestPattern(TestPattern::Grid),
+                    Kind::Solid => ScreenContent::SolidColor([0.1, 0.4, 0.9]),
+                    Kind::Image => {
+                        ScreenContent::Image { name: String::new(), bytes: std::sync::Arc::new(Vec::new()) }
+                    }
+                    Kind::Ndi => ScreenContent::Ndi { source: String::new() },
+                    Kind::Citp => ScreenContent::Citp { source: String::new() },
+                    Kind::Dmx => ScreenContent::PixelMapDmx(crate::scene::screen::PixelMap::default()),
+                };
+            }
+            ui.add_space(2.0);
+            match &mut s.content {
+                ScreenContent::TestPattern(tp) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Pattern");
+                        for p in TestPattern::ALL {
+                            ui.selectable_value(tp, p, p.label());
+                        }
+                    });
+                }
+                ScreenContent::SolidColor(c) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Colour");
+                        ui.color_edit_button_rgb(c);
+                    });
+                }
+                ScreenContent::Image { name, bytes } => {
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose image…").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tga", "exr", "hdr"])
+                                .pick_file()
+                        {
+                            match std::fs::read(&path) {
+                                Ok(b) => {
+                                    *bytes = std::sync::Arc::new(b);
+                                    *name = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("image")
+                                        .to_string();
+                                }
+                                Err(e) => log::error!("read screen image: {e}"),
+                            }
+                        }
+                        let label = if name.is_empty() { "no image".to_string() } else { name.clone() };
+                        ui.label(RichText::new(label).weak());
+                    });
+                }
+                ScreenContent::Ndi { source } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Source");
+                        ui.text_edit_singleline(source);
+                    });
+                    if !sources.ndi.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Discovered:").weak().small());
+                            for name in &sources.ndi {
+                                if ui.small_button(name).clicked() {
+                                    *source = name.clone();
+                                }
+                            }
+                        });
+                    }
+                    let hint = if sources.ndi_available {
+                        "NDI source name (e.g. \"HOST (Output 1)\"). Pick a discovered source above."
+                    } else {
+                        "NDI runtime not available (build with `--features ndi` + install the NDI runtime)."
+                    };
+                    ui.label(RichText::new(hint).weak().small());
+                }
+                ScreenContent::Citp { source } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Source");
+                        ui.text_edit_singleline(source);
+                    });
+                    if !sources.citp.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Servers:").weak().small());
+                            for name in &sources.citp {
+                                if ui.small_button(name).clicked() {
+                                    *source = name.clone();
+                                }
+                            }
+                        });
+                    }
+                    ui.label(
+                        RichText::new("CITP/MSEX media-server stream as \"server | layer\" (servers auto-discovered on the LAN).")
+                            .weak()
+                            .small(),
+                    );
+                }
+                ScreenContent::PixelMapDmx(pm) => {
+                    Grid::new("led-pixelmap").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                        ui.label("Grid");
+                        ui.horizontal(|ui| {
+                            let mut c = pm.cols as i32;
+                            let mut r = pm.rows as i32;
+                            if ui.add(DragValue::new(&mut c).speed(0.1).range(1..=64).prefix("cols ")).changed() {
+                                pm.cols = c.max(1) as u32;
+                            }
+                            if ui.add(DragValue::new(&mut r).speed(0.1).range(1..=64).prefix("rows ")).changed() {
+                                pm.rows = r.max(1) as u32;
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Patch");
+                        ui.horizontal(|ui| {
+                            let mut u = pm.universe as i32;
+                            let mut a = pm.start_address as i32;
+                            if ui.add(DragValue::new(&mut u).speed(0.1).range(0..=63999).prefix("univ ")).changed() {
+                                pm.universe = u.clamp(0, 63999) as u16;
+                            }
+                            if ui.add(DragValue::new(&mut a).speed(0.5).range(1..=512).prefix("addr ")).changed() {
+                                pm.start_address = a.clamp(1, 512) as u16;
+                            }
+                        });
+                        ui.end_row();
+                    });
+                    let chans = pm.cols * pm.rows * 3;
+                    ui.label(
+                        RichText::new(format!(
+                            "{}×{} cells · {chans} ch (RGB) · low-res only — use NDI/CITP/media for hi-res",
+                            pm.cols, pm.rows
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            }
+        });
 }
 
 /// Inspector for an imported GDTF fixture: identity + thumbnail, editable
@@ -2093,6 +2523,14 @@ pub fn viewport(
                 }
                 *scene_anchor = None;
             }
+            Some(Hit::Screen(i)) => {
+                if toggle {
+                    selection.toggle_screen(i);
+                } else {
+                    *selection = Selection::screen(i);
+                }
+                *scene_anchor = None;
+            }
             Some(Hit::Environment(i)) => *selection = Selection::environment(i),
             None if !(toggle || m.shift) => *selection = Selection::default(),
             None => {}
@@ -2116,6 +2554,10 @@ pub fn viewport(
                 }
                 Some(Hit::Geometry(i)) if !selection.contains_geometry(i) => {
                     *selection = Selection::geometry(i);
+                    *scene_anchor = None;
+                }
+                Some(Hit::Screen(i)) if !selection.contains_screen(i) => {
+                    *selection = Selection::screen(i);
                     *scene_anchor = None;
                 }
                 _ => {}
@@ -2145,6 +2587,45 @@ pub fn viewport(
                     for &i in &selection.geometry {
                         if let Some(g) = scene.geometry.get_mut(i) {
                             g.hidden = true;
+                        }
+                    }
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Deselect").clicked() {
+                    *selection = Selection::default();
+                    ui.close();
+                }
+                if ui
+                    .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
+                    .clicked()
+                {
+                    *delete_requested = true;
+                    ui.close();
+                }
+            } else if !selection.screens.is_empty() {
+                // LED-screen selection menu.
+                let n = selection.screens.len();
+                ui.label(egui::RichText::new(format!("{n} screen{}", if n == 1 { "" } else { "s" })).small().weak());
+                if ui.button(format!("{}  Frame selection", theme::icon::FRAME)).clicked() {
+                    let mut lo = Vec3::splat(f32::INFINITY);
+                    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                    for &i in &selection.screens {
+                        if let Some(s) = scene.screens.get(i) {
+                            let (l, h) = s.world_bounds();
+                            lo = lo.min(l);
+                            hi = hi.max(h);
+                        }
+                    }
+                    if lo.is_finite() {
+                        camera.frame_aabb(lo, hi);
+                    }
+                    ui.close();
+                }
+                if ui.button(format!("{}  Hide", theme::icon::EYE_OFF)).clicked() {
+                    for &i in &selection.screens {
+                        if let Some(s) = scene.screens.get_mut(i) {
+                            s.hidden = true;
                         }
                     }
                     ui.close();
@@ -2255,6 +2736,11 @@ pub fn viewport(
         let extra = selection.geometry.len().saturating_sub(1);
         selection.primary_geometry().and_then(|i| scene.geometry.get(i)).map(|g| {
             if extra > 0 { format!("{}  +{extra}", g.name) } else { g.name.clone() }
+        })
+    } else if !selection.screens.is_empty() {
+        let extra = selection.screens.len().saturating_sub(1);
+        selection.primary_screen().and_then(|i| scene.screens.get(i)).map(|s| {
+            if extra > 0 { format!("{}  +{extra}", s.name) } else { s.name.clone() }
         })
     } else if !selection.fixtures.is_empty() {
         let extra = selection.fixtures.len().saturating_sub(1);
@@ -3060,6 +3546,7 @@ fn format_universes(us: &[u16]) -> String {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Hit {
     Fixture(usize),
+    Screen(usize),
     Geometry(usize),
     Environment(usize),
 }
@@ -3082,6 +3569,21 @@ fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
     }
     if let Some((_, i)) = best {
         return Some(Hit::Fixture(i));
+    }
+    // LED screens: ray vs each oriented surface quad (cheaper + tighter than an AABB).
+    let mut scr: Option<(f32, usize)> = None;
+    for (i, s) in scene.screens.iter().enumerate() {
+        if s.hidden {
+            continue;
+        }
+        if let Some(t) = s.ray_hit(ro, rd)
+            && scr.is_none_or(|(bt, _)| t < bt)
+        {
+            scr = Some((t, i));
+        }
+    }
+    if let Some((_, i)) = scr {
+        return Some(Hit::Screen(i));
     }
     // Static geometry: ray vs each object's world-space AABB.
     let mut geo: Option<(f32, usize)> = None;
