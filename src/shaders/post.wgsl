@@ -75,20 +75,38 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     let dd = vec2<f32>(textureDimensions(comp_depth));
     let hi = vec2<i32>(dd) - vec2<i32>(1);
     let dc = textureLoad(comp_depth, clamp(vec2<i32>(in.uv * dd), vec2<i32>(0), hi), 0);
-    var s = textureSample(src_tex, src_samp, in.uv) * 12.0;
-    var wsum = 12.0;
-    let offs = array<vec2<f32>, 4>(
-        vec2<f32>(t.x, 0.0), vec2<f32>(-t.x, 0.0),
-        vec2<f32>(0.0, t.y), vec2<f32>(0.0, -t.y),
-    );
-    for (var i = 0; i < 4; i = i + 1) {
-        let uv = in.uv + offs[i];
-        let dt = textureLoad(comp_depth, clamp(vec2<i32>(uv * dd), vec2<i32>(0), hi), 0);
-        let w = exp(-abs(dt - dc) * 300.0); // ~1 same surface, →0 across a depth edge
-        s += textureSample(src_tex, src_samp, uv) * w;
-        wsum += w;
+    let c = textureSample(src_tex, src_samp, in.uv);
+    // DESPECKLE+upsample of the half-res volumetric. The per-pixel blue-noise jitter, on
+    // thin/oblique beams the ray grazes, makes each pixel a HIGH-CONTRAST outlier (it hits
+    // the shaft vs misses it → bright-dot/dark-gap) — so a range/bilateral guard FAILS (it
+    // can't tell that grain from a real edge; both jump by ~the beam brightness). Instead
+    // detect grain GEOMETRICALLY: build a depth-weighted neighbourhood MEAN (depth weight →
+    // never average across a geometry silhouette, so no halo past occluders) and pull each
+    // pixel toward it PROPORTIONAL to how far it sits from that mean. Grain makes every
+    // pixel an alternating outlier → it collapses to the local mean. A smooth broad beam or
+    // gradual haze cluster has center ≈ mean → left UNCHANGED (the "nearly perfect" look is
+    // preserved); only speckle and hard edges soften — the thin-beam case asked to approximate.
+    // 5×5 depth-weighted neighbourhood mean (a single 3×3 only cuts grain ~3× — the
+    // half-res FBM speckle needs a wider support to collapse).
+    var m = c;
+    var wsum = 1.0;
+    for (var dy = -2; dy <= 2; dy = dy + 1) {
+        for (var dx = -2; dx <= 2; dx = dx + 1) {
+            if (dx == 0 && dy == 0) { continue; }
+            let uv = in.uv + vec2<f32>(f32(dx) * t.x, f32(dy) * t.y);
+            let dt = textureLoad(comp_depth, clamp(vec2<i32>(uv * dd), vec2<i32>(0), hi), 0);
+            let w = exp(-abs(dt - dc) * 300.0); // ~1 same surface, →0 across a depth edge
+            m += textureSample(src_tex, src_samp, uv) * w;
+            wsum += w;
+        }
     }
-    return s / wsum;
+    m = m / wsum;
+    // Outlier strength: how far this pixel's luminance sits from the neighbourhood mean,
+    // relative to it. ~0 in smooth regions (untouched); →1 on grain spikes/gaps (collapsed).
+    let lc = max(c.r, max(c.g, c.b));
+    let lm = max(m.r, max(m.g, m.b));
+    let noisiness = clamp((abs(lc - lm) / (lm + 0.02)) * 2.6 - 0.05, 0.0, 1.0);
+    return mix(c, m, noisiness);
 }
 
 // --- tonemap/resolve: HDR scene + bloom + a small uniform ---

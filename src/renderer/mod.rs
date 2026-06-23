@@ -1133,7 +1133,11 @@ impl Renderer {
         // Warm up the temporal accumulation: a single headless frame would show the raw
         // jittered (dithered) raymarch, so render several static frames first to let the
         // EMA converge to the same smooth result the interactive viewport reaches.
-        for _ in 0..28 {
+        let warmup: u32 = std::env::var("PREVIZ_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(28);
+        for _ in 0..warmup {
             let mut warm = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("warm") });
@@ -2229,12 +2233,15 @@ impl Renderer {
                 ],
                 // Same chroma read-up strength as the froxel pass (below) so the
                 // hybrid masses/heroes seam lifts saturated colours identically.
-                // y = per-frame jitter phase (golden-ratio sequence). The temporal
-                // resolve averages these jittered frames, so the ray-start jitter is
-                // SAFE here (it converges instead of showing as dither).
+                // y = frame index (mod 64): the volumetric uses it to ANIMATE its
+                // interleaved-gradient-noise ray-start jitter (a fresh blue-noise pattern
+                // each frame). Was a screen-coherent golden phase, which shifted the whole
+                // step-band pattern rigidly each frame → read as flicker; per-pixel blue
+                // grain instead resolves via the EMA when static and reads as faint grain
+                // (not coherent bands) during motion.
                 chroma: [
                     settings.chroma_haze,
-                    (self.frame_index as f32 * 0.61803398875).fract(),
+                    (self.frame_index % 64) as f32,
                     fog.uniformity, // z = haze uniformity (1 smooth … 0 clustered)
                     fog.cluster_contrast, // w = cluster vs haze density contrast
                 ],
