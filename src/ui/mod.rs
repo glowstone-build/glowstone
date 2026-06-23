@@ -2,10 +2,12 @@
 //! each dock panel to its drawing function in [`panels`].
 
 mod cues;
+pub(crate) mod op;
 mod panels;
 pub use panels::ScreenSources;
 pub mod project;
 mod share_window;
+pub mod shortcuts;
 pub mod theme;
 mod windows;
 
@@ -20,7 +22,12 @@ use crate::renderer::camera::{CameraView, OrbitCamera};
 use crate::scene::{Library, RenderSettings, Scene, Selection};
 use windows::{Preferences, ProfileEditor};
 
+/// Window within which consecutive arrow-key nudges coalesce into one undo step
+/// (a held key repeats well inside this, so the whole drag is one undo).
+const NUDGE_COALESCE: std::time::Duration = std::time::Duration::from_millis(600);
+
 /// State of the open Duplicate dialog (the `d`-key array tool). `None` = closed.
+#[derive(Clone)]
 pub struct DuplicateDialog {
     /// Fixture being duplicated.
     pub fixture: usize,
@@ -134,11 +141,21 @@ impl Axis {
             Self::Z => Vec3::Z,
         }
     }
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::X => "X",
             Self::Y => "Y",
             Self::Z => "Z",
+        }
+    }
+    /// The Blender-convention axis colour (X red, Y green, Z blue). Single
+    /// source of truth: the screen-space move gizmo, the modal axis-lock line,
+    /// and the renderer's infinite constraint line all read this.
+    pub fn color(self) -> [f32; 3] {
+        match self {
+            Self::X => [1.0, 0.25, 0.25],
+            Self::Y => [0.35, 0.9, 0.35],
+            Self::Z => [0.3, 0.6, 1.0],
         }
     }
 }
@@ -156,12 +173,31 @@ pub struct TransformOp {
     /// Original (geometry index, world transform) snapshot — the static-geometry
     /// equivalent of `start`. Empty when transforming fixtures.
     pub geo_start: Vec<(usize, glam::Mat4)>,
+    /// The axis the screen-space move gizmo is currently grabbed on. Takes
+    /// precedence over `axis` (keyboard X/Y/Z lock) for the live frame, matching
+    /// Blender's "click-a-handle overrides the typed constraint" behaviour. Not
+    /// serialized (TransformOp is never persisted).
+    pub gizmo_hovered_axis: Option<Axis>,
+    /// True when the op was started by dragging a screen-space gizmo handle (vs the
+    /// modal G/R/S keys). A gizmo drag is driven by `drag_delta` and committed on
+    /// pointer release; a modal op is driven by absolute mouse position and
+    /// committed by a click/Enter.
+    pub from_gizmo: bool,
+}
+
+impl TransformOp {
+    /// The axis actually constraining this op: the grabbed gizmo handle wins,
+    /// else the keyboard lock. Read by apply_transform + the constraint-line viz
+    /// so behaviour and visuals stay in sync.
+    pub fn active_axis(&self) -> Option<Axis> {
+        self.gizmo_hovered_axis.or(self.axis)
+    }
 }
 
 impl TransformOp {
     /// The on-viewport status line shown while the op is in progress.
     pub fn hint(&self) -> String {
-        let ax = match self.axis {
+        let ax = match self.active_axis() {
             Some(a) => format!(" · axis {}", a.label()),
             None => String::new(),
         };
@@ -272,13 +308,40 @@ pub struct Ui {
     fm: panels::FmState,
     /// The `s` quick-select palette is open.
     quick_select: bool,
+    /// The Shift+A viewport Add menu (cursor-anchored entity picker).
+    add_menu: windows::AddMenuState,
+    /// The F3 operator-search palette (run any registered op by name).
+    op_search: windows::OperatorSearchState,
+    /// The `P` Patch dialog (assign sequential addresses to the selection).
+    patch_dialog: windows::PatchDialog,
+    /// The `U` Unpatch confirm dialog (disable the selection's patch entries).
+    unpatch_dialog: windows::UnpatchDialog,
     /// In-progress modal transform (G/R/S), if any.
     transform: Option<TransformOp>,
+    /// The document snapshot taken when a modal transform STARTED — its `before`
+    /// end. Pushed (with the post-transform `after`) when the transform confirms;
+    /// dropped without pushing when it cancels (Esc restores in-place). `None`
+    /// whenever no transform is live.
+    transform_before: Option<op::DocSnapshot>,
+    /// Per-frame signals the viewport sets (read after the dock): a transform just
+    /// began / just confirmed this frame. Transient — not serialized.
+    transform_started: bool,
+    transform_finished: bool,
+    /// Timestamp of the last arrow-key nudge — a fresh nudge within
+    /// [`NUDGE_COALESCE`] of it extends the top undo step instead of pushing a new
+    /// one, so holding an arrow key collapses into a single undo. `None` = no
+    /// nudge burst in progress.
+    last_nudge: Option<std::time::Instant>,
+    /// Arrow-key nudge accumulated this frame in `handle_shortcuts`; applied in
+    /// `show()` where the patch is reachable (so it rides the undo stack).
+    pending_nudge: Vec3,
     /// Saved fixture selection groups + the new-group name buffer.
     groups: Vec<SelectionGroup>,
     group_name: String,
     /// The cue list + crossfade engine.
     cues: cues::CueEngine,
+    /// Full-document undo / redo history (snapshots; not serialized into .archie).
+    undo: op::UndoStack,
     /// The online GDTF Share fixture library + its window toggle.
     share: crate::share::Share,
     show_share: bool,
@@ -323,10 +386,20 @@ impl Ui {
             screen_sources: panels::ScreenSources::default(),
             fm: panels::FmState::default(),
             quick_select: false,
+            add_menu: windows::AddMenuState::default(),
+            op_search: windows::OperatorSearchState::default(),
+            patch_dialog: windows::PatchDialog::default(),
+            unpatch_dialog: windows::UnpatchDialog::default(),
             transform: None,
+            transform_before: None,
+            transform_started: false,
+            transform_finished: false,
+            last_nudge: None,
+            pending_nudge: Vec3::ZERO,
             groups: Vec::new(),
             group_name: String::new(),
             cues: cues::CueEngine::default(),
+            undo: op::UndoStack::default(),
             pending_delete: false,
             share: crate::share::Share::new(),
             show_share: false,
@@ -341,6 +414,286 @@ impl Ui {
     /// `app::render`, after live DMX decode and before motion advance.
     pub fn tick_cues(&mut self, scene: &mut Scene, dt: f32) {
         self.cues.tick(scene, dt);
+    }
+
+    // --- undo / redo ----------------------------------------------------
+
+    /// Capture the whole document as the `before` end of an undo step — call
+    /// BEFORE running a mutation, then pair with [`undo_push`](Self::undo_push)
+    /// after. Borrows `self` immutably so it can read cues/groups alongside
+    /// `scene` + `patch` (the snapshot keeps the parsed-GDTF `Arc`s out of band).
+    fn undo_begin(&self, scene: &Scene, patch: &crate::dmx::PatchTable) -> op::DocSnapshot {
+        self.undo.begin(scene, patch, &self.cues, &self.groups, &self.selection)
+    }
+
+    /// Record a finished edit (`before` from [`undo_begin`](Self::undo_begin),
+    /// `after` = the post-mutation document).
+    fn undo_push(
+        &mut self,
+        name: &str,
+        before: op::DocSnapshot,
+        scene: &Scene,
+        patch: &crate::dmx::PatchTable,
+    ) {
+        let after = self.undo.begin(scene, patch, &self.cues, &self.groups, &self.selection);
+        self.undo.push(name, before, after);
+    }
+
+    /// Step back one edit, restoring scene + patch + cues + groups + selection.
+    /// (Field-disjoint borrows: `self.undo` vs the other `self` fields.)
+    fn do_undo(&mut self, scene: &mut Scene, dmx: &mut crate::dmx::DmxIo) {
+        self.undo.undo(
+            scene,
+            dmx.patch_mut(),
+            &mut self.cues,
+            &mut self.groups,
+            &mut self.selection,
+        );
+    }
+
+    /// Step forward one edit (the redo direction).
+    fn do_redo(&mut self, scene: &mut Scene, dmx: &mut crate::dmx::DmxIo) {
+        self.undo.redo(
+            scene,
+            dmx.patch_mut(),
+            &mut self.cues,
+            &mut self.groups,
+            &mut self.selection,
+        );
+    }
+
+    /// Run a closure-operator (the lightweight path the four migrated mutators
+    /// use). Wraps its arguments in an [`op::ClosureOp`] and dispatches through
+    /// [`run_operator`](Self::run_operator), so inline and (future) struct
+    /// operators share one pipeline. `poll` is pre-computed by the caller.
+    fn run_op(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        flags: op::OpFlags,
+        scene: &mut Scene,
+        dmx: &mut crate::dmx::DmxIo,
+        poll: bool,
+        exec: impl FnOnce(&mut op::OpCtx) -> op::OpStatus,
+    ) -> op::OpStatus {
+        let op = op::ClosureOp { id, label, flags, poll, exec: Some(exec) };
+        self.run_operator(op, scene, dmx)
+    }
+
+    /// Run any [`op::Operator`] under Blender's "system pushes undo after Finished"
+    /// rule (`docs/RESEARCH-blender-framework.md` §2.1): if `poll` is false this is
+    /// a no-op; otherwise snapshot BEFORE, run `exec`, and on [`op::OpStatus::Finished`]
+    /// push a (before, after) step when the op carries [`op::OpFlags::UNDO`] and
+    /// record the last op when it carries [`op::OpFlags::REGISTER`]. A `Cancelled`
+    /// / `PassThrough` op pushes nothing. `exec` receives an [`op::OpCtx`] bundling
+    /// the four mutable doc parts + selection + the read-only content library, so
+    /// every operator edits through the same surface a snapshot captures.
+    fn run_operator(
+        &mut self,
+        mut op: impl op::Operator,
+        scene: &mut Scene,
+        dmx: &mut crate::dmx::DmxIo,
+    ) -> op::OpStatus {
+        let flags = op.flags();
+        let (id, label) = (op.id(), op.label().to_string());
+        // poll() against the doc surface; a false poll is a clean no-op.
+        let poll = {
+            let cx = op::OpCtx {
+                scene,
+                patch: dmx.patch_mut(),
+                cues: &mut self.cues,
+                groups: &mut self.groups,
+                selection: &mut self.selection,
+                library: &self.library,
+            };
+            op.poll(&cx)
+        };
+        if !poll {
+            return op::OpStatus::PassThrough;
+        }
+        // Snapshot the whole document as the step's `before` end first.
+        let before = self.undo_begin(scene, dmx.patch());
+        // Assemble the field-disjoint mutable doc surface and run the edit.
+        let status = {
+            let mut cx = op::OpCtx {
+                scene,
+                patch: dmx.patch_mut(),
+                cues: &mut self.cues,
+                groups: &mut self.groups,
+                selection: &mut self.selection,
+                library: &self.library,
+            };
+            op.exec(&mut cx)
+        };
+        if status == op::OpStatus::Finished {
+            if flags.contains(op::OpFlags::UNDO) {
+                self.undo_push(&label, before, scene, dmx.patch());
+            }
+            if flags.contains(op::OpFlags::REGISTER) {
+                self.undo.set_last_op(id, label);
+            }
+        }
+        status
+    }
+
+    /// Apply this frame's accumulated arrow-key nudge (set by `handle_shortcuts`)
+    /// to the selected fixtures, coalescing a burst into a SINGLE undo step: the
+    /// first nudge of a burst pushes a step; subsequent nudges within
+    /// [`NUDGE_COALESCE`] amend that step's `after` end so one undo reverts the
+    /// whole drag. Called from `show()` where the patch is reachable.
+    fn apply_nudge(&mut self, scene: &mut Scene, dmx: &mut crate::dmx::DmxIo) {
+        let nudge = std::mem::replace(&mut self.pending_nudge, Vec3::ZERO);
+        if nudge == Vec3::ZERO {
+            return;
+        }
+        let now = std::time::Instant::now();
+        // Coalesce when the previous nudge was recent AND the top undo step is
+        // still our nudge burst (an intervening edit forfeits the coalesce).
+        let coalesce = self
+            .last_nudge
+            .is_some_and(|t| now.duration_since(t) <= NUDGE_COALESCE)
+            && self.undo.top_name() == Some("Nudge");
+
+        // The `before` end: for a fresh burst, snapshot the pre-move document; for
+        // a coalescing nudge we keep the existing step's `before` (so only `after`
+        // is amended below).
+        let before = (!coalesce).then(|| self.undo_begin(scene, dmx.patch()));
+
+        for &fi in &self.selection.fixtures {
+            if let Some(f) = scene.fixtures.get_mut(fi) {
+                f.position += nudge;
+                f.snap_movement();
+            }
+        }
+
+        if coalesce {
+            let after = self.undo.begin(scene, dmx.patch(), &self.cues, &self.groups, &self.selection);
+            self.undo.amend_after(after);
+        } else if let Some(before) = before {
+            self.undo_push("Nudge", before, scene, dmx.patch());
+            self.undo.set_last_op("transform.nudge", "Nudge");
+        }
+        self.last_nudge = Some(now);
+    }
+
+    // --- operator search (F3) + adjust last (F9) ------------------------
+
+    /// Whether a catalog op's `poll` passes right now — drives the search
+    /// palette's greyed/enabled state (and the F9 adjust-last guard). Each arm
+    /// mirrors the poll the op's run site uses (selection requirements etc.).
+    fn op_runnable(&self, id: &str) -> bool {
+        match id {
+            // Always available (opens the entity picker).
+            "object.add" => true,
+            // Needs a primary fixture to duplicate.
+            "fixture.duplicate" => self.selection.primary_fixture().is_some(),
+            // Patch / unpatch operate on the selected fixtures.
+            "fixture.patch" | "fixture.unpatch" => !self.selection.fixtures.is_empty(),
+            // Delete acts on any selected entity (fixtures / geometry / screens).
+            "object.delete" => {
+                !self.selection.fixtures.is_empty()
+                    || !self.selection.geometry.is_empty()
+                    || !self.selection.screens.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// Dispatch a catalog operator chosen from the F3 search palette or re-invoked
+    /// by F9 (adjust last). `Direct` ops run immediately through [`run_op`]; `Dialog`
+    /// ops re-open their parameter dialog (the dialog's confirm then runs the op as
+    /// usual — Blender's "adjust last operation" flow: tweak params, re-exec). A
+    /// failing `poll` is a clean no-op (the palette already greys those out).
+    fn run_catalog_op(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+        scene: &mut Scene,
+        dmx: &mut crate::dmx::DmxIo,
+    ) {
+        if !self.op_runnable(id) {
+            return;
+        }
+        // Resolve the descriptor so the `invoke` kind (Dialog vs Direct) drives the
+        // path — Dialog ops open their parameter dialog (its confirm runs the op),
+        // Direct ops run immediately. The `id` then selects the specific dialog /
+        // closure, keeping each op's single real run-site intact.
+        let Some(entry) = op::catalog_op(id) else { return };
+        match entry.invoke {
+            // Parameterized — open the dialog (its confirm runs the op).
+            op::OpInvoke::Dialog => match id {
+                "object.add" => {
+                    // Anchor the Add menu at the screen centre (keyboard-invoked).
+                    #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
+                    let anchor = ctx.screen_rect().center();
+                    self.add_menu.show_at(anchor);
+                }
+                "fixture.duplicate" => {
+                    if let Some(idx) = self.selection.primary_fixture() {
+                        self.duplicate = Some(DuplicateDialog {
+                            fixture: idx,
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                            y_angle: 36.0,
+                            count: 9,
+                        });
+                    }
+                }
+                "fixture.patch" => {
+                    let (u, a) = next_free_slot(dmx.patch_mut(), scene);
+                    self.patch_dialog = windows::PatchDialog {
+                        open: true,
+                        count: self.selection.fixtures.len(),
+                        start_universe: u,
+                        start_address: a,
+                    };
+                }
+                _ => {}
+            },
+            // Direct — run immediately through the operator pipeline.
+            op::OpInvoke::Direct => match id {
+                "fixture.unpatch" => {
+                    self.run_op(
+                        "fixture.unpatch",
+                        "Unpatch",
+                        op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                        scene,
+                        dmx,
+                        true,
+                        |cx| {
+                            for &fi in &cx.selection.fixtures {
+                                cx.patch.unpatch(fi);
+                            }
+                            op::OpStatus::Finished
+                        },
+                    );
+                }
+                "object.delete" => {
+                    self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// F9 "Adjust Last Operation": re-invoke the last registered op so the re-exec
+    /// REPLACES its result instead of stacking a second step. If the top undo step
+    /// IS that op (it carried `UNDO`), undo it first; a `Dialog` op then re-opens
+    /// pre-filled and its confirm pushes the replacement (truncating the redo). The
+    /// guard (compare the top step name to the last op) keeps a future
+    /// REGISTER-without-UNDO op from undoing an unrelated earlier step. The F3
+    /// palette deliberately does NOT route through here — it runs the op fresh.
+    /// (If a re-opened dialog is cancelled, the prior result stays undone but is
+    /// recoverable with Redo — acceptable for adjust-last.)
+    fn adjust_last_op(&mut self, ctx: &egui::Context, scene: &mut Scene, dmx: &mut crate::dmx::DmxIo) {
+        let Some((id, label)) = self.undo.last_op().map(|l| (l.id, l.label.clone())) else {
+            return;
+        };
+        if self.undo.undo_name() == Some(label.as_str()) {
+            self.do_undo(scene, dmx);
+        }
+        self.run_catalog_op(ctx, id, scene, dmx);
     }
 
     // --- `.archie` project save / load ----------------------------------
@@ -384,6 +737,17 @@ impl Ui {
             dmx_config: dmx.config(),
         };
         project::write(path, &pr)
+    }
+
+    /// Push the active modal transform's axis-constraint into RenderSettings so
+    /// the renderer can draw the infinite Blender-style axis line through the
+    /// pivot. Call once per frame before `Renderer::render`. Cleared when no op /
+    /// no axis is active. (`axis_hint` is `#[serde(skip)]` — runtime-only.)
+    pub fn sync_axis_hint(&mut self) {
+        self.settings.axis_hint = self.transform.as_ref().and_then(|op| {
+            let ax = op.active_axis()?;
+            Some((op.pivot, ax.color(), ax.vec()))
+        });
     }
 
     /// Save to the current path, or fall back to Save As if untitled.
@@ -729,19 +1093,49 @@ impl Ui {
         self.prefs.apply_theme(ctx);
         // Global shortcuts + drag-dropped .gdtf/.mvr files.
         self.handle_shortcuts(ctx, scene, camera);
+        // Apply any arrow-key nudge collected above (here the patch is reachable, so
+        // it rides the undo stack — a held-key burst coalesces into one step).
+        self.apply_nudge(scene, dmx);
         self.handle_dropped_files(ctx, scene, camera);
 
-        // Project shortcuts (Ctrl/Cmd + S / Shift+S / O / N) — handled here where
-        // scene + camera + dmx are all reachable in one place.
-        let (do_save, do_save_as, do_open, do_new) = ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            (
-                cmd && !i.modifiers.shift && i.key_pressed(egui::Key::S),
-                cmd && i.modifiers.shift && i.key_pressed(egui::Key::S),
-                cmd && i.key_pressed(egui::Key::O),
-                cmd && i.key_pressed(egui::Key::N),
-            )
-        });
+        // Project shortcuts (Cmd/Ctrl + S / Shift+S / O / N) — dispatched via the
+        // central registry, handled here where scene + camera + dmx are reachable.
+        let (mut do_save, mut do_save_as, mut do_open, mut do_new) = (false, false, false, false);
+        let (mut do_patch, mut do_unpatch) = (false, false);
+        let (mut do_undo, mut do_redo) = (false, false);
+        let (mut do_op_search, mut do_adjust_last) = (false, false);
+        for a in shortcuts::poll(ctx, self.active_context()) {
+            match a {
+                shortcuts::Action::Save => do_save = true,
+                shortcuts::Action::SaveAs => do_save_as = true,
+                shortcuts::Action::Open => do_open = true,
+                shortcuts::Action::New => do_new = true,
+                // Patch/Unpatch (P/U) — only meaningful with fixtures selected.
+                shortcuts::Action::Patch => do_patch = !self.selection.fixtures.is_empty(),
+                shortcuts::Action::Unpatch => do_unpatch = !self.selection.fixtures.is_empty(),
+                // Undo / redo (Cmd+Z / Cmd+Shift+Z / Cmd+Y) — applied below where
+                // scene + patch + cues + groups + selection are all reachable.
+                shortcuts::Action::Undo => do_undo = true,
+                shortcuts::Action::Redo => do_redo = true,
+                // F3 operator search / F9 adjust last — dispatched below.
+                shortcuts::Action::OperatorSearch => do_op_search = true,
+                shortcuts::Action::AdjustLast => do_adjust_last = true,
+                _ => {}
+            }
+        }
+        if do_undo {
+            self.do_undo(scene, dmx);
+        } else if do_redo {
+            self.do_redo(scene, dmx);
+        }
+        if do_op_search {
+            self.op_search.show();
+        }
+        // F9 "adjust last operation": re-invoke the last registered op by id (a
+        // parameterized op re-opens its dialog so the user can tweak + re-exec).
+        if do_adjust_last {
+            self.adjust_last_op(ctx, scene, dmx);
+        }
         if do_save_as {
             self.save_project_as(scene, camera, dmx);
         } else if do_save {
@@ -752,6 +1146,23 @@ impl Ui {
         }
         if do_new {
             self.new_project(scene, camera, dmx);
+        }
+        // Open the Patch / Unpatch dialogs (the mutation is committed after the
+        // dock, where `dmx.patch_mut()` is reachable — like `commit_delete`).
+        if do_patch {
+            let (u, a) = next_free_slot(dmx.patch_mut(), scene);
+            self.patch_dialog = windows::PatchDialog {
+                open: true,
+                count: self.selection.fixtures.len(),
+                start_universe: u,
+                start_address: a,
+            };
+        }
+        if do_unpatch {
+            self.unpatch_dialog = windows::UnpatchDialog {
+                open: true,
+                count: self.selection.fixtures.len(),
+            };
         }
 
         // Chrome MUST be reserved before the dock (it fills the CentralPanel).
@@ -779,6 +1190,8 @@ impl Ui {
             scene_search: &mut self.scene_search,
             fm: &mut self.fm,
             transform: &mut self.transform,
+            transform_started: &mut self.transform_started,
+            transform_finished: &mut self.transform_finished,
             groups: &mut self.groups,
             group_name: &mut self.group_name,
             cues: &mut self.cues,
@@ -800,10 +1213,28 @@ impl Ui {
 
         DockArea::new(&mut self.dock).show(ctx, &mut viewer);
 
+        // Modal-transform undo (viewer borrows released — scene + patch reachable):
+        // the viewport drives the live G/R/S op, so its confirm/cancel is routed
+        // through the undo stack HERE. A start snapshots the `before` end; a confirm
+        // pushes (before, after); a cancel (the op already restored in-place — the
+        // transform field went back to None without a confirm) drops `before`.
+        if self.transform_started {
+            self.transform_before = Some(self.undo_begin(scene, dmx.patch()));
+        }
+        if self.transform_finished {
+            if let Some(before) = self.transform_before.take() {
+                self.undo_push("Transform", before, scene, dmx.patch());
+                self.undo.set_last_op("transform.apply", "Transform");
+            }
+        } else if self.transform.is_none() {
+            // Op ended without confirming (cancelled / focus lost) — discard.
+            self.transform_before = None;
+        }
+
         // Commit a requested delete now (viewer borrows released): the patch is
         // reachable here, so fixtures + patch + cues + groups are remapped together.
         if self.pending_delete {
-            self.commit_delete(scene, dmx.patch_mut());
+            self.commit_delete(scene, dmx);
         }
         // The viewport context menu's "Replace…" opens the dialog here (after the
         // dock), where the library + patch are reachable.
@@ -815,8 +1246,68 @@ impl Ui {
         }
         replace_window(ctx, &self.library, scene, &mut self.selection, dmx.patch_mut(), &mut self.replace);
 
+        // Patch / Unpatch dialogs (committed here, where the patch is reachable).
+        // On confirm, P assigns sequential addresses to the selected fixtures from
+        // the chosen start slot; U disables the selected fixtures' patch entries.
+        if windows::patch_dialog_window(ctx, &mut self.patch_dialog) {
+            let (u, a) = (self.patch_dialog.start_universe, self.patch_dialog.start_address);
+            self.run_op(
+                "fixture.patch",
+                "Patch",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    cx.patch.assign_indices(cx.scene, &cx.selection.fixtures, u, a);
+                    op::OpStatus::Finished
+                },
+            );
+        }
+        if windows::unpatch_dialog_window(ctx, &mut self.unpatch_dialog) {
+            self.run_op(
+                "fixture.unpatch",
+                "Unpatch",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    for &fi in &cx.selection.fixtures {
+                        cx.patch.unpatch(fi);
+                    }
+                    op::OpStatus::Finished
+                },
+            );
+        }
+
         // Floating windows (viewer borrows released — scene/selection free again).
-        duplicate_window(ctx, scene, &mut self.selection, &mut self.duplicate);
+        // Duplicate mutates the scene; on confirm, run it through the operator
+        // pipeline so the (before, after) undo step is pushed uniformly.
+        if let Some(d) = duplicate_window(ctx, &mut self.duplicate) {
+            self.run_op(
+                "fixture.duplicate",
+                "Duplicate",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    match cx.scene.duplicate_fixture(
+                        d.fixture,
+                        Vec3::new(d.x, d.y, d.z),
+                        d.y_angle,
+                        d.count,
+                    ) {
+                        Some(first) => {
+                            *cx.selection = Selection::fixture(first);
+                            op::OpStatus::Finished
+                        }
+                        None => op::OpStatus::Cancelled,
+                    }
+                },
+            );
+        }
         windows::profile_editor_window(
             ctx,
             scene,
@@ -835,6 +1326,65 @@ impl Ui {
         windows::about_window(ctx, &mut self.show_about);
         windows::shortcuts_window(ctx, &mut self.show_shortcuts);
         windows::quick_select_window(ctx, scene, &mut self.selection, &mut self.quick_select);
+        // The F3 operator-search palette. Precompute each op's runnable state (the
+        // window borrows `self.op_search` mutably, so `op_runnable`'s `&self` read
+        // can't be live inside the closure) and dispatch the chosen op afterwards.
+        let runnable: Vec<(&'static str, bool)> =
+            op::CATALOG.iter().map(|c| (c.id, self.op_runnable(c.id))).collect();
+        let picked = windows::operator_search_window(ctx, &mut self.op_search, |id| {
+            runnable.iter().find(|(cid, _)| *cid == id).map(|(_, ok)| *ok).unwrap_or(false)
+        });
+        if let Some(id) = picked {
+            self.run_catalog_op(ctx, id, scene, dmx);
+        }
+        // The Shift+A Add menu: on a pick, drop the entity into the scene + select
+        // it (the menu itself stays library-only, decoupled from the mutation).
+        if let Some(action) = windows::add_menu_window(ctx, &self.library, &mut self.add_menu) {
+            self.run_op(
+                "object.add",
+                "Add",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    use windows::AddAction;
+                    let new: Option<Selection> = match action {
+                        AddAction::Fixture(i) => cx
+                            .library
+                            .fixtures
+                            .get(i)
+                            .cloned()
+                            .map(|p| Selection::fixture(cx.scene.add_fixture(&p))),
+                        AddAction::Gdtf(i) => cx
+                            .library
+                            .gdtf
+                            .get(i)
+                            .cloned()
+                            .map(|g| Selection::fixture(cx.scene.add_gdtf(g, Vec3::new(0.0, 4.0, 0.0)))),
+                        AddAction::Screen(i) => cx
+                            .library
+                            .screens
+                            .get(i)
+                            .cloned()
+                            .map(|p| Selection::screen(cx.scene.add_screen(&p))),
+                        AddAction::Environment(i) => cx
+                            .library
+                            .environments
+                            .get(i)
+                            .cloned()
+                            .map(|p| Selection::environment(cx.scene.add_environment(&p))),
+                    };
+                    match new {
+                        Some(sel) => {
+                            *cx.selection = sel;
+                            op::OpStatus::Finished
+                        }
+                        None => op::OpStatus::Cancelled,
+                    }
+                },
+            );
+        }
         share_window::fixture_library_window(
             ctx,
             &mut self.show_share,
@@ -851,6 +1401,11 @@ impl Ui {
     /// Force the quick-select palette open (headless screenshot hook).
     pub fn debug_open_quick_select(&mut self) {
         self.quick_select = true;
+    }
+
+    /// Force the F3 operator-search palette open (headless screenshot hook).
+    pub fn debug_open_op_search(&mut self) {
+        self.op_search.show();
     }
 
     /// Open the online Fixture Library window (headless hook). `demo` injects fake
@@ -910,7 +1465,7 @@ impl Ui {
             None => scene.fixtures.iter().enumerate().filter(|(_, f)| f.is_gdtf()).map(|(i, _)| i).take(n).collect(),
         };
         if !pick.is_empty() {
-            self.selection = Selection { fixtures: pick, geometry: Vec::new(), screens: Vec::new(), environment: None };
+            self.selection = Selection { fixtures: pick, geometry: Vec::new(), screens: Vec::new(), environment: None, world: false };
         }
     }
 
@@ -974,61 +1529,102 @@ impl Ui {
     }
 
     /// Keyboard shortcuts handled globally (camera framing/views, delete, etc.).
-    fn handle_shortcuts(&mut self, ctx: &egui::Context, scene: &mut Scene, camera: &mut OrbitCamera) {
-        // Don't steal keys while a text field has focus.
-        if ctx.egui_wants_keyboard_input() {
-            return;
+    /// Every bind comes from the central [`shortcuts`] registry; this is the
+    /// dispatcher for the `Global` context. The viewport-owned transform binds
+    /// (G/R/S, X/Y/Z) are registered there too but dispatched in `panels::viewport`.
+    /// The keymap contexts active this frame (most-specific-first gating lives in
+    /// `shortcuts::gather`). Viewport binds only apply while the 3D viewport holds
+    /// focus; a live G/R/S transform owns the viewport, suppressing the plain
+    /// press-keymaps (its keys route through `shortcuts::poll_modal`).
+    fn active_context(&self) -> shortcuts::ActiveContext {
+        shortcuts::ActiveContext {
+            viewport_focused: self.viewport_focused,
+            transform_active: self.transform.is_some(),
         }
-        let del = ctx.input(|i| {
-            use egui::Key;
-            if i.key_pressed(Key::F) {
-                let sel = !i.modifiers.shift;
-                if let Some((lo, hi)) = self.frame_bounds(scene, sel) {
-                    camera.frame_aabb(lo, hi);
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context, scene: &mut Scene, camera: &mut OrbitCamera) {
+        use shortcuts::{Action, Dir};
+        // Keymap-v2: gather the active contexts (most-specific-first) and let the
+        // stack do the gating. A focused viewport's `S` (Scale, Viewport map) now
+        // MASKS the Global `S` (quick-select) automatically — no `s_is_scale`
+        // guard needed. `poll` returns empty while a text field has focus.
+        let cx = self.active_context();
+        let actions = shortcuts::poll(ctx, cx);
+
+        // Arrow nudges only act when the viewport has focus and no transform is in
+        // progress (so they don't fight panel scrolling or the live G/R/S op).
+        let nudge_ok =
+            self.viewport_focused && self.transform.is_none() && !self.selection.fixtures.is_empty();
+
+        let mut del = false;
+        let mut nudge = Vec3::ZERO;
+        for a in actions {
+            match a {
+                Action::FrameSelection => {
+                    if let Some((lo, hi)) = self.frame_bounds(scene, true) {
+                        camera.frame_aabb(lo, hi);
+                    }
                 }
-            }
-            if i.modifiers.command && i.key_pressed(Key::Comma) {
-                self.show_prefs = true;
-            }
-            // `s` opens the quick-select palette — UNLESS the viewport is focused
-            // with a selection, where `s` means Scale (Blender modal transform,
-            // handled in panels::viewport). So: something to scale → scale; nothing
-            // to scale → open the select palette.
-            let s_is_scale = self.viewport_focused
-                && (!self.selection.fixtures.is_empty() || !self.selection.geometry.is_empty());
-            if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl && !s_is_scale {
-                self.quick_select = true;
-            }
-            // `a` = select all fixtures; `l` = toggle fixture labels.
-            if i.key_pressed(Key::A) && !i.modifiers.command && !i.modifiers.ctrl && !scene.fixtures.is_empty() {
-                self.selection = Selection { fixtures: (0..scene.fixtures.len()).collect(), geometry: Vec::new(), screens: Vec::new(), environment: None };
-            }
-            if i.key_pressed(Key::L) && !i.modifiers.command {
-                self.prefs.show_labels = !self.prefs.show_labels;
-            }
-            // Shift+R replaces the selected fixtures with another project profile.
-            // (Plain R is the Rotate modal transform, handled in the viewport.)
-            if i.key_pressed(Key::R)
-                && i.modifiers.shift
-                && !i.modifiers.command
-                && !i.modifiers.ctrl
-                && self.replace.is_none()
-                && !self.selection.fixtures.is_empty()
-            {
-                self.replace = Some(ReplaceDialog::default());
-            }
-            for (key, view) in [
-                (Key::Num5, CameraView::Perspective),
-                (Key::Num7, CameraView::Top),
-                (Key::Num1, CameraView::Front),
-                (Key::Num3, CameraView::Right),
-            ] {
-                if i.key_pressed(key) {
-                    camera.set_view(view);
+                Action::FrameAll => {
+                    if let Some((lo, hi)) = self.frame_bounds(scene, false) {
+                        camera.frame_aabb(lo, hi);
+                    }
                 }
+                Action::View(view) => camera.set_view(view),
+                Action::ViewCamera => {} // registered for the cheat sheet; no-op.
+                Action::Preferences => self.show_prefs = true,
+                // Context gating (Viewport `S` = Scale masks this when the viewport
+                // is focused) means QuickSelect only reaches here when it should.
+                Action::QuickSelect => self.quick_select = true,
+                Action::SelectAll => {
+                    if !scene.fixtures.is_empty() {
+                        self.selection = Selection {
+                            fixtures: (0..scene.fixtures.len()).collect(),
+                            geometry: Vec::new(),
+                            screens: Vec::new(),
+                            environment: None,
+                            world: false,
+                        };
+                    }
+                }
+                Action::ToggleLabels => self.prefs.show_labels = !self.prefs.show_labels,
+                Action::Replace => {
+                    if self.replace.is_none() && !self.selection.fixtures.is_empty() {
+                        self.replace = Some(ReplaceDialog::default());
+                    }
+                }
+                Action::Delete => del = true,
+                Action::Nudge(dir, step) => {
+                    if nudge_ok {
+                        nudge += match dir {
+                            Dir::XNeg => Vec3::new(-step, 0.0, 0.0),
+                            Dir::XPos => Vec3::new(step, 0.0, 0.0),
+                            Dir::ZNeg => Vec3::new(0.0, 0.0, -step),
+                            Dir::ZPos => Vec3::new(0.0, 0.0, step),
+                            Dir::YUp => Vec3::new(0.0, step, 0.0),
+                            Dir::YDown => Vec3::new(0.0, -step, 0.0),
+                        };
+                    }
+                }
+                // Shift+A (Viewport keymap): open the cursor-anchored Add menu.
+                // The keymap stack only surfaces this while the viewport is focused
+                // and no transform is live, so no extra guard is needed here.
+                Action::AddMenu => {
+                    // Anchor on the live cursor; fall back to the viewport-ish
+                    // screen centre if the pointer position is unknown (keyboard).
+                    #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
+                    let anchor = ctx
+                        .pointer_latest_pos()
+                        .unwrap_or_else(|| ctx.screen_rect().center());
+                    self.add_menu.show_at(anchor);
+                }
+                // Patch/Unpatch are dispatched in show() (the patch is reachable
+                // there); the rest are no-ops at this site.
+                _ => {}
             }
-            i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)
-        });
+        }
+
         if del
             && (!self.selection.fixtures.is_empty()
                 || !self.selection.geometry.is_empty()
@@ -1037,77 +1633,33 @@ impl Ui {
             self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
         }
 
-        // Arrow keys nudge the selected fixtures on the floor plane (Shift = 1 m,
-        // else 0.1 m), but only when the viewport has focus so they don't fight
-        // panel scrolling. PageUp/Down nudge height.
-        if self.viewport_focused && self.transform.is_none() && !self.selection.fixtures.is_empty() {
-            let (mut dx, mut dz, mut dy) = (0.0f32, 0.0f32, 0.0f32);
-            let step = ctx.input(|i| {
-                use egui::Key;
-                let s = if i.modifiers.shift { 1.0 } else { 0.1 };
-                if i.key_pressed(Key::ArrowLeft) { dx -= s; }
-                if i.key_pressed(Key::ArrowRight) { dx += s; }
-                if i.key_pressed(Key::ArrowUp) { dz -= s; }
-                if i.key_pressed(Key::ArrowDown) { dz += s; }
-                if i.key_pressed(Key::PageUp) { dy += s; }
-                if i.key_pressed(Key::PageDown) { dy -= s; }
-                Vec3::new(dx, dy, dz)
-            });
-            if step != Vec3::ZERO {
-                for &fi in &self.selection.fixtures {
-                    if let Some(f) = scene.fixtures.get_mut(fi) {
-                        f.position += step;
-                        f.snap_movement();
-                    }
-                }
-            }
-        }
+        // Stash the accumulated nudge; show() applies it where the patch is
+        // reachable, so the move can ride the undo stack (coalescing a burst).
+        self.pending_nudge = nudge;
+
     }
 
-    /// Remove every selected fixture and clear the selection.
-    /// Commit a requested fixture deletion, remapping every index-keyed structure
-    /// in lock-step so nothing is silently corrupted: the patch entries, the cue
-    /// look lists, and the saved selection groups all follow the removal. Called
-    /// once after the dock, where the patch is reachable.
-    fn commit_delete(&mut self, scene: &mut Scene, patch: &mut crate::dmx::PatchTable) {
+    /// Commit a requested fixture deletion through the operator pipeline. The
+    /// actual remap-in-lock-step body is the free [`delete_selection`] operator
+    /// (so it edits the shared [`OpCtx`] surface); this wrapper clears the request
+    /// flag, runs it under [`run_op`](Self::run_op) (which snapshots + pushes
+    /// undo), and resets the UI-only scene-anchor when something was removed.
+    /// Called once after the dock, where the patch is reachable.
+    fn commit_delete(&mut self, scene: &mut Scene, dmx: &mut crate::dmx::DmxIo) {
         self.pending_delete = false;
-        // --- fixtures: remove + remap every index-keyed structure in lock-step ---
-        let mut removed: Vec<usize> =
-            self.selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
-        removed.sort_unstable();
-        removed.dedup();
-        if !removed.is_empty() {
-            // Descending so earlier indices stay valid as we remove.
-            for &i in removed.iter().rev() {
-                scene.fixtures.remove(i);
-                patch.remove_at(i);
-                self.cues.remove_fixture(i);
-            }
-            // Groups store arbitrary index references: remap each through the
-            // shift, dropping deleted members, then drop any group left empty.
-            for g in &mut self.groups {
-                g.fixtures = g.fixtures.iter().filter_map(|&idx| remap_index(idx, &removed)).collect();
-            }
-            self.groups.retain(|g| !g.fixtures.is_empty());
-        }
-        // --- static geometry: a plain removal (no patch/cue/group keyed by it) ---
-        let mut geo: Vec<usize> =
-            self.selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-        geo.sort_unstable();
-        geo.dedup();
-        for &i in geo.iter().rev() {
-            scene.geometry.remove(i);
-        }
-        // --- LED screens: a plain removal (no patch/cue/group keyed by it) ---
-        let mut scr: Vec<usize> =
-            self.selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
-        scr.sort_unstable();
-        scr.dedup();
-        for &i in scr.iter().rev() {
-            scene.screens.remove(i);
-        }
-        if !removed.is_empty() || !geo.is_empty() || !scr.is_empty() {
-            self.selection = Selection::default();
+        let poll = !self.selection.fixtures.is_empty()
+            || !self.selection.geometry.is_empty()
+            || !self.selection.screens.is_empty();
+        let status = self.run_op(
+            "object.delete",
+            "Delete",
+            op::OpFlags::UNDO | op::OpFlags::REGISTER,
+            scene,
+            dmx,
+            poll,
+            delete_selection,
+        );
+        if status == op::OpStatus::Finished {
             self.scene_anchor = None;
         }
     }
@@ -1233,6 +1785,44 @@ impl Ui {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
+                    // Undo / Redo — labelled with the edit name, greyed at the ends.
+                    let undo_label = match self.undo.undo_name() {
+                        Some(n) => format!("{}  Undo {n}", icon::UNDO),
+                        None => format!("{}  Undo", icon::UNDO),
+                    };
+                    if ui.add_enabled(self.undo.can_undo(), egui::Button::new(undo_label)).clicked() {
+                        self.do_undo(scene, dmx);
+                        ui.close();
+                    }
+                    let redo_label = match self.undo.redo_name() {
+                        Some(n) => format!("{}  Redo {n}", icon::REDO),
+                        None => format!("{}  Redo", icon::REDO),
+                    };
+                    if ui.add_enabled(self.undo.can_redo(), egui::Button::new(redo_label)).clicked() {
+                        self.do_redo(scene, dmx);
+                        ui.close();
+                    }
+                    ui.separator();
+                    // Operator search (F3) — run any registered op by name.
+                    if ui.button(format!("{}  Run Operator…  (F3)", icon::SEARCH)).clicked() {
+                        self.op_search.show();
+                        ui.close();
+                    }
+                    // Adjust last operation (F9) — re-invoke the last registered op
+                    // (parameterized ops re-open their dialog to tweak + re-exec).
+                    let adjust = self.undo.last_op().map(|l| l.label.clone());
+                    let adjust_label = match &adjust {
+                        Some(l) => format!("{}  Adjust Last: {l}  (F9)", icon::RESET),
+                        None => format!("{}  Adjust Last Operation  (F9)", icon::RESET),
+                    };
+                    if ui
+                        .add_enabled(adjust.is_some(), egui::Button::new(adjust_label))
+                        .clicked()
+                    {
+                        self.adjust_last_op(ctx, scene, dmx);
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.add_enabled(self.selection.primary_fixture().is_some(), egui::Button::new(format!("{}  Duplicate / Array…", icon::DUPLICATE))).clicked() {
                         if let Some(idx) = self.selection.primary_fixture() {
                             self.duplicate = Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
@@ -1374,13 +1964,89 @@ impl Ui {
     }
 }
 
+/// The `object.delete` operator body: remove every selected fixture / geometry /
+/// screen, remapping every index-keyed structure (patch entries, cue look lists,
+/// selection groups) in lock-step so nothing is silently corrupted. Edits the
+/// shared [`op::OpCtx`] surface so it can run through [`Ui::run_op`]. Returns
+/// `Finished` if anything was removed, `Cancelled` otherwise (so no undo step is
+/// pushed for an empty delete).
+fn delete_selection(cx: &mut op::OpCtx) -> op::OpStatus {
+    // --- fixtures: remove + remap every index-keyed structure in lock-step ---
+    let mut removed: Vec<usize> =
+        cx.selection.fixtures.iter().copied().filter(|&i| i < cx.scene.fixtures.len()).collect();
+    removed.sort_unstable();
+    removed.dedup();
+    if !removed.is_empty() {
+        // Descending so earlier indices stay valid as we remove.
+        for &i in removed.iter().rev() {
+            cx.scene.fixtures.remove(i);
+            cx.patch.remove_at(i);
+            cx.cues.remove_fixture(i);
+        }
+        // Groups store arbitrary index references: remap each through the
+        // shift, dropping deleted members, then drop any group left empty.
+        for g in cx.groups.iter_mut() {
+            g.fixtures = g.fixtures.iter().filter_map(|&idx| remap_index(idx, &removed)).collect();
+        }
+        cx.groups.retain(|g| !g.fixtures.is_empty());
+    }
+    // --- static geometry: a plain removal (no patch/cue/group keyed by it) ---
+    let mut geo: Vec<usize> =
+        cx.selection.geometry.iter().copied().filter(|&i| i < cx.scene.geometry.len()).collect();
+    geo.sort_unstable();
+    geo.dedup();
+    for &i in geo.iter().rev() {
+        cx.scene.geometry.remove(i);
+    }
+    // --- LED screens: a plain removal (no patch/cue/group keyed by it) ---
+    let mut scr: Vec<usize> =
+        cx.selection.screens.iter().copied().filter(|&i| i < cx.scene.screens.len()).collect();
+    scr.sort_unstable();
+    scr.dedup();
+    for &i in scr.iter().rev() {
+        cx.scene.screens.remove(i);
+    }
+    if !removed.is_empty() || !geo.is_empty() || !scr.is_empty() {
+        *cx.selection = Selection::default();
+        op::OpStatus::Finished
+    } else {
+        op::OpStatus::Cancelled
+    }
+}
+
 /// The modal Duplicate dialog: array the selected fixture by offset + Y angle.
+/// A sensible default start slot for the Patch dialog: the channel just past the
+/// last enabled patch entry (so a new batch packs onto the end of the rig),
+/// wrapping to the next universe at 512. Falls back to universe 1 / address 1 on
+/// an empty patch. `assign_indices` then finds the first non-clashing slot from
+/// here, so this only needs to be a good starting guess.
+fn next_free_slot(patch: &mut crate::dmx::PatchTable, scene: &Scene) -> (u16, u16) {
+    patch.sync(scene);
+    let mut best: Option<(u16, u16)> = None; // (universe, address-just-past-end)
+    for i in 0..scene.fixtures.len() {
+        if let Some(p) = patch.get(i).filter(|p| p.enabled) {
+            let end = p.address + p.footprint.max(1); // first free channel after it
+            let cand = (p.universe, end);
+            if best.is_none_or(|b| cand > b) {
+                best = Some(cand);
+            }
+        }
+    }
+    match best {
+        Some((u, a)) if a <= 512 => (u, a),
+        Some((u, _)) => (u + 1, 1),
+        None => (1, 1),
+    }
+}
+
+/// Draws the Duplicate dialog and returns the confirmed [`DuplicateDialog`]
+/// parameters on "Duplicate" (so the caller applies the mutation through the
+/// operator pipeline / undo); returns `None` while open, on cancel, or on Esc.
+/// This fn no longer touches the scene itself — it only manages dialog state.
 fn duplicate_window(
     ctx: &egui::Context,
-    scene: &mut Scene,
-    selection: &mut Selection,
     dialog: &mut Option<DuplicateDialog>,
-) {
+) -> Option<DuplicateDialog> {
     let mut do_dup = false;
     let mut close = false;
 
@@ -1425,22 +2091,15 @@ fn duplicate_window(
             });
     }
 
+    let mut confirmed: Option<DuplicateDialog> = None;
     if do_dup {
-        if let Some(d) = dialog.as_ref()
-            && let Some(first) = scene.duplicate_fixture(
-                d.fixture,
-                Vec3::new(d.x, d.y, d.z),
-                d.y_angle,
-                d.count,
-            )
-        {
-            *selection = Selection::fixture(first);
-        }
+        confirmed = dialog.clone();
         close = true;
     }
     if close {
         *dialog = None;
     }
+    confirmed
 }
 
 /// The Replace-fixtures dialog (Shift+R): pick a profile from the **project
@@ -1602,6 +2261,9 @@ struct PanelViewer<'a> {
     scene_search: &'a mut String,
     fm: &'a mut panels::FmState,
     transform: &'a mut Option<TransformOp>,
+    /// Per-frame signals the viewport sets for the modal-transform undo wiring.
+    transform_started: &'a mut bool,
+    transform_finished: &'a mut bool,
     groups: &'a mut Vec<SelectionGroup>,
     group_name: &'a mut String,
     cues: &'a mut cues::CueEngine,
@@ -1648,6 +2310,8 @@ impl TabViewer for PanelViewer<'_> {
                 self.transform,
                 self.delete_requested,
                 self.replace_requested,
+                self.transform_started,
+                self.transform_finished,
             ),
             Tab::Scene => panels::scene_outliner(
                 ui,
@@ -1722,6 +2386,33 @@ mod tests {
     use crate::dmx::DmxIo;
     use crate::scene::Scene;
 
+    /// F9 "Adjust Last Operation" must REPLACE the last op's result, not stack a
+    /// second one (the Phase-1 review's must-fix). Run a Direct op (unpatch), then
+    /// adjust-last: the prior step is undone and the op re-run, so exactly ONE undo
+    /// step remains. With the bug (no undo before re-exec) two would, and one undo
+    /// would leave the stack still non-empty.
+    #[test]
+    fn adjust_last_replaces_not_stacks() {
+        let ctx = egui::Context::default();
+        let mut ui = Ui::new();
+        let mut scene = Scene::default(); // demo scene: one fixture
+        let mut dmx = DmxIo::new();
+        ui.selection = Selection::fixture(0); // so unpatch's poll passes
+
+        // Run the Direct unpatch op once → one undo step named "Unpatch".
+        ui.run_catalog_op(&ctx, "fixture.unpatch", &mut scene, &mut dmx);
+        assert!(ui.undo.can_undo());
+        assert_eq!(ui.undo.undo_name(), Some("Unpatch"));
+
+        // Adjust-last (F9): undo the prior result, then re-run → still ONE step.
+        ui.adjust_last_op(&ctx, &mut scene, &mut dmx);
+        assert!(ui.undo.can_undo(), "the replacement op is undoable");
+
+        // Undo the single step → no further undo (proves replace, not stack).
+        ui.do_undo(&mut scene, &mut dmx);
+        assert!(!ui.undo.can_undo(), "adjust-last must replace, not stack a 2nd unpatch");
+    }
+
     #[test]
     fn remap_index_after_delete() {
         // Delete fixtures 1 and 3 from a 5-fixture scene (0..5).
@@ -1765,7 +2456,7 @@ mod tests {
         g.spec = member.to_string();
         g.raw = Some(Arc::new(bytes));
 
-        let mut ui = Ui::new();
+        let ui = Ui::new();
         let mut scene = Scene::default();
         let base = scene.fixtures.len();
         let idx = scene.add_gdtf(Arc::new(g), Vec3::new(1.0, 4.0, -2.0));

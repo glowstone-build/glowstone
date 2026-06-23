@@ -1741,6 +1741,18 @@ impl Renderer {
                 push_selection_gizmo(&mut lines, (lo + hi) * 0.5);
             }
         }
+        // Infinite axis-constraint line (Blender style): when a modal transform has
+        // an axis locked, draw a long coloured line through the pivot so the user can
+        // see the constraint. The UI threads `(pivot, colour, dir)` via the
+        // (runtime-only) `axis_hint` field on RenderSettings.
+        if let Some((pivot, color, dir)) = settings.axis_hint {
+            let dir = dir.normalize_or_zero();
+            if dir != Vec3::ZERO {
+                let half = camera.zfar * 0.9;
+                lines.push(LineVertex { position: (pivot - dir * half).to_array(), color });
+                lines.push(LineVertex { position: (pivot + dir * half).to_array(), color });
+            }
+        }
         let line_count = self.dynamic_lines.upload(&self.device, &self.queue, &lines);
 
         // --- volumetric uniforms + fixtures (use the first fog box, if any) ---

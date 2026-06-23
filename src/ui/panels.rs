@@ -7,6 +7,7 @@ use std::sync::Arc;
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
 use glam::{Mat4, Quat, Vec2, Vec3};
 
+use super::shortcuts;
 use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
 use super::{Axis, DuplicateDialog, GdtfTextures, SelectionGroup, TransformKind, TransformOp};
@@ -154,6 +155,75 @@ pub fn scene_outliner(
             *s = true;
         }
     }
+
+    // ---- WORLD: the top of the scene hierarchy ----
+    // A selectable container node (HDRI sky + image-based ambient; its inspector
+    // is shown when picked) with the fog-box environments nested under it as
+    // children, mirroring Blender's "World" sitting above the scene collection.
+    // Framed in a faint surface to read as the top-level container.
+    egui::Frame::NONE
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+    folder_header(icon::WORLD, "World", 0, true, &ink).show(ui, |ui| {
+        // The World node itself: selecting it opens the world_inspector.
+        let wrow = entity_row(
+            ui,
+            icon::WORLD,
+            "World",
+            "HDRI · ambient",
+            "",
+            false,
+            selection.world,
+            selection.world,
+            false,
+            false,
+            &ink,
+            accent,
+        );
+        if wrow.body.clicked() {
+            *selection = Selection::world();
+            *anchor = None;
+        }
+        // ENVIRONMENT children: fog boxes / volumes, indented under World.
+        ui.indent("world-children", |ui| {
+            folder_header(icon::ENVIRONMENT, "Environment", scene.environments.len(), true, &ink)
+                .show(ui, |ui| {
+                    if scene.environments.is_empty() {
+                        ui.label(RichText::new("none — add a Fog Box from the Library").weak().small());
+                    }
+                    let mut click: Option<usize> = None;
+                    for (i, env) in scene.environments.iter().enumerate() {
+                        let sel = selection.environment == Some(i);
+                        let row = entity_row(
+                            ui,
+                            icon::ENVIRONMENT,
+                            env.name.as_str(),
+                            "Fog volume",
+                            "",
+                            false,
+                            sel,
+                            sel,
+                            false,
+                            false,
+                            &ink,
+                            accent,
+                        );
+                        if row.body.clicked() {
+                            click = Some(i);
+                        }
+                    }
+                    if let Some(i) = click {
+                        *selection = Selection::environment(i);
+                        *anchor = None;
+                    }
+                });
+        });
+    });
+    }); // World container frame
+    ui.add_space(6.0);
 
     // ---- OBJECTS: imported MVR static geometry (stage / truss / set) ----
     // Selectable + transformable (G/R/S in the viewport); thousands of rows, so
@@ -429,47 +499,15 @@ pub fn scene_outliner(
         }
     });
 
-    // ---- ENVIRONMENT: fog boxes / world ----
-    folder_header(icon::ENVIRONMENT, "Environment", scene.environments.len(), true, &ink).show(ui, |ui| {
-        if scene.environments.is_empty() {
-            ui.label(RichText::new("none — add a Fog Box from the Library").weak().small());
-        }
-        for (i, env) in scene.environments.iter().enumerate() {
-            let sel = selection.environment == Some(i);
-            let row = entity_row(
-                ui,
-                icon::ENVIRONMENT,
-                env.name.as_str(),
-                "Fog volume",
-                "",
-                false,
-                sel,
-                sel,
-                false,
-                false,
-                &ink,
-                accent,
-            );
-            if row.body.clicked() {
-                *selection = Selection::environment(i);
-            }
-        }
-    });
-
-    // ---- WORLD: HDRI environment (sky background + image-based ambient) ----
-    folder_header(icon::WORLD, "World", 0, true, &ink).show(ui, |ui| {
-        world_controls(ui, &mut scene.world, &ink);
-    });
-
     // (Render/look controls live on the viewport overlay (Mode + Exposure), the
     // View menu (grid / gizmo / label toggles) and Preferences > Rendering — not
     // duplicated here, so the Scene panel stays a clean outliner.)
 }
 
-/// The World / environment controls: load an equirectangular HDRI (sky +
-/// image-based ambient), set its brightness, ambient fill, yaw and whether it
-/// shows as the viewport background.
-fn world_controls(ui: &mut egui::Ui, world: &mut crate::scene::World, ink: &theme::Ink) {
+/// The World inspector: load an equirectangular HDRI (sky + image-based
+/// ambient), set its brightness, ambient fill, yaw and whether it shows as the
+/// viewport background. Shown in the Inspector when the World node is selected.
+fn world_inspector(ui: &mut egui::Ui, world: &mut crate::scene::World, ink: &theme::Ink) {
     use theme::icon;
     ui.horizontal(|ui| {
         if ui
@@ -1032,6 +1070,13 @@ pub fn inspector(
 ) {
     ui.heading("Inspector");
     ui.separator();
+
+    // World is the top of the hierarchy: its HDRI sky + ambient controls.
+    if selection.world {
+        let ink = theme::ink(!ui.visuals().dark_mode);
+        world_inspector(ui, &mut scene.world, &ink);
+        return;
+    }
 
     if let Some(env_id) = selection.environment {
         match scene.environments.get_mut(env_id) {
@@ -2273,11 +2318,13 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
     // wheel-motion phase. (Cancel restores from the same snapshot the same way.)
     let d = cur - op.start_screen; // pixel delta
     let (right, up, _fwd) = camera.view_basis();
+    // A grabbed gizmo handle overrides the keyboard axis lock for this frame.
+    let axis = op.active_axis();
     match op.kind {
         TransformKind::Move => {
             let speed = camera.distance * 0.0015;
             let mut world = right * (d.x * speed) + up * (-d.y * speed);
-            if let Some(ax) = op.axis {
+            if let Some(ax) = axis {
                 let a = ax.vec();
                 world = a * world.dot(a); // lock to one axis
             }
@@ -2294,8 +2341,8 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
         }
         TransformKind::Rotate => {
             let angle = d.x * 0.01;
-            let axis = op.axis.map(|a| a.vec()).unwrap_or(Vec3::Y);
-            let rot = Quat::from_axis_angle(axis, angle);
+            let raxis = axis.map(|a| a.vec()).unwrap_or(Vec3::Y);
+            let rot = Quat::from_axis_angle(raxis, angle);
             for (i, p0, q0) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     f.position = op.pivot + rot * (*p0 - op.pivot);
@@ -2368,7 +2415,15 @@ pub fn viewport(
     transform: &mut Option<TransformOp>,
     delete_requested: &mut bool,
     replace_requested: &mut bool,
+    // Modal-transform undo signals (set this frame): `started` = a G/R/S or gizmo
+    // op just began (caller snapshots the `before` end); `finished` = it confirmed
+    // (caller pushes the undo step). A cancel sets neither — the op already
+    // restored in-place, so the caller just drops the pending `before`.
+    transform_started: &mut bool,
+    transform_finished: &mut bool,
 ) {
+    *transform_started = false;
+    *transform_finished = false;
     let available = ui.available_size();
     let ppp = ui.pixels_per_point();
 
@@ -2393,26 +2448,148 @@ pub fn viewport(
         *viewport_focused = rect.contains(p);
     }
 
+    let aspect = rect.width() / rect.height().max(1.0);
+
+    // --- Interactive screen-space MOVE gizmo ---
+    // When a fixture/geometry selection exists and no modal op is running, draw 3
+    // RGB axis handles at the selection centroid (projected via view_proj). Grabbing
+    // a handle (pointer press within a few px of its segment) starts a Move op
+    // constrained to that world axis — reusing apply_transform's camera-basis math
+    // via `gizmo_hovered_axis`. The grab is checked BEFORE orbit/select so dragging a
+    // handle never orbits the camera; an empty-space press falls through untouched.
+    let gizmo_targets: bool = transform.is_none()
+        && *viewport_focused
+        && !selection.world
+        && (!selection.fixtures.is_empty() || !selection.geometry.is_empty());
+    if gizmo_targets {
+        // Centroid of every selected target (fixture origins + geometry bbox centres).
+        let mut sum = Vec3::ZERO;
+        let mut n = 0.0_f32;
+        for &i in &selection.fixtures {
+            if let Some(f) = scene.fixtures.get(i) {
+                sum += f.position;
+                n += 1.0;
+            }
+        }
+        for &i in &selection.geometry {
+            if let Some(g) = scene.geometry.get(i) {
+                let c = g
+                    .world_bounds()
+                    .map(|(lo, hi)| (lo + hi) * 0.5)
+                    .unwrap_or_else(|| g.transform.w_axis.truncate());
+                sum += c;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            let pivot = sum / n;
+            let vp = camera.view_proj(aspect);
+            // Arm length scales with camera distance so handles stay a readable size
+            // regardless of zoom.
+            let arm = (camera.distance * 0.18).clamp(0.4, 4.0);
+            if let Some(origin) = OrbitCamera::project_to_screen(pivot, vp, rect) {
+                let painter = ui.painter_at(rect);
+                let press = ui.input(|i| i.pointer.press_origin());
+                let mut grabbed: Option<Axis> = None;
+                for ax in [Axis::X, Axis::Y, Axis::Z] {
+                    let tip_world = pivot + ax.vec() * arm;
+                    let Some(tip) = OrbitCamera::project_to_screen(tip_world, vp, rect) else {
+                        continue;
+                    };
+                    // Distance from a candidate press to this handle segment.
+                    let near = press
+                        .map(|p| dist_point_segment(p, origin, tip) <= 7.0)
+                        .unwrap_or(false);
+                    let [r, g, b] = ax.color();
+                    let base = egui::Color32::from_rgb(
+                        (r * 255.0) as u8,
+                        (g * 255.0) as u8,
+                        (b * 255.0) as u8,
+                    );
+                    let col = if near {
+                        base
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 150)
+                    };
+                    let w = if near { 3.0 } else { 2.0 };
+                    painter.line_segment([origin, tip], egui::Stroke::new(w, col));
+                    painter.circle_filled(tip, if near { 5.0 } else { 4.0 }, col);
+                    if near {
+                        grabbed = Some(ax);
+                    }
+                }
+                painter.circle_filled(origin, 3.0, egui::Color32::from_gray(220));
+                // A press that landed on a handle this frame starts a constrained Move.
+                if let Some(ax) = grabbed
+                    && response.drag_started()
+                    && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
+                {
+                    let fids: Vec<usize> = selection
+                        .fixtures
+                        .iter()
+                        .copied()
+                        .filter(|&i| i < scene.fixtures.len())
+                        .collect();
+                    let gids: Vec<usize> = selection
+                        .geometry
+                        .iter()
+                        .copied()
+                        .filter(|&i| i < scene.geometry.len())
+                        .collect();
+                    let start: Vec<(usize, Vec3, Quat)> = fids
+                        .iter()
+                        .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
+                        .collect();
+                    let geo_start: Vec<(usize, Mat4)> =
+                        gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
+                    *transform = Some(TransformOp {
+                        kind: TransformKind::Move,
+                        axis: None,
+                        start_screen: cur,
+                        pivot,
+                        start,
+                        geo_start,
+                        gizmo_hovered_axis: Some(ax),
+                        from_gizmo: true,
+                    });
+                    *transform_started = true;
+                }
+            }
+        }
+    }
+
     // --- Modal transform (Blender G/R/S): when active it OWNS the viewport
     // (mouse drives the transform; orbit/select/zoom are suspended). ---
     let mut consumed = transform.is_some();
     if let Some(op) = transform.as_mut() {
-        // Axis constraint: X/Y/Z toggles a single-axis lock.
-        ui.input(|i| {
-            use egui::Key;
-            for (k, ax) in [(Key::X, Axis::X), (Key::Y, Axis::Y), (Key::Z, Axis::Z)] {
-                if i.key_pressed(k) {
-                    op.axis = if op.axis == Some(ax) { None } else { Some(ax) };
-                }
+        // The MODAL keymap owns the viewport now: X/Y/Z axis lock + Enter/Space
+        // confirm + Esc cancel all decode from `poll_modal`, keeping the binds in
+        // the one registry (and out of the plain press-keymaps) — no scattered raw
+        // key reads here.
+        let modal = shortcuts::poll_modal(ui.ctx());
+        for m in &modal {
+            let ax = match m {
+                shortcuts::ModalAction::ConstrainX => Some(Axis::X),
+                shortcuts::ModalAction::ConstrainY => Some(Axis::Y),
+                shortcuts::ModalAction::ConstrainZ => Some(Axis::Z),
+                _ => None,
+            };
+            if let Some(ax) = ax {
+                op.axis = if op.axis == Some(ax) { None } else { Some(ax) };
             }
-        });
-        // Esc / right-click cancels; pressing outside the viewport (focus lost) also
-        // cancels, so a transform can never get stuck owning the viewport.
-        let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape))
+        }
+        // Esc cancels; right-click cancels; pressing outside the viewport (focus
+        // lost) also cancels, so a transform can never get stuck owning it.
+        let cancel = modal.contains(&shortcuts::ModalAction::Cancel)
             || response.secondary_clicked()
             || !*viewport_focused;
-        let confirm = ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))
-            || response.clicked();
+        // A gizmo drag commits when the pointer is released; a modal G/R/S op
+        // commits on a click or Enter/Space (Blender style — via poll_modal).
+        let confirm = if op.from_gizmo {
+            response.drag_stopped() || !ui.input(|i| i.pointer.primary_down())
+        } else {
+            modal.contains(&shortcuts::ModalAction::Confirm) || response.clicked()
+        };
         if cancel {
             for (i, p0, q0) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
@@ -2431,32 +2608,33 @@ pub fn viewport(
                 apply_transform(op, scene, camera, cur);
             }
             let hint = op.hint();
-            ui.painter().text(
+            theme::overlay_label(
+                &ui.painter_at(rect),
                 rect.center_top() + egui::vec2(0.0, 10.0),
                 egui::Align2::CENTER_TOP,
-                hint,
-                egui::FontId::monospace(13.0),
-                egui::Color32::from_rgb(255, 220, 120),
+                &hint,
+                Some(egui::Color32::from_rgb(255, 220, 120)),
             );
             if confirm {
                 *transform = None;
+                *transform_finished = true;
             }
         }
     } else if *viewport_focused && (!selection.fixtures.is_empty() || !selection.geometry.is_empty()) {
         // Start a transform on G / R / S (over fixtures and/or static geometry).
-        let kind = ui.input(|i| {
-            use egui::Key;
-            if i.key_pressed(Key::G) {
-                Some(TransformKind::Move)
-            } else if i.key_pressed(Key::R) && !i.modifiers.shift {
-                // Shift+R is "Replace fixtures" (handled in handle_shortcuts), so
-                // plain R = Rotate only.
-                Some(TransformKind::Rotate)
-            } else if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl {
-                Some(TransformKind::Scale)
-            } else {
-                None
-            }
+        // The binds (and their modifier guards — plain R only, since Shift+R is
+        // "Replace") live in the central registry under the Viewport context.
+        // Viewport context active, no transform in flight (this is the `else`
+        // branch): the keymap stack resolves plain `S` to Scale (masking the Global
+        // quick-select) and `R` to Rotate (Shift+R = Replace stays in Global).
+        let kind = shortcuts::poll(
+            ui.ctx(),
+            shortcuts::ActiveContext { viewport_focused: true, transform_active: false },
+        )
+        .into_iter()
+        .find_map(|a| match a {
+            shortcuts::Action::Transform(k) => Some(k),
+            _ => None,
         });
         if let Some(kind) = kind
             && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
@@ -2492,7 +2670,17 @@ pub fn viewport(
                     })
                     .collect();
                 let pivot = if n > 0.0 { sum / n } else { Vec3::ZERO };
-                *transform = Some(TransformOp { kind, axis: None, start_screen: cur, pivot, start, geo_start });
+                *transform = Some(TransformOp {
+                    kind,
+                    axis: None,
+                    start_screen: cur,
+                    pivot,
+                    start,
+                    geo_start,
+                    gizmo_hovered_axis: None,
+                    from_gizmo: false,
+                });
+                *transform_started = true;
                 consumed = true;
             }
         }
@@ -2707,11 +2895,19 @@ pub fn viewport(
         });
     }
 
-    // `d` opens the Duplicate dialog for the selected fixture.
+    // `d` (or Shift+D) opens the Duplicate dialog for the selected fixture. The
+    // `!consumed && *viewport_focused` guard below already rules out a live/just-
+    // started transform, so the poll asks the Viewport keymap with no modal active.
+    let dup_pressed = shortcuts::poll(
+        ui.ctx(),
+        shortcuts::ActiveContext { viewport_focused: *viewport_focused, transform_active: false },
+    )
+    .iter()
+    .any(|a| matches!(a, shortcuts::Action::Duplicate));
     if !consumed
         && *viewport_focused
         && duplicate.is_none()
-        && ui.input(|i| i.key_pressed(egui::Key::D))
+        && dup_pressed
         && let Some(idx) = selection.primary_fixture()
     {
         *duplicate = Some(DuplicateDialog {
@@ -2734,12 +2930,12 @@ pub fn viewport(
         );
     }
 
-    ui.painter().text(
-        rect.left_bottom() + egui::vec2(8.0, -6.0),
+    theme::overlay_label(
+        &ui.painter_at(rect),
+        rect.left_bottom() + egui::vec2(8.0, -8.0),
         egui::Align2::LEFT_BOTTOM,
         "drag: orbit · shift+drag: pan · scroll: zoom · click: select · g/r/s: move/rotate/scale · d: duplicate",
-        egui::FontId::proportional(11.0),
-        egui::Color32::from_white_alpha(110),
+        None,
     );
 
     // Active selection label (top-right corner, like Blender's active-object
@@ -2766,17 +2962,13 @@ pub fn viewport(
     };
     if let Some(text) = sel_text {
         let painter = ui.painter_at(rect);
-        let font = egui::FontId::proportional(12.5);
-        let galley = painter.layout_no_wrap(text, font, egui::Color32::from_gray(238));
-        let pad = egui::vec2(9.0, 5.0);
-        let size = galley.size() + pad * 2.0;
-        let anchor = rect.right_top() + egui::vec2(-10.0, 10.0);
-        let bg = egui::Rect::from_min_max(
-            egui::pos2(anchor.x - size.x, anchor.y),
-            egui::pos2(anchor.x, anchor.y + size.y),
+        theme::overlay_label(
+            &painter,
+            rect.right_top() + egui::vec2(-10.0, 10.0),
+            egui::Align2::RIGHT_TOP,
+            &text,
+            None,
         );
-        painter.rect_filled(bg, 5.0, egui::Color32::from_black_alpha(150));
-        painter.galley(bg.min + pad, galley, egui::Color32::from_gray(238));
     }
 
     // Fixture labels, projected to screen (name / ID / DMX address).
@@ -3565,6 +3757,19 @@ enum Hit {
     Environment(usize),
 }
 
+/// Shortest distance from a screen-space point `p` to the segment `a`..`b`. Used by
+/// the move gizmo to hit-test its projected axis handles.
+fn dist_point_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_sq();
+    if len2 <= f32::EPSILON {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    let proj = a + ab * t;
+    (p - proj).length()
+}
+
 /// Pick the object a world-space ray hits. Priority: **fixtures** (so you can
 /// always click a head even when it sits inside set geometry or the fog box),
 /// then **static geometry** (its world AABB), then the **environment** volumes.
@@ -3704,9 +3909,10 @@ mod pick_tests {
 #[cfg(test)]
 mod transform_tests {
     use super::*;
+    use crate::ui::Axis;
 
     fn make_op(kind: TransformKind, axis: Option<Axis>, pivot: Vec3, idx: usize, p0: Vec3) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)], geo_start: Vec::new() }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)], geo_start: Vec::new(), gizmo_hovered_axis: None, from_gizmo: false }
     }
 
     #[test]

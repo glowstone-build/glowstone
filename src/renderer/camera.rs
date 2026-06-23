@@ -190,6 +190,22 @@ impl OrbitCamera {
         (np, (fp - np).normalize_or_zero())
     }
 
+    /// Project a world-space point to a screen position inside `rect` using a
+    /// precomputed `view_proj` (`vp`). Returns `None` when the point is behind the
+    /// camera (`w <= 0`). Mirrors the fixture-label math in `panels::viewport`; the
+    /// screen-space move gizmo uses it to place + hit-test its axis handles.
+    pub fn project_to_screen(point: Vec3, vp: Mat4, rect: egui::Rect) -> Option<egui::Pos2> {
+        let clip = vp * point.extend(1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some(egui::pos2(
+            rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
+            rect.min.y + (0.5 - ndc.y * 0.5) * rect.height(),
+        ))
+    }
+
     pub fn uniform(&self, aspect: f32) -> CameraUniform {
         let eye = self.eye();
         let vp = self.view_proj(aspect);

@@ -165,6 +165,13 @@ pub struct RenderSettings {
     pub show_grid: bool,
     /// How the viewport draws the scene (beauty / unlit / wireframe).
     pub mode: ViewportMode,
+    /// Active modal-transform axis constraint, for the Blender-style infinite
+    /// constraint line: `(pivot, axis colour, axis direction)`. Set by the UI each
+    /// frame from the live `TransformOp` (None when no axis is locked). Purely a
+    /// per-frame render hint — never persisted (bincode .archie is positional, so a
+    /// new serialized field would corrupt older saves, like the fields above).
+    #[serde(skip, default)]
+    pub axis_hint: Option<(glam::Vec3, [f32; 3], glam::Vec3)>,
 }
 
 fn default_false() -> bool {
@@ -193,6 +200,7 @@ impl Default for RenderSettings {
             show_beam_wireframes: false,
             show_grid: true,
             mode: ViewportMode::Beauty,
+            axis_hint: None,
         }
     }
 }
@@ -213,27 +221,44 @@ pub struct Selection {
     pub screens: Vec<usize>,
     /// Selected environment volume, if any.
     pub environment: Option<usize>,
+    /// Whether the top-level World node (HDRI sky + ambient) is selected. World
+    /// is mutually exclusive with the entity selections above — selecting World
+    /// clears them, and selecting any entity clears World.
+    pub world: bool,
 }
 
 impl Selection {
     /// Select a single fixture (clearing any other selection).
     pub fn fixture(i: usize) -> Self {
-        Self { fixtures: vec![i], geometry: Vec::new(), screens: Vec::new(), environment: None }
+        Self { fixtures: vec![i], geometry: Vec::new(), screens: Vec::new(), environment: None, world: false }
     }
 
     /// Select a single static-geometry object (clearing any other selection).
     pub fn geometry(i: usize) -> Self {
-        Self { fixtures: Vec::new(), geometry: vec![i], screens: Vec::new(), environment: None }
+        Self { fixtures: Vec::new(), geometry: vec![i], screens: Vec::new(), environment: None, world: false }
     }
 
     /// Select a single LED screen (clearing any other selection).
     pub fn screen(i: usize) -> Self {
-        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: vec![i], environment: None }
+        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: vec![i], environment: None, world: false }
     }
 
     /// Select a single environment.
     pub fn environment(i: usize) -> Self {
-        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: Vec::new(), environment: Some(i) }
+        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: Vec::new(), environment: Some(i), world: false }
+    }
+
+    /// Select the top-level World node (clearing any other selection).
+    pub fn world() -> Self {
+        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: Vec::new(), environment: None, world: true }
+    }
+
+    /// Toggle the World node selection on/off (clearing everything else when on).
+    /// Kept for selection-API symmetry with the other `toggle_*` entities; wired to
+    /// ⌘/Ctrl-click on the World node in a later pass.
+    #[allow(dead_code)]
+    pub fn toggle_world(&mut self) {
+        *self = if self.world { Self::default() } else { Self::world() };
     }
 
     pub fn contains_fixture(&self, i: usize) -> bool {
@@ -265,6 +290,7 @@ impl Selection {
 
     /// Toggle a fixture in/out of the selection (for ctrl/cmd-click multi-select).
     pub fn toggle_fixture(&mut self, i: usize) {
+        self.world = false;
         self.environment = None;
         self.geometry.clear();
         self.screens.clear();
@@ -277,6 +303,7 @@ impl Selection {
 
     /// Toggle a geometry object in/out of the selection (ctrl/cmd-click).
     pub fn toggle_geometry(&mut self, i: usize) {
+        self.world = false;
         self.environment = None;
         self.fixtures.clear();
         self.screens.clear();
@@ -289,6 +316,7 @@ impl Selection {
 
     /// Toggle an LED screen in/out of the selection (ctrl/cmd-click).
     pub fn toggle_screen(&mut self, i: usize) {
+        self.world = false;
         self.environment = None;
         self.fixtures.clear();
         self.geometry.clear();
@@ -301,6 +329,7 @@ impl Selection {
 
     /// Select an inclusive contiguous fixture range (shift-range select).
     pub fn set_fixture_range(&mut self, a: usize, b: usize) {
+        self.world = false;
         self.environment = None;
         self.geometry.clear();
         self.screens.clear();

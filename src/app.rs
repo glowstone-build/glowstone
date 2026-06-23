@@ -1098,6 +1098,9 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     if std::env::var("PREVIZ_UI_QS").is_ok() {
         state.ui.debug_open_quick_select();
     }
+    if std::env::var("PREVIZ_UI_OPS").is_ok() {
+        state.ui.debug_open_op_search();
+    }
     if std::env::var("PREVIZ_UI_PROFILE").is_ok() {
         state.ui.debug_open_profile(&state.scene);
     }
@@ -1316,6 +1319,11 @@ impl State {
                 fps,
             );
         });
+
+        // The viewport may have started/updated a modal transform during the egui
+        // run; push its axis constraint into RenderSettings so the renderer draws the
+        // infinite Blender-style axis line through the pivot this same frame.
+        self.ui.sync_axis_hint();
 
         self.egui_state.handle_platform_output(
             &self.window,

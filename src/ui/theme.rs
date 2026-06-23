@@ -54,6 +54,8 @@ pub mod icon {
     pub const COLOR: &str = p::PALETTE;
     pub const INFO: &str = p::INFO;
     pub const RESET: &str = p::ARROW_CLOCKWISE;
+    pub const UNDO: &str = p::ARROW_COUNTER_CLOCKWISE;
+    pub const REDO: &str = p::ARROW_CLOCKWISE;
     pub const DUPLICATE: &str = p::COPY;
     pub const DESELECT: &str = p::X_CIRCLE;
     pub const EYE: &str = p::EYE;
@@ -126,6 +128,30 @@ pub fn section(ui: &mut egui::Ui, text: &str) {
 
 fn ink_for(ui: &egui::Ui) -> Ink {
     ink(!ui.visuals().dark_mode)
+}
+
+/// A floating viewport overlay pill: a dark, rounded, padded chip with light
+/// (or accent-tinted) text — the shared visual language for the selection
+/// label, the modal-transform hint, and the bottom help line. `anchor` + `align`
+/// position the pill exactly like `Painter::text` does for plain text, so call
+/// sites can drop-in replace a raw `painter.text(...)`.
+pub fn overlay_label(
+    painter: &egui::Painter,
+    anchor: egui::Pos2,
+    align: egui::Align2,
+    text: &str,
+    accent: Option<egui::Color32>,
+) {
+    let fg = accent.unwrap_or(egui::Color32::from_gray(238));
+    let font = egui::FontId::proportional(12.5);
+    let galley = painter.layout_no_wrap(text.to_owned(), font, fg);
+    let pad = egui::vec2(9.0, 5.0);
+    let size = galley.size() + pad * 2.0;
+    // Place the padded box so `anchor`/`align` line up with the text box, the
+    // same contract egui's Align2 uses against a rect of `size`.
+    let bg = align.anchor_size(anchor, size);
+    painter.rect_filled(bg, 5.0, egui::Color32::from_black_alpha(150));
+    painter.galley(bg.min + pad, galley, fg);
 }
 
 /// Accent colour as a Color32 from the preference triple.
