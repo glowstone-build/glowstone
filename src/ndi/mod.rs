@@ -143,7 +143,7 @@ mod imp {
                 };
                 while !stop.load(Ordering::Relaxed) {
                     if let Ok(list) = finder.current_sources() {
-                        let names: Vec<String> = list.map(|s| format!("{s}")).collect();
+                        let names: Vec<String> = list.iter().map(|s| format!("{s}")).collect();
                         *sources.lock().unwrap() = names;
                     }
                     std::thread::sleep(Duration::from_secs(1));
@@ -191,8 +191,19 @@ mod imp {
                     while !stop_t.load(Ordering::Relaxed) {
                         match receiver.video().capture(Duration::from_millis(1000)) {
                             Ok(v) => {
-                                let (w, h) = (v.width(), v.height());
-                                let stride = v.line_stride().max(0) as usize;
+                                // grafton-ndi: width()/height() are i32; stride comes
+                                // from line_stride_or_size() (an enum, since compressed
+                                // formats report a total size instead of a row stride).
+                                let w = v.width().max(0) as u32;
+                                let h = v.height().max(0) as u32;
+                                let stride = match v.line_stride_or_size() {
+                                    grafton_ndi::LineStrideOrSize::LineStrideBytes(s) => {
+                                        s.max(0) as usize
+                                    }
+                                    grafton_ndi::LineStrideOrSize::DataSizeBytes(_) => {
+                                        (w as usize) * 4
+                                    }
+                                };
                                 let rgba = pack_rgba(v.data(), w, h, stride);
                                 if !rgba.is_empty() {
                                     generation = generation.wrapping_add(1);

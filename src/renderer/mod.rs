@@ -295,6 +295,12 @@ pub struct Renderer {
 
     line_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
+    /// Depth-only pre-pass + `Equal`-test main pass (cuts the per-fragment light-loop
+    /// overdraw). Gated on light count: only worth its draw overhead when the fragment
+    /// shader is expensive (many lit fixtures). Beauty/Unlit only; Wireframe keeps
+    /// the single Less+write path.
+    mesh_depth_prepass: wgpu::RenderPipeline,
+    mesh_depth_equal: wgpu::RenderPipeline,
     /// Wireframe variant of the mesh pipeline (None if the GPU lacks line polygon mode).
     mesh_wire_pipeline: Option<wgpu::RenderPipeline>,
     lens_pipeline: wgpu::RenderPipeline,
@@ -548,6 +554,8 @@ impl Renderer {
 
         let line_pipeline = pipeline::line_pipeline(&device, &line_layout);
         let mesh_pipeline = pipeline::mesh_pipeline(&device, &mesh_layout);
+        let mesh_depth_prepass = pipeline::mesh_depth_prepass_pipeline(&device, &mesh_layout);
+        let mesh_depth_equal = pipeline::mesh_depth_equal_pipeline(&device, &mesh_layout);
         let mesh_wire_pipeline =
             wireframe_supported.then(|| pipeline::mesh_wire_pipeline(&device, &mesh_layout));
         let lens_pipeline = pipeline::lens_pipeline(&device, &line_layout);
@@ -793,6 +801,8 @@ impl Renderer {
             camera_bind_group,
             line_pipeline,
             mesh_pipeline,
+            mesh_depth_prepass,
+            mesh_depth_equal,
             mesh_wire_pipeline,
             lens_pipeline,
             wall_pipeline,
@@ -2438,6 +2448,80 @@ impl Renderer {
             }
         }
 
+        // Pass 0.5: DEPTH PRE-PASS — write the opaque scene depth with NO fragment work
+        // so the main forward pass runs its heavy per-fragment light loop EXACTLY once per
+        // visible pixel (Equal test, no overdraw). The pre-pass adds draws/vertex work, so
+        // it only pays off when that loop is expensive — gate it on the lit-fixture count
+        // (a sparse scene keeps the plain single Less+write pass, no regression). Wireframe
+        // (lines, not fill) always skips it. The opaque-mesh draws here MUST stay identical
+        // to the forward pass's, or DEPTH_EQUAL would reject pixels — keep them in sync.
+        const PREPASS_MIN_LIGHTS: usize = 16;
+        // The pre-pass re-draws all opaque geometry, so it only pays off when those draws
+        // are cheap — i.e. instancing collapsed the scene into few mesh groups. If geometry
+        // failed to dedup (thousands of unique meshes), the extra draw calls cost more than
+        // the light-loop overdraw they save (measured: a non-deduped 5932-group scene
+        // regressed 61→56 fps; the same scene deduped to 236 groups gained 72→75). Both load
+        // paths dedup — MVR import shares resource Arcs, `.archie` load re-interns them
+        // (project::intern_geometry_resources) — so real scenes stay well under the cap.
+        const PREPASS_MAX_GROUPS: usize = 1500;
+        let geom_groups = ranges.len() + gdtf_groups.len() + scene_geom_groups.len();
+        let use_prepass = settings.mode != ViewportMode::Wireframe
+            && gpu_fixtures.len() >= PREPASS_MIN_LIGHTS
+            && geom_groups <= PREPASS_MAX_GROUPS;
+        if use_prepass {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("depth-prepass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.viewport.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.mesh_depth_prepass);
+            // Shares the mesh layout (camera+light+world), so bind all three even though
+            // only group 0 is read by the vertex stage.
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(1, &light_bg, &[]);
+            pass.set_bind_group(2, &self.world_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.floor_instances.buffer.slice(..));
+            pass.draw(0..self.floor_mesh.vertex_count, 0..1);
+            pass.set_vertex_buffer(1, self.fixture_instances.buffer.slice(..));
+            for (geometry, start, count) in &ranges {
+                let m = self.mesh_for(*geometry);
+                pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
+                pass.draw(0..m.vertex_count, *start..*start + *count);
+            }
+            if !gdtf_groups.is_empty() {
+                pass.set_vertex_buffer(1, self.gdtf_instances.buffer.slice(..));
+                for (key, model, base, count) in &gdtf_groups {
+                    if let Some(mesh) = self.gdtf_cache.get(key).and_then(|m| m.get(model)) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
+                    }
+                }
+            }
+            if !scene_geom_groups.is_empty() {
+                pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
+                for (key, base, count) in &scene_geom_groups {
+                    if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
+                    }
+                }
+            }
+            if gdtf_placeholder_count > 0 {
+                pass.set_vertex_buffer(0, self.cone_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.gdtf_placeholder_instances.buffer.slice(..));
+                pass.draw(0..self.cone_mesh.vertex_count, 0..gdtf_placeholder_count);
+            }
+        }
+
         // Pass 1: forward opaque scene -> HDR target.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2459,7 +2543,13 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: self.viewport.depth_view(),
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        // Pre-pass already wrote depth → load it (mesh draws test Equal,
+                        // no write). Without it, clear here (plain Less+write path).
+                        load: if use_prepass {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(1.0)
+                        },
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -2484,9 +2574,15 @@ impl Renderer {
             pass.set_bind_group(1, &light_bg, &[]);
             pass.set_bind_group(2, &self.world_bind_group, &[]); // mesh IBL ambient
 
-            let mesh_pipe = match (settings.mode, self.mesh_wire_pipeline.as_ref()) {
-                (ViewportMode::Wireframe, Some(wire)) => wire,
-                _ => &self.mesh_pipeline,
+            // Wireframe → line pipeline (no pre-pass). Else if the pre-pass ran, test
+            // Equal (once per visible pixel); otherwise the plain Less+write pipeline
+            // against the depth cleared this pass.
+            let mesh_pipe = if settings.mode == ViewportMode::Wireframe {
+                self.mesh_wire_pipeline.as_ref().unwrap_or(&self.mesh_pipeline)
+            } else if use_prepass {
+                &self.mesh_depth_equal
+            } else {
+                &self.mesh_pipeline
             };
             pass.set_pipeline(mesh_pipe);
             pass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));

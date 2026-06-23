@@ -48,6 +48,18 @@ fn depth_stencil_no_write() -> wgpu::DepthStencilState {
     }
 }
 
+/// Main forward pass when a depth PRE-PASS already wrote the scene depth: test
+/// `Equal` (so the heavy per-fragment light loop runs exactly once per visible
+/// pixel, no overdraw) and don't re-write depth. Bit-identical clip-Z is required
+/// vs the pre-pass — guaranteed by sharing `mesh.wgsl`'s `@invariant` `vs_main`.
+fn depth_stencil_equal() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Equal),
+        ..depth_stencil()
+    }
+}
+
 fn hdr_target() -> Option<wgpu::ColorTargetState> {
     Some(wgpu::ColorTargetState {
         format: Viewport::HDR_FORMAT,
@@ -243,6 +255,71 @@ fn mesh_pipeline_mode(
             ..Default::default()
         },
         depth_stencil: Some(depth_stencil()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Depth-only PRE-PASS over the opaque meshes: `mesh.wgsl`'s `vs_main` (so the
+/// clip-Z exactly matches the main pass) with NO fragment shader, writing only depth
+/// (`Less` + write). Lets the main pass run with `depth_stencil_equal()` → the heavy
+/// per-fragment light loop executes once per visible pixel instead of per overdrawn layer.
+pub fn mesh_depth_prepass_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load_with_optics(device, "mesh.wgsl", include_str!("../shaders/mesh.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mesh-depth-prepass"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: None,
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// The lit mesh pipeline for the main pass WHEN a depth pre-pass ran: `Equal` depth
+/// test, no depth write (see [`depth_stencil_equal`]).
+pub fn mesh_depth_equal_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load_with_optics(device, "mesh.wgsl", include_str!("../shaders/mesh.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mesh-pipeline-equal"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil_equal()),
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,

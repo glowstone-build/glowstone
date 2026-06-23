@@ -103,11 +103,39 @@ pub fn read(path: &Path) -> Result<Project, String> {
     if ver != FORMAT {
         return Err(format!("unsupported project version {ver} (expected {FORMAT})"));
     }
-    let project: Project = bincode::deserialize(&bytes[head..]).map_err(|e| format!("decode: {e}"))?;
+    let mut project: Project =
+        bincode::deserialize(&bytes[head..]).map_err(|e| format!("decode: {e}"))?;
     if project.format != FORMAT {
         return Err(format!("project body version {} mismatches header", project.format));
     }
+    intern_geometry_resources(&mut project.scene);
     Ok(project)
+}
+
+/// Re-share identical geometry blobs after load.
+///
+/// bincode (via serde's `rc` feature) deserialises every `Arc<Vec<u8>>`
+/// INDEPENDENTLY — so N imported objects that all referenced the same resource
+/// file come back as N distinct `Arc`s holding identical bytes. The renderer
+/// caches and instances geometry by `Arc::as_ptr`, so without re-sharing them an
+/// N-copy set piece (truss, deck, chair) becomes N unique meshes = N draw calls
+/// instead of one instanced draw — exactly the dedup the live import gets for
+/// free. Re-intern by file name (the `.archie` resource key — save bundles one
+/// blob per name, see `mvr::write`), restoring import-time sharing so static
+/// instancing collapses the forward pass.
+fn intern_geometry_resources(scene: &mut Scene) {
+    use std::sync::Arc;
+    let mut interned: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
+    for obj in &mut scene.geometry {
+        for m in &mut obj.models {
+            match interned.get(&m.file) {
+                Some(shared) => m.glb = Arc::clone(shared),
+                None => {
+                    interned.insert(m.file.clone(), Arc::clone(&m.glb));
+                }
+            }
+        }
+    }
 }
 
 // --- recent projects + autosave locations (per-user dirs) -------------------

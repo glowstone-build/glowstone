@@ -86,7 +86,10 @@ struct VsIn {
 };
 
 struct VsOut {
-    @builtin(position) clip_position: vec4<f32>,
+    // @invariant: the depth pre-pass and the DEPTH_EQUAL main pass share this vertex
+    // stage; @invariant guarantees both compute bit-identical clip-Z so the Equal test
+    // matches exactly (no z-fighting / dropped pixels on GPUs that reorder FP math).
+    @invariant @builtin(position) clip_position: vec4<f32>,
     @location(0) world_normal: vec3<f32>,
     @location(1) color: vec3<f32>,
     @location(2) intensity: f32,
