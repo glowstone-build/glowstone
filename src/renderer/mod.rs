@@ -1476,6 +1476,9 @@ impl Renderer {
         let gdtf_to_world = Mat4::from_rotation_x(-FRAC_PI_2); // GDTF +Z up -> world +Y up
         let mut gdtf_parts: Vec<MeshInstance> = Vec::new();
         let mut gdtf_draws: Vec<(usize, String, u32)> = Vec::new();
+        // (mesh key, part model, base instance, count) — one instanced forward draw per
+        // unique fixture-model part (shared across all fixtures of that GDTF type).
+        let mut gdtf_groups: Vec<(usize, String, u32, u32)> = Vec::new();
         // GDTF fixtures whose models didn't bake get a placeholder cone instead.
         let mut gdtf_placeholders: Vec<MeshInstance> = Vec::new();
         let mut beam_frames: Vec<Vec<fixture_model::BeamFrame>> =
@@ -1528,6 +1531,29 @@ impl Renderer {
                 });
             }
         }
+        // Regroup parts by (mesh key, model) so all instances of a part across every
+        // fixture of that type are contiguous → one instanced forward+shadow draw per
+        // part. `gdtf_draws` keeps remapped per-part entries for the shadow loop.
+        {
+            let mut order: Vec<usize> = (0..gdtf_draws.len()).collect();
+            order.sort_by(|&a, &b| {
+                gdtf_draws[a].0.cmp(&gdtf_draws[b].0).then_with(|| gdtf_draws[a].1.cmp(&gdtf_draws[b].1))
+            });
+            let mut parts = Vec::with_capacity(gdtf_parts.len());
+            let mut draws = Vec::with_capacity(gdtf_draws.len());
+            for &old in &order {
+                let new_idx = parts.len() as u32;
+                parts.push(gdtf_parts[old]);
+                let (key, model, _) = (gdtf_draws[old].0, gdtf_draws[old].1.clone(), 0u32);
+                draws.push((key, model.clone(), new_idx));
+                match gdtf_groups.last_mut() {
+                    Some((k, m, _, count)) if *k == key && *m == model => *count += 1,
+                    _ => gdtf_groups.push((key, model, new_idx, 1)),
+                }
+            }
+            gdtf_parts = parts;
+            gdtf_draws = draws;
+        }
         self.gdtf_instances
             .upload(&self.device, &self.queue, &gdtf_parts);
         let gdtf_placeholder_count = self
@@ -1542,6 +1568,8 @@ impl Renderer {
         // (mesh key, instance index, world-space AABB) — the AABB frustum-culls the
         // draw out of shadow passes (and the camera-frustum forward pass).
         let mut scene_geom_draws: Vec<(usize, u32, Vec3, Vec3)> = Vec::new();
+        // (mesh key, base instance, count) — one instanced forward draw per unique mesh.
+        let mut scene_geom_groups: Vec<(usize, u32, u32)> = Vec::new();
         let mut total_models = 0usize;
         for (oi, obj) in scene.geometry.iter().enumerate() {
             if obj.hidden {
@@ -1577,6 +1605,28 @@ impl Renderer {
                     scene_geom_draws.push((key, idx, wlo, whi));
                 }
             }
+        }
+        // Regroup instances by mesh key so identical static meshes are contiguous in
+        // the buffer → ONE instanced forward draw per unique mesh instead of one per
+        // instance (the dominant FOH draw-call cost). `scene_geom_draws` keeps a
+        // per-instance entry (with REMAPPED idx) for the per-beam shadow LOD cull.
+        {
+            let mut order: Vec<usize> = (0..scene_geom_draws.len()).collect();
+            order.sort_by_key(|&i| scene_geom_draws[i].0); // stable by mesh key
+            let mut inst = Vec::with_capacity(scene_geom_instances.len());
+            let mut draws = Vec::with_capacity(scene_geom_draws.len());
+            for &old in &order {
+                let new_idx = inst.len() as u32;
+                inst.push(scene_geom_instances[old]);
+                let (key, _, lo, hi) = scene_geom_draws[old];
+                draws.push((key, new_idx, lo, hi));
+                match scene_geom_groups.last_mut() {
+                    Some((k, _, count)) if *k == key => *count += 1,
+                    _ => scene_geom_groups.push((key, new_idx, 1)),
+                }
+            }
+            scene_geom_instances = inst;
+            scene_geom_draws = draws;
         }
         if std::env::var("PREVIZ_GEOM_STATS").is_ok() {
             let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -2451,29 +2501,29 @@ impl Renderer {
             }
 
             // GDTF fixture model parts (each part is one instance).
-            if !gdtf_draws.is_empty() {
+            // GDTF fixture-model parts — ONE instanced draw per unique part (shared
+            // across every fixture of that GDTF type) instead of one per part per fixture.
+            if !gdtf_groups.is_empty() {
                 pass.set_vertex_buffer(1, self.gdtf_instances.buffer.slice(..));
-                for (key, model, idx) in &gdtf_draws {
+                for (key, model, base, count) in &gdtf_groups {
                     if let Some(mesh) = self.gdtf_cache.get(key).and_then(|m| m.get(model)) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
                     }
                 }
             }
 
-            // Imported MVR static geometry (each model is one instance). Camera-
-            // frustum culled: off-screen crowd/set objects are skipped (lossless),
-            // so orbiting/zooming into part of a big rig doesn't pay for the rest.
-            if !scene_geom_draws.is_empty() {
-                let cam_vp = camera.view_proj(aspect);
+            // Imported MVR static geometry — ONE instanced draw per unique mesh (truss
+            // segments, deck tiles, set pieces are overwhelmingly repeats). Off-screen
+            // instances are GPU-clipped (vertex-only); the per-instance camera-frustum
+            // cull is dropped here since the draw-call collapse is the real win (a future
+            // GPU compute cull can prune off-screen instances before the draw).
+            if !scene_geom_groups.is_empty() {
                 pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
-                for (key, idx, lo, hi) in &scene_geom_draws {
-                    if aabb_outside_clip(&cam_vp, *lo, *hi) {
-                        continue;
-                    }
+                for (key, base, count) in &scene_geom_groups {
                     if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
                     }
                 }
             }
@@ -3350,8 +3400,10 @@ fn transform_aabb(m: &Mat4, lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
 }
 
 /// True if the world AABB is fully outside `vp`'s clip volume (conservative;
-/// wgpu clip z ∈ [0, w]) — i.e. the draw can be skipped for this view. Used to
-/// frustum-cull shadow casters (narrow hero cone) and off-screen forward draws.
+/// wgpu clip z ∈ [0, w]) — i.e. the draw can be skipped for this view. Retained for
+/// the planned GPU compute frustum-cull of instanced static geometry (the forward
+/// per-instance CPU cull was removed in favour of one instanced draw per mesh).
+#[allow(dead_code)]
 fn aabb_outside_clip(vp: &Mat4, lo: Vec3, hi: Vec3) -> bool {
     let (mut nx, mut px, mut ny, mut py, mut nz, mut pz) = (true, true, true, true, true, true);
     for i in 0..8u32 {
