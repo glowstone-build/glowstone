@@ -2035,6 +2035,10 @@ impl Renderer {
         // is only ever extra work, never a dropped contributor. Wide beams (covering most
         // of the screen) go in a global prefix every tile scans, keeping spot lists tight.
         // PREVIZ_NOCULL forces the all-lights fallback (the pixel-identity test harness).
+        // `avg_tile_beams` (set in the block) = the beams an average ray actually marches;
+        // the volumetric step budget divides by THIS, not the full count, so culling's freed
+        // per-ray budget is spent on more march steps (the banding fix) — see the fog block.
+        let mut avg_tile_beams = gpu_fixtures.len().max(1);
         {
             let n_tiles = (tiles_x * tiles_y) as usize;
             let view_proj = camera.view_proj(aspect);
@@ -2151,6 +2155,9 @@ impl Renderer {
             }
             self.tile_offsets.upload(&self.device, &self.queue, &offsets);
             self.tile_lights.upload(&self.device, &self.queue, &flat);
+            // Beams an average ray marches (wide prefix + tile-local). Drives the
+            // volumetric step budget below.
+            avg_tile_beams = (flat.len() / n_tiles).max(1);
         }
 
         // Keep the storage binding non-empty (≥1 element) even with no wheels.
@@ -2179,19 +2186,27 @@ impl Renderer {
             // In HYBRID mode the raymarch only marches the few hero beams (the froxel
             // carries the rest), so divide the step budget by the hero count, not all
             // beams → each hero gets MANY steps = crisp, smooth shafts.
+            // Step budget divides by the beams a ray ACTUALLY marches. Pre-tiling that
+            // was all N (so a 168-beam rig floored at 40 steps → bad longitudinal banding
+            // in a big fog box, worst during camera motion when temporal can't accumulate).
+            // Tiled culling means a ray now marches only its tile's beams (avg_tile_beams),
+            // so the SAME per-ray beam cost buys far more steps — spend that on step count
+            // (the ghost-free banding fix; raising temporal history instead would smear,
+            // since the volumetric reprojects against scene depth, not the mid-air haze).
+            // Isolated beams (sparse tiles → where banding reads most) get the most steps.
             let march_beams = if use_froxel {
                 n_shadows.max(1)
             } else {
-                gpu_fixtures.len().max(1)
+                avg_tile_beams
             };
-            // Temporal accumulation (vol_temporal.wgsl) averages MANY jittered frames,
-            // so the smooth STATIC look no longer depends on a high per-frame step count
-            // — that buys back the step budget (Wronski/Heckel: jitter+accumulation lets
-            // you march far fewer steps). Lowered floor 64→40 + multiplier 6→4: a few
-            // hero beams still get up to 176 (crisp while moving, before history builds),
-            // a busy rig floors at 40 (≈37% fewer rays) and converges smooth over frames.
-            let budget = settings.steps.max(40) as f32 * 4.0;
-            let step_cap = (budget / march_beams as f32).clamp(40.0, 176.0);
+            // Per-ray work budget in beam-samples (steps × beams-marched). Pre-tiling a ray
+            // marched all N beams, so this budget floored the step count (40) and the big
+            // fog box banded; now a ray marches only `avg_tile_beams`, so the same budget
+            // buys ~N/avg× more steps — spent on killing the banding (and the motion flicker,
+            // since a denser per-frame march bands far less when temporal can't accumulate).
+            // Stays well under the pre-tiling per-ray cost. Scale with the `steps` quality knob.
+            let beam_sample_budget = settings.steps.max(40) as f32 * 40.0;
+            let step_cap = (beam_sample_budget / march_beams as f32).clamp(64.0, 176.0);
             let target_dt = (fog.max() - fog.min()).length() / step_cap;
             let vol = VolumetricUniform {
                 inv_view_proj: inv_vp.to_cols_array_2d(),
