@@ -18,6 +18,7 @@ struct Volumetric {
     albedo_beam: vec4<f32>,     // rgb = scattering tint, w = beam intensity
     counts: vec4<f32>,          // y = max step count, z = constant-dt target (world m)
     chroma: vec4<f32>,          // x = Helmholtz–Kohlrausch chroma read-up strength; yzw reserved
+    tile: vec4<f32>,            // x = tiles_x, y = tiles_y, z = tile size (full-res px), w unused
 };
 
 struct Fixture {
@@ -47,6 +48,11 @@ struct Fixture {
 // Per-fixture wheel chain (dynamic count); each fixture indexes a [offset,count)
 // slice via cookie_r.w / cookie_u.w.
 @group(0) @binding(10) var<storage, read> wheels: array<WheelGpu>;
+// Tiled light culling: per-screen-tile CSR light lists, SHARED with the mesh pass.
+// One ray = one screen tile, so the slice is fetched once and reused for every march
+// sample (the whole saving amortizes over the march).
+@group(0) @binding(11) var<storage, read> tile_offsets: array<u32>;
+@group(0) @binding(12) var<storage, read> tile_lights: array<u32>;
 
 const PI: f32 = 3.14159265359;
 
@@ -165,7 +171,18 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let max_steps = max(i32(u.counts.y), 1);
-    let count = i32(arrayLength(&fixtures));
+    // Tiled light culling: this ray's screen tile, fetched ONCE and reused for every
+    // march sample. in.pos.xy is the half-res frag coord; ×2 lifts it onto the full-res
+    // tile grid the mesh pass uses, so the floor pool and the beam shaft march the
+    // identical beam subset (lock-step). u.tile = (tiles_x, tiles_y, tile_px, _).
+    let v_tpx = max(u32(u.tile.z), 1u);
+    let v_txn = max(u32(u.tile.x), 1u);
+    let v_tyn = max(u32(u.tile.y), 1u);
+    let v_tx = min(u32(in.pos.x * 2.0) / v_tpx, v_txn - 1u);
+    let v_ty = min(u32(in.pos.y * 2.0) / v_tpx, v_tyn - 1u);
+    let v_tile = v_ty * v_txn + v_tx;
+    let v_lo = tile_offsets[v_tile];
+    let v_hi = tile_offsets[v_tile + 1u];
     let g = clamp(u.fog_max_g.w, -0.95, 0.95); // keep HG well-conditioned at extremes
     let base = u.fog_min_density.w;
     let albedo = u.albedo_beam.rgb;
@@ -226,7 +243,8 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
         let sigma_s = sigma_t * albedo;
 
         var lin = ambient;
-        for (var f = 0; f < count; f = f + 1) {
+        for (var j = v_lo; j < v_hi; j = j + 1u) {
+            let f = i32(tile_lights[j]);
             let fx = fixtures[f];
             if (hero_only && fx.misc.w < 0.0) {
                 continue; // mass beam → handled by the froxel volume

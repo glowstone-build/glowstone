@@ -409,6 +409,10 @@ pub fn volumetric_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
             shadow_matrices_entry(9),
             // 10: per-fixture wheel chain (dynamic count).
             storage_entry(10),
+            // 11: per-screen-tile light-list CSR offsets, 12: flat light indices
+            // (tiled light culling — the ray's tile bounds which beams it marches).
+            storage_entry(11),
+            storage_entry(12),
         ],
     })
 }
@@ -465,6 +469,10 @@ pub fn light_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             shadow_matrices_entry(5),
             // 6: per-fixture wheel chain (dynamic count).
             storage_entry(6),
+            // 7: per-screen-tile light-list CSR offsets, 8: flat light indices
+            // (tiled light culling — the fragment's tile bounds which lights it loops).
+            storage_entry(7),
+            storage_entry(8),
         ],
     })
 }

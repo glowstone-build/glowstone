@@ -156,25 +156,34 @@ mod imp {
         let frame = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let (frame_t, stop_t) = (frame.clone(), stop.clone());
+        // The discovered name is "NAME@url"; the url can vary, so match on the
+        // stable NAME part (before the last '@').
+        let want = source_name.rsplit_once('@').map(|(n, _)| n.to_string()).unwrap_or(source_name);
         std::thread::Builder::new()
             .name("ndi-recv".into())
             .spawn(move || {
                 let mut generation = 0u64;
+                // ONE persistent finder so discovery accumulates (a fresh finder per
+                // retry + the no-wait `current_sources()` snapshot never finds it).
+                let finder = match Finder::new(&ndi, &finder_opts()) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log::warn!("NDI finder (recv): {e}");
+                        return;
+                    }
+                };
                 while !stop_t.load(Ordering::Relaxed) {
-                    // Resolve the Source matching our name.
-                    let finder = match Finder::new(&ndi, &finder_opts()) {
-                        Ok(f) => f,
-                        Err(_) => {
-                            std::thread::sleep(Duration::from_millis(500));
-                            continue;
-                        }
-                    };
-                    let source = finder
-                        .current_sources()
-                        .ok()
-                        .and_then(|list| list.into_iter().find(|s| format!("{s}") == source_name));
+                    // Give discovery time to populate, then snapshot + match by name.
+                    let _ = finder.wait_for_sources(Duration::from_secs(2));
+                    let source = finder.current_sources().ok().and_then(|list| {
+                        list.into_iter().find(|s| {
+                            let disp = format!("{s}");
+                            let nm = disp.rsplit_once('@').map(|(n, _)| n).unwrap_or(disp.as_str());
+                            nm == want.as_str()
+                        })
+                    });
                     let Some(source) = source else {
-                        std::thread::sleep(Duration::from_millis(500));
+                        std::thread::sleep(Duration::from_millis(300));
                         continue;
                     };
                     // Request RGBA so the bytes upload straight to an Rgba8 texture.
@@ -188,9 +197,11 @@ mod imp {
                             continue;
                         }
                     };
+                    let mut misses = 0u32;
                     while !stop_t.load(Ordering::Relaxed) {
                         match receiver.video().capture(Duration::from_millis(1000)) {
                             Ok(v) => {
+                                misses = 0;
                                 // grafton-ndi: width()/height() are i32; stride comes
                                 // from line_stride_or_size() (an enum, since compressed
                                 // formats report a total size instead of a row stride).
@@ -215,7 +226,14 @@ mod imp {
                                     }));
                                 }
                             }
-                            Err(_) => { /* timeout / connecting — keep trying */ }
+                            Err(_) => {
+                                // Timeout / connecting. After several misses assume the
+                                // source went away and re-resolve it.
+                                misses += 1;
+                                if misses > 5 {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

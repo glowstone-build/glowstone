@@ -71,6 +71,11 @@ var<storage, read> lights: array<Light>;
 @group(1) @binding(5) var<storage, read> shadow_mats: array<mat4x4<f32>>;
 // Per-fixture wheel chain (dynamic count); shared with the volumetric pass.
 @group(1) @binding(6) var<storage, read> wheels: array<WheelGpu>;
+// Tiled light culling: per-screen-tile CSR light lists. tile_offsets[t]..[t+1]
+// slices tile_lights into the beam indices overlapping tile t. The fragment loops
+// only its tile's slice instead of all lights (the volumetric pass shares this grid).
+@group(1) @binding(7) var<storage, read> tile_offsets: array<u32>;
+@group(1) @binding(8) var<storage, read> tile_lights: array<u32>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -149,10 +154,21 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         ambient = vec3<f32>(0.03 + max(dot(normal, key_dir), 0.0) * 0.05);
     }
 
-    // Illumination from every fixture spotlight reaching this surface point.
+    // Illumination from every fixture spotlight reaching this surface point —
+    // restricted to the beams in this fragment's screen tile (tiled light culling).
+    // render_mode.z = tiles_x, .w = tile size (px). The per-light gates below still
+    // run, so an over-included light is only extra work, never wrong; the cull never
+    // drops a contributor (its tile coverage uses the same `cull` radius as below).
     var fixture_light = vec3<f32>(0.0);
-    let n_lights = arrayLength(&lights);
-    for (var i = 0u; i < n_lights; i = i + 1u) {
+    let l_tpx = max(u32(camera.render_mode.w), 1u);
+    let l_txn = max(u32(camera.render_mode.z), 1u);
+    let l_tx = min(u32(in.clip_position.x) / l_tpx, l_txn - 1u);
+    let l_ty = u32(in.clip_position.y) / l_tpx;
+    let l_tile = l_ty * l_txn + l_tx;
+    let l_lo = tile_offsets[l_tile];
+    let l_hi = tile_offsets[l_tile + 1u];
+    for (var j = l_lo; j < l_hi; j = j + 1u) {
+        let i = tile_lights[j];
         let lt = lights[i];
         let lpos = lt.pos_range.xyz;
         let bdir = lt.dir_cos.xyz;

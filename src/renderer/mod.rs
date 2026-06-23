@@ -49,6 +49,10 @@ struct VolumetricUniform {
     /// x = Helmholtz–Kohlrausch chroma read-up strength (saturated beams read more
     /// strongly in haze); yzw reserved. Mirrors `chroma` in volumetric.wgsl.
     chroma: [f32; 4],
+    /// Tiled light culling: x = tiles_x, y = tiles_y, z = tile size (full-res px),
+    /// w = wide-light count (unused by shader). The ray's screen tile bounds which
+    /// beams it marches. Mirrors `tile` in volumetric.wgsl.
+    tile: [f32; 4],
 }
 
 /// Temporal-accumulation uniform (mirrors `TemporalU` in vol_temporal.wgsl). Drives
@@ -227,6 +231,15 @@ struct ScreenRuntime {
 const SUMMARY_W: usize = 8;
 const SUMMARY_H: usize = 4;
 
+/// Tiled light culling (Gem 3): screen-tile size in full-res pixels. The forward
+/// fragment shader and the volumetric raymarch both index this grid to loop only
+/// the beams overlapping their pixel's tile. 32 px is the sweet spot — tight enough
+/// to cull spots hard, coarse enough that the CPU scatter stays sub-millisecond.
+const LIGHT_TILE_PX: u32 = 32;
+/// Below this lit-fixture count, culling is skipped (every tile gets all lights, i.e.
+/// today's brute-force behaviour) — the build/extra-binding overhead isn't worth it.
+const TILE_MIN_LIGHTS: usize = 16;
+
 /// Box-downsample an RGBA8 (sRGB) frame to a `SUMMARY_W × SUMMARY_H` grid of
 /// linear-RGB averages (row 0 = top) for the per-region area-light samples.
 fn summarize_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<[f32; 3]> {
@@ -401,6 +414,11 @@ pub struct Renderer {
     /// Viewport size last frame; a change recreates the EMA targets (history reset).
     prev_size: (u32, u32),
     fixtures_storage: GrowBuffer,
+    /// Tiled light culling (Gem 3): per-screen-tile CSR light lists, shared by the
+    /// forward mesh pass and the volumetric raymarch. `tile_offsets[t]..[t+1]` slices
+    /// `tile_lights` into the beam indices overlapping tile `t`. CPU-built each frame.
+    tile_offsets: GrowBuffer,
+    tile_lights: GrowBuffer,
     /// Flattened per-fixture wheel chains (shared by the volumetric + mesh passes).
     wheels_storage: GrowBuffer,
     composite_pipeline: wgpu::RenderPipeline,
@@ -682,6 +700,8 @@ impl Renderer {
             wgpu::BufferUsages::STORAGE,
             std::mem::size_of::<FixtureGpu>() as u64 * 16,
         );
+        let tile_offsets = GrowBuffer::new(&device, "tile-offsets", wgpu::BufferUsages::STORAGE, 4096);
+        let tile_lights = GrowBuffer::new(&device, "tile-lights", wgpu::BufferUsages::STORAGE, 4096);
         let wheels_storage = GrowBuffer::new(
             &device,
             "wheels-gpu",
@@ -853,6 +873,8 @@ impl Renderer {
             ema_valid: false,
             prev_size: (0, 0),
             fixtures_storage,
+            tile_offsets,
+            tile_lights,
             wheels_storage,
             composite_pipeline,
             composite_upsample_layout,
@@ -1438,6 +1460,15 @@ impl Renderer {
         let mut camera_uniform = camera.uniform(aspect);
         camera_uniform.render_mode[0] = settings.mode.shader_code();
         camera_uniform.render_mode[1] = settings.gobo_sharpness.max(0.0); // floor-pool gobo sharpen
+        // Tiled light culling (Gem 3): the mesh fragment reads its screen tile from
+        // render_mode.zw to index the per-tile light list (the volumetric ray uses the
+        // same full-res grid via VolumetricUniform.tile, so floor pool ↔ beam shaft stay
+        // in lock-step). .z/.w were previously unused.
+        let (vw, vh) = self.viewport.size;
+        let tiles_x = vw.div_ceil(LIGHT_TILE_PX).max(1);
+        let tiles_y = vh.div_ceil(LIGHT_TILE_PX).max(1);
+        camera_uniform.render_mode[2] = tiles_x as f32;
+        camera_uniform.render_mode[3] = LIGHT_TILE_PX as f32;
         {
             let w = &scene.world;
             let has = if self.world_loaded { 1.0 } else { 0.0 };
@@ -1992,6 +2023,136 @@ impl Renderer {
 
         self.fixtures_storage
             .upload(&self.device, &self.queue, &gpu_fixtures);
+
+        // --- tiled light culling (Gem 3) ---
+        // Bucket each beam's screen-projected cull cone into a 2D tile grid so the
+        // forward light loop AND the volumetric raymarch each iterate only the beams
+        // overlapping their pixel's tile, not all N. CPU-built (cheap at this fixture
+        // count), CSR-packed (`tile_offsets`/`tile_lights`), uploaded like fixtures.
+        // CONSERVATIVE by construction: a beam lands in a tile iff its cull cone — using
+        // the EXACT shader cull radius (mesh.wgsl/volumetric.wgsl `cull`) — could light
+        // any pixel there, and the per-light gates still run in-shader, so a tiled light
+        // is only ever extra work, never a dropped contributor. Wide beams (covering most
+        // of the screen) go in a global prefix every tile scans, keeping spot lists tight.
+        // PREVIZ_NOCULL forces the all-lights fallback (the pixel-identity test harness).
+        {
+            let n_tiles = (tiles_x * tiles_y) as usize;
+            let view_proj = camera.view_proj(aspect);
+            let eye = camera.eye();
+            // The 8-point ring INSCRIBES the cull disc, reaching only cos(π/8)≈0.924·r
+            // between vertices; scale it up so the octagon CIRCUMSCRIBES the disc (its
+            // edges touch r) — otherwise the screen AABB under-covers the projected disc
+            // and an edge fragment lands in an unscattered tile (a beam pop).
+            const RING_CIRCUM: f32 = 1.082_392_3; // 1/cos(π/8)
+            let build_tiles = gpu_fixtures.len() >= TILE_MIN_LIGHTS
+                && std::env::var("PREVIZ_NOCULL").is_err();
+            let mut wide: Vec<u32> = Vec::new();
+            let mut per_tile: Vec<Vec<u32>> = vec![Vec::new(); n_tiles];
+            let to_screen = |p: Vec3| -> Option<(f32, f32)> {
+                let clip = view_proj * p.extend(1.0);
+                if clip.w <= 1e-4 {
+                    return None; // at/behind the near plane — unbounded screen extent
+                }
+                let nx = clip.x / clip.w;
+                let ny = clip.y / clip.w;
+                // NDC → framebuffer px (y flipped, matching the volumetric duv mapping).
+                Some(((nx * 0.5 + 0.5) * vw as f32, (0.5 - ny * 0.5) * vh as f32))
+            };
+            for (i, fx) in gpu_fixtures.iter().enumerate() {
+                let idx = i as u32;
+                let range = fx.pos_range[3];
+                let tan_half = fx.dir_cos[3];
+                if !build_tiles || range <= 0.0 || tan_half <= 0.0 {
+                    wide.push(idx); // disabled/degenerate or culling off → everywhere
+                    continue;
+                }
+                let lpos = Vec3::new(fx.pos_range[0], fx.pos_range[1], fx.pos_range[2]);
+                let bdir = Vec3::new(fx.dir_cos[0], fx.dir_cos[1], fx.dir_cos[2]);
+                let right = Vec3::new(fx.cookie_r[0], fx.cookie_r[1], fx.cookie_r[2]);
+                let up = Vec3::new(fx.cookie_u[0], fx.cookie_u[1], fx.cookie_u[2]);
+                let lens_r = fx.color[3];
+                let iris = fx.shape[2];
+                let n_order = fx.shape[0];
+                let ca = fx.misc[0];
+                // The SHADER's conservative cull multiplier (mesh.wgsl / volumetric.wgsl).
+                let k = 2.5 + ca.abs() + (2.0 - n_order.clamp(1.0, 2.0));
+                // Camera inside/near this beam's cone → its projected silhouette wraps or
+                // explodes under perspective and the sampled-ring AABB can't bound it
+                // (the inter-slice bulge the reviewer flagged). Mark it wide — both correct
+                // and cheap, since such a beam genuinely floods most of the view anyway.
+                let rel_eye = eye - lpos;
+                let along = rel_eye.dot(bdir).clamp(0.0, range);
+                let perp = (rel_eye - bdir * along).length();
+                if perp < (lens_r + along * tan_half) * iris * k * 2.5 {
+                    wide.push(idx);
+                    continue;
+                }
+                let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+                let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                let mut cover_all = false;
+                // 9 axial slices (vs the cone widening linearly) bound the inter-slice
+                // perspective bulge; the circumscribed ring bounds each disc.
+                'depths: for sd in 0..9 {
+                    let d = (sd as f32) / 8.0 * range;
+                    let center = lpos + bdir * d;
+                    let r = (lens_r + d * tan_half) * iris * k * RING_CIRCUM; // cull radius at d
+                    for s in 0..8 {
+                        let a = std::f32::consts::TAU * (s as f32) / 8.0;
+                        let p = center + (right * a.cos() + up * a.sin()) * r;
+                        match to_screen(p) {
+                            Some((sx, sy)) => {
+                                min_x = min_x.min(sx);
+                                min_y = min_y.min(sy);
+                                max_x = max_x.max(sx);
+                                max_y = max_y.max(sy);
+                            }
+                            None => {
+                                cover_all = true;
+                                break 'depths;
+                            }
+                        }
+                    }
+                }
+                if cover_all || !min_x.is_finite() {
+                    wide.push(idx);
+                    continue;
+                }
+                let tpx = LIGHT_TILE_PX as f32;
+                let txi = tiles_x as i32;
+                let tyi = tiles_y as i32;
+                let tx0 = ((min_x / tpx).floor() as i32 - 1).clamp(0, txi - 1);
+                let tx1 = ((max_x / tpx).floor() as i32 + 1).clamp(0, txi - 1);
+                let ty0 = ((min_y / tpx).floor() as i32 - 1).clamp(0, tyi - 1);
+                let ty1 = ((max_y / tpx).floor() as i32 + 1).clamp(0, tyi - 1);
+                // Spans most of the screen → cheaper as a wide light (one shared block
+                // every tile scans) than scattered into ~every per-tile list.
+                if ((tx1 - tx0 + 1) * 2 >= txi) && ((ty1 - ty0 + 1) * 2 >= tyi) {
+                    wide.push(idx);
+                    continue;
+                }
+                for ty in ty0..=ty1 {
+                    let row = (ty as u32 * tiles_x) as usize;
+                    for tx in tx0..=tx1 {
+                        per_tile[row + tx as usize].push(idx);
+                    }
+                }
+            }
+            // Flatten to CSR: each tile's slice is [wide-prefix..., its narrow beams].
+            let mut offsets: Vec<u32> = Vec::with_capacity(n_tiles + 1);
+            let mut flat: Vec<u32> = Vec::with_capacity(n_tiles * wide.len() + 64);
+            offsets.push(0);
+            for tile in &per_tile {
+                flat.extend_from_slice(&wide);
+                flat.extend_from_slice(tile);
+                offsets.push(flat.len() as u32);
+            }
+            if flat.is_empty() {
+                flat.push(0); // storage buffers can't bind 0 bytes
+            }
+            self.tile_offsets.upload(&self.device, &self.queue, &offsets);
+            self.tile_lights.upload(&self.device, &self.queue, &flat);
+        }
+
         // Keep the storage binding non-empty (≥1 element) even with no wheels.
         if gpu_wheels.is_empty() {
             gpu_wheels.push(WheelGpu::zeroed());
@@ -2062,6 +2223,9 @@ impl Renderer {
                     fog.uniformity, // z = haze uniformity (1 smooth … 0 clustered)
                     fog.cluster_contrast, // w = cluster vs haze density contrast
                 ],
+                // Tiled light culling: same full-res grid the mesh pass uses (render_mode.zw),
+                // so the ray scans exactly the beams its tile holds.
+                tile: [tiles_x as f32, tiles_y as f32, LIGHT_TILE_PX as f32, 0.0],
             };
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
@@ -2160,6 +2324,14 @@ impl Renderer {
                     binding: 6,
                     resource: wheels_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.tile_offsets.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.tile_lights.buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -2210,6 +2382,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: wheels_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.tile_offsets.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: self.tile_lights.buffer.as_entire_binding(),
                 },
             ],
         });
