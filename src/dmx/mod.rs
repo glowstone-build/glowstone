@@ -221,7 +221,8 @@ impl DmxIo {
         self.status = self.shared.status.lock().unwrap().clone();
     }
 
-    /// Sync the patch to the scene and decode the latest snapshot into fixtures.
+    /// Sync the patch to the scene and decode the latest snapshot into fixtures
+    /// and any pixel-map-DMX LED screens.
     pub fn decode(&mut self, scene: &mut Scene) {
         self.patch.sync(scene);
         decode::apply(
@@ -231,6 +232,7 @@ impl DmxIo {
             &mut self.live_mask,
             self.stale,
         );
+        decode::apply_screens(&mut scene.screens, &self.snapshot);
     }
 
     /// Auto-assign addresses to every unpatched fixture (the "Auto-patch" action).

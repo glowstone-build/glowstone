@@ -29,6 +29,12 @@ struct State {
     /// Live Art-Net / sACN DMX input: owns the patch + receive thread and decodes
     /// incoming universes into the fixtures each frame.
     dmx: crate::dmx::DmxIo,
+    /// CITP/MSEX media-server client (lazily started when a CITP screen exists),
+    /// feeding live video frames onto LED walls.
+    citp: Option<crate::citp::CitpClient>,
+    /// NDI receive client (lazily started; a no-op stub unless built with the
+    /// `ndi` feature + an installed runtime).
+    ndi: Option<crate::ndi::NdiClient>,
     last_frame: Instant,
     fps: f32,
     /// Whether to keep driving redraws (false while the window is occluded), so
@@ -83,6 +89,8 @@ impl ApplicationHandler for App {
             camera: OrbitCamera::default(),
             ui: Ui::new(),
             dmx: crate::dmx::DmxIo::new(),
+            citp: None,
+            ndi: None,
             last_frame: Instant::now(),
             fps: 0.0,
             awake: true,
@@ -198,6 +206,97 @@ impl ApplicationHandler for App {
                 state.scene.fixtures.push(f);
             }
             state.ui.selection = crate::scene::Selection::default();
+        }
+
+        // Optional LED-wall demo: PREVIZ_LED adds an LED video wall to the scene
+        // (verifies the wall surface + the distance-aware LED dot mask + the cheap
+        // blurred light/haze contribution). PREVIZ_LED=<component substring> picks
+        // the library type; PREVIZ_LED_CONTENT=grid|bars|gradient|solid sets it.
+        if std::env::var("PREVIZ_LED").is_ok() {
+            let state = self.state.as_mut().unwrap();
+            let lib = crate::scene::Library::standard();
+            let want = std::env::var("PREVIZ_LED").unwrap_or_default().to_lowercase();
+            let prof = lib
+                .screens
+                .iter()
+                .find(|p| !want.is_empty() && p.name.to_lowercase().contains(&want))
+                .unwrap_or(&lib.screens[0])
+                .clone();
+            let idx = state.scene.add_screen(&prof);
+            {
+                use crate::scene::screen::{ScreenContent, TestPattern};
+                let s = &mut state.scene.screens[idx];
+                s.panels_wide = 8;
+                s.panels_high = 5;
+                let h = s.size_m()[1];
+                s.transform = glam::Mat4::from_translation(glam::Vec3::new(0.0, h * 0.5 + 0.2, -4.0));
+                if let Ok(c) = std::env::var("PREVIZ_LED_CONTENT") {
+                    s.content = match c.to_lowercase().as_str() {
+                        "bars" => ScreenContent::TestPattern(TestPattern::Bars),
+                        "gradient" => ScreenContent::TestPattern(TestPattern::Gradient),
+                        "solid" => ScreenContent::SolidColor([0.10, 0.45, 0.95]),
+                        "dmx" => ScreenContent::PixelMapDmx(crate::scene::screen::PixelMap {
+                            cols: 8,
+                            rows: 5,
+                            universe: 1,
+                            start_address: 1,
+                        }),
+                        _ => ScreenContent::TestPattern(TestPattern::Grid),
+                    };
+                }
+                // PREVIZ_LED_IMAGE=path puts a still image on the wall (Phase 2).
+                if let Ok(p) = std::env::var("PREVIZ_LED_IMAGE") {
+                    match std::fs::read(&p) {
+                        Ok(b) => {
+                            s.content = ScreenContent::Image {
+                                name: p.clone(),
+                                bytes: std::sync::Arc::new(b),
+                            };
+                        }
+                        Err(e) => log::error!("PREVIZ_LED_IMAGE read {p}: {e}"),
+                    }
+                }
+                // PREVIZ_LED_CURVE=deg bends the wall into a horizontal arc.
+                if let Some(d) = std::env::var("PREVIZ_LED_CURVE").ok().and_then(|s| s.parse::<f32>().ok()) {
+                    s.curvature_deg = d;
+                }
+                // PREVIZ_LED_PIXEL=round|square|rgb selects the LED package shape.
+                if let Ok(p) = std::env::var("PREVIZ_LED_PIXEL") {
+                    use crate::scene::screen::PixelShape;
+                    s.pixel_shape = match p.to_lowercase().as_str() {
+                        "square" => PixelShape::SmdSquare,
+                        "rgb" => PixelShape::DiscreteRgb,
+                        _ => PixelShape::SmdRound,
+                    };
+                }
+            }
+            // For the pixel-map case, inject a synthetic Art-Net feed (a rainbow
+            // grid) and decode it so the wall shows live DMX content headlessly.
+            if std::env::var("PREVIZ_LED_CONTENT").map(|c| c.eq_ignore_ascii_case("dmx")).unwrap_or(false) {
+                let (cols, rows) = (8u32, 5u32);
+                let mut spec = String::new();
+                for j in 0..rows {
+                    for i in 0..cols {
+                        let k = j * cols + i;
+                        let ch = 1 + k * 3;
+                        let r = (i as f32 / (cols - 1) as f32 * 255.0) as u8;
+                        let g = (j as f32 / (rows - 1) as f32 * 255.0) as u8;
+                        let b = 255 - r;
+                        spec.push_str(&format!("1,{ch},{r}; 1,{},{g}; 1,{},{b}; ", ch + 1, ch + 2));
+                    }
+                }
+                state.dmx.inject(crate::dmx::feed::inject_spec(&spec));
+                state.dmx.poll();
+                state.dmx.decode(&mut state.scene);
+            }
+            // PREVIZ_LED_SOLO removes the demo PAR so only the wall lights the scene.
+            if std::env::var("PREVIZ_LED_SOLO").is_ok() {
+                state.scene.fixtures.clear();
+            }
+            if let Some((c, r)) = state.scene.scene_frame() {
+                state.camera.frame(c, r * 1.2);
+            }
+            state.ui.selection = crate::scene::Selection::screen(idx);
         }
 
         // Optional MVR scene import for testing: PREVIZ_MVR=scene.mvr loads a full
@@ -1066,6 +1165,78 @@ impl State {
         self.dmx.poll();
         self.dmx.decode(&mut self.scene);
 
+        // Live CITP/MSEX: pump media-server stream frames onto CITP-sourced LED
+        // walls (lazily starting the discovery/stream client on first use).
+        {
+            use crate::scene::screen::ScreenContent;
+            let citp_sources: Vec<String> = self
+                .scene
+                .screens
+                .iter()
+                .filter_map(|s| match &s.content {
+                    ScreenContent::Citp { source } if !source.is_empty() => Some(source.clone()),
+                    _ => None,
+                })
+                .collect();
+            if citp_sources.is_empty() {
+                if let Some(c) = &mut self.citp {
+                    c.retain(&[]); // stop any leftover streams
+                }
+            } else {
+                let client = self.citp.get_or_insert_with(crate::citp::CitpClient::new);
+                client.retain(&citp_sources);
+                for s in &mut self.scene.screens {
+                    let src = match &s.content {
+                        ScreenContent::Citp { source } if !source.is_empty() => Some(source.clone()),
+                        _ => None,
+                    };
+                    if let Some(src) = src {
+                        // Assign unconditionally so switching to a different/empty
+                        // source name clears the previous source's stale frame.
+                        // (frame_for returns the cached latest frame for a live
+                        // source, so a steady stream does not flicker.)
+                        s.frame = client.frame_for(&src);
+                    }
+                }
+            }
+        }
+
+        // Live NDI: pump received frames onto NDI-sourced LED walls (lazily
+        // starting the receive client; a no-op stub without the `ndi` feature).
+        {
+            use crate::scene::screen::ScreenContent;
+            let ndi_sources: Vec<String> = self
+                .scene
+                .screens
+                .iter()
+                .filter_map(|s| match &s.content {
+                    ScreenContent::Ndi { source } if !source.is_empty() => Some(source.clone()),
+                    _ => None,
+                })
+                .collect();
+            if ndi_sources.is_empty() {
+                if let Some(c) = &mut self.ndi {
+                    c.retain(&[]);
+                }
+            } else {
+                let client = self.ndi.get_or_insert_with(crate::ndi::NdiClient::new);
+                client.retain(&ndi_sources);
+                for s in &mut self.scene.screens {
+                    let src = match &s.content {
+                        ScreenContent::Ndi { source } if !source.is_empty() => Some(source.clone()),
+                        _ => None,
+                    };
+                    if let Some(src) = src {
+                        // Assign unconditionally so switching to a different/empty
+                        // source name clears the previous source's stale frame.
+                        // (frame_for returns the cached latest frame for a live
+                        // source, so a steady stream does not flicker.)
+                        s.frame = client.frame_for(&src);
+                    }
+                }
+            }
+        }
+
         // Crossfade any in-progress cue AFTER DMX decode (so an offline cue
         // overrides the rest state) and BEFORE motion advance (so its pan/tilt
         // feeds this frame's slew).
@@ -1081,6 +1252,14 @@ impl State {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let viewport_texture = self.renderer.viewport.texture_id;
         let egui_ctx = self.egui_ctx.clone();
+
+        // Refresh discovered live-video sources for the LED-screen content
+        // pickers (NDI + CITP) before drawing the inspector.
+        self.ui.screen_sources = crate::ui::ScreenSources {
+            ndi: self.ndi.as_ref().map(|c| c.server_names()).unwrap_or_default(),
+            ndi_available: self.ndi.as_ref().map(|c| c.available()).unwrap_or(false),
+            citp: self.citp.as_ref().map(|c| c.server_names()).unwrap_or_default(),
+        };
 
         // Build the UI. The closure borrows the scene/camera/ui fields; egui_ctx
         // is a separate (cloned) handle so there's no borrow conflict.

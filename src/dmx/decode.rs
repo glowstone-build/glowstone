@@ -520,6 +520,53 @@ fn is_shake(f: &ChannelFunction) -> bool {
     f.attribute.to_lowercase().contains("shake") || f.name.to_lowercase().contains("shake")
 }
 
+/// Drive every pixel-map-DMX LED screen's content from the live snapshot: a small
+/// `cols × rows` RGB grid read from Art-Net/sACN starting at `universe`/
+/// `start_address` (walking universe boundaries), uploaded as a `ScreenFrame`.
+/// This is the SECONDARY, low-res content path — it builds a tiny grid texture,
+/// NOT a per-screen-pixel composite, and never touches `Fixture.cells`. Absent /
+/// stale channels read 0 (the wall shows black, like a real wall with no signal).
+pub fn apply_screens(screens: &mut [crate::scene::LedScreen], snap: &UniverseSnapshot) {
+    use crate::scene::screen::{ScreenContent, ScreenFrame};
+    for s in screens.iter_mut() {
+        let ScreenContent::PixelMapDmx(pm) = &s.content else {
+            continue;
+        };
+        // Clamp the grid so a crafted .archie / MVR file can't force a huge
+        // allocation (the UI caps at 64; this is a hard safety bound).
+        let cols = pm.cols.clamp(1, 256);
+        let rows = pm.rows.clamp(1, 256);
+        let base = pm.start_address.saturating_sub(1) as u32; // 0-based channel offset
+        let base_univ = pm.universe;
+        // Resolve a 0-based global channel offset to a level (0 if absent), walking
+        // 512-channel universe boundaries.
+        let level_at = |global_ch0: u32| -> u8 {
+            let univ = base_univ.wrapping_add((global_ch0 / 512) as u16);
+            let ch = (global_ch0 % 512) as u16 + 1; // 1-based
+            snap.level(univ, ch).unwrap_or(0)
+        };
+        let mut rgba = vec![0u8; (cols * rows * 4) as usize];
+        for k in 0..(cols * rows) {
+            let o = (k * 4) as usize;
+            let b0 = base + k * 3;
+            rgba[o] = level_at(b0);
+            rgba[o + 1] = level_at(b0 + 1);
+            rgba[o + 2] = level_at(b0 + 2);
+            rgba[o + 3] = 255;
+        }
+        // Skip the GPU re-upload when nothing changed (a tiny static grid).
+        if let Some(prev) = &s.frame
+            && prev.width == cols
+            && prev.height == rows
+            && prev.rgba == rgba
+        {
+            continue;
+        }
+        let generation = s.frame.as_ref().map(|f| f.generation.wrapping_add(1)).unwrap_or(1);
+        s.frame = Some(std::sync::Arc::new(ScreenFrame { width: cols, height: rows, rgba, generation }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +576,39 @@ mod tests {
     use crate::scene::{Fixture, Library, Scene};
     use glam::{Mat4, Vec3};
     use std::sync::Arc;
+
+    #[test]
+    fn pixelmap_screen_reads_rgb_grid_from_dmx() {
+        use crate::scene::screen::{LedScreen, PixelMap, ScreenContent};
+        use crate::scene::ScreenProfile;
+        // 2×1 grid in universe 1 from address 1: cell0 RGB = ch1..3, cell1 = ch4..6.
+        let mut levels = [0u8; 512];
+        levels[0] = 255; // cell0 R
+        levels[4] = 200; // cell1 G (ch5)
+        let snap = snapshot_with(1, levels);
+        let prof = ScreenProfile {
+            name: "T",
+            category: "LED Wall",
+            cabinet_mm: [500.0, 500.0],
+            cabinet_px: [128, 128],
+            gap_mm: 0.0,
+            transparent: false,
+            default_nits: 1200.0,
+        };
+        let mut screen = LedScreen::from_profile(&prof, "W", Mat4::IDENTITY);
+        screen.content =
+            ScreenContent::PixelMapDmx(PixelMap { cols: 2, rows: 1, universe: 1, start_address: 1 });
+        let mut screens = vec![screen];
+        apply_screens(&mut screens, &snap);
+        let f = screens[0].frame.as_ref().expect("frame produced");
+        assert_eq!((f.width, f.height), (2, 1));
+        assert_eq!(&f.rgba[0..4], &[255, 0, 0, 255], "cell0 = red");
+        assert_eq!(&f.rgba[4..8], &[0, 200, 0, 255], "cell1 = green");
+        // A second identical decode must NOT bump the generation (no re-upload).
+        let gen0 = f.generation;
+        apply_screens(&mut screens, &snap);
+        assert_eq!(screens[0].frame.as_ref().unwrap().generation, gen0);
+    }
 
     fn snapshot_with(universe: u16, levels: [u8; 512]) -> UniverseSnapshot {
         let mut snap = UniverseSnapshot::default();

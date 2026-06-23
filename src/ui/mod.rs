@@ -3,6 +3,7 @@
 
 mod cues;
 mod panels;
+pub use panels::ScreenSources;
 pub mod project;
 mod share_window;
 pub mod theme;
@@ -264,6 +265,9 @@ pub struct Ui {
     scene_sort: panels::SceneSort,
     /// Scene-outliner name filter (fixtures + objects).
     scene_search: String,
+    /// Discovered live video sources (NDI + CITP) for the LED-screen content
+    /// pickers; the app refreshes this each frame.
+    pub screen_sources: panels::ScreenSources,
     /// Fixture-manager (Fixtures tab) state: filter / sort / bulk values.
     fm: panels::FmState,
     /// The `s` quick-select palette is open.
@@ -316,6 +320,7 @@ impl Ui {
             scene_anchor: None,
             scene_sort: panels::SceneSort::Patch,
             scene_search: String::new(),
+            screen_sources: panels::ScreenSources::default(),
             fm: panels::FmState::default(),
             quick_select: false,
             transform: None,
@@ -790,6 +795,7 @@ impl Ui {
             dmx_pending: dmxv.pending,
             dmx_running: dmxv.running,
             fps,
+            screen_sources: &self.screen_sources,
         };
 
         DockArea::new(&mut self.dock).show(ctx, &mut viewer);
@@ -904,7 +910,7 @@ impl Ui {
             None => scene.fixtures.iter().enumerate().filter(|(_, f)| f.is_gdtf()).map(|(i, _)| i).take(n).collect(),
         };
         if !pick.is_empty() {
-            self.selection = Selection { fixtures: pick, geometry: Vec::new(), environment: None };
+            self.selection = Selection { fixtures: pick, geometry: Vec::new(), screens: Vec::new(), environment: None };
         }
     }
 
@@ -995,7 +1001,7 @@ impl Ui {
             }
             // `a` = select all fixtures; `l` = toggle fixture labels.
             if i.key_pressed(Key::A) && !i.modifiers.command && !i.modifiers.ctrl && !scene.fixtures.is_empty() {
-                self.selection = Selection { fixtures: (0..scene.fixtures.len()).collect(), geometry: Vec::new(), environment: None };
+                self.selection = Selection { fixtures: (0..scene.fixtures.len()).collect(), geometry: Vec::new(), screens: Vec::new(), environment: None };
             }
             if i.key_pressed(Key::L) && !i.modifiers.command {
                 self.prefs.show_labels = !self.prefs.show_labels;
@@ -1023,7 +1029,11 @@ impl Ui {
             }
             i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)
         });
-        if del && (!self.selection.fixtures.is_empty() || !self.selection.geometry.is_empty()) {
+        if del
+            && (!self.selection.fixtures.is_empty()
+                || !self.selection.geometry.is_empty()
+                || !self.selection.screens.is_empty())
+        {
             self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
         }
 
@@ -1088,7 +1098,15 @@ impl Ui {
         for &i in geo.iter().rev() {
             scene.geometry.remove(i);
         }
-        if !removed.is_empty() || !geo.is_empty() {
+        // --- LED screens: a plain removal (no patch/cue/group keyed by it) ---
+        let mut scr: Vec<usize> =
+            self.selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+        scr.sort_unstable();
+        scr.dedup();
+        for &i in scr.iter().rev() {
+            scene.screens.remove(i);
+        }
+        if !removed.is_empty() || !geo.is_empty() || !scr.is_empty() {
             self.selection = Selection::default();
             self.scene_anchor = None;
         }
@@ -1601,6 +1619,8 @@ struct PanelViewer<'a> {
     dmx_pending: &'a mut crate::dmx::PendingNetCmd,
     dmx_running: bool,
     fps: f32,
+    /// Discovered live video sources for the LED-screen content pickers.
+    screen_sources: &'a panels::ScreenSources,
 }
 
 impl TabViewer for PanelViewer<'_> {
@@ -1650,7 +1670,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.open_share,
             ),
             Tab::Inspector => {
-                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile)
+                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources)
             }
             Tab::DmxMonitor => panels::dmx_universe_grid(
                 ui,

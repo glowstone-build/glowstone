@@ -4,9 +4,11 @@
 //! event loop and hands control to [`app::App`].
 
 mod app;
+mod citp;
 mod dmx;
 mod gdtf;
 mod mvr;
+mod ndi;
 mod optics;
 mod renderer;
 mod scene;
