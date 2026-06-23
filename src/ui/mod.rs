@@ -2,6 +2,7 @@
 //! each dock panel to its drawing function in [`panels`].
 
 mod cues;
+mod editor;
 pub(crate) mod op;
 mod panels;
 pub use panels::ScreenSources;
@@ -226,6 +227,19 @@ impl Workspace {
 }
 
 impl Tab {
+    /// Every editor type — the SpaceType registry the header's editor-type
+    /// switcher offers (`docs/RESEARCH-blender-framework.md` §2.2).
+    pub(crate) const ALL: [Tab; 8] = [
+        Tab::Viewport,
+        Tab::Scene,
+        Tab::Library,
+        Tab::Inspector,
+        Tab::DmxMonitor,
+        Tab::Connectivity,
+        Tab::Patch,
+        Tab::Cues,
+    ];
+
     /// Panels shown in the Window menu (Viewport is fixed, so excluded there).
     const TOGGLEABLE: [Tab; 7] = [
         Tab::Scene,
@@ -359,6 +373,20 @@ pub struct Ui {
     /// Seconds since the last successful autosave (driven from `app`); the splash
     /// uses the autosave file's presence to offer crash recovery.
     autosave_timer: f32,
+    /// Viewport N-panel / T-panel open state (Blender's RGN_TYPE_UI / RGN_TYPE_TOOLS;
+    /// blueprint §2.2). Toggled by the N / T keys + the viewport-header buttons.
+    viewport_regions: ViewportRegions,
+}
+
+/// Open state for the viewport's side regions — the N-panel (Item/Transform
+/// sidebar, reuses `panels::inspector` verbatim) and the T-panel (tool-rail shell,
+/// Phase 3 fills it with the ActiveTool buttons). Blueprint §2.2 / RGN_TYPE_UI +
+/// RGN_TYPE_TOOLS. Default both off; the lead's note (auto-on in Focus/Visualise
+/// contexts) is a later phase.
+#[derive(Clone, Copy, Default)]
+struct ViewportRegions {
+    n_open: bool,
+    t_open: bool,
 }
 
 impl Ui {
@@ -407,6 +435,7 @@ impl Ui {
             show_splash: true,
             recent: project::load_recent(),
             autosave_timer: 0.0,
+            viewport_regions: ViewportRegions::default(),
         }
     }
 
@@ -1171,6 +1200,13 @@ impl Ui {
 
         // One call hands back all the disjoint DMX borrows the panels need.
         let dmxv = dmx.view();
+        // Editor types currently open (one leaf each). The header's editor-type
+        // switcher reads this to refuse switching a leaf to a type that already has
+        // a leaf — egui_dock derives a leaf's body Id from its title, so two leaves
+        // of one type would clash ids (cross-talk / panic), invisible to the
+        // compiler. (Computed before the viewer so the dock isn't borrowed yet.)
+        let open_tabs: Vec<Tab> =
+            Tab::ALL.iter().copied().filter(|t| self.dock.find_tab(t).is_some()).collect();
         let mut viewer = PanelViewer {
             scene,
             camera,
@@ -1209,6 +1245,8 @@ impl Ui {
             dmx_running: dmxv.running,
             fps,
             screen_sources: &self.screen_sources,
+            viewport_regions: &mut self.viewport_regions,
+            open_tabs,
         };
 
         DockArea::new(&mut self.dock).show(ctx, &mut viewer);
@@ -1619,6 +1657,15 @@ impl Ui {
                         .unwrap_or_else(|| ctx.screen_rect().center());
                     self.add_menu.show_at(anchor);
                 }
+                // N / T — toggle the viewport's side regions (§2.2). Viewport-only
+                // binds (the keymap stack already gates them to a focused viewport
+                // and `poll` is silent while a text field has focus).
+                Action::ToggleNPanel => {
+                    self.viewport_regions.n_open = !self.viewport_regions.n_open;
+                }
+                Action::ToggleTPanel => {
+                    self.viewport_regions.t_open = !self.viewport_regions.t_open;
+                }
                 // Patch/Unpatch are dispatched in show() (the patch is reachable
                 // there); the rest are no-ops at this site.
                 _ => {}
@@ -1860,17 +1907,11 @@ impl Ui {
                         ui.close();
                     }
                     ui.separator();
-                    ui.label("Display mode");
-                    for m in crate::scene::ViewportMode::ALL {
-                        if ui.selectable_label(self.settings.mode == m, m.label()).clicked() {
-                            self.settings.mode = m;
-                        }
-                    }
-                    ui.separator();
+                    // Display Mode + Grid + Beam-gizmo toggles now live in the
+                    // per-editor Viewport header (§2.2); the prefs-bound overlays
+                    // (labels / FPS) stay here.
                     ui.checkbox(&mut self.prefs.show_labels, "Fixture labels");
-                    ui.checkbox(&mut self.settings.show_grid, "Grid");
                     ui.checkbox(&mut self.prefs.show_fps, "FPS overlay");
-                    ui.checkbox(&mut self.settings.show_beam_wireframes, "Beam gizmos");
                 });
                 ui.menu_button("Fixture", |ui| {
                     if ui.button(format!("{}  Online Library…", icon::ONLINE)).clicked() {
@@ -2283,6 +2324,12 @@ struct PanelViewer<'a> {
     fps: f32,
     /// Discovered live video sources for the LED-screen content pickers.
     screen_sources: &'a panels::ScreenSources,
+    /// Viewport N-panel / T-panel open state (§2.2) — read to decide which side
+    /// regions to carve, and flipped by the header's N/T toggle buttons.
+    viewport_regions: &'a mut ViewportRegions,
+    /// Editor types currently open (one leaf each); the header's editor-type
+    /// switcher refuses a target already open to avoid a duplicate-leaf id clash.
+    open_tabs: Vec<Tab>,
 }
 
 impl TabViewer for PanelViewer<'_> {
@@ -2293,26 +2340,75 @@ impl TabViewer for PanelViewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
+        // Per-editor header bar carved from the leaf's `ui` BEFORE the main content
+        // (§2.2): editor-type switcher + right-aligned per-editor controls. May
+        // rewrite `*tab` (the type switcher), so re-match `*tab` below.
+        editor::header(self, ui, tab);
         match tab {
-            Tab::Viewport => panels::viewport(
-                ui,
-                self.camera,
-                self.scene,
-                self.selection,
-                self.scene_anchor,
-                self.viewport_focused,
-                self.duplicate,
-                self.viewport_texture,
-                self.requested_viewport_px,
-                self.fps,
-                self.prefs,
-                self.settings,
-                self.transform,
-                self.delete_requested,
-                self.replace_requested,
-                self.transform_started,
-                self.transform_finished,
-            ),
+            Tab::Viewport => {
+                // §2.2: carve the N-panel (right sidebar) + T-panel (left tool rail)
+                // from the leaf's `ui` BEFORE the main viewport content, so the
+                // texture/main region shrinks to the space between them and still
+                // orbits/selects/gizmos correctly. Region Ids are salted with the
+                // tab title so two Viewport leaves never clash.
+                let id_base = ui.id().with(tab.title());
+                if self.viewport_regions.t_open {
+                    // T-panel tool rail SHELL — a narrow icon-button column. Phase 3
+                    // (§2.4) fills it with the ActiveTool buttons; for now it's an
+                    // empty placeholder rail so the layout + toggle are wired.
+                    egui::SidePanel::left(id_base.with("t-panel"))
+                        .resizable(false)
+                        .exact_width(40.0)
+                        .show_inside(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(4.0);
+                                // PLACEHOLDER (Phase 3 §2.4): the ActiveTool rail.
+                                // A single disabled icon hints at the rail's purpose.
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new(theme::icon::T_PANEL).frame(false),
+                                )
+                                .on_disabled_hover_text("Tool rail (Phase 3)");
+                            });
+                        });
+                }
+                if self.viewport_regions.n_open {
+                    // N-panel — Item/Transform sidebar; reuses `panels::inspector`
+                    // verbatim ("control belongs where the eyes are", §2.2).
+                    egui::SidePanel::right(id_base.with("n-panel"))
+                        .resizable(true)
+                        .default_width(260.0)
+                        .show_inside(ui, |ui| {
+                            panels::inspector(
+                                ui,
+                                self.scene,
+                                self.selection,
+                                self.dmx_patch,
+                                self.gdtf_textures,
+                                self.profile,
+                                self.screen_sources,
+                            );
+                        });
+                }
+                panels::viewport(
+                    ui,
+                    self.camera,
+                    self.scene,
+                    self.selection,
+                    self.scene_anchor,
+                    self.viewport_focused,
+                    self.duplicate,
+                    self.viewport_texture,
+                    self.requested_viewport_px,
+                    self.fps,
+                    self.prefs,
+                    self.transform,
+                    self.delete_requested,
+                    self.replace_requested,
+                    self.transform_started,
+                    self.transform_finished,
+                );
+            }
             Tab::Scene => panels::scene_outliner(
                 ui,
                 self.scene,

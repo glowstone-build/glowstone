@@ -46,6 +46,10 @@ pub enum Action {
     AddMenu,
     Patch,
     Unpatch,
+    /// N — toggle the viewport N-panel (Item/Transform sidebar). Impl in `show()`.
+    ToggleNPanel,
+    /// T — toggle the viewport T-panel (tool rail shell). Impl in `show()`.
+    ToggleTPanel,
     // Edit / history.
     Undo,
     Redo,
@@ -297,6 +301,8 @@ pub static VIEWPORT: &[Kmi] = &[
     kmi(Trigger::key(Key::A).shift(), Action::AddMenu, Category::Add, "Add menu (at cursor)"),
     kmi(Trigger::key(Key::D), Action::Duplicate, Category::Object, "Duplicate / array"),
     kmi(Trigger::key(Key::D).shift(), Action::Duplicate, Category::Object, "Duplicate (alias)"),
+    kmi(Trigger::key(Key::N), Action::ToggleNPanel, Category::View, "Toggle N-panel (sidebar)"),
+    kmi(Trigger::key(Key::T), Action::ToggleTPanel, Category::View, "Toggle T-panel (tool rail)"),
 ];
 
 /// The Modal transform keymap — only active while a G/R/S op owns the viewport.

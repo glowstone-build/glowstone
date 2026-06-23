@@ -63,6 +63,9 @@ pub mod icon {
     pub const CAMERA: &str = p::VIDEO_CAMERA;
     pub const LAYOUT: &str = p::SQUARES_FOUR;
     pub const KEYBOARD: &str = p::KEYBOARD;
+    // Viewport region toggles (Blender's N-panel sidebar + T-panel tool rail).
+    pub const N_PANEL: &str = p::SIDEBAR_SIMPLE;
+    pub const T_PANEL: &str = p::TOOLBOX;
     // Status glyphs
     pub const WARNING: &str = p::WARNING;
     // Online fixture library (GDTF Share)

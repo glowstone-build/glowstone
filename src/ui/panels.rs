@@ -18,7 +18,7 @@ use crate::optics::{self, OpticField, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
 use crate::scene::screen::{LedScreen, PixelShape, ScreenContent, TestPattern};
-use crate::scene::{apply_fixture_click, Fixture, Library, RenderSettings, Scene, Selection, ViewportMode};
+use crate::scene::{apply_fixture_click, Fixture, Library, Scene, Selection};
 
 /// Universe is considered live if it updated within this window.
 const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -2411,7 +2411,8 @@ pub fn viewport(
     requested_px: &mut (u32, u32),
     fps: f32,
     prefs: &Preferences,
-    settings: &mut RenderSettings,
+    // RenderSettings (Mode / Exposure / Grid / Beam-gizmo) are edited from the
+    // Viewport HEADER (`ui::editor`) now, not from the viewport body (§2.2).
     transform: &mut Option<TransformOp>,
     delete_requested: &mut bool,
     replace_requested: &mut bool,
@@ -3041,32 +3042,10 @@ pub fn viewport(
         );
     }
 
-    // Display overlay (top-left, on the viewport where the eyes are — Blender's
-    // shading buttons live here too): the display Mode + exposure, the two
-    // controls a designer reaches for constantly. Advanced look settings
-    // (bloom/beam/steps) stay in Preferences; toggles in the View menu.
-    egui::Area::new(egui::Id::new("viewport-display-overlay"))
-        .fixed_pos(rect.left_top() + egui::vec2(8.0, if prefs.show_fps { 28.0 } else { 8.0 }))
-        // Middle (not Foreground): above the dock/viewport so it captures its own
-        // clicks, but BELOW the floating windows (Preferences/About/…), which are
-        // also Middle but created after the dock — so they render on top.
-        .order(egui::Order::Middle)
-        .show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style())
-                .inner_margin(egui::Margin::symmetric(6, 3))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for m in ViewportMode::ALL {
-                            if ui.selectable_label(settings.mode == m, m.label()).clicked() {
-                                settings.mode = m;
-                            }
-                        }
-                        ui.separator();
-                        ui.label(RichText::new("Exp").small());
-                        ui.add(DragValue::new(&mut settings.exposure).speed(0.01).range(0.05..=8.0));
-                    });
-                });
-        });
+    // The display Mode + Exposure controls (and the Grid / Beam-gizmo toggles)
+    // now live in the per-editor Viewport HEADER (`ui::editor`), migrated off the
+    // old floating "viewport-display-overlay" Area (§2.2). Advanced look settings
+    // (bloom/beam/steps) stay in Preferences.
 }
 
 /// Bottom tab: Art-Net / sACN connectivity settings + live source status.
