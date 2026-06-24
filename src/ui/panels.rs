@@ -7,10 +7,13 @@ use std::sync::Arc;
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
 use glam::{Mat4, Quat, Vec2, Vec3};
 
+use super::gizmo::{self, GizmoCtx, Handle};
 use super::shortcuts;
 use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
-use super::{Axis, DuplicateDialog, GdtfTextures, SelectionGroup, TransformKind, TransformOp};
+use super::{
+    ActiveTool, Axis, DuplicateDialog, GdtfTextures, SelectionGroup, TransformKind, TransformOp,
+};
 use crate::dmx::patch::channel_map;
 use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
 use crate::gdtf::{GdtfFixture, WheelKind};
@@ -2395,6 +2398,96 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
     }
 }
 
+/// Live state for the Measure tool (§2.4) — a read-only two-point ruler that never
+/// mutates the scene (so no op / no undo). `a` is the first point; once `b` is set the
+/// segment + its distance label persist until a third click resets to a fresh `a`.
+/// Esc clears both. Held on [`super::Ui`] so the measurement survives across frames /
+/// tool switches; cleared lazily when the Measure tool isn't active.
+#[derive(Clone, Copy, Default)]
+pub struct MeasureState {
+    /// First picked world point (set on the first click).
+    pub a: Option<Vec3>,
+    /// Second picked world point (set on the second click) — completes the ruler.
+    pub b: Option<Vec3>,
+}
+
+impl MeasureState {
+    /// Forget the current measurement (Esc, or when leaving the Measure tool).
+    pub fn clear(&mut self) {
+        self.a = None;
+        self.b = None;
+    }
+}
+
+/// Live state for the Aim tool (§2.4) — the lighting differentiator. While a drag is
+/// in flight `Some(target)` holds the world point the selected heads are being aimed
+/// at this frame (so the viewport can draw the target marker + aim lines). The undo
+/// snapshot is taken on drag-start (via `transform_started`) and committed on release
+/// (via `transform_finished`), exactly like the modal/gizmo transforms — but Aim
+/// writes `pan`/`tilt` (the commanded slew targets), not position/orientation, so it
+/// is NOT a [`TransformOp`]. `active()` lets the caller keep the pending undo snapshot
+/// alive across the intermediate drag frames (when no `TransformOp` is in flight).
+#[derive(Clone, Copy, Default)]
+pub struct AimState {
+    /// The world target under the cursor this frame while dragging; `None` when idle.
+    target: Option<Vec3>,
+}
+
+impl AimState {
+    /// Whether an aim drag is currently in flight (a snapshot is pending a commit).
+    pub fn active(&self) -> bool {
+        self.target.is_some()
+    }
+}
+
+/// Where a viewport ray lands in the world, for the Measure tool: the nearest hit on
+/// real surfaces (fixtures' bodies, screens, geometry AABBs, environment volumes),
+/// falling back to the **ground plane y=0** when the ray misses everything (so you can
+/// always measure floor distances). Returns the world-space hit point. Unlike `pick`
+/// this wants a *point*, not a `Hit`, so it tracks the nearest `t` across all surfaces.
+fn pick_world_point(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Vec3> {
+    let mut best_t = f32::INFINITY;
+    let mut consider = |t: f32| {
+        if t > 0.0 && t < best_t {
+            best_t = t;
+        }
+    };
+    for f in &scene.fixtures {
+        if !f.hidden && let Some(t) = ray_sphere(ro, rd, f.position, 0.5) {
+            consider(t);
+        }
+    }
+    for s in &scene.screens {
+        if !s.hidden && let Some(t) = s.ray_hit(ro, rd) {
+            consider(t);
+        }
+    }
+    for g in &scene.geometry {
+        if !g.hidden
+            && let Some((lo, hi)) = g.world_bounds()
+            && let Some(t) = ray_aabb(ro, rd, lo, hi)
+        {
+            consider(t);
+        }
+    }
+    for e in &scene.environments {
+        if let Some(t) = ray_aabb(ro, rd, e.min(), e.max()) {
+            consider(t);
+        }
+    }
+    // Ground-plane fallback: intersect the ray with y=0 when it's heading downward
+    // toward (or up toward) the floor. Guards a near-parallel ray (|rd.y| tiny).
+    if rd.y.abs() > 1e-4 {
+        let t = -ro.y / rd.y;
+        consider(t);
+    }
+    if best_t.is_finite() {
+        Some(ro + rd * best_t)
+    } else {
+        None
+    }
+}
+
 /// Central tab: the 3D scene, rendered offscreen and shown as a texture.
 /// Drag to orbit, shift+drag to pan, scroll to zoom, click to select, `d` to
 /// duplicate the selected fixture; G/R/S to move/rotate/scale the selection.
@@ -2422,6 +2515,17 @@ pub fn viewport(
     // restored in-place, so the caller just drops the pending `before`.
     transform_started: &mut bool,
     transform_finished: &mut bool,
+    // The viewport's active tool (§2.4). Only `ActiveTool::Move` shows + handles the
+    // screen-space xform gizmo; Select (and the not-yet-wired tools) keep plain
+    // click-select. The spring-loaded modal G/R/S transforms stay available under
+    // every tool — they OWN the viewport once started, regardless of the rail.
+    active_tool: ActiveTool,
+    // The Measure tool's two-point ruler state (§2.4). Persists across frames so a
+    // completed measurement stays drawn; only the Measure tool reads/writes it.
+    measure: &mut MeasureState,
+    // The Aim tool's in-flight drag state (§2.4). Holds the world target while a drag
+    // aims the selected heads; only the Aim tool reads/writes it.
+    aim: &mut AimState,
 ) {
     *transform_started = false;
     *transform_finished = false;
@@ -2451,18 +2555,23 @@ pub fn viewport(
 
     let aspect = rect.width() / rect.height().max(1.0);
 
-    // --- Interactive screen-space MOVE gizmo ---
-    // When a fixture/geometry selection exists and no modal op is running, draw 3
-    // RGB axis handles at the selection centroid (projected via view_proj). Grabbing
-    // a handle (pointer press within a few px of its segment) starts a Move op
-    // constrained to that world axis — reusing apply_transform's camera-basis math
-    // via `gizmo_hovered_axis`. The grab is checked BEFORE orbit/select so dragging a
-    // handle never orbits the camera; an empty-space press falls through untouched.
-    let gizmo_targets: bool = transform.is_none()
+    // --- Interactive transform-gizmo group (§2.4 GizmoGroup) ---
+    // The ACTIVE TOOL selects which gizmo draws at the selection pivot: Move→arrows,
+    // Rotate→rings, Scale→boxes (gizmo::for_tool is the single tool→group map; Select
+    // and the non-transform tools return None → plain click-select). Each group
+    // hit-tests its handles in screen space; grabbing one (a press within a few px)
+    // starts the matching axis-locked TransformOp — reusing apply_transform via
+    // `gizmo_hovered_axis`/`axis` so all three share the live-apply + undo path. The
+    // grab is checked BEFORE orbit/select so dragging a handle never orbits the
+    // camera; an empty-space press falls through untouched.
+    let gizmo_targets: bool = active_tool.shows_xform_gizmo()
+        && transform.is_none()
         && *viewport_focused
         && !selection.world
         && (!selection.fixtures.is_empty() || !selection.geometry.is_empty());
-    if gizmo_targets {
+    if gizmo_targets
+        && let Some(group) = gizmo::for_tool(active_tool)
+    {
         // Centroid of every selected target (fixture origins + geometry bbox centres).
         let mut sum = Vec3::ZERO;
         let mut n = 0.0_f32;
@@ -2483,85 +2592,230 @@ pub fn viewport(
             }
         }
         if n > 0.0 {
-            let pivot = sum / n;
-            let vp = camera.view_proj(aspect);
-            // Arm length scales with camera distance so handles stay a readable size
-            // regardless of zoom.
-            let arm = (camera.distance * 0.18).clamp(0.4, 4.0);
-            if let Some(origin) = OrbitCamera::project_to_screen(pivot, vp, rect) {
-                let painter = ui.painter_at(rect);
-                let press = ui.input(|i| i.pointer.press_origin());
-                let mut grabbed: Option<Axis> = None;
-                for ax in [Axis::X, Axis::Y, Axis::Z] {
-                    let tip_world = pivot + ax.vec() * arm;
-                    let Some(tip) = OrbitCamera::project_to_screen(tip_world, vp, rect) else {
-                        continue;
-                    };
-                    // Distance from a candidate press to this handle segment.
-                    let near = press
-                        .map(|p| dist_point_segment(p, origin, tip) <= 7.0)
-                        .unwrap_or(false);
-                    let [r, g, b] = ax.color();
-                    let base = egui::Color32::from_rgb(
-                        (r * 255.0) as u8,
-                        (g * 255.0) as u8,
-                        (b * 255.0) as u8,
-                    );
-                    let col = if near {
-                        base
+            let cx = GizmoCtx {
+                pivot: sum / n,
+                vp: camera.view_proj(aspect),
+                rect,
+                // Arm/ring size scales with camera distance so handles stay a
+                // readable pixel size regardless of zoom.
+                arm: (camera.distance * 0.18).clamp(0.4, 4.0),
+            };
+            // Highlight the handle under the live pointer; on a press we hit-test the
+            // press origin instead (so the grabbed handle is the one the drag began on).
+            let hover_pt = ui.input(|i| i.pointer.latest_pos());
+            let hover = hover_pt.and_then(|p| group.test_select(p, &cx));
+            group.draw(&ui.painter_at(rect), &cx, hover);
+            // A press that landed on a handle this frame starts the op.
+            let press = ui.input(|i| i.pointer.press_origin());
+            let grabbed: Option<Handle> = press.and_then(|p| group.test_select(p, &cx));
+            if let Some(handle) = grabbed
+                && response.drag_started()
+                && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
+            {
+                let start_spec = group.invoke(handle);
+                let fids: Vec<usize> = selection
+                    .fixtures
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < scene.fixtures.len())
+                    .collect();
+                let gids: Vec<usize> = selection
+                    .geometry
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < scene.geometry.len())
+                    .collect();
+                let start: Vec<(usize, Vec3, Quat)> = fids
+                    .iter()
+                    .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
+                    .collect();
+                let geo_start: Vec<(usize, Mat4)> =
+                    gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
+                *transform = Some(TransformOp {
+                    kind: start_spec.kind,
+                    // Move locks via `gizmo_hovered_axis` (matching P3a); rotate/scale
+                    // carry their axis in `axis` (apply_transform reads it directly,
+                    // and the uniform-scale centre yields None = scale all axes).
+                    axis: if start_spec.kind == TransformKind::Move { None } else { start_spec.axis },
+                    start_screen: cur,
+                    pivot: cx.pivot,
+                    start,
+                    geo_start,
+                    gizmo_hovered_axis: if start_spec.kind == TransformKind::Move {
+                        start_spec.axis
                     } else {
-                        egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 150)
-                    };
-                    let w = if near { 3.0 } else { 2.0 };
-                    painter.line_segment([origin, tip], egui::Stroke::new(w, col));
-                    painter.circle_filled(tip, if near { 5.0 } else { 4.0 }, col);
-                    if near {
-                        grabbed = Some(ax);
-                    }
-                }
-                painter.circle_filled(origin, 3.0, egui::Color32::from_gray(220));
-                // A press that landed on a handle this frame starts a constrained Move.
-                if let Some(ax) = grabbed
-                    && response.drag_started()
-                    && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
-                {
-                    let fids: Vec<usize> = selection
-                        .fixtures
-                        .iter()
-                        .copied()
-                        .filter(|&i| i < scene.fixtures.len())
-                        .collect();
-                    let gids: Vec<usize> = selection
-                        .geometry
-                        .iter()
-                        .copied()
-                        .filter(|&i| i < scene.geometry.len())
-                        .collect();
-                    let start: Vec<(usize, Vec3, Quat)> = fids
-                        .iter()
-                        .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
-                        .collect();
-                    let geo_start: Vec<(usize, Mat4)> =
-                        gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
-                    *transform = Some(TransformOp {
-                        kind: TransformKind::Move,
-                        axis: None,
-                        start_screen: cur,
-                        pivot,
-                        start,
-                        geo_start,
-                        gizmo_hovered_axis: Some(ax),
-                        from_gizmo: true,
-                    });
-                    *transform_started = true;
-                }
+                        None
+                    },
+                    from_gizmo: true,
+                });
+                *transform_started = true;
             }
         }
     }
 
+    // --- Measure tool (§2.4): a read-only two-point ruler. ---
+    // Click sets A (ray → nearest surface, else the y=0 ground plane); a second click
+    // sets B; a third click resets to a fresh A. Esc clears. NEVER mutates the scene,
+    // so there is no op / no undo. Runs BEFORE the click-select block and consumes the
+    // click so measuring never also picks an object. Stale state is dropped when the
+    // tool isn't active (so switching away clears the ruler).
+    let mut consumed = transform.is_some();
+    if active_tool == ActiveTool::Measure {
+        // Esc clears the current measurement (decoded from the shared modal keymap so
+        // the bind stays in the one registry, like the transform Cancel).
+        if shortcuts::poll_modal(ui.ctx()).contains(&shortcuts::ModalAction::Cancel) {
+            measure.clear();
+        }
+        if !consumed
+            && response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+            let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+            let (ro, rd) = camera.ray(ndc, aspect);
+            if let Some(p) = pick_world_point(scene, ro, rd) {
+                match (measure.a, measure.b) {
+                    // Fresh, or restarting after a completed measurement → new A.
+                    (None, _) | (Some(_), Some(_)) => {
+                        measure.a = Some(p);
+                        measure.b = None;
+                    }
+                    // A set, B open → complete the ruler.
+                    (Some(_), None) => measure.b = Some(p),
+                }
+            }
+            consumed = true; // never fall through to click-select
+        }
+        // Draw the ruler: a dashed-ish polyline A→(B or live cursor) + endpoint dots
+        // + a distance pill at the midpoint (metres/feet per prefs). With only A set we
+        // preview to the cursor's ground/surface hit so the length reads live.
+        if let Some(a) = measure.a {
+            let painter = ui.painter_at(rect);
+            let vp = camera.view_proj(aspect);
+            // The far end: the committed B, else a live preview under the cursor.
+            let live_b = measure.b.or_else(|| {
+                ui.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p)).and_then(|pos| {
+                    let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+                    let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+                    let (ro, rd) = camera.ray(ndc, aspect);
+                    pick_world_point(scene, ro, rd)
+                })
+            });
+            let sa = OrbitCamera::project_to_screen(a, vp, rect);
+            let sb = live_b.and_then(|b| OrbitCamera::project_to_screen(b, vp, rect));
+            let accent = egui::Color32::from_rgb(120, 220, 160);
+            if let Some(sa) = sa {
+                painter.circle_filled(sa, 4.0, accent);
+            }
+            if let (Some(sa), Some(sb)) = (sa, sb) {
+                painter.line_segment([sa, sb], egui::Stroke::new(2.0, accent));
+            }
+            if let Some(sb) = sb {
+                painter.circle_filled(sb, 4.0, accent);
+            }
+            // Distance label at the segment midpoint (or near A while only A is set).
+            if let Some(b) = live_b {
+                let metres = (b - a).length();
+                let (val, unit) = prefs.len(metres);
+                let mid = sa
+                    .zip(sb)
+                    .map(|(p, q)| p + (q - p) * 0.5)
+                    .or(sa)
+                    .unwrap_or_else(|| rect.center());
+                theme::overlay_label(
+                    &painter,
+                    mid + egui::vec2(0.0, -14.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    &format!("{val:.2}{unit}"),
+                    Some(accent),
+                );
+            }
+        }
+    } else {
+        // Left the Measure tool — forget any partial / completed ruler.
+        measure.clear();
+    }
+
+    // --- Aim tool (§2.4): the lighting differentiator. ---
+    // While the Aim tool is active and one or more fixtures are selected, a click-drag
+    // in the viewport AIMS the selected heads at the world point under the cursor:
+    // ray-pick the ground/geometry hit (like Measure), then for each selected fixture
+    // solve the pan/tilt that points its beam axis there (`Fixture::aim_pan_tilt`, the
+    // inverse of `beam_direction` — it writes the COMMANDED pan/tilt so the slew engine
+    // drives the heads, cooperating with cues/motion rather than poking a quaternion).
+    // Undo: one step per drag — snapshot on drag-start (`transform_started`), commit on
+    // release (`transform_finished`), reusing the modal/gizmo undo pipeline verbatim.
+    // Runs BEFORE the modal/orbit/select blocks and consumes the drag so aiming never
+    // also orbits or click-selects. Non-fixture selections are left untouched.
+    if active_tool == ActiveTool::Aim && transform.is_none() {
+        // The selected, in-range fixtures we aim (geometry/screen selections ignored).
+        let fids: Vec<usize> =
+            selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+        if !consumed && !fids.is_empty() && *viewport_focused {
+            // World target under the cursor (ground-plane fallback like Measure), used
+            // both to aim and to draw the marker/lines this frame.
+            let cursor_target = ui.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p)).and_then(
+                |pos| {
+                    let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+                    let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+                    let (ro, rd) = camera.ray(ndc, aspect);
+                    pick_world_point(scene, ro, rd)
+                },
+            );
+            // A press begins the aim drag → snapshot the undo `before` once.
+            if response.drag_started() {
+                *transform_started = true;
+                aim.target = cursor_target.or(Some(Vec3::ZERO));
+            }
+            // While dragging, re-aim every selected head at the live target.
+            if response.dragged()
+                && aim.active()
+                && let Some(target) = cursor_target
+            {
+                aim.target = Some(target);
+                for &i in &fids {
+                    if let Some((pan, tilt)) = scene.fixtures[i].aim_pan_tilt(target) {
+                        scene.fixtures[i].pan = pan;
+                        scene.fixtures[i].tilt = tilt;
+                    }
+                }
+            }
+            // Release commits the single undo step and ends the drag.
+            if aim.active() && (response.drag_stopped() || !ui.input(|i| i.pointer.primary_down())) {
+                *transform_finished = true;
+                aim.target = None;
+            }
+            // The aim interaction owns any press/drag this frame (no orbit/select).
+            if response.dragged() || response.drag_started() || response.clicked() {
+                consumed = true;
+            }
+        }
+        // Draw the aim viz while a drag is in flight: a small target marker at the
+        // aimed point + a line from each selected head to it (so the designer sees the
+        // throw). Soft amber to distinguish from the RGB gizmos and green ruler.
+        if let Some(target) = aim.target {
+            let painter = ui.painter_at(rect);
+            let vp = camera.view_proj(aspect);
+            let accent = egui::Color32::from_rgb(255, 180, 90);
+            if let Some(st) = OrbitCamera::project_to_screen(target, vp, rect) {
+                // A small crosshair-in-circle target marker.
+                painter.circle_stroke(st, 7.0, egui::Stroke::new(2.0, accent));
+                painter.line_segment([st - egui::vec2(10.0, 0.0), st + egui::vec2(10.0, 0.0)], egui::Stroke::new(1.5, accent));
+                painter.line_segment([st - egui::vec2(0.0, 10.0), st + egui::vec2(0.0, 10.0)], egui::Stroke::new(1.5, accent));
+                for &i in &fids {
+                    if let Some(sf) = OrbitCamera::project_to_screen(scene.fixtures[i].position, vp, rect) {
+                        painter.line_segment([sf, st], egui::Stroke::new(1.5, accent.gamma_multiply(0.7)));
+                    }
+                }
+            }
+        }
+    } else {
+        // Not the Aim tool (or a modal transform owns the viewport) — end any drag.
+        aim.target = None;
+    }
+
     // --- Modal transform (Blender G/R/S): when active it OWNS the viewport
     // (mouse drives the transform; orbit/select/zoom are suspended). ---
-    let mut consumed = transform.is_some();
     if let Some(op) = transform.as_mut() {
         // The MODAL keymap owns the viewport now: X/Y/Z axis lock + Enter/Space
         // confirm + Esc cancel all decode from `poll_modal`, keeping the binds in
@@ -2935,7 +3189,13 @@ pub fn viewport(
         &ui.painter_at(rect),
         rect.left_bottom() + egui::vec2(8.0, -8.0),
         egui::Align2::LEFT_BOTTOM,
-        "drag: orbit · shift+drag: pan · scroll: zoom · click: select · g/r/s: move/rotate/scale · d: duplicate",
+        if active_tool == ActiveTool::Measure {
+            "measure: click two points for distance · esc: clear · scroll: zoom · shift+drag: pan"
+        } else if active_tool == ActiveTool::Aim {
+            "aim: drag to point selected head(s) at the cursor · scroll: zoom · shift+drag: pan"
+        } else {
+            "drag: orbit · shift+drag: pan · scroll: zoom · click: select · g/r/s: move/rotate/scale · d: duplicate"
+        },
         None,
     );
 
@@ -3737,8 +3997,8 @@ enum Hit {
 }
 
 /// Shortest distance from a screen-space point `p` to the segment `a`..`b`. Used by
-/// the move gizmo to hit-test its projected axis handles.
-fn dist_point_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+/// the gizmo groups to hit-test their projected axis handles / rings.
+pub(super) fn dist_point_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let ab = b - a;
     let len2 = ab.length_sq();
     if len2 <= f32::EPSILON {
@@ -3882,6 +4142,32 @@ mod pick_tests {
         let ro = f + Vec3::new(0.0, 0.0, 6.0);
         let rd = (f - ro).normalize();
         assert_eq!(pick(&scene, ro, rd), Some(Hit::Fixture(0)));
+    }
+
+    #[test]
+    fn measure_point_falls_back_to_ground_plane() {
+        // An empty scene: a downward ray from y=10 must land on y=0 (the floor).
+        let scene = Scene { fixtures: vec![], screens: vec![], geometry: vec![], environments: vec![], ..Scene::demo() };
+        let ro = Vec3::new(2.0, 10.0, 3.0);
+        let rd = Vec3::new(0.0, -1.0, 0.0);
+        let p = pick_world_point(&scene, ro, rd).expect("ground hit");
+        assert!((p.y - 0.0).abs() < 1e-3, "expected y=0, got {}", p.y);
+        assert!((p.x - 2.0).abs() < 1e-3 && (p.z - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn measure_point_prefers_nearer_surface_over_ground() {
+        // A fixture sphere between the camera and the floor wins over the y=0 plane.
+        let mut scene = Scene { fixtures: vec![], screens: vec![], geometry: vec![], environments: vec![], ..Scene::demo() };
+        let demo = Scene::demo();
+        scene.fixtures.push(demo.fixtures[0].clone());
+        scene.fixtures[0].position = Vec3::new(0.0, 4.0, 0.0);
+        scene.fixtures[0].hidden = false;
+        let ro = Vec3::new(0.0, 10.0, 0.0);
+        let rd = Vec3::new(0.0, -1.0, 0.0);
+        let p = pick_world_point(&scene, ro, rd).expect("hit");
+        // Should hit the top of the fixture sphere (~y=4.5), not the floor (y=0).
+        assert!(p.y > 3.0, "expected fixture hit near y=4.5, got {}", p.y);
     }
 }
 

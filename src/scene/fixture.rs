@@ -394,6 +394,44 @@ impl Fixture {
             .transform_vector3(Vec3::new(0.0, -1.0, 0.0))
             .normalize_or_zero()
     }
+
+    /// Solve the commanded **pan/tilt** (degrees) that aims this head's beam axis at
+    /// `target` (world). This is the inverse of [`model_matrix`]'s beam mapping: the
+    /// beam exits along local `-Y`, so for a desired world direction `dir` we strip
+    /// the base hang [`orientation`] (`dir_local = orientation⁻¹ · dir`) and invert
+    /// the `RotY(pan) · RotX(tilt)` chain. With `RotX(tilt)·(0,-1,0) = (0,-cos t,-sin t)`
+    /// then `RotY(pan)` applied, the local beam dir is
+    /// `(-sin t·sin p, -cos t, -sin t·cos p)`, giving
+    /// `tilt = acos(-y)` and `pan = atan2(-x, -z)`. The Aim tool writes these to the
+    /// commanded `pan`/`tilt`; the slew engine then drives `pan_actual`/`tilt_actual`
+    /// toward them (so Aim cooperates with the motion model — no raw quaternion poke).
+    ///
+    /// Returns `None` when `target` coincides with the head (no defined direction).
+    /// The returned pan is kept near the current commanded `pan` (adding/removing full
+    /// turns) so the yoke takes the short way and doesn't unwind across `±180°`.
+    ///
+    /// [`model_matrix`]: Self::model_matrix
+    /// [`orientation`]: Self::orientation
+    pub fn aim_pan_tilt(&self, target: Vec3) -> Option<(f32, f32)> {
+        let dir = (target - self.position).normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return None;
+        }
+        // Beam exits the lens, not the head origin, but for aiming the lens is ~at the
+        // head (BODY_LENGTH along the beam) — using the head position is the standard
+        // look-at and avoids a feedback loop (the lens moves as we aim).
+        let dl = self.orientation.inverse() * dir;
+        let tilt = (-dl.y).clamp(-1.0, 1.0).acos().to_degrees();
+        let mut pan = (-dl.x).atan2(-dl.z).to_degrees();
+        // Unwrap toward the current commanded pan so the head doesn't spin the long way.
+        while pan - self.pan > 180.0 {
+            pan -= 360.0;
+        }
+        while pan - self.pan < -180.0 {
+            pan += 360.0;
+        }
+        Some((pan, tilt))
+    }
 }
 
 /// One axis of an accel-limited follower (trapezoidal velocity profile): ramp
@@ -466,6 +504,39 @@ mod tests {
         assert!(max_fast <= 270.0 + 0.5, "no overshoot, peaked at {max_fast}");
         assert!((max_fast - 270.0).abs() < 1.0, "reaches target, got {max_fast}");
         assert!(n_slow > n_fast * 3, "slow motor is much slower: {n_slow} vs {n_fast}");
+    }
+
+    /// `aim_pan_tilt` is the inverse of `beam_direction`: solving pan/tilt for a
+    /// target then snapping the head makes the beam point at it. Covers straight
+    /// down, sideways, and an angled target.
+    #[test]
+    fn aim_round_trips_through_beam_direction() {
+        let lib = Library::standard();
+        let check = |target: Vec3| {
+            let mut f = Fixture::from_profile(&lib.fixtures[0], "t", Vec3::new(0.0, 5.0, 0.0));
+            let (pan, tilt) = f.aim_pan_tilt(target).expect("solvable");
+            f.pan = pan;
+            f.tilt = tilt;
+            f.snap_movement();
+            let want = (target - f.position).normalize();
+            let got = f.beam_direction();
+            assert!(
+                got.distance(want) < 1e-3,
+                "aim at {target:?}: beam {got:?} != want {want:?} (pan {pan}, tilt {tilt})"
+            );
+        };
+        check(Vec3::new(0.0, 0.0, 0.0)); // straight down
+        check(Vec3::new(10.0, 5.0, 0.0)); // due +X, level
+        check(Vec3::new(4.0, 0.0, -6.0)); // down-and-forward
+        check(Vec3::new(-3.0, 8.0, 2.0)); // up-and-back
+    }
+
+    /// Aiming at the head's own position has no defined direction → `None`.
+    #[test]
+    fn aim_at_self_is_none() {
+        let lib = Library::standard();
+        let f = Fixture::from_profile(&lib.fixtures[0], "t", Vec3::new(1.0, 2.0, 3.0));
+        assert!(f.aim_pan_tilt(Vec3::new(1.0, 2.0, 3.0)).is_none());
     }
 
     /// `snap_movement` settles instantly to the commanded pose.

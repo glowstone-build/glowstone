@@ -3,6 +3,7 @@
 
 mod cues;
 mod editor;
+mod gizmo;
 pub(crate) mod op;
 mod panels;
 pub use panels::ScreenSources;
@@ -10,6 +11,8 @@ pub mod project;
 mod share_window;
 pub mod shortcuts;
 pub mod theme;
+mod tools;
+pub use tools::ActiveTool;
 mod windows;
 
 use std::collections::HashMap;
@@ -376,6 +379,16 @@ pub struct Ui {
     /// Viewport N-panel / T-panel open state (Blender's RGN_TYPE_UI / RGN_TYPE_TOOLS;
     /// blueprint §2.2). Toggled by the N / T keys + the viewport-header buttons.
     viewport_regions: ViewportRegions,
+    /// The viewport's active tool (§2.4) — decides which gizmo draws (Move shows the
+    /// screen-space xform gizmo; Select is plain click-select). Set from the T-panel
+    /// tool rail. Default [`ActiveTool::Select`].
+    active_tool: ActiveTool,
+    /// The Measure tool's two-point ruler (§2.4) — a read-only viewport measurement
+    /// that persists across frames; cleared when the Measure tool isn't active.
+    measure: panels::MeasureState,
+    /// The Aim tool's in-flight drag (§2.4) — `active()` while a head-aim drag is
+    /// underway, so the pending undo snapshot is kept alive across the drag frames.
+    aim: panels::AimState,
 }
 
 /// Open state for the viewport's side regions — the N-panel (Item/Transform
@@ -436,6 +449,9 @@ impl Ui {
             recent: project::load_recent(),
             autosave_timer: 0.0,
             viewport_regions: ViewportRegions::default(),
+            active_tool: ActiveTool::default(),
+            measure: panels::MeasureState::default(),
+            aim: panels::AimState::default(),
         }
     }
 
@@ -1246,6 +1262,9 @@ impl Ui {
             fps,
             screen_sources: &self.screen_sources,
             viewport_regions: &mut self.viewport_regions,
+            active_tool: &mut self.active_tool,
+            measure: &mut self.measure,
+            aim: &mut self.aim,
             open_tabs,
         };
 
@@ -1264,8 +1283,10 @@ impl Ui {
                 self.undo_push("Transform", before, scene, dmx.patch());
                 self.undo.set_last_op("transform.apply", "Transform");
             }
-        } else if self.transform.is_none() {
-            // Op ended without confirming (cancelled / focus lost) — discard.
+        } else if self.transform.is_none() && !self.aim.active() {
+            // Op ended without confirming (cancelled / focus lost) — discard. An Aim
+            // drag has no `TransformOp` in flight, so guard on `aim.active()` too or its
+            // mid-drag frames would drop the pending snapshot before the release commit.
             self.transform_before = None;
         }
 
@@ -2327,9 +2348,50 @@ struct PanelViewer<'a> {
     /// Viewport N-panel / T-panel open state (§2.2) — read to decide which side
     /// regions to carve, and flipped by the header's N/T toggle buttons.
     viewport_regions: &'a mut ViewportRegions,
+    /// The viewport's active tool (§2.4) — the T-panel rail sets it; `viewport()`
+    /// reads `shows_xform_gizmo()` to gate the screen-space move gizmo.
+    active_tool: &'a mut ActiveTool,
+    /// The Measure tool's persistent two-point ruler (§2.4); `viewport()` reads/writes
+    /// it when the Measure tool is active and clears it otherwise.
+    measure: &'a mut panels::MeasureState,
+    /// The Aim tool's in-flight drag (§2.4); `viewport()` sets it while aiming heads.
+    aim: &'a mut panels::AimState,
     /// Editor types currently open (one leaf each); the header's editor-type
     /// switcher refuses a target already open to avoid a duplicate-leaf id clash.
     open_tabs: Vec<Tab>,
+}
+
+/// Draw the viewport T-panel tool rail (§2.4): a vertical radio column of icon
+/// toggle-buttons over [`ActiveTool::TOOLBAR`], highlighting the active tool;
+/// clicking sets `*active`. Square-ish buttons in a dense, centred column to match
+/// the console chrome. A faint separator splits the transform trio from the
+/// (still-stubbed) lighting tools so the rail reads in groups.
+fn tool_rail(ui: &mut egui::Ui, active: &mut ActiveTool) {
+    ui.add_space(4.0);
+    ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        for tool in ActiveTool::TOOLBAR {
+            // A thin group separator before the lighting tools (Aim onward).
+            if tool == ActiveTool::Aim {
+                ui.add_space(2.0);
+                ui.separator();
+                ui.add_space(2.0);
+            }
+            let selected = *active == tool;
+            let resp = ui
+                .add_sized(
+                    [30.0, 28.0],
+                    egui::SelectableLabel::new(
+                        selected,
+                        egui::RichText::new(tool.icon()).size(16.0),
+                    ),
+                )
+                .on_hover_text(tool.tooltip());
+            if resp.clicked() {
+                *active = tool;
+            }
+        }
+    });
 }
 
 impl TabViewer for PanelViewer<'_> {
@@ -2353,23 +2415,15 @@ impl TabViewer for PanelViewer<'_> {
                 // tab title so two Viewport leaves never clash.
                 let id_base = ui.id().with(tab.title());
                 if self.viewport_regions.t_open {
-                    // T-panel tool rail SHELL — a narrow icon-button column. Phase 3
-                    // (§2.4) fills it with the ActiveTool buttons; for now it's an
-                    // empty placeholder rail so the layout + toggle are wired.
+                    // T-panel tool rail (§2.4): a vertical radio column of icon
+                    // toggle-buttons, one per `ActiveTool`, with the active tool
+                    // highlighted. Clicking sets `active_tool` — which `viewport()`
+                    // reads to decide whether the screen-space xform gizmo draws.
                     egui::SidePanel::left(id_base.with("t-panel"))
                         .resizable(false)
                         .exact_width(40.0)
                         .show_inside(ui, |ui| {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(4.0);
-                                // PLACEHOLDER (Phase 3 §2.4): the ActiveTool rail.
-                                // A single disabled icon hints at the rail's purpose.
-                                ui.add_enabled(
-                                    false,
-                                    egui::Button::new(theme::icon::T_PANEL).frame(false),
-                                )
-                                .on_disabled_hover_text("Tool rail (Phase 3)");
-                            });
+                            tool_rail(ui, self.active_tool);
                         });
                 }
                 if self.viewport_regions.n_open {
@@ -2407,6 +2461,9 @@ impl TabViewer for PanelViewer<'_> {
                     self.replace_requested,
                     self.transform_started,
                     self.transform_finished,
+                    *self.active_tool,
+                    self.measure,
+                    self.aim,
                 );
             }
             Tab::Scene => panels::scene_outliner(

@@ -66,6 +66,15 @@ pub mod icon {
     // Viewport region toggles (Blender's N-panel sidebar + T-panel tool rail).
     pub const N_PANEL: &str = p::SIDEBAR_SIMPLE;
     pub const T_PANEL: &str = p::TOOLBOX;
+
+    // Viewport tool rail (§2.4 ActiveTool). X=red/Y=green/Z=blue gizmo handle
+    // colours live on `Axis::color` (mod.rs); these are just the rail glyphs.
+    pub const TOOL_SELECT: &str = p::CURSOR;
+    pub const TOOL_MOVE: &str = p::ARROWS_OUT_CARDINAL;
+    pub const TOOL_ROTATE: &str = p::ARROWS_CLOCKWISE;
+    pub const TOOL_SCALE: &str = p::RESIZE;
+    pub const TOOL_AIM: &str = p::TARGET;
+    pub const TOOL_MEASURE: &str = p::RULER;
     // Status glyphs
     pub const WARNING: &str = p::WARNING;
     // Online fixture library (GDTF Share)
