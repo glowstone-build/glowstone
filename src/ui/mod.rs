@@ -12,6 +12,7 @@ mod share_window;
 pub mod shortcuts;
 pub mod theme;
 mod tools;
+mod tree;
 pub use tools::ActiveTool;
 mod windows;
 
@@ -319,6 +320,15 @@ pub struct Ui {
     scene_sort: panels::SceneSort,
     /// Scene-outliner name filter (fixtures + objects).
     scene_search: String,
+    /// Expanded outliner-tree nodes (absent = collapsed). Group/Root keys are
+    /// constant; entity keys are stable EntityIds, so expand-state survives
+    /// reorder. Held across frames on `Ui` (the tree is rebuilt each frame).
+    scene_expanded: std::collections::HashSet<tree::NodeKey>,
+    /// In-flight inline rename: the target node key + its edit buffer (one live).
+    scene_rename: Option<(tree::NodeKey, String)>,
+    /// Deferred outliner action (hide/rename) returned by the tree mid-dock and
+    /// applied after the dock where the undo stack is reachable.
+    pending_tree: tree::TreeAction,
     /// Discovered live video sources (NDI + CITP) for the LED-screen content
     /// pickers; the app refreshes this each frame.
     pub screen_sources: panels::ScreenSources,
@@ -426,6 +436,22 @@ impl Ui {
             scene_anchor: None,
             scene_sort: panels::SceneSort::Patch,
             scene_search: String::new(),
+            scene_expanded: {
+                // Sensible default expand-state: the project + its top groups open,
+                // so fixtures are visible at a glance (and the headless screenshot
+                // is deterministic).
+                use tree::{GroupKind, NodeKey};
+                let mut s = std::collections::HashSet::new();
+                s.insert(NodeKey::Root);
+                s.insert(NodeKey::World);
+                s.insert(NodeKey::EnvGroup);
+                s.insert(NodeKey::Group(GroupKind::Fixtures));
+                s.insert(NodeKey::Group(GroupKind::Objects));
+                s.insert(NodeKey::Group(GroupKind::Screens));
+                s
+            },
+            scene_rename: None,
+            pending_tree: tree::TreeAction::None,
             screen_sources: panels::ScreenSources::default(),
             fm: panels::FmState::default(),
             quick_select: false,
@@ -621,6 +647,106 @@ impl Ui {
             self.undo.set_last_op("transform.nudge", "Nudge");
         }
         self.last_nudge = Some(now);
+    }
+
+    /// Apply a deferred outliner [`tree::TreeAction`] as a SINGLE undo step.
+    /// Toggling a GROUP's eye flips every child's `hidden` in one step (Blender's
+    /// shift-children behaviour, made the default): if any child is visible →
+    /// hide all, else show all. Id→index resolution treats a stale id as a no-op.
+    fn apply_tree_action(
+        &mut self,
+        action: tree::TreeAction,
+        scene: &mut Scene,
+        dmx: &mut crate::dmx::DmxIo,
+    ) {
+        use tree::{GroupKind, NodeKey, TreeAction};
+        match action {
+            TreeAction::None => {}
+            TreeAction::ToggleHidden(key) => {
+                let before = self.undo_begin(scene, dmx.patch());
+                let changed = match key {
+                    NodeKey::Entity(id) => {
+                        // Resolve across all four entity collections (id is unique).
+                        if let Some(i) = scene.fixture_index_of(id) {
+                            scene.fixtures[i].hidden = !scene.fixtures[i].hidden;
+                            true
+                        } else if let Some(i) = scene.geometry_index_of(id) {
+                            scene.geometry[i].hidden = !scene.geometry[i].hidden;
+                            true
+                        } else if let Some(i) = scene.screen_index_of(id) {
+                            scene.screens[i].hidden = !scene.screens[i].hidden;
+                            true
+                        } else if let Some(i) = scene.environment_index_of(id) {
+                            scene.environments[i].hidden = !scene.environments[i].hidden;
+                            true
+                        } else {
+                            false // stale id (deleted) — no-op
+                        }
+                    }
+                    NodeKey::Group(GroupKind::Fixtures) => {
+                        let hide = scene.fixtures.iter().any(|f| !f.hidden);
+                        for f in &mut scene.fixtures {
+                            f.hidden = hide;
+                        }
+                        !scene.fixtures.is_empty()
+                    }
+                    NodeKey::Group(GroupKind::Objects) => {
+                        let hide = scene.geometry.iter().any(|g| !g.hidden);
+                        for g in &mut scene.geometry {
+                            g.hidden = hide;
+                        }
+                        !scene.geometry.is_empty()
+                    }
+                    NodeKey::Group(GroupKind::Screens) => {
+                        let hide = scene.screens.iter().any(|s| !s.hidden);
+                        for s in &mut scene.screens {
+                            s.hidden = hide;
+                        }
+                        !scene.screens.is_empty()
+                    }
+                    NodeKey::EnvGroup | NodeKey::World => {
+                        // Toggle all environments (World/HDRI has no hidden field).
+                        let hide = scene.environments.iter().any(|e| !e.hidden);
+                        for e in &mut scene.environments {
+                            e.hidden = hide;
+                        }
+                        !scene.environments.is_empty()
+                    }
+                    NodeKey::Root => false,
+                };
+                if changed {
+                    self.undo_push("Toggle visibility", before, scene, dmx.patch());
+                    self.undo.set_last_op("object.hide", "Toggle visibility");
+                }
+            }
+            TreeAction::Rename(key, name) => {
+                let before = self.undo_begin(scene, dmx.patch());
+                let changed = match key {
+                    NodeKey::Entity(id) => {
+                        if let Some(i) = scene.fixture_index_of(id) {
+                            scene.fixtures[i].name = name;
+                            true
+                        } else if let Some(i) = scene.geometry_index_of(id) {
+                            scene.geometry[i].name = name;
+                            true
+                        } else if let Some(i) = scene.screen_index_of(id) {
+                            scene.screens[i].name = name;
+                            true
+                        } else if let Some(i) = scene.environment_index_of(id) {
+                            scene.environments[i].name = name;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false, // only entity leaves are renameable
+                };
+                if changed {
+                    self.undo_push("Rename", before, scene, dmx.patch());
+                    self.undo.set_last_op("object.rename", "Rename");
+                }
+            }
+        }
     }
 
     // --- operator search (F3) + adjust last (F9) ------------------------
@@ -887,6 +1013,9 @@ impl Ui {
         dmx: &mut crate::dmx::DmxIo,
     ) {
         *scene = p.scene;
+        // serde-skip zeroed every EntityId on load → reassign stable ids before
+        // the outliner addresses any row (the Fixture.gdtf snapshot-trap class).
+        scene.ensure_ids();
         // Re-link each fixture's GDTF by re-parsing the bundled archive (one parse
         // per unique spec, Arc-shared so the renderer's per-type model cache and
         // the GPU wheel atlas stay deduped).
@@ -1243,6 +1372,9 @@ impl Ui {
             scene_anchor: &mut self.scene_anchor,
             scene_sort: &mut self.scene_sort,
             scene_search: &mut self.scene_search,
+            scene_expanded: &mut self.scene_expanded,
+            scene_rename: &mut self.scene_rename,
+            pending_tree: &mut self.pending_tree,
             fm: &mut self.fm,
             transform: &mut self.transform,
             transform_started: &mut self.transform_started,
@@ -1298,6 +1430,11 @@ impl Ui {
         if self.pending_delete {
             self.commit_delete(scene, dmx);
         }
+        // Apply a deferred outliner action (hide toggle / rename) as ONE undo step,
+        // now that the undo stack + patch are reachable (the tree itself can't touch
+        // undo mid-dock, so it returned the intent — mirrors pending_delete).
+        let tree_action = std::mem::replace(&mut self.pending_tree, tree::TreeAction::None);
+        self.apply_tree_action(tree_action, scene, dmx);
         // The viewport context menu's "Replace…" opens the dialog here (after the
         // dock), where the library + patch are reachable.
         if self.pending_replace {
@@ -2327,6 +2464,9 @@ struct PanelViewer<'a> {
     scene_anchor: &'a mut Option<usize>,
     scene_sort: &'a mut panels::SceneSort,
     scene_search: &'a mut String,
+    scene_expanded: &'a mut std::collections::HashSet<tree::NodeKey>,
+    scene_rename: &'a mut Option<(tree::NodeKey, String)>,
+    pending_tree: &'a mut tree::TreeAction,
     fm: &'a mut panels::FmState,
     transform: &'a mut Option<TransformOp>,
     /// Per-frame signals the viewport sets for the modal-transform undo wiring.
@@ -2481,6 +2621,9 @@ impl TabViewer for PanelViewer<'_> {
                 self.scene_anchor,
                 self.scene_sort,
                 self.scene_search,
+                self.scene_expanded,
+                self.scene_rename,
+                self.pending_tree,
                 self.groups,
                 self.group_name,
             ),

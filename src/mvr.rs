@@ -553,6 +553,7 @@ fn parse_video_screen(node: &roxmltree::Node, mvr_xform: Mat4) -> crate::scene::
             _ => crate::scene::screen::PixelShape::SmdRound,
         },
         hidden: false,
+        id: 0, // assigned by Scene::ensure_ids after import
         content,
         frame: None,
     }

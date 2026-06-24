@@ -193,6 +193,10 @@ pub struct LedScreen {
     pub pixel_shape: PixelShape,
     /// Hidden in the viewport (outliner eye toggle): not drawn, not pickable.
     pub hidden: bool,
+    /// Session-stable identity (serde-skip → reassigned by `Scene::ensure_ids`
+    /// on load). The Scene outliner keys rows by this; never serialized.
+    #[serde(skip)]
+    pub id: super::EntityId,
 
     /// What the surface displays.
     pub content: ScreenContent,
@@ -227,6 +231,7 @@ impl LedScreen {
             emit: 1.0,
             pixel_shape: PixelShape::SmdRound,
             hidden: false,
+            id: 0, // assigned by Scene::add_screen / ensure_ids
             content: ScreenContent::TestPattern(TestPattern::Grid),
             frame: None,
         }

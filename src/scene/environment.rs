@@ -34,6 +34,16 @@ pub struct Environment {
     /// vs the surrounding haze, and how clear the gaps. Higher = pockets pop harder.
     /// Only matters as `uniformity` drops below 1. (Serialized; .archie FORMAT 6.)
     pub cluster_contrast: f32,
+
+    /// Hidden in the viewport (the Scene outliner's eye toggle). serde-skip →
+    /// session-only → NO .archie format bump (matches the other entities' eye,
+    /// which reuse a persisted `hidden`; environments gain it session-only here).
+    // Wired to the outliner eye column (the tree's visibility toggle).
+    #[serde(skip)]
+    pub hidden: bool,
+    /// Session-stable identity (serde-skip → reassigned by `Scene::ensure_ids`).
+    #[serde(skip)]
+    pub id: super::EntityId,
 }
 
 impl Environment {
@@ -52,6 +62,8 @@ impl Environment {
             anisotropy: 0.25,
             uniformity: 0.6,
             cluster_contrast: 0.0,
+            hidden: false,
+            id: 0, // assigned by Scene::add_environment / ensure_ids
         }
     }
 

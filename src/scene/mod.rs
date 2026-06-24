@@ -19,6 +19,12 @@ use glam::{Mat4, Vec3};
 
 use crate::mvr::{GeometryModel, MvrHeader, MvrImport, MvrObjectMeta};
 
+/// Session-stable per-entity identity. Assigned at create + reconstructed on
+/// load (serde-skip → never serialized → NO .archie format bump, same trick as
+/// `Fixture.gdtf`). The outliner addresses rows by this so expand-state + the
+/// range anchor survive add/delete reordering (Blender's `TreeStoreElem.id` role).
+pub type EntityId = u64;
+
 /// A static, non-fixture object placed in the scene — a stage deck, truss,
 /// set piece, or screen imported from MVR. Drawn as lit geometry that occludes
 /// beams; not a light source.
@@ -39,6 +45,10 @@ pub struct SceneGeometry {
     /// Hidden in the viewport (the Scene outliner's eye toggle): not drawn, not
     /// pickable. Still listed in the outliner.
     pub hidden: bool,
+    /// Session-stable identity (serde-skip → reassigned by [`Scene::ensure_ids`]
+    /// on load). The outliner keys rows by this so reorder/delete is robust.
+    #[serde(skip)]
+    pub id: EntityId,
 }
 
 impl SceneGeometry {
@@ -438,6 +448,11 @@ pub struct Scene {
     /// Retained MVR document data, present when the scene came from an MVR
     /// import, so it can be exported back out faithfully.
     pub mvr: Option<MvrSceneData>,
+    /// Monotonic [`EntityId`] allocator. serde-skip → reset to 0 on load;
+    /// [`ensure_ids`](Self::ensure_ids) reseeds it past the max live id after
+    /// every load/import/undo-restore.
+    #[serde(skip)]
+    next_id: EntityId,
 }
 
 impl Scene {
@@ -459,14 +474,17 @@ impl Scene {
         let on_floor = Vec3::new(0.0, fog.default_size[1] * 0.5, 0.0);
         let environment = Environment::from_profile(fog, "Fog Box", on_floor);
 
-        Self {
+        let mut scene = Self {
             fixtures: vec![fixture],
             environments: vec![environment],
             world: World::default(),
             geometry: Vec::new(),
             screens: Vec::new(),
             mvr: None,
-        }
+            next_id: 0,
+        };
+        scene.ensure_ids(); // hand the demo entities their stable ids
+        scene
     }
 
     /// Advance time-based wheel motion (gobo/color/animation/prism spin and
@@ -506,6 +524,7 @@ impl Scene {
         let mut fixture = Fixture::from_profile(profile, name, Vec3::new(0.0, 4.0, 0.0));
         fixture.tilt = 30.0;
         fixture.snap_movement(); // appear at the placed pose, not slewing from 0
+        fixture.id = self.alloc_id();
         self.fixtures.push(fixture);
         self.fixtures.len() - 1
     }
@@ -529,6 +548,7 @@ impl Scene {
             f.pan = base.pan + y_angle_deg * i as f32;
             f.name = format!("{} ({i})", base.name);
             f.snap_movement(); // each copy starts at its fanned pose
+            f.id = self.alloc_id(); // a clone shares base.id → give each a fresh one
             self.fixtures.push(f);
         }
         (count > 0).then_some(first)
@@ -560,6 +580,7 @@ impl Scene {
                 mvr: Some(o.meta),
                 bounds,
                 hidden: false,
+                id: 0, // assigned by ensure_ids() at the end of import_mvr
             });
         }
         for s in import.screens {
@@ -569,6 +590,8 @@ impl Scene {
             header: import.header,
             resources: import.resources,
         });
+        // The imported entities were pushed with id == 0; hand them stable ids.
+        self.ensure_ids();
         log::info!(
             "scene: imported MVR — {} fixtures, {} static objects",
             self.fixtures.len(),
@@ -602,7 +625,9 @@ impl Scene {
     ) -> usize {
         let n = self.fixtures.iter().filter(|f| f.is_gdtf()).count() + 1;
         let name = format!("{} {}", gdtf.name, n);
-        self.fixtures.push(Fixture::from_gdtf(gdtf, name, position));
+        let mut fixture = Fixture::from_gdtf(gdtf, name, position);
+        fixture.id = self.alloc_id();
+        self.fixtures.push(fixture);
         self.fixtures.len() - 1
     }
 
@@ -617,7 +642,8 @@ impl Scene {
         let proto = LedScreen::from_profile(profile, name.clone(), Mat4::IDENTITY);
         let [_, h] = proto.size_m();
         let transform = Mat4::from_translation(Vec3::new(0.0, h * 0.5 + 0.2, -4.0));
-        let screen = LedScreen::from_profile(profile, name, transform);
+        let mut screen = LedScreen::from_profile(profile, name, transform);
+        screen.id = self.alloc_id();
         self.screens.push(screen);
         self.screens.len() - 1
     }
@@ -628,9 +654,88 @@ impl Scene {
         let name = format!("{} {}", profile.name, n);
         // Rest the box on the floor (see Scene::demo) so it doesn't sink below ground.
         let on_floor = Vec3::new(0.0, profile.default_size[1] * 0.5, 0.0);
-        self.environments
-            .push(Environment::from_profile(profile, name, on_floor));
-        self.environments.len() - 1
+        let idx = {
+            self.environments
+                .push(Environment::from_profile(profile, name, on_floor));
+            self.environments.len() - 1
+        };
+        self.environments[idx].id = self.alloc_id();
+        idx
+    }
+
+    /// Hand out a fresh, never-reused [`EntityId`].
+    pub fn alloc_id(&mut self) -> EntityId {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    /// Assign ids to any entity with `id == 0` and reseed `next_id` past the max
+    /// live id. MUST run after every load / MVR import / undo-restore: serde-skip
+    /// zeroes ids on a bincode round-trip, so without this every entity shares id
+    /// 0 → `NodeKey` collisions → selection/expand cross-talk. This is Blender's
+    /// treestore reconstruction on file read.
+    pub fn ensure_ids(&mut self) {
+        // Seed the counter past the highest id that survived (in-memory adds), so
+        // freshly-assigned ids never collide with live ones.
+        let mut n = self.next_id;
+        for f in &self.fixtures {
+            n = n.max(f.id);
+        }
+        for g in &self.geometry {
+            n = n.max(g.id);
+        }
+        for s in &self.screens {
+            n = n.max(s.id);
+        }
+        for e in &self.environments {
+            n = n.max(e.id);
+        }
+        // Fill every zeroed id (post-load) with a fresh value.
+        for f in &mut self.fixtures {
+            if f.id == 0 {
+                n += 1;
+                f.id = n;
+            }
+        }
+        for g in &mut self.geometry {
+            if g.id == 0 {
+                n += 1;
+                g.id = n;
+            }
+        }
+        for s in &mut self.screens {
+            if s.id == 0 {
+                n += 1;
+                s.id = n;
+            }
+        }
+        for e in &mut self.environments {
+            if e.id == 0 {
+                n += 1;
+                e.id = n;
+            }
+        }
+        self.next_id = n;
+    }
+
+    /// Resolve an [`EntityId`] to its current `fixtures` index (`None` if stale
+    /// after a delete). The outliner converts id→index at the click moment so
+    /// `Selection`'s `Vec<usize>` can stay index-based.
+    // Consumed by the S2 custom tree widget (id↔index seam).
+    pub fn fixture_index_of(&self, id: EntityId) -> Option<usize> {
+        self.fixtures.iter().position(|e| e.id == id)
+    }
+    /// Resolve an [`EntityId`] to its current `geometry` index.
+    pub fn geometry_index_of(&self, id: EntityId) -> Option<usize> {
+        self.geometry.iter().position(|e| e.id == id)
+    }
+    /// Resolve an [`EntityId`] to its current `screens` index.
+    pub fn screen_index_of(&self, id: EntityId) -> Option<usize> {
+        self.screens.iter().position(|e| e.id == id)
+    }
+    /// Resolve an [`EntityId`] to its current `environments` index.
+    pub fn environment_index_of(&self, id: EntityId) -> Option<usize> {
+        self.environments.iter().position(|e| e.id == id)
     }
 }
 
@@ -657,5 +762,78 @@ mod tests {
         let c = &scene.fixtures[first + 2];
         assert!((c.position.x - (base.position.x + 3.0)).abs() < 1e-4);
         assert!((c.pan - (base.pan + 108.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn entity_ids_unique_and_stable_across_delete() {
+        let library = Library::standard();
+        let mut scene = Scene::demo(); // one fixture, one environment
+
+        // Build a multi-fixture rig (demo's 1 + 4 added = 5).
+        for _ in 0..4 {
+            scene.add_fixture(&library.fixtures[0]);
+        }
+        assert_eq!(scene.fixtures.len(), 5);
+
+        // 1) Every id is unique and non-zero.
+        let ids: Vec<EntityId> = scene.fixtures.iter().map(|f| f.id).collect();
+        assert!(ids.iter().all(|&id| id != 0), "no entity keeps id 0");
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "fixture ids are unique");
+
+        // 2) index_of resolves each id to its current slot.
+        for (i, f) in scene.fixtures.iter().enumerate() {
+            assert_eq!(scene.fixture_index_of(f.id), Some(i));
+        }
+
+        // 3) Delete a middle fixture → indices shift, but index_of(id) stays
+        //    correct for the survivors and the deleted id resolves to None.
+        let removed_id = scene.fixtures[1].id;
+        let third_id = scene.fixtures[2].id; // was at index 2, should become 1
+        scene.fixtures.remove(1);
+        assert_eq!(scene.fixture_index_of(removed_id), None, "stale id → None");
+        assert_eq!(scene.fixture_index_of(third_id), Some(1), "survivor re-indexed");
+        for (i, f) in scene.fixtures.iter().enumerate() {
+            assert_eq!(scene.fixture_index_of(f.id), Some(i));
+        }
+
+        // 4) A subsequent add never reuses the deleted id.
+        let new_idx = scene.add_fixture(&library.fixtures[0]);
+        let new_id = scene.fixtures[new_idx].id;
+        assert!(!ids.contains(&new_id), "fresh id is never a previously-used id");
+        assert_ne!(new_id, removed_id);
+    }
+
+    #[test]
+    fn ensure_ids_reassigns_after_serde_roundtrip() {
+        // serde-skip zeroes ids; ensure_ids must reassign unique ones (the load /
+        // undo-restore path). Simulate the round-trip by zeroing ids.
+        let library = Library::standard();
+        let mut scene = Scene::demo();
+        for _ in 0..3 {
+            scene.add_fixture(&library.fixtures[0]);
+        }
+        scene.add_environment(&library.environments[0]);
+
+        // Round-trip wipe (what bincode deserialize of serde-skip fields does).
+        scene.next_id = 0;
+        for f in &mut scene.fixtures {
+            f.id = 0;
+        }
+        for e in &mut scene.environments {
+            e.id = 0;
+        }
+
+        scene.ensure_ids();
+
+        let mut all: Vec<EntityId> = scene.fixtures.iter().map(|f| f.id).collect();
+        all.extend(scene.environments.iter().map(|e| e.id));
+        assert!(all.iter().all(|&id| id != 0), "all reassigned");
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "ids unique across entity kinds");
     }
 }

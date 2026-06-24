@@ -61,7 +61,7 @@ impl SceneSort {
 }
 
 /// The display order of fixture indices for the given sort.
-fn fixture_order(scene: &Scene, patch: &PatchTable, sort: SceneSort) -> Vec<usize> {
+pub(super) fn fixture_order(scene: &Scene, patch: &PatchTable, sort: SceneSort) -> Vec<usize> {
     let mut order: Vec<usize> = (0..scene.fixtures.len()).collect();
     match sort {
         SceneSort::Patch => {
@@ -111,13 +111,15 @@ pub fn scene_outliner(
     anchor: &mut Option<usize>,
     sort: &mut SceneSort,
     search: &mut String,
+    expanded: &mut std::collections::HashSet<super::tree::NodeKey>,
+    rename: &mut Option<(super::tree::NodeKey, String)>,
+    pending: &mut super::tree::TreeAction,
     groups: &mut Vec<SelectionGroup>,
     group_name: &mut String,
 ) {
     use theme::icon;
     let ink = theme::ink(!ui.visuals().dark_mode);
     let accent = ui.visuals().selection.stroke.color;
-    const ROW_H: f32 = 34.0;
 
     ui.horizontal(|ui| {
         ui.heading("Scene");
@@ -142,297 +144,30 @@ pub fn scene_outliner(
             search.clear();
         }
     });
-    let q = search.trim().to_lowercase();
-    let matches = |name: &str| q.is_empty() || name.to_lowercase().contains(q.as_str());
     ui.separator();
 
-    // Mark which fixtures are in an address conflict (computed once, not per row).
-    let mut conflicted = vec![false; scene.fixtures.len()];
-    for c in patch.conflicts() {
-        // Guard: patch entry indices may transiently exceed the fixture count
-        // (mid-import / before reconcile).
-        if let Some(s) = conflicted.get_mut(c.a) {
-            *s = true;
+    // The project HIERARCHY: one custom recursive tree under a single "Scene"
+    // root (World/Fixtures/Objects/Screens nested beneath), replacing the old
+    // flat CollapsingHeader folders. See src/ui/tree.rs.
+    ui.horizontal(|ui| {
+        ui.label(theme::ico(icon::SORT).weak()).on_hover_text("Sort fixtures by");
+        for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type] {
+            ui.selectable_value(sort, s, s.label());
         }
-        if let Some(s) = conflicted.get_mut(c.b) {
-            *s = true;
-        }
-    }
-
-    // ---- WORLD: the top of the scene hierarchy ----
-    // A selectable container node (HDRI sky + image-based ambient; its inspector
-    // is shown when picked) with the fog-box environments nested under it as
-    // children, mirroring Blender's "World" sitting above the scene collection.
-    // Framed in a faint surface to read as the top-level container.
+    });
     egui::Frame::NONE
         .fill(ui.visuals().faint_bg_color)
         .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
         .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(6, 4))
+        .inner_margin(egui::Margin::symmetric(4, 4))
         .show(ui, |ui| {
-    folder_header(icon::WORLD, "World", 0, true, &ink).show(ui, |ui| {
-        // The World node itself: selecting it opens the world_inspector.
-        let wrow = entity_row(
-            ui,
-            icon::WORLD,
-            "World",
-            "HDRI · ambient",
-            "",
-            false,
-            selection.world,
-            selection.world,
-            false,
-            false,
-            &ink,
-            accent,
-        );
-        if wrow.body.clicked() {
-            *selection = Selection::world();
-            *anchor = None;
-        }
-        // ENVIRONMENT children: fog boxes / volumes, indented under World.
-        ui.indent("world-children", |ui| {
-            folder_header(icon::ENVIRONMENT, "Environment", scene.environments.len(), true, &ink)
-                .show(ui, |ui| {
-                    if scene.environments.is_empty() {
-                        ui.label(RichText::new("none — add a Fog Box from the Library").weak().small());
-                    }
-                    let mut click: Option<usize> = None;
-                    for (i, env) in scene.environments.iter().enumerate() {
-                        let sel = selection.environment == Some(i);
-                        let row = entity_row(
-                            ui,
-                            icon::ENVIRONMENT,
-                            env.name.as_str(),
-                            "Fog volume",
-                            "",
-                            false,
-                            sel,
-                            sel,
-                            false,
-                            false,
-                            &ink,
-                            accent,
-                        );
-                        if row.body.clicked() {
-                            click = Some(i);
-                        }
-                    }
-                    if let Some(i) = click {
-                        *selection = Selection::environment(i);
-                        *anchor = None;
-                    }
-                });
+            let act = super::tree::scene_tree(ui, scene, selection, patch, anchor, *sort, search, expanded, rename);
+            // Defer hide/rename (need an undo step) to the post-dock consumer.
+            if !matches!(act, super::tree::TreeAction::None) {
+                *pending = act;
+            }
         });
-    });
-    }); // World container frame
     ui.add_space(6.0);
-
-    // ---- OBJECTS: imported MVR static geometry (stage / truss / set) ----
-    // Selectable + transformable (G/R/S in the viewport); thousands of rows, so
-    // the body is virtualised and the folder defaults closed.
-    folder_header(icon::GEOMETRY, "Objects", scene.geometry.len(), false, &ink).show(ui, |ui| {
-        if scene.geometry.is_empty() {
-            ui.label(RichText::new("none — import an MVR scene").weak().small());
-            return;
-        }
-        let order: Vec<usize> = (0..scene.geometry.len()).filter(|&i| matches(&scene.geometry[i].name)).collect();
-        if order.is_empty() {
-            ui.label(RichText::new("no match").weak().small());
-            return;
-        }
-        let mut click: Option<(usize, bool)> = None;
-        let mut vis: Option<usize> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("scene-objects")
-            .max_height(240.0)
-            .auto_shrink([false, true])
-            .show_rows(ui, ROW_H, order.len(), |ui, range| {
-                for di in range {
-                    let i = order[di];
-                    let g = &scene.geometry[i];
-                    let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
-                    let row = entity_row(
-                        ui,
-                        icon::GEOMETRY,
-                        &g.name,
-                        kind,
-                        "",
-                        false,
-                        selection.contains_geometry(i),
-                        selection.primary_geometry() == Some(i),
-                        g.hidden,
-                        true,
-                        &ink,
-                        accent,
-                    );
-                    if row.eye_clicked {
-                        vis = Some(i);
-                    } else if row.body.clicked() {
-                        let m = ui.input(|x| x.modifiers);
-                        click = Some((i, m.command || m.ctrl));
-                    }
-                }
-            });
-        if let Some(i) = vis {
-            if let Some(g) = scene.geometry.get_mut(i) {
-                g.hidden = !g.hidden;
-            }
-        }
-        if let Some((i, toggle)) = click {
-            if toggle {
-                selection.toggle_geometry(i);
-            } else {
-                *selection = Selection::geometry(i);
-            }
-            *anchor = None;
-        }
-    });
-
-    // ---- SCREENS: LED video walls (emissive surfaces) ----
-    folder_header(icon::SCREEN, "Screens", scene.screens.len(), false, &ink).show(ui, |ui| {
-        if scene.screens.is_empty() {
-            ui.label(RichText::new("none — add an LED Wall from the Library").weak().small());
-            return;
-        }
-        let order: Vec<usize> =
-            (0..scene.screens.len()).filter(|&i| matches(&scene.screens[i].name)).collect();
-        if order.is_empty() {
-            ui.label(RichText::new("no match").weak().small());
-            return;
-        }
-        let mut click: Option<(usize, bool)> = None;
-        let mut vis: Option<usize> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("scene-screens")
-            .max_height(200.0)
-            .auto_shrink([false, true])
-            .show_rows(ui, ROW_H, order.len(), |ui, range| {
-                for di in range {
-                    let i = order[di];
-                    let s = &scene.screens[i];
-                    let [rx, ry] = s.resolution();
-                    let sub = format!("{rx}×{ry} · {}", s.content.label());
-                    let row = entity_row(
-                        ui,
-                        icon::SCREEN,
-                        &s.name,
-                        &sub,
-                        "",
-                        false,
-                        selection.contains_screen(i),
-                        selection.primary_screen() == Some(i),
-                        s.hidden,
-                        true,
-                        &ink,
-                        accent,
-                    );
-                    if row.eye_clicked {
-                        vis = Some(i);
-                    } else if row.body.clicked() {
-                        let m = ui.input(|x| x.modifiers);
-                        click = Some((i, m.command || m.ctrl));
-                    }
-                }
-            });
-        if let Some(i) = vis {
-            if let Some(s) = scene.screens.get_mut(i) {
-                s.hidden = !s.hidden;
-            }
-        }
-        if let Some((i, toggle)) = click {
-            if toggle {
-                selection.toggle_screen(i);
-            } else {
-                *selection = Selection::screen(i);
-            }
-            *anchor = None;
-        }
-    });
-
-    // ---- FIXTURES: sortable, virtualised, patch-ordered ----
-    folder_header(icon::FIXTURE, "Fixtures", scene.fixtures.len(), true, &ink).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(theme::ico(icon::SORT).weak()).on_hover_text("Sort fixtures by");
-            for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type] {
-                ui.selectable_value(sort, s, s.label());
-            }
-        });
-        if scene.fixtures.is_empty() {
-            ui.label(RichText::new("none — add from the Library").weak().small());
-            return;
-        }
-        let order: Vec<usize> =
-            fixture_order(scene, patch, *sort).into_iter().filter(|&i| matches(&scene.fixtures[i].name)).collect();
-        if order.is_empty() {
-            ui.label(RichText::new("no match").weak().small());
-            return;
-        }
-        let mut click: Option<(usize, bool, bool)> = None;
-        let mut vis: Option<usize> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("scene-fixtures")
-            .max_height(300.0)
-            .auto_shrink([false, true])
-            .show_rows(ui, ROW_H, order.len(), |ui, range| {
-                for di in range {
-                    let i = order[di];
-                    let fixture = &scene.fixtures[i];
-                    let patch_tag = match patch.get(i).filter(|p| p.enabled) {
-                        Some(p) => format!("{}.{:03}", p.universe, p.address),
-                        None => "unpatched".into(),
-                    };
-                    let row_icon = if fixture.is_laser { icon::COLOR } else { icon::FIXTURE };
-                    let row = entity_row(
-                        ui,
-                        row_icon,
-                        &fixture.name,
-                        &fixture.profile,
-                        &patch_tag,
-                        conflicted[i],
-                        selection.contains_fixture(i),
-                        selection.primary_fixture() == Some(i),
-                        fixture.hidden,
-                        true,
-                        &ink,
-                        accent,
-                    );
-                    if row.eye_clicked {
-                        vis = Some(i);
-                    } else if row.body.clicked() {
-                        let m = ui.input(|x| x.modifiers);
-                        click = Some((i, m.shift, m.command || m.ctrl));
-                    }
-                }
-            });
-        if let Some(i) = vis {
-            if let Some(f) = scene.fixtures.get_mut(i) {
-                f.hidden = !f.hidden;
-            }
-        }
-        if let Some((i, shift, toggle)) = click {
-            if shift {
-                // Range follows the VISIBLE (sorted) order, not raw scene indices:
-                // select every fixture whose display row is between the anchor's
-                // row and the clicked row.
-                let click_pos = order.iter().position(|&x| x == i).unwrap_or(0);
-                let anchor_pos = anchor
-                    .and_then(|a| order.iter().position(|&x| x == a))
-                    .unwrap_or(click_pos);
-                let (lo, hi) = (anchor_pos.min(click_pos), anchor_pos.max(click_pos));
-                selection.fixtures = order[lo..=hi].to_vec();
-                selection.environment = None;
-                selection.geometry.clear();
-                // Establish an anchor if this was the first (anchorless) click, so
-                // subsequent shift-clicks grow the range from here.
-                if anchor.is_none() {
-                    *anchor = Some(i);
-                }
-            } else {
-                apply_fixture_click(selection, anchor, i, false, toggle, scene.fixtures.len());
-            }
-        }
-    });
 
     // ---- GROUPS: saved named selections (console-style), recalled by click ----
     folder_header(icon::CATEGORY, "Groups", groups.len(), true, &ink).show(ui, |ui| {
@@ -884,7 +619,7 @@ fn apply_lib_click(lib: &mut LibState, ri: usize, mods: &egui::Modifiers, _len: 
 
 /// Paint left-anchored text truncated with an ellipsis to `max_w` (single row) —
 /// used by the dense list rows so a long name can't run under the right column.
-fn paint_truncated(
+pub(super) fn paint_truncated(
     painter: &egui::Painter,
     top_left: egui::Pos2,
     text: &str,
@@ -907,114 +642,6 @@ fn paint_truncated(
     painter.galley(top_left, galley, color);
 }
 
-/// Outcome of one scene-outliner row: the body response (drives selection) plus
-/// whether the visibility eye was clicked this frame (toggles hide).
-struct RowOut {
-    body: egui::Response,
-    eye_clicked: bool,
-}
-
-/// A scene-outliner row, Blender-outliner style: an optional left **active** bar,
-/// a type icon, the name + secondary line, a right-aligned patch tag / conflict
-/// badge, and (when `show_eye`) a far-right **visibility eye** toggle. Full-width
-/// clickable; the active (primary) row reads brighter than merely-selected rows,
-/// and a hidden row is dimmed. Shared by fixtures, objects, and environments.
-#[allow(clippy::too_many_arguments)]
-fn entity_row(
-    ui: &mut egui::Ui,
-    icon: &str,
-    name: &str,
-    secondary: &str,
-    patch_tag: &str,
-    conflict: bool,
-    selected: bool,
-    active: bool,
-    hidden: bool,
-    show_eye: bool,
-    ink: &theme::Ink,
-    accent: Color32,
-) -> RowOut {
-    let h = 34.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
-    let painter = ui.painter_at(rect);
-    let visuals = ui.visuals();
-    if selected {
-        painter.rect_filled(rect, 4.0, visuals.selection.bg_fill);
-        // The active (primary) item gets a full accent outline; passive
-        // multi-selection members get a quieter one.
-        let w = if active { 1.5 } else { 1.0 };
-        let col = if active { accent } else { accent.gamma_multiply(0.6) };
-        painter.rect_stroke(rect, 4.0, egui::Stroke::new(w, col), egui::StrokeKind::Inside);
-    } else if resp.hovered() {
-        painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
-    }
-    // Active marker: a left accent bar (Blender's active-object emphasis).
-    if active {
-        painter.rect_filled(
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.5, h)),
-            0.0,
-            accent,
-        );
-    }
-    // Dim hidden rows so the eye state reads at a glance.
-    let dim = if hidden { 0.45 } else { 1.0 };
-
-    // Far-right visibility eye (its own hit-test, so it doesn't trigger select).
-    let mut eye_clicked = false;
-    let mut right_edge = 9.0;
-    if show_eye {
-        let eye_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - 27.0, rect.top()),
-            egui::vec2(24.0, h),
-        );
-        let eye = ui.interact(eye_rect, resp.id.with("eye"), Sense::click());
-        let glyph = if hidden { theme::icon::EYE_OFF } else { theme::icon::EYE };
-        let col = if hidden {
-            ink.muted
-        } else if eye.hovered() {
-            ink.primary
-        } else {
-            ink.tertiary
-        };
-        painter.text(eye_rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(14.0), col);
-        eye.clone().on_hover_text(if hidden { "Hidden — click to show" } else { "Visible — click to hide" });
-        eye_clicked = eye.clicked();
-        right_edge = 30.0;
-    }
-
-    painter.text(
-        rect.left_center() + egui::vec2(9.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        icon,
-        egui::FontId::proportional(15.0),
-        (if selected { accent } else { ink.secondary }).gamma_multiply(dim),
-    );
-    // Left text zone is bounded so a long name can't run under the right column.
-    let text_w = (rect.width() - 30.0 - 60.0 - (right_edge - 9.0)).max(40.0);
-    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), name, 13.0, ink.primary.gamma_multiply(dim), text_w);
-    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), secondary, 10.5, ink.tertiary.gamma_multiply(dim), text_w);
-    // Right column: patch tag on top, conflict badge below (left of the eye).
-    if !patch_tag.is_empty() {
-        let unpatched = patch_tag == "unpatched";
-        painter.text(
-            egui::pos2(rect.right() - right_edge, rect.top() + 6.0),
-            egui::Align2::RIGHT_TOP,
-            patch_tag,
-            egui::FontId::monospace(10.0),
-            if unpatched { ink.muted } else { ink.tertiary },
-        );
-    }
-    if conflict {
-        painter.text(
-            egui::pos2(rect.right() - right_edge, rect.bottom() - 5.0),
-            egui::Align2::RIGHT_BOTTOM,
-            theme::icon::WARNING,
-            egui::FontId::proportional(12.0),
-            theme::CONFLICT,
-        );
-    }
-    RowOut { body: resp, eye_clicked }
-}
 
 /// One library row: icon + name (strong) + dim meta, full-width clickable, with
 /// selection highlight + hover. Returns the row response.
@@ -2471,6 +2098,9 @@ fn pick_world_point(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Vec3> {
         }
     }
     for e in &scene.environments {
+        if e.hidden {
+            continue; // outliner eye: a hidden fog box isn't a measure/aim target
+        }
         if let Some(t) = ray_aabb(ro, rd, e.min(), e.max()) {
             consider(t);
         }
@@ -4070,6 +3700,9 @@ fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
     }
     let mut env: Option<(f32, usize)> = None;
     for (i, e) in scene.environments.iter().enumerate() {
+        if e.hidden {
+            continue; // outliner eye: a hidden fog box isn't pickable
+        }
         if let Some(t) = ray_aabb(ro, rd, e.min(), e.max())
             && env.is_none_or(|(bt, _)| t < bt)
         {
@@ -4156,7 +3789,11 @@ mod pick_tests {
     #[test]
     fn measure_point_falls_back_to_ground_plane() {
         // An empty scene: a downward ray from y=10 must land on y=0 (the floor).
-        let scene = Scene { fixtures: vec![], screens: vec![], geometry: vec![], environments: vec![], ..Scene::demo() };
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        scene.screens.clear();
+        scene.geometry.clear();
+        scene.environments.clear();
         let ro = Vec3::new(2.0, 10.0, 3.0);
         let rd = Vec3::new(0.0, -1.0, 0.0);
         let p = pick_world_point(&scene, ro, rd).expect("ground hit");
@@ -4167,7 +3804,11 @@ mod pick_tests {
     #[test]
     fn measure_point_prefers_nearer_surface_over_ground() {
         // A fixture sphere between the camera and the floor wins over the y=0 plane.
-        let mut scene = Scene { fixtures: vec![], screens: vec![], geometry: vec![], environments: vec![], ..Scene::demo() };
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        scene.screens.clear();
+        scene.geometry.clear();
+        scene.environments.clear();
         let demo = Scene::demo();
         scene.fixtures.push(demo.fixtures[0].clone());
         scene.fixtures[0].position = Vec3::new(0.0, 4.0, 0.0);

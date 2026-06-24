@@ -1759,6 +1759,9 @@ impl Renderer {
         // --- dynamic lines: fog-box wireframes + beam indicators ---
         let mut lines: Vec<LineVertex> = Vec::new();
         for (i, env) in scene.environments.iter().enumerate() {
+            if env.hidden {
+                continue; // outliner eye: a hidden fog box draws no wireframe
+            }
             let color = if selection.environment == Some(i) {
                 [0.6, 0.95, 1.0]
             } else {
@@ -1803,8 +1806,10 @@ impl Renderer {
         }
         let line_count = self.dynamic_lines.upload(&self.device, &self.queue, &lines);
 
-        // --- volumetric uniforms + fixtures (use the first fog box, if any) ---
-        let fog = scene.environments.first();
+        // --- volumetric uniforms + fixtures (use the first VISIBLE fog box, if any) ---
+        // Outliner eye: skip hidden fog boxes so toggling a fog volume's visibility
+        // actually removes its haze, not just the wireframe.
+        let fog = scene.environments.iter().find(|e| !e.hidden);
         let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
         // Haze uniformity (1 smooth … 0 clustered). Drives the density-noise contrast
         // AND the temporal history cap below: at low uniformity the user WANTS to see the

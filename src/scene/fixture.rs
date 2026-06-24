@@ -27,6 +27,11 @@ pub struct Fixture {
     /// beam comes from its Beam geometry.
     #[serde(skip)]
     pub gdtf: Option<Arc<GdtfFixture>>,
+    /// Session-stable identity (serde-skip → reassigned by `Scene::ensure_ids`
+    /// on load). The Scene outliner keys rows by this so reorder/delete stays
+    /// robust; never serialized → no .archie format bump.
+    #[serde(skip)]
+    pub id: super::EntityId,
 
     /// World position of the fixture head, in metres. Y is up.
     pub position: Vec3,
@@ -112,6 +117,7 @@ impl Fixture {
             category: profile.category.to_string(),
             geometry: profile.geometry,
             gdtf: None,
+            id: 0, // a real id is assigned by the Scene add_* / ensure_ids caller
             is_laser: profile.laser,
             hidden: false,
             beam: 1.0,
@@ -147,6 +153,7 @@ impl Fixture {
             category: gdtf.manufacturer.clone(),
             geometry: FixtureGeometry::Cylinder,
             gdtf: Some(gdtf),
+            id: 0, // assigned by Scene::add_gdtf / ensure_ids
             is_laser,
             hidden: false,
             beam: 1.0,
@@ -202,6 +209,7 @@ impl Fixture {
             category,
             geometry: FixtureGeometry::Cylinder,
             gdtf: imported.gdtf,
+            id: 0, // assigned by import_mvr's ensure_ids
             is_laser,
             hidden: false,
             beam: 1.0,

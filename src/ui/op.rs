@@ -92,6 +92,10 @@ impl DocSnapshot {
     ) {
         if let Ok(s) = bincode::deserialize::<Scene>(&self.scene) {
             *scene = s;
+            // The undo snapshot serde-roundtripped → every EntityId is now 0.
+            // Reseed stable ids so the outliner's expand-state/selection keyed by
+            // id survive an undo/redo (same serde-skip trap as Fixture.gdtf).
+            scene.ensure_ids();
         }
         if let Ok(p) = bincode::deserialize::<PatchTable>(&self.patch) {
             *patch = p;

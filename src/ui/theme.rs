@@ -52,6 +52,9 @@ pub mod icon {
     pub const CLOSE: &str = p::X;
     pub const PREV: &str = p::CARET_LEFT;
     pub const NEXT: &str = p::CARET_RIGHT;
+    // Outliner-tree disclosure triangles (expanded ▾ / collapsed ▸), Blender-style.
+    pub const TREE_OPEN: &str = p::CARET_DOWN;
+    pub const TREE_CLOSED: &str = p::CARET_RIGHT;
     pub const COLOR: &str = p::PALETTE;
     pub const INFO: &str = p::INFO;
     pub const RESET: &str = p::ARROW_CLOCKWISE;
