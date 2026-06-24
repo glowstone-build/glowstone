@@ -215,15 +215,20 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     // Equal spacing + per-pixel jitter is the robust choice; the count reduction
     // (and the constant-dt cap above) is where the speed comes from.
     let dt = seg / fn_steps;
-    // Ray-start offset: a PER-FRAME golden-ratio phase (chroma.y), the SAME for every
-    // pixel this frame. Crucially NOT per-pixel — a per-pixel offset makes neighbouring
-    // rays sample the haze at different depths, which BLURS the smoke-cluster structure
-    // into mush (that's what hid the clusters). With a uniform per-frame offset, all rays
-    // sample coherently (clusters read), and the temporal-accumulation resolve
-    // (vol_temporal.wgsl) averages successive frames' offsets to dissolve the step
-    // banding — coherent clusters AND smooth shafts. A tiny per-pixel dither is added
-    // only as a fallback for the first frame / fast motion before history converges.
-    let jitter = fract(u.chroma.y + ign(in.pos.xy) * 0.06);
+    // Ray-start offset: ANIMATED interleaved-gradient-noise (Jiménez, COD:AW) — a
+    // spatiotemporal blue-noise the cheap way. `chroma.y` carries the frame index (mod 64);
+    // offsetting the IGN input by `frame·5.588238` gives a FRESH blue-noise pattern each
+    // frame whose per-pixel sequence is well distributed over 64 frames. Why this beats the
+    // old screen-coherent golden-ratio phase: that phase was the SAME for every pixel, so
+    // the whole step-band pattern shifted RIGIDLY each frame → it read as coherent FLICKER
+    // (and bands, since per-pixel variation was only 6%) even with a still camera. Blue
+    // grain instead is integrated by the eye AND dissolved by the EMA when static (blue
+    // along time → resolves in ~8 frames), so banding/flicker → faint stable grain. At
+    // half-res each IGN sample already spans a 2×2 full-res block, so it does NOT dither
+    // thin beams apart or mush clusters (the reason the old code capped IGN at 6% — that
+    // concern was full-res per-pixel; here the march is already half-res). Research:
+    // Wolfe 2021 STBN; UE BlueNoise.ush; Wronski temporal volumetric integration.
+    let jitter = ign(in.pos.xy + vec2<f32>(u.chroma.y * 5.588238));
 
     // HYBRID mode (counts.x = -2 sentinel): the froxel volume carries the wide/dim
     // "masses", so the raymarch renders ONLY the sharp hero beams (those with a

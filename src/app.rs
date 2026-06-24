@@ -115,9 +115,9 @@ impl ApplicationHandler for App {
                 &mut state.camera,
                 &mut state.dmx,
             );
-            if let Some((c, r)) = state.scene.scene_frame() {
-                state.camera.frame(c, r * 1.1);
-            }
+            // Keep the project's *saved* camera (open_project restores it) — that's
+            // the whole point of reopening a show. PREVIZ_CAM_* still overrides in
+            // the screenshot path if a specific framing is wanted for profiling.
             log::info!(
                 "opened project: {} fixtures, {} geometry",
                 state.scene.fixtures.len(),
@@ -1132,6 +1132,8 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         };
         let viewport_texture = state.renderer.viewport.texture_id;
         let egui_ctx = state.egui_ctx.clone();
+        let mut perf_timings = state.renderer.last_timings;
+        perf_timings.frame_ms = 1000.0 / 60.0;
         let out = egui_ctx.run(raw, |ctx| {
             ctx.set_pixels_per_point(1.0);
             state.ui.show(
@@ -1141,6 +1143,7 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
                 &mut state.dmx,
                 viewport_texture,
                 60.0,
+                &perf_timings,
             );
         });
         // Settle the atlas + size the 3D viewport to the panel's request.
@@ -1307,6 +1310,11 @@ impl State {
             citp: self.citp.as_ref().map(|c| c.server_names()).unwrap_or_default(),
         };
 
+        // Per-pass GPU timings + scene counts for the perf overlay; the CPU EMA fps
+        // fills frame_ms (GPU passes overlap, so the header uses the CPU timer).
+        let mut perf_timings = self.renderer.last_timings;
+        perf_timings.frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+
         // Build the UI. The closure borrows the scene/camera/ui fields; egui_ctx
         // is a separate (cloned) handle so there's no borrow conflict.
         let mut full_output = egui_ctx.run(raw_input, |ctx| {
@@ -1317,6 +1325,7 @@ impl State {
                 &mut self.dmx,
                 viewport_texture,
                 fps,
+                &perf_timings,
             );
         });
 

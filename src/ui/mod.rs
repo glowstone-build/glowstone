@@ -309,6 +309,7 @@ pub struct Ui {
     show_prefs: bool,
     show_about: bool,
     show_shortcuts: bool,
+    show_perf: bool,
     profile: Option<ProfileEditor>,
     /// Library panel state (search / sort / multi-select).
     lib: panels::LibState,
@@ -419,6 +420,7 @@ impl Ui {
             show_prefs: false,
             show_about: false,
             show_shortcuts: false,
+            show_perf: std::env::var("PREVIZ_PERF").is_ok(),
             profile: None,
             lib: panels::LibState::default(),
             scene_anchor: None,
@@ -1133,6 +1135,7 @@ impl Ui {
         dmx: &mut crate::dmx::DmxIo,
         viewport_texture: egui::TextureId,
         fps: f32,
+        timings: &crate::renderer::PassTimings,
     ) {
         // Theme/accent/DPI live every frame (cheap; egui dedups).
         self.prefs.apply_theme(ctx);
@@ -1384,6 +1387,7 @@ impl Ui {
         );
         windows::about_window(ctx, &mut self.show_about);
         windows::shortcuts_window(ctx, &mut self.show_shortcuts);
+        windows::perf_overlay_window(ctx, &mut self.show_perf, timings, &mut self.settings);
         windows::quick_select_window(ctx, scene, &mut self.selection, &mut self.quick_select);
         // The F3 operator-search palette. Precompute each op's runnable state (the
         // window borrows `self.op_search` mutably, so `op_runnable`'s `&self` read
@@ -1958,6 +1962,8 @@ impl Ui {
                         }
                     });
                     ui.separator();
+                    ui.checkbox(&mut self.show_perf, format!("{}  Performance", icon::PERF));
+                    ui.separator();
                     ui.label(egui::RichText::new("Panels").small().weak());
                     for tab in Tab::TOGGLEABLE {
                         let mut open = self.is_tab_open(tab);
@@ -2456,6 +2462,7 @@ impl TabViewer for PanelViewer<'_> {
                     self.requested_viewport_px,
                     self.fps,
                     self.prefs,
+                    self.settings.render_scale,
                     self.transform,
                     self.delete_requested,
                     self.replace_requested,

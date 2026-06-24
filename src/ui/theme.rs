@@ -29,6 +29,7 @@ pub mod icon {
     pub const DMX: &str = p::SQUARES_FOUR;
     pub const PATCH: &str = p::GRID_FOUR;
     pub const CONNECT: &str = p::PLUGS_CONNECTED;
+    pub const PERF: &str = p::GAUGE;
     // Entities
     pub const FIXTURE: &str = p::LIGHTBULB_FILAMENT;
     pub const ENVIRONMENT: &str = p::SPHERE;
