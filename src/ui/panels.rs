@@ -2372,9 +2372,15 @@ pub fn viewport(
     let available = ui.available_size();
     let ppp = ui.pixels_per_point();
 
+    // Internal render scale: render the offscreen targets below native and let the
+    // egui image() draw upscale them (the LDR view is FilterMode::Linear). The single
+    // biggest fps lever on Retina — every per-pixel pass (forward, SSAO, volumetric,
+    // post) scales with scale². Snapped to 0.05 so a slider drag doesn't reallocate
+    // targets every sub-pixel step (Viewport::resize early-returns on unchanged size).
+    let scale = (settings.render_scale.clamp(0.5, 1.0) * 20.0).round() / 20.0;
     *requested_px = (
-        (available.x * ppp).round().max(1.0) as u32,
-        (available.y * ppp).round().max(1.0) as u32,
+        (available.x * ppp * scale).round().max(1.0) as u32,
+        (available.y * ppp * scale).round().max(1.0) as u32,
     );
 
     let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());

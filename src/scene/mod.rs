@@ -160,6 +160,19 @@ pub struct RenderSettings {
     /// Floor-pool gobo edge sharpening amount (0 = off). Drives the contour
     /// steepening in mesh.wgsl via `camera.render_mode.y`.
     pub gobo_sharpness: f32,
+    /// Internal render scale (0.5..=1.0): the viewport renders at this fraction of
+    /// native and bilinearly upscales — the single biggest fps lever on a Retina
+    /// display (everything per-pixel scales with it²). `skip`-ped: it's a machine/
+    /// GPU-specific perf preference, not part of the SHOW, so it must NOT ride in the
+    /// positional bincode .archie (which would also force a FORMAT bump that rejects
+    /// every existing save). Defaults to 1.0 = native (unchanged behaviour).
+    #[serde(skip, default = "default_render_scale")]
+    pub render_scale: f32,
+    /// Max hero (per-beam) shadow maps to render, capped to `shadow::MAX`. Lower =
+    /// fewer shadow depth passes = faster (each is ~2-3 ms at Retina). `skip`-ped:
+    /// machine-specific perf knob (see [render_scale]).
+    #[serde(skip, default = "default_shadow_max")]
+    pub shadow_max: u32,
     pub show_beam_wireframes: bool,
     /// Show the origin grid + world axes.
     pub show_grid: bool,
@@ -173,6 +186,14 @@ fn default_false() -> bool {
 
 fn default_chroma_haze() -> f32 {
     1.2
+}
+
+fn default_render_scale() -> f32 {
+    1.0
+}
+
+fn default_shadow_max() -> u32 {
+    8
 }
 
 impl Default for RenderSettings {
@@ -190,6 +211,8 @@ impl Default for RenderSettings {
             froxel_volumetric: false,
             chroma_haze: 1.2,
             gobo_sharpness: 0.6,
+            render_scale: 1.0,
+            shadow_max: 8,
             show_beam_wireframes: false,
             show_grid: true,
             mode: ViewportMode::Beauty,

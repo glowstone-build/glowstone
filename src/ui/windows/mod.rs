@@ -5,12 +5,14 @@
 //! of `panels.rs` (the docked panels), which these float over.
 
 mod about;
+mod perf_overlay;
 mod preferences;
 mod profile_editor;
 mod quick_select;
 mod shortcuts;
 
 pub use about::about_window;
+pub use perf_overlay::perf_overlay_window;
 pub use preferences::{preferences_window, LabelMode, Preferences};
 pub use profile_editor::{profile_editor_window, ProfileEditor};
 pub use quick_select::quick_select_window;

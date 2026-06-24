@@ -11,12 +11,15 @@
 mod atlas;
 pub mod camera;
 pub mod fixture_model;
+pub mod gpu_timer;
 pub mod mesh;
 mod noise;
 mod pipeline;
 mod shadow;
 pub mod viewport;
 mod world;
+
+pub use gpu_timer::PassTimings;
 
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
@@ -387,6 +390,11 @@ pub struct Renderer {
     /// Froxel volumetric (PREVIZ_FROXEL); `None` if the adapter lacks rgba16float
     /// storage textures.
     froxel: Option<FroxelState>,
+    /// Per-pass GPU timing for the perf overlay; `None` if the adapter lacks
+    /// `TIMESTAMP_QUERY` (the overlay then shows only CPU frame-ms + scene counts).
+    gpu_timers: Option<gpu_timer::GpuTimers>,
+    /// Latest per-pass timings + scene counts, read by the perf overlay each frame.
+    pub last_timings: PassTimings,
 
     // Volumetric raymarch (rendered at half resolution, then upsampled).
     volumetric_pipeline: wgpu::RenderPipeline,
@@ -481,12 +489,22 @@ impl Renderer {
         let froxel_supported = adapter
             .features()
             .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+        // Per-pass GPU timing for the performance overlay. TIMESTAMP_QUERY enables
+        // RenderPass/ComputePass `timestamp_writes` + `resolve_query_set` — all we need
+        // (NOT the INSIDE_ENCODERS/PASSES variants). Opt-in feature; present on Apple
+        // Silicon but absent on some older drivers, so probe + degrade to a CPU-only HUD.
+        let timestamps_supported = adapter
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY);
         let mut required_features = wgpu::Features::empty();
         if wireframe_supported {
             required_features |= wgpu::Features::POLYGON_MODE_LINE;
         }
         if froxel_supported {
             required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
+        if timestamps_supported {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
 
         let (device, queue) = adapter
@@ -810,6 +828,9 @@ impl Renderer {
         let gobo_atlas = atlas::GoboAtlas::new(&device, &queue);
         let shadow = shadow::ShadowMaps::new(&device);
         let froxel = froxel_supported.then(|| FroxelState::new(&device));
+        let gpu_timers = timestamps_supported.then(|| gpu_timer::GpuTimers::new(&device));
+        let mut last_timings = PassTimings::default();
+        last_timings.gpu_valid = timestamps_supported;
 
         Self {
             surface,
@@ -859,6 +880,8 @@ impl Renderer {
             gobo_atlas,
             shadow,
             froxel,
+            gpu_timers,
+            last_timings,
             volumetric_pipeline,
             volumetric_layout,
             volumetric_uniform,
@@ -1100,6 +1123,17 @@ impl Renderer {
         self.queue
             .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
+
+        // Pump the async per-pass GPU-timing readback (reads data 2 frames stale; never
+        // blocks — the submit above services the pending map callbacks).
+        let period = self.queue.get_timestamp_period();
+        let bars = self.gpu_timers.as_mut().map(|t| {
+            t.pump(period);
+            t.bars
+        });
+        if let Some(b) = bars {
+            self.last_timings.passes = b;
+        }
 
         true
     }
@@ -1444,6 +1478,16 @@ impl Renderer {
             );
             rt.content_key = key;
         }
+    }
+
+    /// `timestamp_writes` for a render/compute pass timing query `pair`, or None when
+    /// GPU timestamps are unavailable / the ring slot is busy (the pass just records
+    /// untimed). Used to populate the perf overlay's per-pass bars.
+    fn ts_rp(&self, pair: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.gpu_timers.as_ref().and_then(|t| t.rp(pair))
+    }
+    fn ts_cp(&self, pair: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        self.gpu_timers.as_ref().and_then(|t| t.cp(pair))
     }
 
     fn record_scene(
@@ -1868,7 +1912,9 @@ impl Renderer {
         let max_shadows = if settings.mode == ViewportMode::Beauty
             && std::env::var("PREVIZ_NOSHADOW").is_err()
         {
-            shadow::MAX
+            // Capped by the user's `shadow_max` lever (each hero map is a depth pass,
+            // ~2-3 ms at Retina) — can only reduce below the atlas-sized `shadow::MAX`.
+            (settings.shadow_max as usize).min(shadow::MAX)
         } else {
             0
         };
@@ -1915,13 +1961,16 @@ impl Renderer {
         }
 
         // SHARED occluder: ONE ortho depth pass fit to the union of every lit beam's
-        // volume, used as the fallback occluder for every NON-hero beam — so beams
-        // beyond the 8 heroes still get mid-air occlusion (no more leaking straight
-        // through solid geometry) at O(1) cost instead of one pass per beam. Look
-        // along the mean beam direction so a typical downward/forward rig captures
-        // the truss / set / performers between the lights and the floor.
+        // volume, used as the fallback occluder for every NON-hero beam. DISABLED by
+        // default (opt-in via PREVIZ_SHARED): the single mean-direction projection stamped
+        // a truss/set into the fog of EVERY non-hero beam — including beams whose path
+        // never crosses it — producing phantom occluder outlines in the haze (occlusion is
+        // per-light-to-sample, which one shared direction can't represent). Dropping it
+        // means non-hero beams just don't self-occlude mid-air (hero beams keep correct
+        // per-beam shadows); zero phantoms, and it reclaims the pass (~0.5 ms). A future
+        // direction-binned version could restore correct occlusion for all beams.
         let mut shared_layer = -1i32;
-        if max_shadows > 0 && std::env::var("PREVIZ_NOSHARED").is_err() {
+        if max_shadows > 0 && std::env::var("PREVIZ_SHARED").is_ok() {
             let mut lo = Vec3::splat(f32::INFINITY);
             let mut hi = Vec3::splat(f32::NEG_INFINITY);
             let mut mean_dir = Vec3::ZERO;
@@ -2603,6 +2652,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
+                timestamp_writes: self.ts_rp(gpu_timer::P_SHADOW_BASE + layer as u32),
                 ..Default::default()
             });
             spass.set_pipeline(&self.shadow.pipeline);
@@ -2682,6 +2732,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
+                timestamp_writes: self.ts_rp(gpu_timer::P_DEPTH),
                 ..Default::default()
             });
             pass.set_pipeline(&self.mesh_depth_prepass);
@@ -2756,6 +2807,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
+                timestamp_writes: self.ts_rp(gpu_timer::P_FORWARD),
                 ..Default::default()
             });
 
@@ -2921,6 +2973,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
+                timestamp_writes: self.ts_rp(gpu_timer::P_SSAO),
                 ..Default::default()
             });
             pass.set_pipeline(&self.ssao_pipeline);
@@ -2993,6 +3046,7 @@ impl Renderer {
                             },
                         })],
                         depth_stencil_attachment: None,
+                        timestamp_writes: self.ts_rp(gpu_timer::P_VOL),
                         ..Default::default()
                     });
                     pass.set_pipeline(&self.volumetric_pipeline);
@@ -3012,6 +3066,7 @@ impl Renderer {
                             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                         })],
                         depth_stencil_attachment: None,
+                        timestamp_writes: self.ts_rp(gpu_timer::P_VOLTEMP),
                         ..Default::default()
                     });
                     pass.set_pipeline(&self.vol_temporal_pipeline);
@@ -3028,6 +3083,7 @@ impl Renderer {
                         ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: None,
+                    timestamp_writes: self.ts_rp(gpu_timer::P_COMPOSITE),
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.composite_pipeline);
@@ -3037,12 +3093,26 @@ impl Renderer {
         }
 
         // Pass 3: bloom bright-pass (HDR -> bloom[0]).
-        self.fullscreen(encoder, "bloom-bright", &self.bloom_bright, self.viewport.bloom_view(0), &bright_bg);
+        self.fullscreen(encoder, "bloom-bright", &self.bloom_bright, self.viewport.bloom_view(0), &bright_bg, self.ts_rp(gpu_timer::P_BLOOM_BRIGHT));
         // Pass 4: separable blur (bloom[0] -> bloom[1] -> bloom[0]).
-        self.fullscreen(encoder, "bloom-blur-h", &self.bloom_blur_h, self.viewport.bloom_view(1), &blur_h_bg);
-        self.fullscreen(encoder, "bloom-blur-v", &self.bloom_blur_v, self.viewport.bloom_view(0), &blur_v_bg);
+        self.fullscreen(encoder, "bloom-blur-h", &self.bloom_blur_h, self.viewport.bloom_view(1), &blur_h_bg, self.ts_rp(gpu_timer::P_BLOOM_H));
+        self.fullscreen(encoder, "bloom-blur-v", &self.bloom_blur_v, self.viewport.bloom_view(0), &blur_v_bg, self.ts_rp(gpu_timer::P_BLOOM_V));
         // Pass 5: tonemap/resolve (HDR + bloom -> LDR, sRGB-encoded).
-        self.fullscreen(encoder, "tonemap", &self.tonemap_pipeline, self.viewport.ldr_view(), &tonemap_bg);
+        self.fullscreen(encoder, "tonemap", &self.tonemap_pipeline, self.viewport.ldr_view(), &tonemap_bg, self.ts_rp(gpu_timer::P_TONEMAP));
+
+        // Resolve this frame's per-pass GPU timestamps into the ring (read back async in
+        // render()); skipped automatically if the ring slot is still being read.
+        if let Some(t) = self.gpu_timers.as_ref() {
+            t.resolve(encoder);
+        }
+        // "What's being rendered" counts for the perf overlay — populated every frame even
+        // when GPU timestamps are unavailable (the bars come from the render() ring pump).
+        self.last_timings.fixtures = scene.fixtures.len() as u32;
+        self.last_timings.beams = gpu_fixtures.len() as u32;
+        self.last_timings.shadow_maps = n_shadows as u32;
+        self.last_timings.geom_draws =
+            (ranges.len() + gdtf_groups.len() + scene_geom_groups.len()) as u32;
+        self.last_timings.render_px = self.viewport.size;
 
         // Advance temporal-accumulation state for next frame. `ema_valid` reflects
         // whether the EMA was actually written this frame (so next frame knows whether
@@ -3078,6 +3148,7 @@ impl Renderer {
         pipeline: &wgpu::RenderPipeline,
         target: &wgpu::TextureView,
         bind_group: &wgpu::BindGroup,
+        ts: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -3091,6 +3162,7 @@ impl Renderer {
                 },
             })],
             depth_stencil_attachment: None,
+            timestamp_writes: ts,
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
