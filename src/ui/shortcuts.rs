@@ -69,7 +69,7 @@ pub enum Action {
     // Edit / history.
     Undo,
     Redo,
-    /// F3 — open the operator-search palette (run any registered op by name).
+    /// F3 / Space — open the operator-search palette (run any registered op by name).
     OperatorSearch,
     /// F9 — re-invoke the last registered op (Blender's "adjust last operation").
     AdjustLast,
@@ -455,6 +455,9 @@ pub static GLOBAL: &[Kmi] = &[
     kmi(Trigger::key(Key::Z).cmd().shift(), "edit.redo"),
     kmi(Trigger::key(Key::Y).cmd(), "edit.redo_alias"),
     kmi(Trigger::key(Key::F3), "edit.operator_search"),
+    // Blender-style spacebar search. Global context only — the transform MODAL map
+    // keeps Space = confirm mid-G/R/S (global binds are suppressed during a modal op).
+    kmi(Trigger::key(Key::Space), "edit.operator_search"),
     kmi(Trigger::key(Key::F9), "edit.adjust_last"),
     // --- File ---
     kmi(Trigger::key(Key::S).cmd(), "file.save"),

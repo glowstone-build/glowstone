@@ -43,13 +43,16 @@ pub fn operator_search_window(
         return None;
     }
 
-    // Filter the catalog by the live query (case-insensitive substring on label).
-    // `op::catalog()` projects the unified command registry's catalog ops.
-    let q = state.search.to_lowercase();
-    let list: Vec<CatalogOp> = op::catalog()
+    // Fuzzy-filter the catalog by the live query (subsequence match; contiguous runs
+    // rank higher — like Blender's search), so "mvx" finds "Move on X". An empty query
+    // keeps registry order. `op::catalog()` projects the unified command registry.
+    let q = state.search.trim();
+    let mut scored: Vec<(i32, CatalogOp)> = op::catalog()
         .into_iter()
-        .filter(|c| q.is_empty() || c.label.to_lowercase().contains(&q))
+        .filter_map(|c| crate::ui::lib_prefs::fuzzy_score(q, c.label).map(|s| (s, c)))
         .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0)); // best match first; stable sort preserves ties' order
+    let list: Vec<CatalogOp> = scored.into_iter().map(|(_, c)| c).collect();
 
     // --- keyboard navigation (read before the window so it works before focus
     // lands on a widget) ---
