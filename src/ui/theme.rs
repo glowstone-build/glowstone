@@ -87,6 +87,8 @@ pub mod icon {
     pub const WARNING: &str = p::WARNING;
     pub const WARN: &str = p::WARNING;
     pub const ERROR: &str = p::WARNING_CIRCLE;
+    /// The report-log window (the toast/notification history).
+    pub const LOG: &str = p::LIST_BULLETS;
     // Online fixture library (GDTF Share)
     pub const ONLINE: &str = p::GLOBE_SIMPLE;
     pub const DOWNLOAD: &str = p::DOWNLOAD_SIMPLE;

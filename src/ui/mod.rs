@@ -19,7 +19,7 @@ mod tree;
 pub use tools::ActiveTool;
 mod windows;
 mod xform;
-pub use xform::{PivotMode, SnapSettings, TransformPrefs};
+pub use xform::{PivotMode, SnapMode, SnapSettings, TransformOrientation, TransformPrefs};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -208,6 +208,11 @@ pub struct TransformOp {
     pub axis: Option<Axis>,
     /// Mouse position (screen) when the op started.
     pub start_screen: egui::Pos2,
+    /// The viewport rect (screen px) the op runs in. Lets `apply_transform`
+    /// reconstruct picking rays from `start_screen` / the live cursor for the
+    /// #40 ray-plane ABSOLUTE gizmo drag and the #71 Vertex/Surface snap modes
+    /// (which need a ray + screen-space threshold, not just a pixel delta).
+    pub viewport: egui::Rect,
     /// Selection centroid (pivot for rotate/scale).
     pub pivot: Vec3,
     /// Original (fixture index, position, orientation) snapshot, for live re-apply
@@ -236,6 +241,13 @@ pub struct TransformOp {
     /// Grid/increment snap settings (#4) captured at op start — `apply_transform`
     /// quantizes the committed amount when `snap.on` (XOR the live Ctrl invert).
     pub snap: SnapSettings,
+    /// Transform-orientation (#37): which basis the axis-lock + numeric-default axis
+    /// map through. `apply_transform` resolves it to a 3×3 whose COLUMNS are the
+    /// X/Y/Z directions — Global = identity (world axes, today's behaviour), Local =
+    /// the active element's orientation (its `start` Quat snapshot, stable across the
+    /// drag), View = the camera basis (`view_basis`, screen-aligned). Shown in the
+    /// modal hint.
+    pub orientation: TransformOrientation,
 }
 
 impl TransformOp {
@@ -266,14 +278,24 @@ impl TransformOp {
                 TransformKind::Rotate => (self.num.display(), "°"),
                 TransformKind::Scale => (self.num.display(), "x"),
             };
-            return format!("{}{}: {}{}", self.kind.label(), axl, val, unit);
+            let orient = match self.orientation {
+                TransformOrientation::Global => String::new(),
+                o => format!(" ({})", o.label()),
+            };
+            return format!("{}{}{}: {}{}", self.kind.label(), axl, orient, val, unit);
         }
         let ax = match self.active_axis() {
             Some(a) => format!(" · axis {}", a.label()),
             None => String::new(),
         };
-        // "Move · axis X    X/Y/Z lock · type number · Enter confirm · Esc cancel"
-        format!("{}{}    {keys}", self.kind.label(), ax)
+        // The orientation tag is suppressed for Global (the default world axes) so the
+        // common case stays uncluttered; Local/View are surfaced.
+        let orient = match self.orientation {
+            TransformOrientation::Global => String::new(),
+            o => format!(" · {}", o.label()),
+        };
+        // "Move · axis X · Local    X/Y/Z lock · type number · Enter confirm · Esc cancel"
+        format!("{}{}{}    {keys}", self.kind.label(), ax, orient)
     }
 }
 
@@ -501,6 +523,10 @@ pub struct Ui {
     /// Handle-based status-bar message stack (#21): a transient slot pushed/popped
     /// by handle, layered over the selection/units/fps content. Last push wins.
     status_msgs: notify::StatusStack,
+    /// The report-log window (§2.10 #22): a persistent newest-first view of the
+    /// `notify` history. Opened from the status-bar message area, the Window menu,
+    /// or the `window.report_log` command (so it surfaces in the F3 palette).
+    show_report_log: bool,
     /// Was the DMX I/O running last frame? Used to detect the connect/disconnect
     /// edge in `show()` (the actual start/stop happens on the DMX worker) and emit
     /// one toast per transition rather than every frame.
@@ -598,6 +624,10 @@ impl Ui {
             view_pie: pie::PieState::default(),
             notify: notify::Notifier::default(),
             status_msgs: notify::StatusStack::default(),
+            // Debug hook (S3): PREVIZ_UI_LOG opens the report-log window at startup
+            // so the headless PREVIZ_UI screenshot can capture it (mirrors the
+            // PREVIZ_UI_PREFS prefs-window hook) without touching app.rs.
+            show_report_log: std::env::var_os("PREVIZ_UI_LOG").is_some(),
             dmx_was_running: false,
         }
     }
@@ -1658,6 +1688,9 @@ impl Ui {
         );
         windows::about_window(ctx, &mut self.show_about);
         windows::shortcuts_window(ctx, &mut self.show_shortcuts);
+        // The report-log history window (§2.10 #22) — the persistent companion to
+        // the fading toasts drawn below; lists past notifications newest-first.
+        self.notify.draw_log_window(ctx, &mut self.show_report_log);
         windows::perf_overlay_window(ctx, &mut self.show_perf, timings, &mut self.settings);
         windows::quick_select_window(ctx, scene, &mut self.selection, &mut self.quick_select);
         // The F3 operator-search palette (S2: lists + runs the WHOLE registry, not
@@ -2140,6 +2173,8 @@ impl Ui {
             Action::AdjustLast => self.adjust_last_op(ctx, scene, dmx),
             // --- App / file -----------------------------------------------------
             Action::Preferences => self.show_prefs = true,
+            // Toggle (not just open) so the same key/palette pick closes it again.
+            Action::ToggleReportLog => self.show_report_log = !self.show_report_log,
             Action::Save => self.save_project(scene, camera, dmx),
             Action::SaveAs => self.save_project_as(scene, camera, dmx),
             Action::Open => self.open_project_dialog(scene, camera, dmx),
@@ -2414,6 +2449,7 @@ impl Ui {
                     });
                     ui.separator();
                     ui.checkbox(&mut self.show_perf, format!("{}  Performance", icon::PERF));
+                    ui.checkbox(&mut self.show_report_log, format!("{}  Report Log", icon::LOG));
                     ui.separator();
                     ui.label(egui::RichText::new("Panels").small().weak());
                     for tab in Tab::TOGGLEABLE {
@@ -2445,7 +2481,7 @@ impl Ui {
     /// The bottom status bar (selection · units · DMX · fixtures · FPS).
     #[allow(deprecated)]
     fn status_bar(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         scene: &Scene,
         dmx: &crate::dmx::DmxIo,
@@ -2454,14 +2490,23 @@ impl Ui {
         egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
             let pal = theme::Palette::get(ui);
             ui.horizontal(|ui| {
+                // A small log glyph opens the report-log history; placed first so
+                // it's a stable affordance regardless of which message is showing.
+                if ui
+                    .add(egui::Button::new(theme::icon::LOG).frame(false))
+                    .on_hover_text("Report log")
+                    .clicked()
+                {
+                    self.show_report_log = !self.show_report_log;
+                }
                 // Left slot precedence (Unreal `PushStatusBarMessage` model): a
                 // pushed transient message (top of the handle stack) MASKS the
                 // selection summary; otherwise the selection summary shows. The grey
-                // passive hint is appended after, separated by a thin rule.
-                match self.status_msgs.top() {
-                    Some(msg) => {
-                        ui.colored_label(pal.accent, msg);
-                    }
+                // passive hint is appended after, separated by a thin rule. Clicking
+                // the message area also opens the log (the whole left slot is the
+                // affordance, matching Blender's clickable info line).
+                let msg_resp = match self.status_msgs.top() {
+                    Some(msg) => ui.colored_label(pal.accent, msg),
                     None => {
                         let sel = match self.selection.fixtures.len() {
                             0 => "nothing selected".to_string(),
@@ -2472,8 +2517,15 @@ impl Ui {
                                 .unwrap_or_default(),
                             n => format!("{n} fixtures selected"),
                         };
-                        ui.label(sel);
+                        ui.label(sel)
                     }
+                };
+                if msg_resp
+                    .on_hover_text("Open report log")
+                    .interact(egui::Sense::click())
+                    .clicked()
+                {
+                    self.show_report_log = true;
                 }
                 if let Some(hint) = self.status_msgs.hint() {
                     ui.separator();

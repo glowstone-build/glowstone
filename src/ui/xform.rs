@@ -71,6 +71,111 @@ impl PivotMode {
     }
 }
 
+/// The basis the move/rotate/scale axis is expressed in (§2.4 #37 / row 37).
+/// Mirrors Blender's transform-orientation dropdown (`V3D_ORIENT_*`,
+/// `transform_orientations.cc` `applyTransformOrientation` /
+/// `ED_transform_calc_orientation_from_type_ex`):
+///
+/// * `Global` — the world axes (the prior, only behaviour). Basis = identity.
+/// * `Local` — the active element's OWN orientation basis (a head on a raked
+///   truss moves along ITS up, not the world's). Basis = the primary selected
+///   fixture's orientation `Quat` (or the geometry transform's rotation 3×3).
+/// * `View` — the camera basis: X = screen-right, Y = screen-up, Z = toward the
+///   viewer. A `View`-space move follows the screen plane. Basis columns =
+///   `camera.view_basis()` (right, up, −forward).
+///
+/// The chosen orientation produces a 3×3 `basis` whose COLUMNS are the X/Y/Z
+/// directions; [`apply_transform`](super::panels) maps the axis-lock (and the
+/// numeric single-value default axis) through `basis * Axis::vec()`, so axis-lock
+/// and numeric input compose with the orientation. Global resolves to the world
+/// axes, leaving today's behaviour byte-identical.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TransformOrientation {
+    /// World axes (identity basis) — the prior hardcoded behaviour.
+    #[default]
+    Global,
+    /// The active element's own orientation basis (Quat / geometry rotation).
+    Local,
+    /// The camera basis (right / up / toward-viewer) — moves follow the screen.
+    View,
+}
+
+impl TransformOrientation {
+    /// Dropdown order, matching Blender's Global → Local → View.
+    pub const ALL: [TransformOrientation; 3] =
+        [TransformOrientation::Global, TransformOrientation::Local, TransformOrientation::View];
+
+    /// Short menu / header label.
+    pub fn label(self) -> &'static str {
+        match self {
+            TransformOrientation::Global => "Global",
+            TransformOrientation::Local => "Local",
+            TransformOrientation::View => "View",
+        }
+    }
+
+    /// One-line hover hint.
+    pub fn hint(self) -> &'static str {
+        match self {
+            TransformOrientation::Global => "Transform along the world axes",
+            TransformOrientation::Local => "Transform along the active element's own axes",
+            TransformOrientation::View => "Transform along the camera's screen axes",
+        }
+    }
+}
+
+/// What a Move snap targets (§2.4 #71 / row 71 — "snap fixture to scene
+/// vertex / truss node" — generalized to a small snap-MODE selector beside the
+/// header Snap toggle). Mirrors Blender's snap-element dropdown
+/// (`SCE_SNAP_MODE_INCREMENT` / `_VERTEX` / `_FACE`, `transform_snap.cc`):
+///
+/// * `Increment` — the grid/increment quantizer (today's only behaviour): the
+///   committed Move/Rotate/Scale amount rounds to the per-type step.
+/// * `Vertex` — the moved origin jumps to the nearest OTHER entity origin
+///   (fixture / geometry / screen), within a screen-space pixel threshold, so a
+///   head clicks onto a truss node. Move only (Rotate/Scale fall back to
+///   Increment-or-off, like Blender, since vertex snap is positional).
+/// * `Surface` — the moved origin lands on the nearest geometry/ground hit under
+///   the cursor (reuses `pick_world_point`), so a fixture drops onto a deck.
+///
+/// Vertex/Surface are absolute snaps (they REPLACE the dragged position, like
+/// Blender's `snapObjectsTransform`); Increment quantizes the delta. Only `Move`
+/// honours Vertex/Surface — Rotate/Scale keep the increment quantizer regardless
+/// (a vertex/surface target has no meaning for an angle or a factor).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SnapMode {
+    /// Grid/increment quantize the committed amount (the prior behaviour).
+    #[default]
+    Increment,
+    /// Snap the moved origin to the nearest other entity origin (truss node).
+    Vertex,
+    /// Snap the moved origin onto the nearest geometry/ground hit under the cursor.
+    Surface,
+}
+
+impl SnapMode {
+    /// Dropdown order, mirroring Blender's Increment → Vertex → Face.
+    pub const ALL: [SnapMode; 3] = [SnapMode::Increment, SnapMode::Vertex, SnapMode::Surface];
+
+    /// Short menu / header label.
+    pub fn label(self) -> &'static str {
+        match self {
+            SnapMode::Increment => "Grid",
+            SnapMode::Vertex => "Vertex",
+            SnapMode::Surface => "Surface",
+        }
+    }
+
+    /// One-line hover hint.
+    pub fn hint(self) -> &'static str {
+        match self {
+            SnapMode::Increment => "Snap the moved amount to the grid increment",
+            SnapMode::Vertex => "Snap the moved origin to the nearest other object's origin",
+            SnapMode::Surface => "Drop the moved origin onto the surface under the cursor",
+        }
+    }
+}
+
 /// Grid/increment snap config (§2.4 #4). `on` is the persistent toggle; the per-
 /// type increments default to 1 m / 15° / 0.1× (Blender's defaults; the doc's
 /// per-type 0.25 m / 15° / 10% is the #94 follow-up — these are sane round
@@ -79,6 +184,9 @@ impl PivotMode {
 pub struct SnapSettings {
     /// Master toggle. Ctrl held mid-drag inverts this for the live frame.
     pub on: bool,
+    /// What a Move snap targets (§2.4 #71): grid increment / vertex / surface.
+    /// Rotate + Scale always use the increment quantizer regardless of this.
+    pub mode: SnapMode,
     /// Move increment, metres.
     pub move_step: f32,
     /// Rotate increment, degrees.
@@ -89,7 +197,7 @@ pub struct SnapSettings {
 
 impl Default for SnapSettings {
     fn default() -> Self {
-        Self { on: false, move_step: 1.0, rotate_deg: 15.0, scale_step: 0.1 }
+        Self { on: false, mode: SnapMode::Increment, move_step: 1.0, rotate_deg: 15.0, scale_step: 0.1 }
     }
 }
 
@@ -144,6 +252,8 @@ impl SnapSettings {
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct TransformPrefs {
     pub pivot: PivotMode,
+    /// The basis the move/rotate/scale axis is expressed in (§2.4 #37).
+    pub orientation: TransformOrientation,
     pub snap: SnapSettings,
 }
 

@@ -75,6 +75,8 @@ pub enum Action {
     AdjustLast,
     // App / file.
     Preferences,
+    /// Toggle the report-log window (the toast/notification history). Impl in `show()`.
+    ToggleReportLog,
     Save,
     SaveAs,
     Open,
@@ -409,6 +411,7 @@ pub static COMMANDS: &[Command] = &[
     command_row("file.new", "New project", Category::File, Action::New),
     // --- App ---
     command_row("app.preferences", "Preferences", Category::App, Action::Preferences),
+    command_row("window.report_log", "Report Log", Category::App, Action::ToggleReportLog),
 ];
 
 impl Command {

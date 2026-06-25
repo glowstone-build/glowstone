@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
-use glam::{Mat4, Quat, Vec2, Vec3};
+use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 
 use super::gizmo::{self, GizmoCtx, Handle};
 use super::shortcuts;
@@ -2485,6 +2485,141 @@ fn compute_pivot(
     }
 }
 
+/// Resolve the transform-orientation (#37) to a 3×3 whose COLUMNS are the X/Y/Z
+/// directions the axis-lock + numeric default map through (`basis * Axis::vec()`).
+/// Mirrors Blender's `applyTransformOrientation` / `ED_transform_calc_orientation`:
+///
+/// * Global → identity (the world axes; today's behaviour, byte-identical).
+/// * Local → the active element's OWN orientation. For a fixture that's its
+///   `start` Quat snapshot (stable across the drag); for geometry-only selections
+///   the geometry transform's rotation. Falls back to identity if the basis is
+///   degenerate (no selection / zero-scale geometry).
+/// * View → the camera basis: column 0 = screen-right, 1 = screen-up, 2 = toward
+///   the viewer (`-forward`), so a View-axis move follows the screen plane.
+fn orientation_basis(op: &TransformOp, camera: &OrbitCamera) -> glam::Mat3 {
+    use super::TransformOrientation as TO;
+    match op.orientation {
+        TO::Global => glam::Mat3::IDENTITY,
+        TO::View => {
+            let (right, up, fwd) = camera.view_basis();
+            // Columns = X(right) / Y(up) / Z(toward viewer = -forward).
+            glam::Mat3::from_cols(right, up, -fwd)
+        }
+        TO::Local => {
+            // Prefer the active fixture's orientation (its op-start Quat snapshot);
+            // else the first geometry piece's rotation from its op-start matrix.
+            if let Some((_, _, q)) = op.start.first() {
+                glam::Mat3::from_quat(*q)
+            } else if let Some((_, m0)) = op.geo_start.first() {
+                let b = glam::Mat3::from_mat4(*m0);
+                // Normalize the columns so non-uniform scale doesn't skew the axes;
+                // a degenerate column falls back to the world axis.
+                let col = |i: usize, fallback: Vec3| {
+                    let c = b.col(i);
+                    c.try_normalize().unwrap_or(fallback)
+                };
+                glam::Mat3::from_cols(col(0, Vec3::X), col(1, Vec3::Y), col(2, Vec3::Z))
+            } else {
+                glam::Mat3::IDENTITY
+            }
+        }
+    }
+}
+
+/// The point on the infinite axis line `p + t·axis` CLOSEST to the ray
+/// `ro + s·rd` — the #40 ray-plane absolute drag for a single-axis Move. Standard
+/// closest-points-between-two-lines (UE `GetAbsoluteTranslationDelta` / Blender
+/// `transform_constraints.cc applyAxisConstraintVec` project the cursor ray onto
+/// the constraint axis the same way). The handle "sticks" to the cursor because
+/// the returned point tracks the cursor's projection along the axis at any camera
+/// angle, instead of a fixed pixels→metres speed that drifts at grazing angles.
+///
+/// `axis` need not be unit (it's normalized here). When the ray is (near-)parallel
+/// to the axis the cross-product denominator collapses → returns `p` (no motion),
+/// so a degenerate viewing angle can't fling the handle to infinity.
+fn ray_axis_closest_point(ro: Vec3, rd: Vec3, p: Vec3, axis: Vec3) -> Vec3 {
+    let a = axis.normalize_or_zero();
+    let r = rd.normalize_or_zero();
+    if a == Vec3::ZERO || r == Vec3::ZERO {
+        return p;
+    }
+    // Closest points between two lines (Ericson, Real-Time Collision Detection):
+    // axis line = p + s·a, ray line = ro + u·r, both directions unit. Solve for the
+    // parameter `s` along the axis that minimizes the gap, then return p + s·a.
+    let rel = p - ro;
+    let b = a.dot(r); // = cos∠ between axis and ray
+    let c = a.dot(rel);
+    let f = r.dot(rel);
+    let denom = 1.0 - b * b; // = |a×r|² for unit a,r
+    if denom.abs() < 1e-6 {
+        return p; // axis ∥ ray — undefined projection, hold position
+    }
+    let s = (b * f - c) / denom; // parameter along the axis
+    p + a * s
+}
+
+/// Intersect the ray `ro + t·rd` with the plane through `p` with `normal` — the
+/// #40 absolute drag for a PLANE-constrained / screen-plane Move (and a building
+/// block for future two-axis gizmo handles). Returns the world hit, or `None` when
+/// the ray is parallel to the plane (or points away from it: `t ≤ 0`).
+// Provided + unit-tested now; wired in once the gizmo grows plane handles (the
+// current Move gizmo only exposes single-axis arrows → ray_axis_closest_point).
+#[allow(dead_code)]
+fn ray_plane_point(ro: Vec3, rd: Vec3, p: Vec3, normal: Vec3) -> Option<Vec3> {
+    let n = normal.normalize_or_zero();
+    let denom = rd.dot(n);
+    if denom.abs() < 1e-6 {
+        return None; // ray ∥ plane
+    }
+    let t = (p - ro).dot(n) / denom;
+    if t <= 0.0 {
+        return None;
+    }
+    Some(ro + rd * t)
+}
+
+/// The nearest OTHER entity origin to `moved` within `max_dist_px` on screen — the
+/// #71 Vertex snap target. Scans fixtures, geometry origins and screen origins
+/// (skipping `exclude` — the fixtures being moved — and hidden ones), projecting
+/// each to screen and keeping the closest to the live cursor `cursor_px`. Screen-
+/// space thresholding (Blender's snap is screen-radius based) means the snap only
+/// engages when the cursor is genuinely over a node, regardless of world scale.
+/// Returns the WORLD origin to snap to, or `None` when nothing is in range.
+fn nearest_origin_screen(
+    scene: &Scene,
+    vp: Mat4,
+    rect: egui::Rect,
+    cursor_px: egui::Pos2,
+    exclude: &[usize],
+    max_dist_px: f32,
+) -> Option<Vec3> {
+    let mut best: Option<(f32, Vec3)> = None;
+    let mut consider = |world: Vec3| {
+        if let Some(sp) = OrbitCamera::project_to_screen(world, vp, rect) {
+            let d = sp.distance(cursor_px);
+            if d <= max_dist_px && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, world));
+            }
+        }
+    };
+    for (i, f) in scene.fixtures.iter().enumerate() {
+        if !f.hidden && !exclude.contains(&i) {
+            consider(f.position);
+        }
+    }
+    for g in &scene.geometry {
+        if !g.hidden {
+            consider(g.transform.w_axis.truncate());
+        }
+    }
+    for s in &scene.screens {
+        if !s.hidden {
+            consider(s.transform.w_axis.truncate());
+        }
+    }
+    best.map(|(_, w)| w)
+}
+
 /// frame the op is live; cancelling restores from the same snapshot.
 fn apply_transform(
     op: &TransformOp,
@@ -2503,29 +2638,110 @@ fn apply_transform(
     let (right, up, _fwd) = camera.view_basis();
     // A grabbed gizmo handle overrides the keyboard axis lock for this frame.
     let axis = op.active_axis();
+    // #37: the transform-orientation basis (columns = X/Y/Z directions). The axis
+    // lock + numeric-default axis map through this — Global = identity (world axes),
+    // Local = the element's own basis, View = the camera basis. `axis_dir` gives the
+    // world direction of an `Axis` in the chosen orientation.
+    let basis = orientation_basis(op, camera);
+    let axis_dir = |a: Axis| basis * a.vec();
     // Explicit-amount: a typed number OVERRIDES the mouse (Blender applyNumInput
     // returns true). Single value → along the active axis (Move falls back to
     // global X, Rotate to Y, Scale to uniform — matching the mouse-path defaults).
     let amount = op.num.value();
     let typed = op.num.active;
+    // Build a picking ray from a screen position through the op's viewport rect
+    // (#40 absolute drag + #71 Vertex/Surface snap both need world rays, not just
+    // the pixel delta). Aspect derives from the stored rect.
+    let aspect = op.viewport.width() / op.viewport.height().max(1.0);
+    let ray_at = |p: egui::Pos2| -> (Vec3, Vec3) {
+        let size = op.viewport.size().max(egui::vec2(1.0, 1.0));
+        let uv = (p - op.viewport.min) / size;
+        let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        camera.ray(ndc, aspect)
+    };
     match op.kind {
         TransformKind::Move => {
             let mut world = if typed {
-                // Metres along the active axis; no lock → global X (Blender's
-                // single-value-no-constraint behaviour).
-                let a = axis.map(|a| a.vec()).unwrap_or(Vec3::X);
+                // Metres along the active axis (in the chosen orientation); no lock →
+                // the orientation's X (Blender's single-value-no-constraint default,
+                // expressed in the active basis — world X for Global).
+                let a = axis.map(axis_dir).unwrap_or_else(|| basis * Vec3::X);
                 a * amount
+            } else if op.from_gizmo && axis.is_some() && op.viewport.area() > 0.0 {
+                // #40 ray-plane ABSOLUTE drag: project the start + live cursor rays onto
+                // the constraint axis line through the pivot; the world delta is the
+                // difference, so the grabbed handle STICKS to the cursor at any camera
+                // angle (vs the pixel-speed heuristic that drifts at grazing angles).
+                let a = axis_dir(axis.unwrap());
+                let (ro0, rd0) = ray_at(op.start_screen);
+                let (ro1, rd1) = ray_at(cur);
+                let from = ray_axis_closest_point(ro0, rd0, op.pivot, a);
+                let to = ray_axis_closest_point(ro1, rd1, op.pivot, a);
+                to - from
             } else {
                 let speed = camera.distance * 0.0015;
                 let mut w = right * (d.x * speed) + up * (-d.y * speed);
                 if let Some(ax) = axis {
-                    let a = ax.vec();
-                    w = a * w.dot(a); // lock to one axis
+                    let a = axis_dir(ax); // the axis in the active orientation
+                    w = a * w.dot(a); // lock to that (possibly tilted) axis
                 }
                 w
             };
-            // #4: quantize the world delta per-axis (composes with the typed path).
-            world = op.snap.snap_move(world, snap_on);
+            // SNAP. Vertex/Surface (#71) REPLACE the moved origin absolutely (Blender's
+            // snapObjectsTransform): they only apply to Move, and they re-aim `world` so
+            // the PRIMARY element's origin lands on the snap target — the rest of the
+            // selection rides the same delta (rigid). Grid/Increment (the default and
+            // every Rotate/Scale) quantizes the committed DELTA instead.
+            let primary_p0 = op.start.first().map(|(_, p, _)| *p);
+            let snapped_absolute: Option<Vec3> = if snap_on {
+                match op.snap.mode {
+                    super::SnapMode::Vertex => primary_p0.map(|p0| {
+                        let vp = camera.view_proj(aspect);
+                        let exclude: Vec<usize> = op.start.iter().map(|(i, _, _)| *i).collect();
+                        // Threshold the live CURSOR (not the projected origin) so the snap
+                        // engages when the pointer is over a node, Blender-style. When
+                        // nothing is in range, keep the un-quantized free `world`.
+                        match nearest_origin_screen(scene, vp, op.viewport, cur, &exclude, 18.0) {
+                            Some(target) => target - p0,
+                            None => world,
+                        }
+                    }),
+                    super::SnapMode::Surface => {
+                        let (ro, rd) = ray_at(cur);
+                        // Surface needs a hit AND a primary origin; otherwise fall through
+                        // to the free `world` (no quantize) so the drag still moves.
+                        match (primary_p0, pick_world_point(scene, ro, rd)) {
+                            (Some(p0), Some(hit)) => Some(hit - p0),
+                            _ => Some(world),
+                        }
+                    }
+                    super::SnapMode::Increment => None,
+                }
+            } else {
+                None
+            };
+            if let Some(w) = snapped_absolute {
+                // Vertex/Surface already produced an absolute world delta — no grid
+                // quantize on top (the snap target IS the destination).
+                world = w;
+            } else {
+                // #4 Grid/Increment: quantize the committed delta (composes with the typed
+                // path; `snapped_absolute` is None ⇒ snap is off OR mode == Increment).
+                // For a world-axis (Global, unconstrained or axis-locked) we snap per world
+                // component as before; for an ORIENTED axis lock the delta lies along a
+                // tilted direction, so we snap its scalar magnitude along that axis
+                // (Blender snaps in the constraint space) rather than per world component.
+                match axis {
+                    Some(ax) if op.orientation != super::TransformOrientation::Global => {
+                        let dir = axis_dir(ax);
+                        let mag = crate::ui::xform::quantize(world.dot(dir), op.snap.move_step);
+                        if snap_on {
+                            world = dir * mag;
+                        }
+                    }
+                    _ => world = op.snap.snap_move(world, snap_on),
+                }
+            }
             for (i, p0, _q) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     f.position = *p0 + world;
@@ -2542,7 +2758,10 @@ fn apply_transform(
             // committed angle to the rotate increment (e.g. nearest 15°).
             let angle = if typed { amount.to_radians() } else { d.x * 0.01 };
             let angle = op.snap.snap_angle(angle, snap_on);
-            let raxis = axis.map(|a| a.vec()).unwrap_or(Vec3::Y);
+            // Rotate about the active axis IN THE CHOSEN ORIENTATION: Local spins about
+            // the element's own axis (a raked head tilts about its local pitch axis),
+            // View about the camera axis. No lock → the orientation's Y.
+            let raxis = axis.map(axis_dir).unwrap_or_else(|| basis * Vec3::Y);
             let rot = Quat::from_axis_angle(raxis, angle);
             for (i, p0, q0) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
@@ -2582,24 +2801,33 @@ fn apply_transform(
                     let pivot = if op.individual { *p0 } else { op.pivot };
                     let off = *p0 - pivot;
                     let new = if let Some(ax) = op.axis {
-                        let a = ax.vec();
+                        // Scale only the locked axis IN THE CHOSEN ORIENTATION: decompose
+                        // the offset along the (possibly tilted) axis direction.
+                        let a = axis_dir(ax);
                         let comp = a * off.dot(a);
-                        (off - comp) + comp * factor // scale only the locked axis
+                        (off - comp) + comp * factor
                     } else {
                         off * factor
                     };
                     f.position = pivot + new;
                 }
             }
-            // Scale about the pivot in world space — uniform, or only the locked axis.
-            let s = match op.axis {
-                Some(ax) => Vec3::ONE + ax.vec() * (factor - 1.0),
-                None => Vec3::splat(factor),
+            // Scale about the pivot in world space. Uniform → a plain scale matrix;
+            // an axis lock builds a DIRECTIONAL scale `I + (factor-1)·d⊗d` so the
+            // stretch follows the locked axis in the chosen orientation (a world-axis
+            // direction reduces to the per-component scale this used to do).
+            let scale_mat: Mat3 = match op.axis {
+                Some(ax) => {
+                    let d = axis_dir(ax);
+                    Mat3::IDENTITY + (factor - 1.0) * Mat3::from_cols(d * d.x, d * d.y, d * d.z)
+                }
+                None => Mat3::from_diagonal(Vec3::splat(factor)),
             };
+            let about4 = Mat4::from_mat3(scale_mat);
             for (i, m0) in &op.geo_start {
                 let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
                 let about = Mat4::from_translation(pivot)
-                    * Mat4::from_scale(s)
+                    * about4
                     * Mat4::from_translation(-pivot);
                 if let Some(g) = scene.geometry.get_mut(*i) {
                     g.transform = about * *m0;
@@ -2908,6 +3136,7 @@ pub fn viewport(
                     // and the uniform-scale centre yields None = scale all axes).
                     axis: if start_spec.kind == TransformKind::Move { None } else { start_spec.axis },
                     start_screen: cur,
+                    viewport: rect,
                     pivot: cx.pivot,
                     start,
                     geo_start,
@@ -2920,6 +3149,7 @@ pub fn viewport(
                     num: NumInput::default(),
                     individual: xform.pivot.is_individual(),
                     snap: xform.snap,
+                    orientation: xform.orientation,
                 });
                 *transform_started = true;
             }
@@ -3246,6 +3476,7 @@ pub fn viewport(
                     kind,
                     axis: None,
                     start_screen: cur,
+                    viewport: rect,
                     pivot,
                     start,
                     geo_start,
@@ -3254,6 +3485,7 @@ pub fn viewport(
                     num: NumInput::default(),
                     individual: xform.pivot.is_individual(),
                     snap: xform.snap,
+                    orientation: xform.orientation,
                 });
                 *transform_started = true;
                 consumed = true;
@@ -4708,10 +4940,24 @@ mod pick_tests {
 #[cfg(test)]
 mod transform_tests {
     use super::*;
-    use crate::ui::{Axis, SnapSettings};
+    use crate::ui::{Axis, SnapSettings, TransformOrientation};
 
     fn make_op(kind: TransformKind, axis: Option<Axis>, pivot: Vec3, idx: usize, p0: Vec3) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)], geo_start: Vec::new(), gizmo_hovered_axis: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default() }
+        make_op_q(kind, axis, pivot, idx, p0, Quat::IDENTITY, TransformOrientation::Global)
+    }
+
+    /// Like [`make_op`] but with an explicit start-orientation Quat (the Local-basis
+    /// source) and a transform orientation (#37).
+    fn make_op_q(
+        kind: TransformKind,
+        axis: Option<Axis>,
+        pivot: Vec3,
+        idx: usize,
+        p0: Vec3,
+        q: Quat,
+        orientation: TransformOrientation,
+    ) -> TransformOp {
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), gizmo_hovered_axis: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
     }
 
     #[test]
@@ -4898,6 +5144,7 @@ mod transform_tests {
             kind: TransformKind::Rotate,
             axis: Some(Axis::Y),
             start_screen: egui::pos2(0.0, 0.0),
+            viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
             pivot: median,
             start: vec![(0, p0a, q0a), (1, p0b, scene.fixtures[1].orientation)],
             geo_start: Vec::new(),
@@ -4906,6 +5153,7 @@ mod transform_tests {
             num: NumInput { str: "90".into(), sign: false, active: true },
             individual: true,
             snap: SnapSettings::default(),
+            orientation: TransformOrientation::Global,
         };
         o.num.active = true;
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
@@ -4932,6 +5180,7 @@ mod transform_tests {
             kind: TransformKind::Rotate,
             axis: Some(Axis::Y),
             start_screen: egui::pos2(0.0, 0.0),
+            viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
             pivot: median,
             start: vec![
                 (0, p0a, scene.fixtures[0].orientation),
@@ -4943,6 +5192,7 @@ mod transform_tests {
             num: NumInput { str: "90".into(), sign: false, active: true },
             individual: false,
             snap: SnapSettings::default(),
+            orientation: TransformOrientation::Global,
         };
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
         // At least one position moved (they orbited the centroid).
@@ -4951,6 +5201,160 @@ mod transform_tests {
                 || (scene.fixtures[1].position - p0b).length() > 0.1,
             "median rotate did not orbit"
         );
+    }
+
+    // --- #37 transform orientations -----------------------------------------
+    #[test]
+    fn local_rotate_spins_about_elements_own_axis() {
+        // A fixture yawed 90° about world +Y has its LOCAL +X pointing along world
+        // −Z. A typed Local rotate locked to X must turn the orientation about THAT
+        // local axis, not world X — so the resulting spin axis is world −Z.
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let q = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2); // local X → world -Z
+        let mut o = make_op_q(
+            TransformKind::Rotate,
+            Some(Axis::X),
+            p0,
+            0,
+            p0,
+            q,
+            TransformOrientation::Local,
+        );
+        o.num = NumInput { str: "90".into(), sign: false, active: true };
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        // The applied delta rotation = orientation_after * orientation_before⁻¹.
+        let delta = scene.fixtures[0].orientation * q.inverse();
+        let (axis, angle) = delta.to_axis_angle();
+        // Spun 90° about the LOCAL X = world (q * X) = (0,0,-1) (sign-agnostic).
+        let local_x = q * Vec3::X;
+        assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 1e-3, "angle {angle}");
+        assert!(
+            axis.dot(local_x).abs() > 0.999,
+            "spin axis {axis:?} not aligned to local X {local_x:?}"
+        );
+        // And it is NOT world X (which Global would have used).
+        assert!(axis.dot(Vec3::X).abs() < 1e-2, "leaked onto world X: {axis:?}");
+    }
+
+    #[test]
+    fn view_move_follows_the_screen_plane() {
+        // A View-space X (screen-right) move must land in the camera's right/up plane
+        // — i.e. it has NO component along the camera forward axis (it slides across
+        // the screen, never toward/away from the viewer).
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let cam = OrbitCamera::default();
+        let (right, up, fwd) = cam.view_basis();
+        let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
+        o.orientation = TransformOrientation::View;
+        o.num = NumInput { str: "3".into(), sign: false, active: true };
+        apply_transform(&o, &mut scene, &cam, egui::pos2(0.0, 0.0), false);
+        let d = scene.fixtures[0].position - p0;
+        // Moved 3 m along screen-right, and stayed in the screen plane.
+        assert!((d.dot(right) - 3.0).abs() < 1e-3, "expected +3 along screen-right, got {}", d.dot(right));
+        assert!(d.dot(fwd).abs() < 1e-3, "leaked toward the viewer: {}", d.dot(fwd));
+        assert!(d.dot(up).abs() < 1e-3, "leaked onto screen-up: {}", d.dot(up));
+    }
+
+    #[test]
+    fn global_orientation_matches_world_axes() {
+        // Sanity: Global == identity basis, so an oriented op reduces to the old
+        // world-axis behaviour byte-for-byte (no regression).
+        let mut a = Scene::demo();
+        let mut b = Scene::demo();
+        let p0 = a.fixtures[0].position;
+        let cam = OrbitCamera::default();
+        let mut o = make_op(TransformKind::Move, Some(Axis::Z), p0, 0, p0);
+        o.orientation = TransformOrientation::Global;
+        o.num = NumInput { str: "2".into(), sign: false, active: true };
+        apply_transform(&o, &mut a, &cam, egui::pos2(0.0, 0.0), false);
+        let d = a.fixtures[0].position - p0;
+        assert!((d.z - 2.0).abs() < 1e-4 && d.x.abs() < 1e-4 && d.y.abs() < 1e-4, "global Z move wrong: {d:?}");
+        // Untouched control scene stays put.
+        assert_eq!(b.fixtures[0].position, p0);
+        let _ = &mut b;
+    }
+
+    // --- S2 #40 ray-plane absolute drag math --------------------------------
+    #[test]
+    fn ray_axis_projection_sticks_to_the_cursor() {
+        // A ray aimed straight down at (5,*,0) projected onto the world-X axis line
+        // through the origin must land at x=5 (the cursor's foot on the axis),
+        // regardless of the ray's height — the "handle sticks to the cursor" core.
+        let ro = Vec3::new(5.0, 10.0, 0.0);
+        let rd = Vec3::new(0.0, -1.0, 0.0);
+        let p = ray_axis_closest_point(ro, rd, Vec3::ZERO, Vec3::X);
+        assert!((p.x - 5.0).abs() < 1e-4, "expected x=5 on the axis, got {}", p.x);
+        // The result lies ON the axis line (y=z=0).
+        assert!(p.y.abs() < 1e-4 && p.z.abs() < 1e-4, "off the X axis line: {p:?}");
+        // A second cursor further along maps further along — monotone, no drift.
+        let q = ray_axis_closest_point(Vec3::new(9.0, 3.0, 0.0), rd, Vec3::ZERO, Vec3::X);
+        assert!((q.x - 9.0).abs() < 1e-4, "expected x=9, got {}", q.x);
+    }
+
+    #[test]
+    fn ray_axis_parallel_holds_position() {
+        // A ray PARALLEL to the constraint axis has no well-defined projection — the
+        // helper must return the pivot (no motion) rather than flinging to infinity.
+        let ro = Vec3::new(0.0, 2.0, 0.0);
+        let rd = Vec3::X; // parallel to the X axis
+        let p = ray_axis_closest_point(ro, rd, Vec3::new(1.0, 0.0, 0.0), Vec3::X);
+        assert!((p - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4, "should hold the pivot, got {p:?}");
+    }
+
+    #[test]
+    fn ray_plane_intersects() {
+        // Ray down the −Y from (2,5,3) meets the y=0 plane (normal +Y) at (2,0,3).
+        let hit = ray_plane_point(
+            Vec3::new(2.0, 5.0, 3.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::ZERO,
+            Vec3::Y,
+        )
+        .expect("should hit the plane");
+        assert!((hit - Vec3::new(2.0, 0.0, 3.0)).length() < 1e-4, "wrong plane hit: {hit:?}");
+        // A ray parallel to the plane misses (None).
+        assert!(ray_plane_point(Vec3::new(0.0, 5.0, 0.0), Vec3::X, Vec3::ZERO, Vec3::Y).is_none());
+    }
+
+    // --- S2 #71 Vertex snap: nearest other origin within the screen threshold ---
+    #[test]
+    fn vertex_snap_picks_nearest_other_origin() {
+        // Two fixtures: 0 (being moved) and 1 (a target node). Looking straight down
+        // the −Y with fixture 1 directly under the cursor, the nearest-origin query
+        // returns fixture 1's world origin (and never fixture 0, which is excluded).
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        scene.screens.clear();
+        scene.geometry.clear();
+        scene.environments.clear();
+        let demo = Scene::demo();
+        scene.fixtures.push(demo.fixtures[0].clone()); // 0: moved
+        scene.fixtures.push(demo.fixtures[0].clone()); // 1: target node
+        scene.fixtures[0].position = Vec3::new(0.0, 0.0, 0.0);
+        scene.fixtures[0].hidden = false;
+        let target = Vec3::new(4.0, 0.0, -2.0);
+        scene.fixtures[1].position = target;
+        scene.fixtures[1].hidden = false;
+
+        let mut cam = OrbitCamera::default();
+        cam.target = target; // centre the view on the node so it projects to rect-centre
+        cam.set_aspect(1.0);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 600.0));
+        let vp = cam.view_proj(1.0);
+        // Cursor sitting on the projected target node.
+        let cursor = OrbitCamera::project_to_screen(target, vp, rect).expect("target on screen");
+        let got = nearest_origin_screen(&scene, vp, rect, cursor, &[0], 18.0).expect("a node in range");
+        assert!((got - target).length() < 1e-3, "expected the node origin {target:?}, got {got:?}");
+
+        // Excluding fixture 1 too (no other nodes) → nothing in range.
+        let none = nearest_origin_screen(&scene, vp, rect, cursor, &[0, 1], 18.0);
+        assert!(none.is_none(), "expected no snap target, got {none:?}");
+
+        // A cursor far from any node → out of the pixel threshold → None.
+        let far = nearest_origin_screen(&scene, vp, rect, cursor + egui::vec2(300.0, 0.0), &[0], 18.0);
+        assert!(far.is_none(), "cursor off all nodes should not snap, got {far:?}");
     }
 }
 

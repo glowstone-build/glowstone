@@ -10,7 +10,7 @@
 
 use egui::RichText;
 
-use super::{PanelViewer, PivotMode, Tab};
+use super::{PanelViewer, PivotMode, Tab, TransformOrientation};
 use crate::scene::ViewportMode;
 use crate::ui::theme;
 
@@ -130,6 +130,27 @@ fn transform_options(ui: &mut egui::Ui, xform: &mut super::TransformPrefs) {
         .response
         .on_hover_text("Per-type snap increments (Move / Rotate / Scale)");
     });
+    // Snap MODE selector (#71): what a Move snap targets — Grid / Vertex / Surface.
+    // Greyed while Snap is off (it only matters with snapping live). Declared before
+    // the toggle so, right-to-left, it sits to the RIGHT of the [⊞ Snap] button.
+    ui.add_enabled_ui(xform.snap.on, |ui| {
+        egui::ComboBox::from_id_salt("viewport-snap-mode")
+            .selected_text(RichText::new(xform.snap.mode.label()).small())
+            .width(76.0)
+            .show_ui(ui, |ui| {
+                for m in super::SnapMode::ALL {
+                    if ui
+                        .selectable_label(xform.snap.mode == m, m.label())
+                        .on_hover_text(m.hint())
+                        .clicked()
+                    {
+                        xform.snap.mode = m;
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Snap mode — Grid increment / Vertex (nearest origin) / Surface (under cursor)");
+    });
     // Snap toggle (Ctrl held mid-drag inverts it — see apply_transform).
     if ui
         .selectable_label(xform.snap.on, RichText::new(format!("{} Snap", theme::icon::SNAP)).small())
@@ -155,4 +176,22 @@ fn transform_options(ui: &mut egui::Ui, xform: &mut super::TransformPrefs) {
         })
         .response
         .on_hover_text("Pivot point — what rotate/scale transforms about");
+    // Transform-orientation selector (#37): the basis the move/rotate/scale axis is
+    // expressed in (Global world axes / Local element axes / View camera axes).
+    egui::ComboBox::from_id_salt("viewport-orient")
+        .selected_text(RichText::new(xform.orientation.label()).small())
+        .width(80.0)
+        .show_ui(ui, |ui| {
+            for o in TransformOrientation::ALL {
+                if ui
+                    .selectable_label(xform.orientation == o, o.label())
+                    .on_hover_text(o.hint())
+                    .clicked()
+                {
+                    xform.orientation = o;
+                }
+            }
+        })
+        .response
+        .on_hover_text("Transform orientation — which axes move/rotate/scale follow");
 }

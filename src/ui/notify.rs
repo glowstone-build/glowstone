@@ -61,6 +61,15 @@ impl Severity {
             Severity::Error => theme::icon::ERROR,
         }
     }
+    /// Short uppercase tag for the log window's severity column.
+    fn label(self) -> &'static str {
+        match self {
+            Severity::Info => "INFO",
+            Severity::Success => "OK",
+            Severity::Warn => "WARN",
+            Severity::Error => "ERROR",
+        }
+    }
     /// Accent colour for the icon + left rule, read from the live role palette so
     /// it tracks the theme (Success→ok, Warn→warn, Error→conflict, Info→accent).
     fn color(self, pal: &theme::Palette) -> egui::Color32 {
@@ -97,12 +106,14 @@ impl Toast {
 }
 
 /// A permanent log row — the report history that outlives the toast. `text` +
-/// `severity` mirror the toast; a future log window reads these (the fields are
-/// read by tests + the upcoming report-log window, not by the toast renderer).
-#[allow(dead_code)] // consumed by the report-log window (later stage).
+/// `severity` mirror the toast; the report-log window reads these. `seq` is a
+/// process-monotonic arrival id (so the window can show a stable "#N" ordinal
+/// that survives the ring-buffer dropping older rows — the first visible row
+/// isn't necessarily #0).
 pub struct LogEntry {
     pub severity: Severity,
     pub text: String,
+    pub seq: u64,
 }
 
 /// The notifier: the live toast queue + the persistent log. Held on `Ui`, ticked
@@ -111,6 +122,9 @@ pub struct LogEntry {
 pub struct Notifier {
     toasts: Vec<Toast>,
     log: Vec<LogEntry>,
+    /// Monotonic arrival counter stamped onto each [`LogEntry::seq`]. Never reset
+    /// (so a dropped-then-refilled ring keeps strictly increasing ordinals).
+    next_seq: u64,
 }
 
 impl Notifier {
@@ -125,7 +139,9 @@ impl Notifier {
             _ => log::info!("{text}"),
         }
         self.toasts.push(Toast { severity, text: text.clone(), age: 0.0, ttl: severity.ttl() });
-        self.log.push(LogEntry { severity, text });
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.log.push(LogEntry { severity, text, seq });
         if self.log.len() > LOG_CAP {
             // Drop the oldest overflow in one shot (rare; only on a long session).
             let drop = self.log.len() - LOG_CAP;
@@ -147,10 +163,19 @@ impl Notifier {
         self.report(Severity::Error, text);
     }
 
-    /// The persistent report history (oldest→newest). Read by a future log window.
-    #[allow(dead_code)] // consumed by the report-log window (later stage).
+    /// The persistent report history (oldest→newest). The window iterates the
+    /// field directly (newest-first); this accessor backs the tests + any external
+    /// reader.
+    #[allow(dead_code)] // window reads the field directly; accessor used by tests.
     pub fn log(&self) -> &[LogEntry] {
         &self.log
+    }
+
+    /// Empty the persistent report history (the log window's Clear button). Live
+    /// toasts are left to age out on their own — Clear is about the history pane,
+    /// not the transient corner stack.
+    pub fn clear_log(&mut self) {
+        self.log.clear();
     }
 
     /// Age every live toast by `dt` and retire the expired ones. Called once per
@@ -187,6 +212,91 @@ impl Notifier {
             }
         });
     }
+
+    /// The report-log window (§2.10, #22): the persistent notification history a
+    /// closed toast retires into. Lists every retained [`LogEntry`] NEWEST-FIRST
+    /// with its severity tag + colour and the message, behind a Clear button. The
+    /// toggle is owned by the caller (`open`); the window's own close box flips it.
+    /// Consistent with the dense console aesthetic (monospace ordinals, tight rows).
+    pub fn draw_log_window(&mut self, ctx: &egui::Context, open: &mut bool) {
+        if !*open {
+            return;
+        }
+        let pal = theme::Palette::get_ctx(ctx);
+        let mut keep = *open;
+        let mut clear = false;
+        egui::Window::new(format!("{}  Report Log", theme::icon::LOG))
+            .open(&mut keep)
+            .resizable(true)
+            .default_width(440.0)
+            .default_height(320.0)
+            .show(ctx, |ui| {
+                // Header row: entry count + Clear. Clear is disabled when empty so
+                // it reads as a no-op rather than an active button on a blank list.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} entries", self.log.len()))
+                            .small()
+                            .color(pal.ink_tertiary),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn = egui::Button::new(format!("{}  Clear", theme::icon::TRASH));
+                        if ui.add_enabled(!self.log.is_empty(), btn).clicked() {
+                            clear = true;
+                        }
+                    });
+                });
+                ui.separator();
+
+                if self.log.is_empty() {
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("No notifications yet").color(pal.ink_muted),
+                        );
+                    });
+                    return;
+                }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    // Newest at the top, so the scroll opens on the latest report
+                    // (stick to the top rather than auto-following the bottom).
+                    .stick_to_bottom(false)
+                    .show(ui, |ui| {
+                        for e in self.log.iter().rev() {
+                            log_row(ui, e, &pal);
+                        }
+                    });
+            });
+        *open = keep;
+        if clear {
+            self.clear_log();
+        }
+    }
+}
+
+/// Draw one report-log row: a monospace `#N` ordinal, a severity-tinted tag +
+/// icon, and the message. Dense, single-line-ish — the console aesthetic.
+fn log_row(ui: &mut egui::Ui, e: &LogEntry, pal: &theme::Palette) {
+    let accent = e.severity.color(pal);
+    ui.horizontal_top(|ui| {
+        ui.label(
+            egui::RichText::new(format!("#{:<4}", e.seq))
+                .monospace()
+                .small()
+                .color(pal.ink_muted),
+        );
+        ui.label(egui::RichText::new(e.severity.icon()).color(accent).size(13.0));
+        ui.label(
+            egui::RichText::new(format!("{:<5}", e.severity.label()))
+                .monospace()
+                .small()
+                .color(accent),
+        );
+        // Let the message wrap within the remaining width.
+        ui.label(egui::RichText::new(&e.text).color(pal.ink_secondary).size(12.5));
+    });
 }
 
 /// Draw one toast: a dark rounded chip with a severity-tinted left rule + icon
@@ -358,5 +468,50 @@ mod tests {
         assert_eq!(n.log.len(), LOG_CAP, "log ring-capped");
         // The oldest were dropped; the newest survives.
         assert_eq!(n.log.last().unwrap().text, format!("msg {}", LOG_CAP + 24));
+    }
+
+    #[test]
+    fn log_window_reads_history_newest_first() {
+        // The window iterates `log()` reversed; assert that view lists entries
+        // newest-first with the right messages + severities.
+        let mut n = Notifier::default();
+        n.info("first");
+        n.warn("second");
+        n.error("third");
+        let newest_first: Vec<(&str, Severity)> =
+            n.log().iter().rev().map(|e| (e.text.as_str(), e.severity)).collect();
+        assert_eq!(
+            newest_first,
+            vec![
+                ("third", Severity::Error),
+                ("second", Severity::Warn),
+                ("first", Severity::Info),
+            ]
+        );
+    }
+
+    #[test]
+    fn seq_is_monotonic_across_ring_drop() {
+        // Ordinals strictly increase and SURVIVE the ring dropping the oldest, so
+        // the first retained row's `seq` is the count of dropped entries (not 0).
+        let mut n = Notifier::default();
+        for i in 0..(LOG_CAP + 5) {
+            n.info(format!("msg {i}"));
+        }
+        let seqs: Vec<u64> = n.log().iter().map(|e| e.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seq strictly increasing");
+        assert_eq!(*seqs.first().unwrap(), 5, "first retained ordinal past the dropped 5");
+        assert_eq!(*seqs.last().unwrap(), (LOG_CAP + 5 - 1) as u64);
+    }
+
+    #[test]
+    fn clear_log_empties_history_but_keeps_toasts() {
+        let mut n = Notifier::default();
+        n.error("boom"); // a live toast + a log entry
+        assert_eq!(n.log().len(), 1);
+        assert_eq!(n.toasts.len(), 1);
+        n.clear_log();
+        assert!(n.log().is_empty(), "history cleared");
+        assert_eq!(n.toasts.len(), 1, "live toast left to age out");
     }
 }
