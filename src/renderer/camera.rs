@@ -39,6 +39,11 @@ pub struct OrbitCamera {
     pub fov_y: f32,
     pub znear: f32,
     pub zfar: f32,
+
+    /// Orthographic projection toggle (session UI state — numpad 5 / axis views).
+    /// Serde-skipped: defaults to false on load, no .archie version bump.
+    #[serde(skip)]
+    pub ortho: bool,
 }
 
 impl Default for OrbitCamera {
@@ -52,6 +57,7 @@ impl Default for OrbitCamera {
             fov_y: 55.0_f32.to_radians(),
             znear: 0.05,
             zfar: 500.0,
+            ortho: false,
         }
     }
 }
@@ -61,6 +67,7 @@ impl Default for OrbitCamera {
 pub enum CameraView {
     Perspective,
     Top,
+    Bottom,
     Front,
     Back,
     Left,
@@ -68,9 +75,10 @@ pub enum CameraView {
 }
 
 impl CameraView {
-    pub const ALL: [CameraView; 6] = [
+    pub const ALL: [CameraView; 7] = [
         Self::Perspective,
         Self::Top,
+        Self::Bottom,
         Self::Front,
         Self::Back,
         Self::Left,
@@ -80,6 +88,7 @@ impl CameraView {
         match self {
             Self::Perspective => "Perspective",
             Self::Top => "Top",
+            Self::Bottom => "Bottom",
             Self::Front => "Front",
             Self::Back => "Back",
             Self::Left => "Left",
@@ -97,6 +106,7 @@ impl OrbitCamera {
         let (yaw, pitch) = match view {
             CameraView::Perspective => (0.6, 0.08),
             CameraView::Top => (0.0, Self::PITCH_LIMIT),
+            CameraView::Bottom => (0.0, -Self::PITCH_LIMIT),
             CameraView::Front => (0.0, 0.0),
             CameraView::Back => (std::f32::consts::PI, 0.0),
             CameraView::Right => (std::f32::consts::FRAC_PI_2, 0.0),
@@ -104,6 +114,24 @@ impl OrbitCamera {
         };
         self.yaw = yaw;
         self.pitch = pitch.clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
+        // Axis views go ortho; Perspective restores persp (Blender AUTOPERSP).
+        self.ortho = view != CameraView::Perspective;
+    }
+
+    /// numpad-5: pure persp↔ortho toggle, no angle change (Blender
+    /// viewpersportho_exec, view3d_edit.cc).
+    pub fn toggle_ortho(&mut self) {
+        self.ortho = !self.ortho;
+    }
+
+    /// numpad 2/4/6/8: orbit by a fixed step (degrees). Reuses `orbit()`'s sign
+    /// convention by feeding pixel-equivalent deltas (deg→rad / SENSITIVITY).
+    pub fn orbit_step(&mut self, yaw_deg: f32, pitch_deg: f32) {
+        const SENSITIVITY: f32 = 0.005; // keep in sync with orbit()
+        self.orbit(
+            yaw_deg.to_radians() / SENSITIVITY,
+            pitch_deg.to_radians() / SENSITIVITY,
+        );
     }
 
     /// Frame an explicit AABB (min/max): aim at its centre and dolly to fit.
@@ -170,9 +198,22 @@ impl OrbitCamera {
     }
 
     /// Right-handed, reverse-Z-free perspective with the `0..1` depth range
-    /// wgpu expects (`perspective_rh`, not the `_gl` variant).
+    /// wgpu expects (`perspective_rh`, not the `_gl` variant). When `ortho`, an
+    /// orthographic_rh sized so the framed content matches the perspective
+    /// framing at the same distance: half-height `= distance·tan(fov_y/2)` (the
+    /// extent the perspective frustum spans at the target plane). Near/far are
+    /// symmetric about the target (Blender camera.cc `clip_start = -clip_end`) so
+    /// geometry between eye and target isn't front-clipped.
     pub fn proj_matrix(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective_rh(self.fov_y, aspect.max(0.0001), self.znear, self.zfar)
+        let aspect = aspect.max(0.0001);
+        if self.ortho {
+            let h = self.distance * (self.fov_y * 0.5).tan();
+            let w = h * aspect;
+            let far = self.zfar * 0.5;
+            Mat4::orthographic_rh(-w, w, -h, h, -far, far)
+        } else {
+            Mat4::perspective_rh(self.fov_y, aspect, self.znear, self.zfar)
+        }
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
@@ -182,6 +223,9 @@ impl OrbitCamera {
     /// Build a world-space picking ray for a normalized-device-coordinate point
     /// (`ndc` in `-1..1`, y up). Returns `(origin, unit direction)`.
     pub fn ray(&self, ndc: Vec2, aspect: f32) -> (Vec3, Vec3) {
+        // Inverse-VP unproject works for BOTH persp + ortho: an ortho
+        // inv_view_proj yields parallel rays (origin varies across the image
+        // plane, direction constant = forward). Do NOT special-case ortho here.
         let inv = self.view_proj(aspect).inverse();
         let near = inv * Vec4::new(ndc.x, ndc.y, 0.0, 1.0);
         let far = inv * Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
@@ -216,5 +260,83 @@ impl OrbitCamera {
             world: [0.0; 4],
             inv_view_proj: vp.inverse().to_cols_array_2d(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Axis views switch to ortho; Perspective restores persp (Blender AUTOPERSP).
+    #[test]
+    fn axis_views_go_ortho_persp_restores() {
+        let mut cam = OrbitCamera::default();
+        assert!(!cam.ortho);
+        cam.set_view(CameraView::Front);
+        assert!(cam.ortho);
+        cam.set_view(CameraView::Top);
+        assert!(cam.ortho);
+        cam.set_view(CameraView::Perspective);
+        assert!(!cam.ortho);
+    }
+
+    #[test]
+    fn toggle_ortho_flips_without_changing_angles() {
+        let mut cam = OrbitCamera::default();
+        let (yaw, pitch) = (cam.yaw, cam.pitch);
+        cam.toggle_ortho();
+        assert!(cam.ortho);
+        assert_eq!((cam.yaw, cam.pitch), (yaw, pitch));
+        cam.toggle_ortho();
+        assert!(!cam.ortho);
+    }
+
+    /// The ortho projection is parallel: w is constant across the clip volume, so
+    /// the proj matrix has no perspective divide (last row = (0,0,0,1)).
+    #[test]
+    fn ortho_proj_is_parallel() {
+        let mut cam = OrbitCamera::default();
+        cam.ortho = true;
+        let p = cam.proj_matrix(16.0 / 9.0);
+        let row3 = p.row(3);
+        assert!((row3.x).abs() < 1e-6);
+        assert!((row3.y).abs() < 1e-6);
+        assert!((row3.z).abs() < 1e-6);
+        assert!((row3.w - 1.0).abs() < 1e-6);
+        // Persp, by contrast, has a perspective divide (last row z = -1).
+        cam.ortho = false;
+        let pp = cam.proj_matrix(16.0 / 9.0);
+        assert!((pp.row(3).z + 1.0).abs() < 1e-6);
+    }
+
+    /// In ortho, picking rays are parallel: different image points give the same
+    /// direction (= forward) but distinct origins.
+    #[test]
+    fn ortho_rays_are_parallel() {
+        let mut cam = OrbitCamera::default();
+        cam.ortho = true;
+        let aspect = 16.0 / 9.0;
+        let (o0, d0) = cam.ray(Vec2::new(-0.5, -0.5), aspect);
+        let (o1, d1) = cam.ray(Vec2::new(0.5, 0.5), aspect);
+        // Parallel: directions equal.
+        assert!((d0 - d1).length() < 1e-4, "dirs differ: {d0} vs {d1}");
+        // Direction matches the camera forward.
+        let (_, _, fwd) = cam.view_basis();
+        assert!((d0 - fwd).length() < 1e-4, "dir not forward: {d0} vs {fwd}");
+        // Distinct origins across the image plane.
+        assert!((o0 - o1).length() > 0.1, "origins not spread: {o0} vs {o1}");
+    }
+
+    /// An ortho ray through the image centre still hits geometry at the target
+    /// (the perspective ray does too — framing is preserved on toggle).
+    #[test]
+    fn ortho_center_ray_passes_through_target_plane() {
+        let mut cam = OrbitCamera::default();
+        cam.ortho = true;
+        let (o, d) = cam.ray(Vec2::ZERO, 16.0 / 9.0);
+        // The target lies on the centre ray: (target - o) is parallel to d.
+        let to_target = cam.target - o;
+        let along = d * to_target.dot(d);
+        assert!((to_target - along).length() < 1e-3);
     }
 }

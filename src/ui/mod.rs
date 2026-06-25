@@ -165,6 +165,39 @@ impl Axis {
     }
 }
 
+/// Blender-style modal numeric entry for a transform op. A SINGLE typed value
+/// (arch-viz simplification of Blender's up-to-3 components, editors/util/
+/// numinput.cc) that maps onto the op's active axis: Move = metres, Rotate =
+/// degrees, Scale = factor. `active` is the `hasNumInput()` gate — while true the
+/// typed amount OVERRIDES the mouse; clearing the buffer (backspace past empty)
+/// reverts `active` to false and hands control back to the mouse. `sign` mirrors
+/// Blender's NUM_NEGATE: '-' toggles it rather than inserting a literal char.
+#[derive(Default)]
+pub struct NumInput {
+    /// The literal typed digits/'.' (no sign char — see `sign`). Capped at 16.
+    pub str: String,
+    /// NUM_NEGATE: '-' toggles this; applied to the parsed value.
+    pub sign: bool,
+    /// == Blender hasNumInput(): typed value overrides the mouse while true.
+    pub active: bool,
+}
+
+impl NumInput {
+    /// Parse the buffer to a finite amount. Empty / lone '.' / parse-fail → 0.0;
+    /// `sign` negates. Used by the explicit-amount apply path.
+    pub fn value(&self) -> f32 {
+        let v = self.str.parse::<f32>().unwrap_or(0.0);
+        let v = if v.is_finite() { v } else { 0.0 };
+        if self.sign { -v } else { v }
+    }
+    /// The typed readout for the header pill, e.g. `-4.0`. Shows a lone `-` when
+    /// only the sign is set, so the user sees their keystroke land.
+    pub fn display(&self) -> String {
+        let s = if self.str.is_empty() { "0" } else { self.str.as_str() };
+        if self.sign { format!("-{s}") } else { s.to_string() }
+    }
+}
+
 pub struct TransformOp {
     pub kind: TransformKind,
     pub axis: Option<Axis>,
@@ -188,6 +221,9 @@ pub struct TransformOp {
     /// pointer release; a modal op is driven by absolute mouse position and
     /// committed by a click/Enter.
     pub from_gizmo: bool,
+    /// Modal numeric entry. Default = empty/inactive (mouse drives). Never
+    /// serialized (TransformOp is never persisted).
+    pub num: NumInput,
 }
 
 impl TransformOp {
@@ -206,8 +242,22 @@ impl TransformOp {
             Some(a) => format!(" · axis {}", a.label()),
             None => String::new(),
         };
+        if self.num.active {
+            // Blender-style typed readout: "Move X: 4.0 m" / "Rotate Z: -45°" /
+            // "Scale: 2.0x". Axis label is blank when unconstrained.
+            let axl = self
+                .active_axis()
+                .map(|a| format!(" {}", a.label()))
+                .unwrap_or_default();
+            let (val, unit) = match self.kind {
+                TransformKind::Move => (self.num.display(), " m"),
+                TransformKind::Rotate => (self.num.display(), "°"),
+                TransformKind::Scale => (self.num.display(), "x"),
+            };
+            return format!("{}{}: {}{}", self.kind.label(), axl, val, unit);
+        }
         format!(
-            "{}{}   X/Y/Z lock · click/Enter confirm · Esc cancel",
+            "{}{}   type number · X/Y/Z lock · click/Enter confirm · Esc cancel",
             self.kind.label(),
             ax
         )
@@ -1348,13 +1398,6 @@ impl Ui {
 
         // One call hands back all the disjoint DMX borrows the panels need.
         let dmxv = dmx.view();
-        // Editor types currently open (one leaf each). The header's editor-type
-        // switcher reads this to refuse switching a leaf to a type that already has
-        // a leaf — egui_dock derives a leaf's body Id from its title, so two leaves
-        // of one type would clash ids (cross-talk / panic), invisible to the
-        // compiler. (Computed before the viewer so the dock isn't borrowed yet.)
-        let open_tabs: Vec<Tab> =
-            Tab::ALL.iter().copied().filter(|t| self.dock.find_tab(t).is_some()).collect();
         let mut viewer = PanelViewer {
             scene,
             camera,
@@ -1400,7 +1443,6 @@ impl Ui {
             active_tool: &mut self.active_tool,
             measure: &mut self.measure,
             aim: &mut self.aim,
-            open_tabs,
         };
 
         DockArea::new(&mut self.dock).show(ctx, &mut viewer);
@@ -2502,9 +2544,6 @@ struct PanelViewer<'a> {
     measure: &'a mut panels::MeasureState,
     /// The Aim tool's in-flight drag (§2.4); `viewport()` sets it while aiming heads.
     aim: &'a mut panels::AimState,
-    /// Editor types currently open (one leaf each); the header's editor-type
-    /// switcher refuses a target already open to avoid a duplicate-leaf id clash.
-    open_tabs: Vec<Tab>,
 }
 
 /// Draw the viewport T-panel tool rail (§2.4): a vertical radio column of icon

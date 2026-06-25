@@ -29,6 +29,12 @@ pub enum Action {
     View(CameraView),
     /// Numpad-0 "camera view" — registered for the cheat sheet; no-op for now.
     ViewCamera,
+    /// numpad-5 — pure persp↔ortho toggle (no angle change).
+    ToggleOrtho,
+    /// numpad 2/4/6/8 — orbit by a fixed step (yaw_deg, pitch_deg).
+    OrbitStep(f32, f32),
+    /// `~` (backtick) — open the radial View pie at the cursor. Wired in S3.
+    ViewPie,
     ToggleLabels,
     // Selection.
     SelectAll,
@@ -243,13 +249,6 @@ pub static GLOBAL: &[Kmi] = &[
     kmi(Trigger::key(Key::F).shift(), Action::FrameAll, Category::View, "Frame all"),
     kmi(Trigger::key(Key::Period), Action::FrameSelection, Category::View, "Frame selection (alias)"),
     kmi(Trigger::key(Key::Home), Action::FrameAll, Category::View, "Frame all (alias)"),
-    kmi(Trigger::key(Key::Num5), Action::View(CameraView::Perspective), Category::View, "Perspective view"),
-    kmi(Trigger::key(Key::Num7), Action::View(CameraView::Top), Category::View, "Top view"),
-    kmi(Trigger::key(Key::Num1), Action::View(CameraView::Front), Category::View, "Front view"),
-    kmi(Trigger::key(Key::Num3), Action::View(CameraView::Right), Category::View, "Right view"),
-    kmi(Trigger::key(Key::Num1).cmd(), Action::View(CameraView::Back), Category::View, "Back view"),
-    kmi(Trigger::key(Key::Num3).cmd(), Action::View(CameraView::Left), Category::View, "Left view"),
-    kmi(Trigger::key(Key::Num0), Action::ViewCamera, Category::View, "Camera view"),
     kmi(Trigger::key(Key::L), Action::ToggleLabels, Category::View, "Toggle fixture labels"),
     // --- Selection ---
     kmi(Trigger::key(Key::A), Action::SelectAll, Category::Selection, "Select all fixtures"),

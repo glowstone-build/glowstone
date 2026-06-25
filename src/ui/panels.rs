@@ -12,7 +12,8 @@ use super::shortcuts;
 use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
 use super::{
-    ActiveTool, Axis, DuplicateDialog, GdtfTextures, SelectionGroup, TransformKind, TransformOp,
+    ActiveTool, Axis, DuplicateDialog, GdtfTextures, NumInput, SelectionGroup, TransformKind,
+    TransformOp,
 };
 use crate::dmx::patch::channel_map;
 use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
@@ -122,7 +123,6 @@ pub fn scene_outliner(
     let accent = ui.visuals().selection.stroke.color;
 
     ui.horizontal(|ui| {
-        ui.heading("Scene");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let n = selection.fixtures.len() + selection.geometry.len() + selection.screens.len();
             if n > 0 {
@@ -453,7 +453,6 @@ pub fn library_browser(
 
     // --- header: import / export toolbar (icon buttons) ---
     ui.horizontal(|ui| {
-        ui.heading("Library");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button(format!("{}  Online", icon::ONLINE))
@@ -698,9 +697,6 @@ pub fn inspector(
     profile: &mut Option<ProfileEditor>,
     sources: &ScreenSources,
 ) {
-    ui.heading("Inspector");
-    ui.separator();
-
     // World is the top of the hierarchy: its HDRI sky + ambient controls.
     if selection.world {
         let ink = theme::ink(!ui.visuals().dark_mode);
@@ -1946,18 +1942,31 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
     // Position/orientation are read directly by the renderer, so they need no
     // snap_movement() — and calling it every frame would freeze each fixture's
     // wheel-motion phase. (Cancel restores from the same snapshot the same way.)
-    let d = cur - op.start_screen; // pixel delta
+    let d = cur - op.start_screen; // pixel delta (mouse-driven path)
     let (right, up, _fwd) = camera.view_basis();
     // A grabbed gizmo handle overrides the keyboard axis lock for this frame.
     let axis = op.active_axis();
+    // Explicit-amount: a typed number OVERRIDES the mouse (Blender applyNumInput
+    // returns true). Single value → along the active axis (Move falls back to
+    // global X, Rotate to Y, Scale to uniform — matching the mouse-path defaults).
+    let amount = op.num.value();
+    let typed = op.num.active;
     match op.kind {
         TransformKind::Move => {
-            let speed = camera.distance * 0.0015;
-            let mut world = right * (d.x * speed) + up * (-d.y * speed);
-            if let Some(ax) = axis {
-                let a = ax.vec();
-                world = a * world.dot(a); // lock to one axis
-            }
+            let world = if typed {
+                // Metres along the active axis; no lock → global X (Blender's
+                // single-value-no-constraint behaviour).
+                let a = axis.map(|a| a.vec()).unwrap_or(Vec3::X);
+                a * amount
+            } else {
+                let speed = camera.distance * 0.0015;
+                let mut w = right * (d.x * speed) + up * (-d.y * speed);
+                if let Some(ax) = axis {
+                    let a = ax.vec();
+                    w = a * w.dot(a); // lock to one axis
+                }
+                w
+            };
             for (i, p0, _q) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     f.position = *p0 + world;
@@ -1970,7 +1979,8 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
             }
         }
         TransformKind::Rotate => {
-            let angle = d.x * 0.01;
+            // Typed degrees override the mouse-derived angle (radians).
+            let angle = if typed { amount.to_radians() } else { d.x * 0.01 };
             let raxis = axis.map(|a| a.vec()).unwrap_or(Vec3::Y);
             let rot = Quat::from_axis_angle(raxis, angle);
             for (i, p0, q0) in &op.start {
@@ -1991,7 +2001,12 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
             }
         }
         TransformKind::Scale => {
-            let factor = (1.0 + d.x * 0.005).max(0.01);
+            // Typed 1 → ×1 (identity); clamp >0 (Blender NUM_NO_ZERO).
+            let factor = if typed {
+                amount.max(0.0001)
+            } else {
+                (1.0 + d.x * 0.005).max(0.01)
+            };
             for (i, p0, _q) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     let off = *p0 - op.pivot;
@@ -2286,6 +2301,7 @@ pub fn viewport(
                         None
                     },
                     from_gizmo: true,
+                    num: NumInput::default(),
                 });
                 *transform_started = true;
             }
@@ -2461,6 +2477,49 @@ pub fn viewport(
         // the one registry (and out of the plain press-keymaps) — no scattered raw
         // key reads here.
         let modal = shortcuts::poll_modal(ui.ctx());
+        // --- Modal numeric input (Blender editors/util/numinput.cc) ---
+        // Typed digits/'.' OVERRIDE the mouse; '-' toggles sign; Backspace edits
+        // and, when it empties the buffer, hands control back to the mouse. Read
+        // Event::Text for locale-correct digits + accept Key::Period/Comma as '.'
+        // (numpad-period) and Key::Minus for the sign toggle. This block lives
+        // INSIDE `if let Some(op)` — the modal op owns the viewport, so no text
+        // field can be focused (LOCKED DECISION 5 scope guard).
+        ui.input(|i| {
+            for ev in &i.events {
+                if let egui::Event::Text(t) = ev {
+                    for c in t.chars() {
+                        if c.is_ascii_digit() {
+                            if op.num.str.len() < 16 {
+                                op.num.str.push(c);
+                                op.num.active = true;
+                            }
+                        } else if c == '.' && !op.num.str.contains('.') {
+                            op.num.str.push('.');
+                            op.num.active = true;
+                        }
+                        // '-' is NOT inserted here (handled as a sign toggle below).
+                    }
+                }
+            }
+            // Numpad '.' may arrive as a key, not Text — accept Period/Comma too.
+            if (i.key_pressed(egui::Key::Period) || i.key_pressed(egui::Key::Comma))
+                && !op.num.str.contains('.')
+            {
+                op.num.str.push('.');
+                op.num.active = true;
+            }
+            // '-' toggles the sign (Blender NUM_NEGATE); it activates numinput too.
+            if i.key_pressed(egui::Key::Minus) {
+                op.num.sign = !op.num.sign;
+                op.num.active = true;
+            }
+            if i.key_pressed(egui::Key::Backspace) {
+                op.num.str.pop();
+                if op.num.str.is_empty() && !op.num.sign {
+                    op.num.active = false; // empty → mouse takes over again
+                }
+            }
+        });
         for m in &modal {
             let ax = match m {
                 shortcuts::ModalAction::ConstrainX => Some(Axis::X),
@@ -2573,6 +2632,7 @@ pub fn viewport(
                     geo_start,
                     gizmo_hovered_axis: None,
                     from_gizmo: false,
+                    num: NumInput::default(),
                 });
                 *transform_started = true;
                 consumed = true;
@@ -2958,7 +3018,6 @@ pub fn connectivity(
     running: bool,
 ) {
     ui.horizontal(|ui| {
-        ui.heading("Connectivity");
         let mut enabled = running;
         if ui
             .checkbox(&mut enabled, "Receive DMX")
@@ -3137,9 +3196,6 @@ pub fn dmx_universe_grid(
 
     // --- header: title · universe nav · live / conflict status ---
     ui.horizontal(|ui| {
-        ui.label(RichText::new(theme::icon::DMX).size(16.0).color(ink.secondary));
-        ui.heading("DMX Universe");
-        ui.add_space(6.0);
         if ui.button(theme::ico(theme::icon::PREV)).clicked()
             && let Some(pos) = universes.iter().position(|x| x == selected_universe)
         {
@@ -3827,7 +3883,7 @@ mod transform_tests {
     use crate::ui::Axis;
 
     fn make_op(kind: TransformKind, axis: Option<Axis>, pivot: Vec3, idx: usize, p0: Vec3) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)], geo_start: Vec::new(), gizmo_hovered_axis: None, from_gizmo: false }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)], geo_start: Vec::new(), gizmo_hovered_axis: None, from_gizmo: false, num: NumInput::default() }
     }
 
     #[test]
@@ -3876,5 +3932,77 @@ mod transform_tests {
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(-100000.0, 0.0));
         let after = (scene.fixtures[0].position - pivot).length();
         assert!(after > 0.0, "geometry collapsed to the pivot");
+    }
+
+    #[test]
+    fn numinput_value_parses() {
+        let n = NumInput { str: "4.5".into(), sign: false, active: true };
+        assert!((n.value() - 4.5).abs() < 1e-6);
+        let n = NumInput { str: "4".into(), sign: true, active: true };
+        assert!((n.value() + 4.0).abs() < 1e-6);
+        assert_eq!(NumInput::default().value(), 0.0);
+        assert_eq!(NumInput { str: ".".into(), sign: false, active: true }.value(), 0.0);
+    }
+
+    #[test]
+    fn numinput_display_shows_sign() {
+        assert_eq!(NumInput { str: "4.0".into(), sign: false, active: true }.display(), "4.0");
+        assert_eq!(NumInput { str: "45".into(), sign: true, active: true }.display(), "-45");
+        // Lone sign before any digit still renders, so the keystroke lands.
+        assert_eq!(NumInput { str: String::new(), sign: true, active: true }.display(), "-0");
+    }
+
+    #[test]
+    fn typed_move_overrides_mouse_exact_metres() {
+        // G,X,"4",Enter → move +4 m on global X regardless of mouse position.
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let cam = OrbitCamera::default();
+        let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
+        o.num = NumInput { str: "4".into(), sign: false, active: true };
+        // A wild mouse position must be ignored once numinput is active.
+        apply_transform(&o, &mut scene, &cam, egui::pos2(9999.0, -9999.0));
+        let d = scene.fixtures[0].position - p0;
+        assert!((d.x - 4.0).abs() < 1e-4, "expected +4 on X, got {}", d.x);
+        assert!(d.y.abs() < 1e-4 && d.z.abs() < 1e-4, "leaked off X: {d:?}");
+    }
+
+    #[test]
+    fn typed_move_no_axis_falls_back_to_global_x() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let mut o = make_op(TransformKind::Move, None, p0, 0, p0);
+        o.num = NumInput { str: "2.5".into(), sign: true, active: true };
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0));
+        let d = scene.fixtures[0].position - p0;
+        assert!((d.x + 2.5).abs() < 1e-4, "expected -2.5 on X, got {}", d.x);
+    }
+
+    #[test]
+    fn typed_rotate_uses_degrees() {
+        // R,Y,"90" → quarter turn about Y; pivot offset on +X maps to +Z (RH).
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let pivot = p0 - Vec3::new(1.0, 0.0, 0.0); // fixture sits at pivot + X
+        let mut o = make_op(TransformKind::Rotate, Some(Axis::Y), pivot, 0, p0);
+        o.num = NumInput { str: "90".into(), sign: false, active: true };
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0));
+        let off = scene.fixtures[0].position - pivot;
+        // +X (1,0,0) rotated 90° about +Y → (0,0,-1) in glam's RH convention.
+        assert!((off.x).abs() < 1e-4, "x not zeroed: {}", off.x);
+        assert!((off.z + 1.0).abs() < 1e-4, "expected z=-1, got {}", off.z);
+    }
+
+    #[test]
+    fn typed_scale_factor_is_exact() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
+        let mut o = make_op(TransformKind::Scale, None, pivot, 0, p0);
+        o.num = NumInput { str: "2".into(), sign: false, active: true };
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(12345.0, 0.0));
+        let before = (p0 - pivot).length();
+        let after = (scene.fixtures[0].position - pivot).length();
+        assert!((after - before * 2.0).abs() < 1e-4, "expected ×2, {before} -> {after}");
     }
 }

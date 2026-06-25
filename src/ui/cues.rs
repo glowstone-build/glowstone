@@ -253,7 +253,6 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
     let accent = ui.visuals().selection.stroke.color;
 
     ui.horizontal(|ui| {
-        ui.heading("Cues");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(format!("{}", engine.cues.len())).small().weak());
         });

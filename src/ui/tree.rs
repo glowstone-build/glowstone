@@ -73,11 +73,11 @@ pub enum TreeAction {
 }
 
 // --- row metrics -----------------------------------------------------------
-const ROW_H: f32 = 34.0; // dense two-line row (name + secondary), matches entity_row
-const INDENT: f32 = 14.0; // px per depth level
+const ROW_H: f32 = 22.0; // single-line row — Blender outliner density (was a 34px two-line row, which made the indentation unreadable)
+const INDENT: f32 = 15.0; // px per depth level
 const PAD_X: f32 = 4.0; // left gutter before depth 0
-const DISCLOSURE_W: f32 = 16.0; // disclosure-triangle cell width
-const ICON_DX: f32 = 6.0; // gap between disclosure cell and the type icon
+const DISCLOSURE_W: f32 = 15.0; // disclosure-triangle cell width (≈ one indent step)
+const ICON_DX: f32 = 5.0; // gap between disclosure cell and the type icon
 const TEXT_DX: f32 = 21.0; // gap between icon origin and the name text
 
 /// What a flattened row represents (carries the data-array index for leaves).
@@ -652,6 +652,9 @@ fn draw_row(
             }
         }
     } else {
+        // Single line: the type icon already conveys the kind, so the row shows
+        // just the NAME (Blender's outliner does the same). The secondary type
+        // string moves to the row tooltip instead of a cramped second line.
         super::panels::paint_truncated(
             &painter,
             egui::pos2(text_x, rect.top() + 4.0),
@@ -660,34 +663,32 @@ fn draw_row(
             ink.primary.gamma_multiply(dim),
             text_w,
         );
-        super::panels::paint_truncated(
-            &painter,
-            egui::pos2(text_x, rect.top() + 19.0),
-            &row.secondary,
-            10.5,
-            ink.tertiary.gamma_multiply(dim),
-            text_w,
-        );
+        if !row.secondary.is_empty() {
+            resp.clone().on_hover_text(&row.secondary);
+        }
     }
 
-    // ---- right column: patch tag + conflict (fixtures) ----
-    if !row.patch_tag.is_empty() {
-        let unpatched = row.patch_tag == "unpatched";
-        painter.text(
-            egui::pos2(rect.right() - right_edge, rect.top() + 6.0),
-            egui::Align2::RIGHT_TOP,
-            &row.patch_tag,
-            egui::FontId::monospace(10.0),
-            if unpatched { ink.muted } else { ink.tertiary },
-        );
-    }
+    // ---- right info column (left of the eye), single line, centered ----
+    // A conflict IS a patch problem, so the warning REPLACES the patch tag (they
+    // never stack — that was the old two-line collision). Both are read here, so no
+    // dead-field warnings.
+    let info_x = rect.right() - right_edge - 4.0;
     if row.conflict {
         painter.text(
-            egui::pos2(rect.right() - right_edge, rect.bottom() - 5.0),
-            egui::Align2::RIGHT_BOTTOM,
+            egui::pos2(info_x, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
             theme::icon::WARNING,
             egui::FontId::proportional(12.0),
             theme::CONFLICT,
+        );
+    } else if !row.patch_tag.is_empty() {
+        let unpatched = row.patch_tag == "unpatched";
+        painter.text(
+            egui::pos2(info_x, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            &row.patch_tag,
+            egui::FontId::monospace(10.0),
+            if unpatched { ink.muted } else { ink.tertiary },
         );
     }
 
