@@ -27,6 +27,21 @@ use crate::scene::{apply_fixture_click, apply_select, Fixture, Library, Scene, S
 /// Universe is considered live if it updated within this window.
 const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
 
+/// Per-frame drag edges the [`inspector`] reports up to [`Ui`](super::Ui) so a
+/// slider / DragValue drag becomes ONE undo step (P0 #13). The inspector edits the
+/// scene directly (its established live-edit model); these flags let the
+/// post-dock consumer wrap the WHOLE gesture in a single [`op::DragTx`]
+/// transaction — `started` snapshots the `before`, `stopped` pushes one step.
+/// Detected at panel scope (no per-widget instrumentation): a numeric widget
+/// inside the inspector's content rect began / ended a pointer drag this frame.
+#[derive(Default, Clone, Copy)]
+pub struct InspectorEdit {
+    /// A numeric drag inside the inspector just began this frame.
+    pub started: bool,
+    /// A numeric drag inside the inspector was released this frame.
+    pub stopped: bool,
+}
+
 /// Left tab: the scene outliner — every fixture and environment, selectable —
 /// plus the global view/look controls.
 /// Discovered live video sources for the LED-screen content pickers, refreshed
@@ -966,6 +981,36 @@ impl FixtureDefaults {
 /// straight into the scene, so the viewport updates on the next frame.
 #[allow(clippy::too_many_arguments)]
 pub fn inspector(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    selection: &Selection,
+    patch: &mut PatchTable,
+    gdtf_textures: &mut HashMap<usize, GdtfTextures>,
+    profile: &mut Option<ProfileEditor>,
+    sources: &ScreenSources,
+    edit: &mut InspectorEdit,
+) {
+    // Render the body in a scope so its content rect is known, then derive the
+    // drag edges (#13) from egui's global drag state intersected with that rect —
+    // a slider/DragValue drag INSIDE the inspector becomes one undo step without
+    // instrumenting every widget. `inspector_body` is the prior function body
+    // verbatim (its early returns become early returns from the closure).
+    let resp = ui.scope(|ui| inspector_body(ui, scene, selection, patch, gdtf_textures, profile, sources));
+    let content = resp.response.rect;
+    let ctx = ui.ctx();
+    // A widget id is "in the inspector" when its last-frame rect lies within the
+    // panel content rect (read_response gives the rect; missing ⇒ not ours).
+    let in_panel = |id: egui::Id| ctx.read_response(id).is_some_and(|r| content.contains(r.rect.center()));
+    *edit = InspectorEdit {
+        started: ctx.drag_started_id().is_some_and(in_panel),
+        stopped: ctx.drag_stopped_id().is_some_and(in_panel),
+    };
+}
+
+/// The inspector content (extracted so [`inspector`] can wrap it for drag-edge
+/// detection, #13). Edits flow straight into the scene as before.
+#[allow(clippy::too_many_arguments)]
+fn inspector_body(
     ui: &mut egui::Ui,
     scene: &mut Scene,
     selection: &Selection,

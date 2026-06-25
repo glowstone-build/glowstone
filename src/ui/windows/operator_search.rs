@@ -1,5 +1,5 @@
 //! The F3 operator-search palette — a keyboard-driven command finder (Blender's
-//! `F3` "search menu"). Lists every REGISTER operator from [`op::CATALOG`] by
+//! `F3` "search menu"). Lists every REGISTER operator from [`op::catalog()`] by
 //! label + category, filtered by a live text field; arrows move the highlight,
 //! Enter runs the highlighted op, Esc dismisses. The actual op dispatch happens
 //! at the call site ([`Ui::run_catalog_op`](crate::ui::Ui::run_catalog_op)) — a
@@ -44,9 +44,10 @@ pub fn operator_search_window(
     }
 
     // Filter the catalog by the live query (case-insensitive substring on label).
+    // `op::catalog()` projects the unified command registry's catalog ops.
     let q = state.search.to_lowercase();
-    let list: Vec<&'static CatalogOp> = op::CATALOG
-        .iter()
+    let list: Vec<CatalogOp> = op::catalog()
+        .into_iter()
         .filter(|c| q.is_empty() || c.label.to_lowercase().contains(&q))
         .collect();
 

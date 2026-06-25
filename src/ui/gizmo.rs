@@ -22,6 +22,7 @@ use glam::{Mat4, Vec3};
 use crate::renderer::camera::OrbitCamera;
 
 use super::panels::dist_point_segment;
+use super::tools::GizmoKind;
 use super::{ActiveTool, Axis, TransformKind};
 
 /// Pixel radius within which a press counts as grabbing a handle. Matches the P3a
@@ -81,13 +82,15 @@ pub trait GizmoGroup {
 }
 
 /// The gizmo group for the active tool, or `None` for tools that show no transform
-/// gizmo (Select / Aim / Measure / Add — those keep plain click-select in P3b).
+/// gizmo (Select / Aim / Measure / Add — those keep plain click-select in P3b). The
+/// tool→group mapping is data-driven: the tool's [`ToolDef`] declares a [`GizmoKind`]
+/// (C2 / P0 #10) and this projects it to the concrete group implementor.
 pub fn for_tool(tool: ActiveTool) -> Option<Box<dyn GizmoGroup>> {
-    match tool {
-        ActiveTool::Move => Some(Box::new(MoveGizmo)),
-        ActiveTool::Rotate => Some(Box::new(RotateGizmo)),
-        ActiveTool::Scale => Some(Box::new(ScaleGizmo)),
-        _ => None,
+    match tool.def().gizmo {
+        GizmoKind::Move => Some(Box::new(MoveGizmo)),
+        GizmoKind::Rotate => Some(Box::new(RotateGizmo)),
+        GizmoKind::Scale => Some(Box::new(ScaleGizmo)),
+        GizmoKind::None => None,
     }
 }
 

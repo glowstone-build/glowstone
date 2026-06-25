@@ -44,8 +44,8 @@ pub fn shortcuts_window(ctx: &egui::Context, open: &mut bool) {
                 let rows: Vec<(&str, String)> = shortcuts::KEYMAPS
                     .iter()
                     .flat_map(|km| km.items.iter())
-                    .filter(|kmi| kmi.category == cat)
-                    .map(|kmi| (kmi.label, shortcuts::key_label(&kmi.trigger)))
+                    .filter(|kmi| kmi.category() == cat)
+                    .map(|kmi| (kmi.label(), shortcuts::key_label(&kmi.trigger)))
                     .collect();
                 if rows.is_empty() {
                     continue;

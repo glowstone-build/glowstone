@@ -33,15 +33,64 @@ const LIMIT_STEPS: usize = 64;
 /// Soft cap on total snapshot bytes (~256 MB). Oldest steps drop past it.
 const LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
+/// One delta-compressed document blob (P0 #12): the `bincode` bytes behind a
+/// refcounted [`Arc<[u8]>`] plus a content hash. Two consecutive snapshots that
+/// left this sub-document untouched [`share`](Blob::share_unchanged) the SAME
+/// `Arc` (no re-store), so a one-fixture move doesn't clone the whole scene blob
+/// into both the `before` and `after` of every neighbouring step. Mirrors Blender
+/// memfile's chunk-sharing (the spec's "delta chunk-sharing", §2.6).
+#[derive(Clone)]
+struct Blob {
+    /// FNV-1a hash of `bytes`, compared first so sharing is O(1) before the Arc
+    /// pointer/equality work.
+    hash: u64,
+    bytes: Arc<[u8]>,
+}
+
+impl Blob {
+    /// Encode a serde value into a hashed blob. bincode of these serde types
+    /// cannot fail in practice (no custom impls that error); fall back to empty
+    /// bytes rather than panicking the editor — matching the prior `enc` closure.
+    fn encode<T: serde::Serialize>(value: &T) -> Blob {
+        let bytes = bincode::serialize(value).unwrap_or_default();
+        Blob { hash: fnv1a(&bytes), bytes: bytes.into() }
+    }
+
+    /// If `prev` holds byte-identical content (same hash AND bytes), adopt its
+    /// `Arc` so the two snapshots share one allocation. The hash gate makes the
+    /// common "unchanged" case a single integer compare; the `==` guards against
+    /// the (astronomically rare) hash collision so sharing is always sound.
+    fn share_unchanged(&mut self, prev: &Blob) {
+        if self.hash == prev.hash && self.bytes == prev.bytes {
+            self.bytes = Arc::clone(&prev.bytes);
+        }
+    }
+}
+
+/// FNV-1a 64-bit — a tiny, dependency-free content hash for the blob-sharing gate
+/// (#12). Not cryptographic; only used to skip the byte compare in the common
+/// unchanged case (a collision still falls back to the `==` check, so it's safe).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// An immutable picture of the whole mutable document at one instant. The four
-/// `Vec<u8>` blobs are positional `bincode` dumps of the same serde types the
-/// `.archie` format round-trips; [`gdtf`](Self::gdtf) carries the parsed-GDTF
-/// `Arc`s out of band (see the module docs — they are `serde(skip)`).
+/// blobs are positional `bincode` dumps of the same serde types the `.archie`
+/// format round-trips, each behind a delta-compressed [`Blob`] (#12) so unchanged
+/// sub-documents are shared between adjacent steps; [`gdtf`](Self::gdtf) carries
+/// the parsed-GDTF `Arc`s out of band (see the module docs — they are
+/// `serde(skip)`).
+#[derive(Clone)]
 pub struct DocSnapshot {
-    scene: Vec<u8>,
-    patch: Vec<u8>,
-    cues: Vec<u8>,
-    groups: Vec<u8>,
+    scene: Blob,
+    patch: Blob,
+    cues: Blob,
+    groups: Blob,
     /// Live selection (cheap; not serialized — just cloned).
     selection: Selection,
     /// Out-of-band parsed-GDTF handles, aligned to `scene.fixtures` order. A
@@ -50,9 +99,27 @@ pub struct DocSnapshot {
 }
 
 impl DocSnapshot {
-    /// Approximate retained size, for the byte-cap accounting.
+    /// Approximate retained size, for the byte-cap accounting. Note: this counts a
+    /// shared blob's bytes under EVERY snapshot that references it, so the cap is a
+    /// conservative (over-) estimate after delta-sharing — it never under-counts,
+    /// so the byte ceiling is still honoured.
     fn bytes(&self) -> usize {
-        self.scene.len() + self.patch.len() + self.cues.len() + self.groups.len()
+        self.scene.bytes.len()
+            + self.patch.bytes.len()
+            + self.cues.bytes.len()
+            + self.groups.bytes.len()
+    }
+
+    /// Delta-compress THIS snapshot against `prev` (the step end that immediately
+    /// precedes it in the timeline): each sub-document whose bytes are unchanged
+    /// adopts `prev`'s `Arc`, so the two share one allocation (#12). Called by the
+    /// stack right before a snapshot is stored, with `prev` = the current top
+    /// step's `after` (the document state this snapshot follows from).
+    fn share_unchanged_from(&mut self, prev: &DocSnapshot) {
+        self.scene.share_unchanged(&prev.scene);
+        self.patch.share_unchanged(&prev.patch);
+        self.cues.share_unchanged(&prev.cues);
+        self.groups.share_unchanged(&prev.groups);
     }
 }
 
@@ -66,14 +133,11 @@ pub fn capture(
     groups: &[SelectionGroup],
     selection: &Selection,
 ) -> DocSnapshot {
-    // bincode of these serde types cannot fail in practice (no custom impls that
-    // error); fall back to empty blobs rather than panicking the editor.
-    let enc = |r: Result<Vec<u8>, _>| r.unwrap_or_default();
     DocSnapshot {
-        scene: enc(bincode::serialize(scene)),
-        patch: enc(bincode::serialize(patch)),
-        cues: enc(bincode::serialize(cues)),
-        groups: enc(bincode::serialize(&groups.to_vec())),
+        scene: Blob::encode(scene),
+        patch: Blob::encode(patch),
+        cues: Blob::encode(cues),
+        groups: Blob::encode(&groups.to_vec()),
         selection: selection.clone(),
         gdtf: scene.fixtures.iter().map(|f| f.gdtf.clone()).collect(),
     }
@@ -90,20 +154,20 @@ impl DocSnapshot {
         groups: &mut Vec<SelectionGroup>,
         selection: &mut Selection,
     ) {
-        if let Ok(s) = bincode::deserialize::<Scene>(&self.scene) {
+        if let Ok(s) = bincode::deserialize::<Scene>(&self.scene.bytes) {
             *scene = s;
             // The undo snapshot serde-roundtripped → every EntityId is now 0.
             // Reseed stable ids so the outliner's expand-state/selection keyed by
             // id survive an undo/redo (same serde-skip trap as Fixture.gdtf).
             scene.ensure_ids();
         }
-        if let Ok(p) = bincode::deserialize::<PatchTable>(&self.patch) {
+        if let Ok(p) = bincode::deserialize::<PatchTable>(&self.patch.bytes) {
             *patch = p;
         }
-        if let Ok(c) = bincode::deserialize::<CueEngine>(&self.cues) {
+        if let Ok(c) = bincode::deserialize::<CueEngine>(&self.cues.bytes) {
             *cues = c;
         }
-        if let Ok(g) = bincode::deserialize::<Vec<SelectionGroup>>(&self.groups) {
+        if let Ok(g) = bincode::deserialize::<Vec<SelectionGroup>>(&self.groups.bytes) {
             *groups = g;
         }
         // Reattach the GDTF handles the bincode dropped, in fixture order, then
@@ -134,6 +198,68 @@ pub struct UndoStack {
     last_op: Option<LastOp>,
 }
 
+// ===========================================================================
+// Interactive transaction (P0 #13) — begin → preview → finalize / cancel.
+//
+// A DRAG gesture (gizmo handle, inspector slider/DragValue) wants ONE undo step
+// for the whole gesture, not one-per-frame and not none. The pattern, adopted
+// from Unreal's `FScopedTransaction` + `SnapshotObject` (spec §2.6): on
+// drag-START capture the `before` document ONCE; each frame the widget mutates
+// the live document directly (the "preview" — no push, the viewport already
+// re-renders from the live scene); on RELEASE push exactly one (before, after)
+// step; on cancel/abort drop `before` (the live doc is left as-is, or the caller
+// restores it). The viewport's modal G/R/S transform already follows this shape
+// via `Ui::transform_before`; [`DragTx`] generalises it for the inspector drags
+// (and any future interactive editor) behind a tiny owned handle.
+// ===========================================================================
+
+/// An in-flight interactive edit (#13): holds the `before` snapshot captured at
+/// drag-start, plus the undo-step label to push on finalize. Lives on
+/// [`Ui`](super::Ui) for the duration of one drag gesture; `None` between
+/// gestures. Preview frames mutate the live document directly and touch this not
+/// at all — only begin (construct), finalize (push), and cancel (drop) do.
+pub struct DragTx {
+    /// The document state at drag-start — the step's `before` end.
+    before: DocSnapshot,
+    /// Undo-step name + last-op id/label to record when the gesture finalizes.
+    label: &'static str,
+    op_id: &'static str,
+}
+
+impl DragTx {
+    /// Begin a transaction: snapshot the current document as the `before` end. The
+    /// caller passes the already-captured snapshot (it holds the doc borrows).
+    pub fn begin(before: DocSnapshot, op_id: &'static str, label: &'static str) -> DragTx {
+        DragTx { before, op_id, label }
+    }
+}
+
+impl UndoStack {
+    /// Finalize an interactive [`DragTx`] (#13): push ONE (before, after) step for
+    /// the whole gesture and record it as the last op. `after` is the live
+    /// post-drag document (captured by the caller, which holds the borrows).
+    pub fn finalize_drag(&mut self, tx: DragTx, after: DocSnapshot) {
+        self.push(tx.label, tx.before, after);
+        self.set_last_op(tx.op_id, tx.label);
+    }
+
+    /// Cancel an interactive [`DragTx`] (#13): restore the `before` end into the
+    /// live document and push nothing. For gestures that need an explicit revert
+    /// (Esc); a plain abort can just drop the `DragTx` instead.
+    #[allow(dead_code)]
+    pub fn cancel_drag(
+        &mut self,
+        tx: DragTx,
+        scene: &mut Scene,
+        patch: &mut PatchTable,
+        cues: &mut CueEngine,
+        groups: &mut Vec<SelectionGroup>,
+        selection: &mut Selection,
+    ) {
+        tx.before.restore(scene, patch, cues, groups, selection);
+    }
+}
+
 impl UndoStack {
     /// Capture the document state to use as a step's `before` end. Call this
     /// BEFORE running a mutation, then pair it with [`push`](Self::push) after.
@@ -151,9 +277,18 @@ impl UndoStack {
     /// Record a finished edit: `before` (from [`begin`](Self::begin)) and `after`
     /// (the post-mutation state). Truncates the redo tail, then enforces the step
     /// + byte caps by dropping from the oldest end.
-    pub fn push(&mut self, name: impl Into<String>, before: DocSnapshot, after: DocSnapshot) {
+    pub fn push(&mut self, name: impl Into<String>, mut before: DocSnapshot, mut after: DocSnapshot) {
         // Drop any redo tail past the cursor — a new edit forks the history.
         self.steps.truncate(self.cursor);
+        // Delta-compress along the timeline (#12): a new step's `before` is the
+        // SAME document the prior step ended at, so share every unchanged blob with
+        // the prior `after`; then this step's `after` shares its unchanged blobs
+        // with its own `before`. A one-fixture edit thus stores ONE fresh scene
+        // blob across the whole burst instead of cloning it into every snapshot.
+        if let Some(prev) = self.steps.last() {
+            before.share_unchanged_from(&prev.after);
+        }
+        after.share_unchanged_from(&before);
         self.steps.push(UndoStep { name: name.into(), before, after });
         self.cursor = self.steps.len();
         self.enforce_limits();
@@ -165,11 +300,14 @@ impl UndoStack {
     /// [`push`](Self::push)es a step, each follow-up nudge amends its `after` so
     /// one undo reverts the whole burst back to the pre-burst `before`. No-op when
     /// the cursor isn't at the top (a redo tail exists / nothing pushed yet).
-    pub fn amend_after(&mut self, after: DocSnapshot) -> bool {
+    pub fn amend_after(&mut self, mut after: DocSnapshot) -> bool {
         if self.cursor == 0 || self.cursor != self.steps.len() {
             return false;
         }
         if let Some(step) = self.steps.last_mut() {
+            // Share unchanged blobs with the step's own `before` (#12) so a long
+            // coalesced burst doesn't re-store the untouched sub-documents.
+            after.share_unchanged_from(&step.before);
             step.after = after;
             self.enforce_limits();
             true
@@ -404,15 +542,18 @@ impl UndoStack {
 }
 
 // ===========================================================================
-// The operator catalog (P1d) — the searchable registry of REGISTER operators.
+// The operator catalog (P1d) — now a VIEW over the unified command registry.
 //
-// The migrated mutators are inline closures at their commit sites in
-// `Ui::show` (they need egui / dialog state the catalog can't hold), so the
-// catalog does NOT own the closures: it is a static table of *descriptors*
-// (id + label + category + how to invoke) that the F3 operator-search palette
-// and the F9 adjust-last affordance render + dispatch. `Ui::run_catalog_op`
-// maps a descriptor's `id` back to the real run-site (direct run vs re-open the
-// op's dialog), so there is still exactly ONE place each op actually executes.
+// Since C1 the catalog is no longer its own static table: a "catalog op" is just
+// a [`shortcuts::Command`] that carries an [`OpInvoke`] (`invoke.is_some()`). The
+// migrated mutators are still inline closures at their commit sites in `Ui::show`
+// (they need egui / dialog state a descriptor can't hold) — the catalog only
+// holds *descriptors* (id + label + category + how to invoke) that the F3
+// operator-search palette + the F9 adjust-last affordance render + dispatch.
+// `Ui::run_catalog_op` maps a descriptor's `id` back to the real run-site (direct
+// run vs re-open the op's dialog), so there is still exactly ONE place each op
+// actually executes. The [`OpInvoke`] type lives here (next to the pipeline it
+// drives); the registry re-exports it as `shortcuts::OpInvoke`.
 // ===========================================================================
 
 /// How the operator-search palette / adjust-last affordance should INVOKE a
@@ -427,9 +568,10 @@ pub enum OpInvoke {
     Dialog,
 }
 
-/// A searchable / re-invokable operator descriptor. Mirrors the `id` / `label` a
-/// [`ClosureOp`] carries at its run site, plus the cheat-sheet [`category`] and
-/// the [`invoke`] kind the palette + F9 use to dispatch it.
+/// A searchable / re-invokable operator descriptor — the catalog projection of a
+/// [`Command`](super::shortcuts::Command) that carries an [`OpInvoke`]. The fields
+/// mirror the command's `id` / `label` / `category` plus the resolved `invoke`
+/// kind the palette + F9 use to dispatch it.
 #[derive(Clone, Copy)]
 pub struct CatalogOp {
     pub id: &'static str,
@@ -438,46 +580,28 @@ pub struct CatalogOp {
     pub invoke: OpInvoke,
 }
 
-/// Every REGISTER operator the F3 search palette lists, in display order. The
-/// `id`s match the ones the run sites pass to [`Ui::run_op`](super::Ui::run_op),
-/// so [`Ui::run_catalog_op`](super::Ui::run_catalog_op) can route each back to
-/// its single real invocation point.
-pub static CATALOG: &[CatalogOp] = &[
-    CatalogOp {
-        id: "object.add",
-        label: "Add Object…",
-        category: super::shortcuts::Category::Add,
-        invoke: OpInvoke::Dialog,
-    },
-    CatalogOp {
-        id: "fixture.duplicate",
-        label: "Duplicate / Array…",
-        category: super::shortcuts::Category::Object,
-        invoke: OpInvoke::Dialog,
-    },
-    CatalogOp {
-        id: "fixture.patch",
-        label: "Patch Fixtures…",
-        category: super::shortcuts::Category::Object,
-        invoke: OpInvoke::Dialog,
-    },
-    CatalogOp {
-        id: "fixture.unpatch",
-        label: "Unpatch Fixtures",
-        category: super::shortcuts::Category::Object,
-        invoke: OpInvoke::Direct,
-    },
-    CatalogOp {
-        id: "object.delete",
-        label: "Delete Selected",
-        category: super::shortcuts::Category::Object,
-        invoke: OpInvoke::Direct,
-    },
-];
+impl CatalogOp {
+    /// Project a registry [`Command`](super::shortcuts::Command) carrying an
+    /// `invoke` into a catalog descriptor.
+    fn from_command(c: &super::shortcuts::Command) -> Option<CatalogOp> {
+        c.invoke.map(|invoke| CatalogOp { id: c.id, label: c.label, category: c.category, invoke })
+    }
+}
 
-/// Look up a catalog entry by its operator `id` (for F9 adjust-last).
-pub fn catalog_op(id: &str) -> Option<&'static CatalogOp> {
-    CATALOG.iter().find(|c| c.id == id)
+/// Every REGISTER operator the F3 search palette lists, in registry display order
+/// — built once from the unified [`COMMANDS`](super::shortcuts::COMMANDS) table
+/// (every command with an `invoke` kind). The `id`s match the ones the run sites
+/// pass to [`Ui::run_op`](super::Ui::run_op), so
+/// [`Ui::run_catalog_op`](super::Ui::run_catalog_op) routes each back to its
+/// single real invocation point.
+pub fn catalog() -> Vec<CatalogOp> {
+    super::shortcuts::COMMANDS.iter().filter_map(CatalogOp::from_command).collect()
+}
+
+/// Look up a catalog entry by its operator `id` (for F9 adjust-last) — resolves
+/// the registry [`Command`](super::shortcuts::Command) and projects it.
+pub fn catalog_op(id: &str) -> Option<CatalogOp> {
+    super::shortcuts::command(id).and_then(CatalogOp::from_command)
 }
 
 #[cfg(test)]
@@ -711,8 +835,9 @@ mod tests {
         assert_eq!(catalog_op("object.delete").map(|c| c.invoke), Some(OpInvoke::Direct));
         assert_eq!(catalog_op("fixture.unpatch").map(|c| c.invoke), Some(OpInvoke::Direct));
         // No duplicate ids in the catalog (the palette would list one twice).
-        for (i, a) in CATALOG.iter().enumerate() {
-            for b in CATALOG.iter().skip(i + 1) {
+        let cat = catalog();
+        for (i, a) in cat.iter().enumerate() {
+            for b in cat.iter().skip(i + 1) {
                 assert_ne!(a.id, b.id, "duplicate catalog id {}", a.id);
             }
         }
@@ -743,5 +868,139 @@ mod tests {
             assert!(stack.amend_after(after), "amends the top step in place");
         }
         assert_eq!(stack.steps.len(), 1, "burst coalesced into one step");
+    }
+
+    /// #12: a step that only changed the GROUPS shares its scene/patch/cues blob
+    /// `Arc`s with the prior step's `after` (delta compression — the unchanged
+    /// 500-fixture scene isn't re-stored), while the changed groups blob is fresh.
+    #[test]
+    fn delta_snapshot_shares_unchanged_blobs() {
+        let mut scene = Scene::default();
+        scene.fixtures.push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
+        let patch = PatchTable::default();
+        let cues = CueEngine::default();
+        let mut groups: Vec<SelectionGroup> = Vec::new();
+        let selection = Selection::default();
+        let mut stack = UndoStack::default();
+
+        // Step 1: an edit that leaves everything as-is (a no-op base step).
+        let b0 = stack.begin(&scene, &patch, &cues, &groups, &selection);
+        let a0 = stack.begin(&scene, &patch, &cues, &groups, &selection);
+        stack.push("base", b0, a0);
+
+        // Step 2: change ONLY the groups, leaving scene/patch/cues untouched.
+        let b1 = stack.begin(&scene, &patch, &cues, &groups, &selection);
+        groups.push(SelectionGroup { name: "G".into(), fixtures: vec![0] });
+        let a1 = stack.begin(&scene, &patch, &cues, &groups, &selection);
+        stack.push("group", b1, a1);
+
+        let prev = &stack.steps[0].after; // the document state step 2 follows from
+        let cur_b = &stack.steps[1].before;
+        let cur_a = &stack.steps[1].after;
+
+        // The unchanged sub-documents share the prior step's allocations…
+        assert!(Arc::ptr_eq(&cur_b.scene.bytes, &prev.scene.bytes), "scene blob shared");
+        assert!(Arc::ptr_eq(&cur_b.patch.bytes, &prev.patch.bytes), "patch blob shared");
+        assert!(Arc::ptr_eq(&cur_b.cues.bytes, &prev.cues.bytes), "cues blob shared");
+        // …and within step 2, `after`'s scene still shares (only groups changed).
+        assert!(Arc::ptr_eq(&cur_a.scene.bytes, &cur_b.scene.bytes), "scene shared across step ends");
+        // The groups blob actually changed between the two ends → NOT shared.
+        assert!(!Arc::ptr_eq(&cur_a.groups.bytes, &cur_b.groups.bytes), "changed groups blob is fresh");
+    }
+
+    /// #12: delta-sharing is transparent to undo/redo — restoring a step whose
+    /// scene blob is shared with a neighbour still reproduces the document exactly.
+    #[test]
+    fn delta_shared_blob_restores_correctly() {
+        let mut scene = Scene::default();
+        let mut patch = PatchTable::default();
+        let mut cues = CueEngine::default();
+        let mut groups: Vec<SelectionGroup> = Vec::new();
+        let mut selection = Selection::default();
+        let mut stack = UndoStack::default();
+        let base = scene.fixtures.len(); // Scene::default() is the demo rig (non-empty).
+
+        // Step 1: add a fixture (scene changes).
+        let b0 = stack.begin(&scene, &patch, &cues, &groups, &selection);
+        scene.fixtures.push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
+        let a0 = stack.begin(&scene, &patch, &cues, &groups, &selection);
+        stack.push("add", b0, a0);
+
+        // Step 2: change only the groups (scene blob will be shared with step 1).
+        let b1 = stack.begin(&scene, &patch, &cues, &groups, &selection);
+        groups.push(SelectionGroup { name: "G".into(), fixtures: vec![0] });
+        let a1 = stack.begin(&scene, &patch, &cues, &groups, &selection);
+        stack.push("group", b1, a1);
+        assert!(Arc::ptr_eq(&stack.steps[1].after.scene.bytes, &stack.steps[0].after.scene.bytes));
+
+        // Undo step 2 → scene unchanged (still has the added fixture), groups reverted.
+        stack.undo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        assert_eq!(scene.fixtures.len(), base + 1, "shared scene blob restored intact");
+        assert!(groups.is_empty(), "groups reverted");
+        // Undo step 1 → added fixture gone.
+        stack.undo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        assert_eq!(scene.fixtures.len(), base);
+        // Redo both → back to the added fixture (shared blob redoes intact).
+        stack.redo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        stack.redo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        assert_eq!(scene.fixtures.len(), base + 1);
+    }
+
+    /// #13: an interactive [`DragTx`] gesture pushes EXACTLY ONE undo step on
+    /// finalize regardless of how many preview frames mutated the document, and a
+    /// single undo reverts the whole gesture back to the pre-drag state.
+    #[test]
+    fn drag_transaction_is_one_step() {
+        let mut scene = Scene::default();
+        scene.fixtures.push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
+        let mut patch = PatchTable::default();
+        let mut cues = CueEngine::default();
+        let mut groups: Vec<SelectionGroup> = Vec::new();
+        let mut selection = Selection::default();
+        let mut stack = UndoStack::default();
+
+        let start_x = scene.fixtures[0].position.x;
+
+        // Drag START: capture `before` once.
+        let before = capture(&scene, &patch, &cues, &groups, &selection);
+        let tx = DragTx::begin(before, "inspector.edit", "Edit Value");
+
+        // Preview frames: mutate the live doc directly, NO pushes.
+        for i in 1..=10 {
+            scene.fixtures[0].position.x = i as f32;
+            assert_eq!(stack.steps.len(), 0, "preview frames push nothing");
+        }
+
+        // Drag RELEASE: finalize → exactly one step.
+        let after = capture(&scene, &patch, &cues, &groups, &selection);
+        stack.finalize_drag(tx, after);
+        assert_eq!(stack.steps.len(), 1, "one step for the whole gesture");
+        assert_eq!(stack.last_op().map(|l| l.id), Some("inspector.edit"));
+
+        // One undo reverts the entire drag back to the pre-drag value.
+        stack.undo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        assert_eq!(scene.fixtures[0].position.x, start_x, "drag fully reverted in one undo");
+    }
+
+    /// #13: `cancel_drag` restores the pre-drag document and pushes nothing (the
+    /// Esc-abort path).
+    #[test]
+    fn drag_transaction_cancel_restores() {
+        let mut scene = Scene::default();
+        scene.fixtures.push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
+        let mut patch = PatchTable::default();
+        let mut cues = CueEngine::default();
+        let mut groups: Vec<SelectionGroup> = Vec::new();
+        let mut selection = Selection::default();
+        let mut stack = UndoStack::default();
+
+        scene.fixtures[0].position.x = 5.0;
+        let before = capture(&scene, &patch, &cues, &groups, &selection);
+        let tx = DragTx::begin(before, "inspector.edit", "Edit Value");
+        scene.fixtures[0].position.x = 42.0; // preview
+
+        stack.cancel_drag(tx, &mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        assert_eq!(stack.steps.len(), 0, "cancel pushes nothing");
+        assert_eq!(scene.fixtures[0].position.x, 5.0, "cancel restored pre-drag value");
     }
 }

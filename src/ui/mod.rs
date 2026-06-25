@@ -418,6 +418,12 @@ pub struct Ui {
     /// began / just confirmed this frame. Transient — not serialized.
     transform_started: bool,
     transform_finished: bool,
+    /// In-flight inspector slider/DragValue drag transaction (#13): captured at
+    /// drag-start, pushed as ONE undo step on release. `None` between gestures.
+    inspector_tx: Option<op::DragTx>,
+    /// Per-frame drag edges the inspector reports (read after the dock) to drive
+    /// the `inspector_tx` begin/finalize. Transient — not serialized.
+    inspector_edit: panels::InspectorEdit,
     /// Timestamp of the last arrow-key nudge — a fresh nudge within
     /// [`NUDGE_COALESCE`] of it extends the top undo step instead of pushing a new
     /// one, so holding an arrow key collapses into a single undo. `None` = no
@@ -552,6 +558,8 @@ impl Ui {
             transform_before: None,
             transform_started: false,
             transform_finished: false,
+            inspector_tx: None,
+            inspector_edit: panels::InspectorEdit::default(),
             last_nudge: None,
             pending_nudge: Vec3::ZERO,
             groups: Vec::new(),
@@ -1473,6 +1481,10 @@ impl Ui {
         self.menu_bar(ctx, scene, camera, dmx);
         self.status_bar(ctx, scene, dmx, fps);
 
+        // Reset the per-frame inspector drag edges before the dock OR-accumulates
+        // this frame's signals into them (#13).
+        self.inspector_edit = panels::InspectorEdit::default();
+
         // One call hands back all the disjoint DMX borrows the panels need.
         let dmxv = dmx.view();
         let mut viewer = PanelViewer {
@@ -1499,6 +1511,7 @@ impl Ui {
             transform: &mut self.transform,
             transform_started: &mut self.transform_started,
             transform_finished: &mut self.transform_finished,
+            inspector_edit: &mut self.inspector_edit,
             groups: &mut self.groups,
             group_name: &mut self.group_name,
             cues: &mut self.cues,
@@ -1545,6 +1558,22 @@ impl Ui {
             // drag has no `TransformOp` in flight, so guard on `aim.active()` too or its
             // mid-drag frames would drop the pending snapshot before the release commit.
             self.transform_before = None;
+        }
+
+        // Inspector slider/DragValue undo transaction (#13): the inspector edits the
+        // scene live each frame (no push) — the same begin→preview→finalize shape as
+        // the gizmo. On drag-START snapshot `before` into `inspector_tx`; on RELEASE
+        // push ONE step for the whole gesture. A drag both starting AND stopping in
+        // one frame (a tiny nudge) still gets begin-then-finalize in order.
+        if self.inspector_edit.started {
+            let before = self.undo_begin(scene, dmx.patch());
+            self.inspector_tx = Some(op::DragTx::begin(before, "inspector.edit", "Edit Value"));
+        }
+        if self.inspector_edit.stopped
+            && let Some(tx) = self.inspector_tx.take()
+        {
+            let after = self.undo_begin(scene, dmx.patch());
+            self.undo.finalize_drag(tx, after);
         }
 
         // Commit a requested delete now (viewer borrows released): the patch is
@@ -1652,7 +1681,7 @@ impl Ui {
         // window borrows `self.op_search` mutably, so `op_runnable`'s `&self` read
         // can't be live inside the closure) and dispatch the chosen op afterwards.
         let runnable: Vec<(&'static str, bool)> =
-            op::CATALOG.iter().map(|c| (c.id, self.op_runnable(c.id))).collect();
+            op::catalog().iter().map(|c| (c.id, self.op_runnable(c.id))).collect();
         let picked = windows::operator_search_window(ctx, &mut self.op_search, |id| {
             runnable.iter().find(|(cid, _)| *cid == id).map(|(_, ok)| *ok).unwrap_or(false)
         });
@@ -2712,6 +2741,9 @@ struct PanelViewer<'a> {
     /// Per-frame signals the viewport sets for the modal-transform undo wiring.
     transform_started: &'a mut bool,
     transform_finished: &'a mut bool,
+    /// Per-frame drag edges the inspector reports for the slider-drag undo
+    /// transaction (#13). Read after the dock to begin/finalize `inspector_tx`.
+    inspector_edit: &'a mut panels::InspectorEdit,
     groups: &'a mut Vec<SelectionGroup>,
     group_name: &'a mut String,
     cues: &'a mut cues::CueEngine,
@@ -2825,6 +2857,7 @@ impl TabViewer for PanelViewer<'_> {
                         .resizable(true)
                         .default_width(260.0)
                         .show_inside(ui, |ui| {
+                            let mut e = panels::InspectorEdit::default();
                             panels::inspector(
                                 ui,
                                 self.scene,
@@ -2833,7 +2866,12 @@ impl TabViewer for PanelViewer<'_> {
                                 self.gdtf_textures,
                                 self.profile,
                                 self.screen_sources,
+                                &mut e,
                             );
+                            // OR into the shared edge flags (N-panel + Inspector
+                            // tab can both render; only one is dragged at a time).
+                            self.inspector_edit.started |= e.started;
+                            self.inspector_edit.stopped |= e.stopped;
                         });
                 }
                 panels::viewport(
@@ -2886,7 +2924,10 @@ impl TabViewer for PanelViewer<'_> {
                 self.open_share,
             ),
             Tab::Inspector => {
-                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources)
+                let mut e = panels::InspectorEdit::default();
+                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, &mut e);
+                self.inspector_edit.started |= e.started;
+                self.inspector_edit.stopped |= e.stopped;
             }
             Tab::DmxMonitor => panels::dmx_universe_grid(
                 ui,
