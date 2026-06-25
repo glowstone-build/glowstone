@@ -1,10 +1,12 @@
 //! egui + egui_dock setup: the dock layout and the [`TabViewer`] that routes
 //! each dock panel to its drawing function in [`panels`].
 
+mod bookmarks;
 mod cues;
 mod editor;
 mod gizmo;
 mod lib_prefs;
+pub mod nav_gizmo;
 mod notify;
 pub(crate) mod op;
 mod panels;
@@ -226,6 +228,12 @@ pub struct TransformOp {
     /// Blender's "click-a-handle overrides the typed constraint" behaviour. Not
     /// serialized (TransformOp is never persisted).
     pub gizmo_hovered_axis: Option<Axis>,
+    /// Set when a Move op was started by grabbing a screen-space PLANE handle: the
+    /// plane *normal* (the axis held FIXED). The drag then slides on the other two
+    /// axes via a `ray_plane_point` absolute drag (the handle sticks to the cursor),
+    /// instead of the single-axis projection a `gizmo_hovered_axis` lock drives.
+    /// Mutually exclusive with `gizmo_hovered_axis`. Not serialized.
+    pub gizmo_plane_normal: Option<Axis>,
     /// True when the op was started by dragging a screen-space gizmo handle (vs the
     /// modal G/R/S keys). A gizmo drag is driven by `drag_delta` and committed on
     /// pointer release; a modal op is driven by absolute mouse position and
@@ -497,6 +505,11 @@ pub struct Ui {
     /// shared by the Library browser and the Add menu. Loaded once at startup,
     /// saved (synchronously, tiny payload) on each add/star toggle.
     lib_prefs: lib_prefs::LibraryPrefs,
+    /// Numbered view/camera bookmarks (P1 #34): saved camera poses recalled with an
+    /// eased jump. Persisted to `bookmarks.json` in the config dir (loaded once at
+    /// startup, saved on each save/delete). Reachable from the Window menu strip +
+    /// the registered `view.bookmark_*` commands (F3 palette / keymap).
+    bookmarks: bookmarks::Bookmarks,
     /// Runtime keymap overrides (S1): a rebind/disable/add layer over the static
     /// [`shortcuts::KEYMAPS`] defaults, persisted to `keymap.json` in the config
     /// dir. EMPTY by default ⇒ the app dispatches exactly the shipped binds. Loaded
@@ -617,6 +630,7 @@ impl Ui {
             xform: TransformPrefs::default(),
             cursor_3d: Vec3::ZERO,
             lib_prefs: lib_prefs::LibraryPrefs::load(),
+            bookmarks: bookmarks::Bookmarks::load(),
             keymap_overrides: shortcuts::KeymapOverrides::load(),
             keymap_editor: windows::KeymapEditorState::default(),
             measure: panels::MeasureState::default(),
@@ -2074,6 +2088,17 @@ impl Ui {
                 let anchor = ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
                 self.view_pie.open_at(anchor);
             }
+            // --- View bookmarks (P1 #34) ---------------------------------------
+            // Save the live camera pose into the next free numbered slot; recall a
+            // slot eases the camera there (`apply_pose` reuses `animate_to`).
+            Action::SaveBookmark => match self.bookmarks.save_pose(camera.pose()) {
+                Some(slot) => self.notify.success(format!("Saved view bookmark {slot}")),
+                None => self.notify.warn("All view bookmark slots are full"),
+            },
+            Action::RecallBookmark(slot) => match self.bookmarks.pose_in_slot(slot) {
+                Some(pose) => camera.apply_pose(&pose),
+                None => self.notify.info(format!("View bookmark {slot} is empty")),
+            },
             Action::ToggleLabels => self.prefs.show_labels = !self.prefs.show_labels,
             // N / T — toggle the viewport's side regions (§2.2). Viewport-only
             // binds (the keymap stack already gates them to a focused viewport
@@ -2444,6 +2469,43 @@ impl Ui {
                             if ui.button(name).clicked() {
                                 self.dock = Self::workspace_dock(ws);
                                 ui.close();
+                            }
+                        }
+                    });
+                    // View bookmarks strip (P1 #34): save the current shot to the next
+                    // free numbered slot; recall (eased) or delete a saved slot.
+                    ui.menu_button(format!("{}  View Bookmarks", icon::CAMERA), |ui| {
+                        let full = self.bookmarks.next_free_slot().is_none();
+                        if ui
+                            .add_enabled(!full, egui::Button::new(format!("{}  Save Current View", icon::FRAME)))
+                            .clicked()
+                        {
+                            if let Some(slot) = self.bookmarks.save_pose(camera.pose()) {
+                                self.notify.success(format!("Saved view bookmark {slot}"));
+                            }
+                            ui.close();
+                        }
+                        if self.bookmarks.items.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("No saved views").small().weak());
+                        } else {
+                            ui.separator();
+                            // Snapshot the slots so the recall/delete borrow doesn't
+                            // overlap the iteration over `self.bookmarks.items`.
+                            let rows: Vec<(usize, String)> =
+                                self.bookmarks.items.iter().map(|b| (b.slot, b.name.clone())).collect();
+                            for (slot, name) in rows {
+                                ui.horizontal(|ui| {
+                                    if ui.button(format!("{slot}.  {name}")).clicked() {
+                                        if let Some(pose) = self.bookmarks.pose_in_slot(slot) {
+                                            camera.apply_pose(&pose);
+                                        }
+                                        ui.close();
+                                    }
+                                    if ui.small_button(icon::TRASH).on_hover_text("Delete bookmark").clicked() {
+                                        self.bookmarks.delete_slot(slot);
+                                    }
+                                });
                             }
                         }
                     });
@@ -3212,6 +3274,13 @@ mod tests {
         assert!(run(Action::Redo, noop).3, "Redo routes through dispatch_action");
         assert!(run(Action::AdjustLast, noop).3, "AdjustLast routes through dispatch_action");
         assert!(run(Action::New, noop).3, "New routes through dispatch_action");
+
+        // --- View bookmarks (P1 #34): save fills a slot; recall eases the camera. ---
+        let (ui, _, _, h) = run(Action::SaveBookmark, noop);
+        assert!(h && ui.bookmarks.pose_in_slot(1).is_some(), "SaveBookmark fills slot 1");
+        // Recall an empty slot is a handled no-op (just a notify); recall a saved one
+        // routes (the camera mutation is exercised by the camera-side pose tests).
+        assert!(run(Action::RecallBookmark(1), noop).3, "RecallBookmark routes (empty slot)");
 
         // --- Viewport-owned: NOT handled here (dispatched in panels::viewport). ---
         assert!(!run(Action::Transform(TransformKind::Move), noop).3, "Transform is viewport-owned");

@@ -45,6 +45,12 @@ pub enum Action {
     OrbitStep(f32, f32),
     /// `~` (backtick) — open the radial View pie at the cursor. Wired in S3.
     ViewPie,
+    /// Save the current camera pose into the next free numbered bookmark slot
+    /// (P1 #34). Impl in `Ui::dispatch_action`.
+    SaveBookmark,
+    /// Recall the camera bookmark in the given 1-based slot (eased jump). A
+    /// `Recall view bookmark N` command per slot is registered for the palette/keymap.
+    RecallBookmark(usize),
     ToggleLabels,
     // Selection.
     SelectAll,
@@ -351,6 +357,19 @@ pub static COMMANDS: &[Command] = &[
     command_row("view.orbit_left", "Orbit left", Category::View, Action::OrbitStep(-15.0, 0.0)),
     command_row("view.orbit_right", "Orbit right", Category::View, Action::OrbitStep(15.0, 0.0)),
     command_row("view.pie", "View pie (radial)", Category::View, Action::ViewPie),
+    // --- View bookmarks (P1 #34): save the live pose to the next free slot, recall
+    // a numbered slot with an eased jump. One recall command per slot so each gets a
+    // stable id the F3 palette lists + the keymap can bind. ---
+    command_row("view.bookmark_save", "Save view bookmark", Category::View, Action::SaveBookmark),
+    command_row("view.bookmark_recall_1", "Recall view bookmark 1", Category::View, Action::RecallBookmark(1)),
+    command_row("view.bookmark_recall_2", "Recall view bookmark 2", Category::View, Action::RecallBookmark(2)),
+    command_row("view.bookmark_recall_3", "Recall view bookmark 3", Category::View, Action::RecallBookmark(3)),
+    command_row("view.bookmark_recall_4", "Recall view bookmark 4", Category::View, Action::RecallBookmark(4)),
+    command_row("view.bookmark_recall_5", "Recall view bookmark 5", Category::View, Action::RecallBookmark(5)),
+    command_row("view.bookmark_recall_6", "Recall view bookmark 6", Category::View, Action::RecallBookmark(6)),
+    command_row("view.bookmark_recall_7", "Recall view bookmark 7", Category::View, Action::RecallBookmark(7)),
+    command_row("view.bookmark_recall_8", "Recall view bookmark 8", Category::View, Action::RecallBookmark(8)),
+    command_row("view.bookmark_recall_9", "Recall view bookmark 9", Category::View, Action::RecallBookmark(9)),
     command_row("view.toggle_n_panel", "Toggle N-panel (sidebar)", Category::View, Action::ToggleNPanel),
     command_row("view.toggle_t_panel", "Toggle T-panel (tool rail)", Category::View, Action::ToggleTPanel),
     // --- Selection ---

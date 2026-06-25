@@ -8,6 +8,7 @@ use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 
 use super::gizmo::{self, GizmoCtx, Handle};
+use super::nav_gizmo;
 use super::shortcuts;
 use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
@@ -2562,9 +2563,8 @@ fn ray_axis_closest_point(ro: Vec3, rd: Vec3, p: Vec3, axis: Vec3) -> Vec3 {
 /// #40 absolute drag for a PLANE-constrained / screen-plane Move (and a building
 /// block for future two-axis gizmo handles). Returns the world hit, or `None` when
 /// the ray is parallel to the plane (or points away from it: `t ≤ 0`).
-// Provided + unit-tested now; wired in once the gizmo grows plane handles (the
-// current Move gizmo only exposes single-axis arrows → ray_axis_closest_point).
-#[allow(dead_code)]
+// Drives the move gizmo's PLANE handles (#S2): the absolute two-axis drag that keeps
+// the grabbed quad stuck to the cursor while the off-plane axis stays fixed.
 fn ray_plane_point(ro: Vec3, rd: Vec3, p: Vec3, normal: Vec3) -> Option<Vec3> {
     let n = normal.normalize_or_zero();
     let denom = rd.dot(n);
@@ -2667,6 +2667,23 @@ fn apply_transform(
                 // expressed in the active basis — world X for Global).
                 let a = axis.map(axis_dir).unwrap_or_else(|| basis * Vec3::X);
                 a * amount
+            } else if let Some(normal) = op.gizmo_plane_normal.filter(|_| op.from_gizmo && op.viewport.area() > 0.0) {
+                // PLANE handle (#S2): intersect the start + live cursor rays with the
+                // plane through the pivot whose normal is the held axis (in the active
+                // orientation), and take the difference. The off-plane axis stays fixed
+                // (the delta lies in the plane), and the grabbed quad STICKS to the
+                // cursor at any camera angle. Falls back to no motion if either ray
+                // misses (grazing the plane edge-on).
+                let n = axis_dir(normal);
+                let (ro0, rd0) = ray_at(op.start_screen);
+                let (ro1, rd1) = ray_at(cur);
+                match (
+                    ray_plane_point(ro0, rd0, op.pivot, n),
+                    ray_plane_point(ro1, rd1, op.pivot, n),
+                ) {
+                    (Some(from), Some(to)) => to - from,
+                    _ => Vec3::ZERO,
+                }
             } else if op.from_gizmo && axis.is_some() && op.viewport.area() > 0.0 {
                 // #40 ray-plane ABSOLUTE drag: project the start + live cursor rays onto
                 // the constraint axis line through the pivot; the world delta is the
@@ -3145,6 +3162,10 @@ pub fn viewport(
                     } else {
                         None
                     },
+                    // A grabbed PLANE quad drives the two-axis ray_plane_point drag
+                    // (the normal is the held axis). Move-only; mutually exclusive
+                    // with the single-axis `gizmo_hovered_axis` lock above.
+                    gizmo_plane_normal: start_spec.plane_normal,
                     from_gizmo: true,
                     num: NumInput::default(),
                     individual: xform.pivot.is_individual(),
@@ -3481,6 +3502,7 @@ pub fn viewport(
                     start,
                     geo_start,
                     gizmo_hovered_axis: None,
+                    gizmo_plane_normal: None,
                     from_gizmo: false,
                     num: NumInput::default(),
                     individual: xform.pivot.is_individual(),
@@ -3564,6 +3586,67 @@ pub fn viewport(
                 }
                 ui.data_mut(|d| d.remove_temp::<egui::Pos2>(box_anchor_id));
             }
+        }
+    }
+
+    // --- Navigation axis gizmo (#35) -----------------------------------------
+    // Blender's corner orientation gizmo: six labelled axis balls oriented live by
+    // the camera (a readout of which way the world axes point) that double as click
+    // targets — clicking a ball snaps the camera to look down that axis (eased
+    // `set_view`). Drawn top-right with the egui painter (no extra render pass);
+    // hover highlights the ball under the pointer. Hit-tested BEFORE orbit so a
+    // click on the cluster snaps the view instead of starting an orbit drag.
+    {
+        // Cluster centre: top-right corner, inset by its radius (+ a little margin)
+        // and tucked below the active-selection label that lives up there.
+        let center = rect.right_top()
+            + egui::vec2(-(nav_gizmo::GIZMO_RADIUS + 12.0), nav_gizmo::GIZMO_RADIUS + 34.0);
+        let balls = nav_gizmo::balls(camera, center);
+        let hover_pos = ui.input(|i| i.pointer.hover_pos());
+        let hovered = hover_pos.and_then(|p| nav_gizmo::hit_test(&balls, p));
+        let painter = ui.painter_at(rect);
+        // Faint backing disc so the cluster reads against any scene.
+        painter.circle_filled(center, nav_gizmo::GIZMO_RADIUS + 6.0, egui::Color32::from_black_alpha(70));
+        // Draw far balls first so near ones overlap them (painter order = depth).
+        let mut order: Vec<usize> = (0..balls.len()).collect();
+        order.sort_by(|&a, &b| balls[a].depth.partial_cmp(&balls[b].depth).unwrap_or(std::cmp::Ordering::Equal));
+        for &i in &order {
+            let b = balls[i];
+            let [r, g, bl] = b.color;
+            let base = egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (bl * 255.0) as u8);
+            let hot = hovered == Some(b.view);
+            // Connecting arm from centre to the ball.
+            painter.line_segment(
+                [center, b.pos],
+                egui::Stroke::new(1.0, base.gamma_multiply(if b.depth >= 0.0 { 0.6 } else { 0.3 })),
+            );
+            if b.positive || hot {
+                // Positive (and any hovered) balls are solid + labelled.
+                let col = if hot { egui::Color32::WHITE } else { base };
+                painter.circle_filled(b.pos, nav_gizmo::BALL_RADIUS, base);
+                if hot {
+                    painter.circle_stroke(b.pos, nav_gizmo::BALL_RADIUS, egui::Stroke::new(1.5, col));
+                }
+                painter.text(
+                    b.pos,
+                    egui::Align2::CENTER_CENTER,
+                    b.label,
+                    egui::FontId::monospace(10.0),
+                    egui::Color32::from_gray(20),
+                );
+            } else {
+                // Negative balls are hollow rings (so the cluster reads as a sphere).
+                painter.circle_stroke(b.pos, nav_gizmo::BALL_RADIUS - 1.0, egui::Stroke::new(1.5, base.gamma_multiply(0.8)));
+            }
+        }
+        // A click on a ball snaps the view + consumes the press (no orbit).
+        if !consumed
+            && response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(view) = nav_gizmo::hit_test(&balls, pos)
+        {
+            camera.set_view(view);
+            consumed = true;
         }
     }
 
@@ -4957,7 +5040,7 @@ mod transform_tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), gizmo_hovered_axis: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
     }
 
     #[test]
@@ -4970,6 +5053,40 @@ mod transform_tests {
         let d = scene.fixtures[0].position - p0;
         assert!(d.y.abs() < 1e-4, "y leaked: {}", d.y);
         assert!(d.z.abs() < 1e-4, "z leaked: {}", d.z);
+    }
+
+    /// A move started by grabbing a PLANE handle (#S2) slides ON that plane: the
+    /// off-plane (normal) coordinate of every element stays fixed, while the two
+    /// in-plane coordinates track the cursor (ray_plane_point absolute drag).
+    #[test]
+    fn plane_drag_keeps_off_axis_fixed() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let cam = OrbitCamera::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        // Plane normal Z → the XY plane: Z must not move.
+        let o = TransformOp {
+            kind: TransformKind::Move,
+            axis: None,
+            start_screen: egui::pos2(400.0, 300.0),
+            viewport: rect,
+            pivot: p0,
+            start: vec![(0, p0, scene.fixtures[0].orientation)],
+            geo_start: Vec::new(),
+            gizmo_hovered_axis: None,
+            gizmo_plane_normal: Some(Axis::Z),
+            from_gizmo: true,
+            num: NumInput::default(),
+            individual: false,
+            snap: SnapSettings::default(),
+            orientation: TransformOrientation::Global,
+        };
+        // Drag to a clearly different screen point so the in-plane delta is nonzero.
+        apply_transform(&o, &mut scene, &cam, egui::pos2(560.0, 180.0), false);
+        let d = scene.fixtures[0].position - p0;
+        assert!(d.z.abs() < 1e-4, "off-plane Z leaked: {}", d.z);
+        // The drag actually moved the fixture in the plane (not a no-op).
+        assert!(d.length() > 1e-3, "plane drag produced no motion: {d:?}");
     }
 
     #[test]
@@ -5149,6 +5266,7 @@ mod transform_tests {
             start: vec![(0, p0a, q0a), (1, p0b, scene.fixtures[1].orientation)],
             geo_start: Vec::new(),
             gizmo_hovered_axis: None,
+            gizmo_plane_normal: None,
             from_gizmo: false,
             num: NumInput { str: "90".into(), sign: false, active: true },
             individual: true,
@@ -5188,6 +5306,7 @@ mod transform_tests {
             ],
             geo_start: Vec::new(),
             gizmo_hovered_axis: None,
+            gizmo_plane_normal: None,
             from_gizmo: false,
             num: NumInput { str: "90".into(), sign: false, active: true },
             individual: false,

@@ -106,6 +106,22 @@ impl Default for OrbitCamera {
     }
 }
 
+/// A saved camera pose — the serializable subset of [`OrbitCamera`] a view
+/// bookmark (S1) stores: where it looks (`target`), the orbit angles, the dolly
+/// `distance`, the `fov_y`, and the `ortho` projection flag. Plain `f32`/array
+/// fields so it round-trips cleanly through `bookmarks.json` (and could ride in
+/// `.archie` later). Animation/aspect session state is deliberately excluded.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CameraPose {
+    pub target: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    pub fov_y: f32,
+    #[serde(default)]
+    pub ortho: bool,
+}
+
 /// Canned orthographic-style viewpoints (set via the View menu / shortcuts).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CameraView {
@@ -249,6 +265,29 @@ impl OrbitCamera {
         // Axis views go ortho; Perspective restores persp (Blender AUTOPERSP).
         let ortho = view != CameraView::Perspective;
         self.animate_to(self.target, yaw, pitch, self.distance, ortho);
+    }
+
+    /// Snapshot the live orbit pose — target / yaw / pitch / distance / fov /
+    /// ortho — as a plain [`CameraPose`]. Used by view bookmarks (S1) to save the
+    /// current shot to a numbered slot. Excludes session-only animation state.
+    pub fn pose(&self) -> CameraPose {
+        CameraPose {
+            target: self.target.to_array(),
+            yaw: self.yaw,
+            pitch: self.pitch,
+            distance: self.distance,
+            fov_y: self.fov_y,
+            ortho: self.ortho,
+        }
+    }
+
+    /// Recall a saved [`CameraPose`] (view bookmark): eases the live camera to the
+    /// stored target / angles / distance / projection via the shared `animate_to`
+    /// transition, and restores the saved FOV. A near-identical pose snaps (no
+    /// animation churn), exactly like a canned-view jump.
+    pub fn apply_pose(&mut self, p: &CameraPose) {
+        self.fov_y = p.fov_y;
+        self.animate_to(Vec3::from_array(p.target), p.yaw, p.pitch, p.distance, p.ortho);
     }
 
     /// numpad-5: pure persp↔ortho toggle, no angle change (Blender
@@ -718,6 +757,45 @@ mod tests {
         cam.zoom(1.0, None);
         assert!((cam.target - t0).length() < 1e-6);
         assert!(cam.distance < OrbitCamera::default().distance);
+    }
+
+    /// A saved pose recalls EXACTLY: `apply_pose` eases the live camera to the
+    /// stored target / angles / distance / fov / projection (the bookmark path).
+    #[test]
+    fn pose_recall_sets_target_pose() {
+        let mut cam = OrbitCamera::default();
+        // Author a distinct pose to save.
+        cam.target = Vec3::new(4.0, 1.5, -2.0);
+        cam.yaw = 1.1;
+        cam.pitch = 0.3;
+        cam.distance = 12.0;
+        cam.fov_y = 0.7;
+        cam.ortho = true;
+        let saved = cam.pose();
+
+        // Move the camera somewhere else, then recall.
+        let mut other = OrbitCamera::default();
+        other.apply_pose(&saved);
+        settle(&mut other);
+        assert!((Vec3::from_array(saved.target) - other.target).length() < 1e-4);
+        assert!((other.yaw - saved.yaw).abs() < 1e-4);
+        assert!((other.pitch - saved.pitch).abs() < 1e-4);
+        assert!((other.distance - saved.distance).abs() < 1e-3);
+        assert!((other.fov_y - saved.fov_y).abs() < 1e-6);
+        assert!(other.ortho);
+    }
+
+    /// A pose round-trips through JSON unchanged (the bookmark-persistence path).
+    #[test]
+    fn pose_round_trips_through_json() {
+        let mut cam = OrbitCamera::default();
+        cam.target = Vec3::new(-1.0, 9.0, 3.0);
+        cam.yaw = -0.4;
+        cam.distance = 22.0;
+        let p = cam.pose();
+        let text = serde_json::to_string(&p).unwrap();
+        let back: CameraPose = serde_json::from_str(&text).unwrap();
+        assert_eq!(p, back);
     }
 
     /// An ortho ray through the image centre still hits geometry at the target
