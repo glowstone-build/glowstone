@@ -1058,16 +1058,18 @@ impl Renderer {
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return false;
-            }
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
                 log::debug!("surface not presentable; skipping frame");
                 return false;
             }
+            // Anything else (Outdated / Lost, and the Vulkan/Windows backend's
+            // `Validation` for an out-of-date swapchain after a resize/maximize/DPI
+            // change) means the swapchain must be rebuilt. Reconfigure and recover
+            // next frame — otherwise the surface stays broken forever and we spam
+            // dropped frames.
             other => {
-                log::warn!("dropping frame: surface status {other:?}");
+                log::debug!("reconfiguring surface after status {other:?}");
+                self.surface.configure(&self.device, &self.config);
                 return false;
             }
         };

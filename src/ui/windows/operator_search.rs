@@ -1,14 +1,17 @@
 //! The F3 operator-search palette — a keyboard-driven command finder (Blender's
-//! `F3` "search menu"). Lists every REGISTER operator from [`op::catalog()`] by
-//! label + category, filtered by a live text field; arrows move the highlight,
-//! Enter runs the highlighted op, Esc dismisses. The actual op dispatch happens
-//! at the call site ([`Ui::run_catalog_op`](crate::ui::Ui::run_catalog_op)) — a
-//! pick only returns the chosen operator `id`. Ops whose `poll` fails are shown
-//! greyed and can't be picked (mirrors the menu's `add_enabled`).
+//! `F3` "search menu"). Lists every palette-runnable command from
+//! [`shortcuts::palette_commands()`](crate::ui::shortcuts::palette_commands) by
+//! label + category + its currently-bound shortcut, filtered by a live text field;
+//! arrows move the highlight, Enter runs the highlighted command, Esc dismisses.
+//! The actual dispatch happens at the call site
+//! ([`Ui::run_palette_command`](crate::ui::Ui::run_palette_command)) — a pick only
+//! returns the chosen command `id`. Catalog ops whose `poll` fails are shown greyed
+//! and can't be picked (mirrors the menu's `add_enabled`); pure-action commands
+//! (view / nav / selection) are always enabled.
 
 use egui::{RichText, Sense};
 
-use crate::ui::op::{self, CatalogOp};
+use crate::ui::shortcuts::{self, Command};
 use crate::ui::theme;
 
 /// State of the operator-search palette. `open == false` = closed.
@@ -30,9 +33,9 @@ impl OperatorSearchState {
     }
 }
 
-/// Render the operator-search palette. `runnable(id)` reports whether each op's
+/// Render the operator-search palette. `runnable(id)` reports whether each command's
 /// `poll` passes right now (so it renders enabled / pickable). Returns the chosen
-/// operator `id` exactly once on Enter / click; `None` while open, on cancel, or
+/// command `id` exactly once on Enter / click; `None` while open, on cancel, or
 /// on Esc. The window auto-closes on a pick or cancel.
 pub fn operator_search_window(
     ctx: &egui::Context,
@@ -43,16 +46,17 @@ pub fn operator_search_window(
         return None;
     }
 
-    // Fuzzy-filter the catalog by the live query (subsequence match; contiguous runs
-    // rank higher — like Blender's search), so "mvx" finds "Move on X". An empty query
-    // keeps registry order. `op::catalog()` projects the unified command registry.
+    // Fuzzy-filter the palette commands by the live query (subsequence match; contiguous
+    // runs rank higher — like Blender's search), so "mvx" finds "Move on X". An empty
+    // query keeps registry order. `shortcuts::palette_commands()` is the whole registry
+    // minus the viewport-/modal-only actions (Transform grab + axis lock).
     let q = state.search.trim();
-    let mut scored: Vec<(i32, CatalogOp)> = op::catalog()
+    let mut scored: Vec<(i32, &'static Command)> = shortcuts::palette_commands()
         .into_iter()
         .filter_map(|c| crate::ui::lib_prefs::fuzzy_score(q, c.label).map(|s| (s, c)))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0)); // best match first; stable sort preserves ties' order
-    let list: Vec<CatalogOp> = scored.into_iter().map(|(_, c)| c).collect();
+    let list: Vec<&'static Command> = scored.into_iter().map(|(_, c)| c).collect();
 
     // --- keyboard navigation (read before the window so it works before focus
     // lands on a widget) ---
@@ -81,7 +85,7 @@ pub fn operator_search_window(
         state.idx %= list.len();
     }
 
-    let mut picked: Option<&'static str> = None; // chosen op id
+    let mut picked: Option<&'static str> = None; // chosen command id
 
     egui::Window::new("operator-search")
         .title_bar(false)
@@ -89,7 +93,7 @@ pub fn operator_search_window(
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, -80.0])
         .show(ctx, |ui| {
-            ui.set_min_width(320.0);
+            ui.set_min_width(360.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{}  Run Operator", theme::icon::SEARCH)).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -114,13 +118,15 @@ pub fn operator_search_window(
                 ui.label(RichText::new("No matching operators").weak());
                 return;
             }
-            for (i, c) in list.iter().enumerate() {
-                let enabled = runnable(c.id);
-                let resp = op_row(ui, c, i == state.idx, enabled);
-                if resp.clicked() && enabled {
-                    picked = Some(c.id);
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                for (i, c) in list.iter().enumerate() {
+                    let enabled = runnable(c.id);
+                    let resp = op_row(ui, c, i == state.idx, enabled);
+                    if resp.clicked() && enabled {
+                        picked = Some(c.id);
+                    }
                 }
-            }
+            });
         });
 
     // Enter runs the highlighted row (if it's runnable).
@@ -138,9 +144,10 @@ pub fn operator_search_window(
     picked
 }
 
-/// One operator row: category tag on the right, label on the left, highlighted
-/// when it's the keyboard cursor and greyed when its `poll` fails.
-fn op_row(ui: &mut egui::Ui, c: &CatalogOp, highlighted: bool, enabled: bool) -> egui::Response {
+/// One command row: label on the left; the currently-bound shortcut (if any) then
+/// the category tag on the right. Highlighted when it's the keyboard cursor and
+/// greyed when its `poll` fails.
+fn op_row(ui: &mut egui::Ui, c: &Command, highlighted: bool, enabled: bool) -> egui::Response {
     let ink = theme::ink(!ui.visuals().dark_mode);
     let h = 26.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
@@ -161,12 +168,23 @@ fn op_row(ui: &mut egui::Ui, c: &CatalogOp, highlighted: bool, enabled: bool) ->
         egui::FontId::proportional(13.0),
         fg,
     );
-    painter.text(
-        rect.right_center() - egui::vec2(8.0, 0.0),
+    // Category on the far right; the bound shortcut (if any) sits just left of it.
+    let cat_anchor = rect.right_center() - egui::vec2(8.0, 0.0);
+    let cat = painter.text(
+        cat_anchor,
         egui::Align2::RIGHT_CENTER,
         c.category.title(),
         egui::FontId::monospace(10.0),
         ink.tertiary,
     );
+    if let Some(sc) = shortcuts::shortcut_for(c.id) {
+        painter.text(
+            egui::pos2(cat.min.x - 12.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            sc,
+            egui::FontId::monospace(11.0),
+            ink.secondary,
+        );
+    }
     resp
 }

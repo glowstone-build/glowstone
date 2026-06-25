@@ -574,8 +574,14 @@ pub enum OpInvoke {
 /// kind the palette + F9 use to dispatch it.
 #[derive(Clone, Copy)]
 pub struct CatalogOp {
+    // id / label / category mirror the command for the catalog-consistency tests;
+    // only `invoke` is read at runtime (run_catalog_op dispatches on it). Since S2
+    // the palette renders straight from `Command`, so these are test-surface only.
+    #[allow(dead_code)]
     pub id: &'static str,
+    #[allow(dead_code)]
     pub label: &'static str,
+    #[allow(dead_code)]
     pub category: super::shortcuts::Category,
     pub invoke: OpInvoke,
 }
@@ -588,12 +594,13 @@ impl CatalogOp {
     }
 }
 
-/// Every REGISTER operator the F3 search palette lists, in registry display order
-/// — built once from the unified [`COMMANDS`](super::shortcuts::COMMANDS) table
-/// (every command with an `invoke` kind). The `id`s match the ones the run sites
-/// pass to [`Ui::run_op`](super::Ui::run_op), so
-/// [`Ui::run_catalog_op`](super::Ui::run_catalog_op) routes each back to its
-/// single real invocation point.
+/// Every catalog operator (every command with an `invoke` kind), in registry
+/// display order — built from the unified [`COMMANDS`](super::shortcuts::COMMANDS)
+/// table. Since S2 the F3 palette lists the WHOLE palette-runnable registry (via
+/// [`shortcuts::palette_commands`](super::shortcuts::palette_commands)), not just
+/// these — so this projection is now the catalog-consistency *test* surface (the
+/// `id`s still match the run sites that [`Ui::run_catalog_op`] routes back to).
+#[cfg(test)]
 pub fn catalog() -> Vec<CatalogOp> {
     super::shortcuts::COMMANDS.iter().filter_map(CatalogOp::from_command).collect()
 }

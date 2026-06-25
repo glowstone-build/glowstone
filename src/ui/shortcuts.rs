@@ -411,9 +411,65 @@ pub static COMMANDS: &[Command] = &[
     command_row("app.preferences", "Preferences", Category::App, Action::Preferences),
 ];
 
+impl Command {
+    /// The [`Action`] this command dispatches.
+    pub fn action(&self) -> Action {
+        self.action
+    }
+
+    /// Whether this command can be offered in the F3 operator-search palette (S2).
+    /// EXCLUDES the viewport-/modal-only actions that need live viewport mouse
+    /// state and so are dispatched in `panels::viewport`, never via the palette:
+    /// the G/R/S transform grab ([`Action::Transform`]) and the X/Y/Z axis lock
+    /// ([`Action::AxisLock`]). The modal Confirm/Cancel aren't even [`Action`]s
+    /// (they live in [`ModalAction`]), so there's nothing to exclude for them.
+    /// Everything else — view/nav/selection/file/object actions AND every catalog
+    /// op (`invoke.is_some()`) — is palette-runnable: a catalog op routes through
+    /// `run_catalog_op`, a pure action routes through `Ui::dispatch_action`.
+    pub fn palette_runnable(&self) -> bool {
+        // Viewport-/modal-only actions need live viewport mouse state (G/R/S grab +
+        // X/Y/Z axis lock), and `ViewCamera` is a registered no-op placeholder — none
+        // can do anything from the palette, so exclude them (no dead picks).
+        if matches!(self.action, Action::Transform(_) | Action::AxisLock(_) | Action::ViewCamera) {
+            return false;
+        }
+        // Keymap-only twins (`kmi.*`) and aliases (`*_alias`) each DUPLICATE a
+        // canonical command — its catalog op (object.add / fixture.patch /
+        // fixture.unpatch / object.delete / fixture.duplicate) or the primary bind
+        // (edit.redo, view.frame_*). Listing them would double the rows AND, for the
+        // Duplicate twins, leave dead picks (`dispatch_action` doesn't own Duplicate —
+        // it's the catalog `fixture.duplicate` dialog). Keep only the canonical row.
+        if self.id.starts_with("kmi.") || self.id.ends_with("_alias") {
+            return false;
+        }
+        true
+    }
+}
+
+/// Every command the F3 operator-search palette lists + can run (S2): the whole
+/// registry minus the viewport-/modal-only actions (see
+/// [`Command::palette_runnable`]). In registry display order. The palette resolves
+/// each pick's `id` back through [`command`]: a catalog op (`invoke.is_some()`)
+/// runs via `run_catalog_op`, any other action via `Ui::dispatch_action`.
+pub fn palette_commands() -> Vec<&'static Command> {
+    COMMANDS.iter().filter(|c| c.palette_runnable()).collect()
+}
+
 /// Look up a [`Command`] by its `id` — the unified registry's single accessor.
 pub fn command(id: &str) -> Option<&'static Command> {
     COMMANDS.iter().find(|c| c.id == id)
+}
+
+/// The human-readable shortcut label currently bound to a command `id` (S2), e.g.
+/// `"⌘S"` or `"F"`, resolved live from [`KEYMAPS`] so a rebind flows straight into
+/// the palette row. Returns the FIRST bind found (registry/keymap order); `None`
+/// when no key is bound to that command (it's palette- or menu-only).
+pub fn shortcut_for(id: &str) -> Option<String> {
+    KEYMAPS
+        .iter()
+        .flat_map(|km| km.items.iter())
+        .find(|kmi| kmi.cmd == id)
+        .map(|kmi| key_label(&kmi.trigger))
 }
 
 /// The Global keymap — fires whenever the egui context has keyboard focus and no
@@ -763,6 +819,64 @@ mod tests {
         // route through poll_modal instead).
         let cx = ActiveContext { viewport_focused: true, transform_active: true };
         assert!(gather(cx).is_empty());
+    }
+
+    // --- S2 comprehensive-palette parity ---------------------------------
+
+    #[test]
+    fn palette_lists_whole_registry_minus_viewport_modal() {
+        // The palette (S2) offers the WHOLE registry except the viewport-/modal-only
+        // actions (G/R/S grab + X/Y/Z axis lock), which need live viewport mouse
+        // state and so are dispatched in panels::viewport, never the palette.
+        let ids: Vec<&str> = palette_commands().iter().map(|c| c.id).collect();
+        // Many more than the old 5-op catalog: representative pure-action commands
+        // are now listed + runnable from the palette.
+        assert!(ids.contains(&"view.top"), "Top View is palette-runnable");
+        assert!(ids.contains(&"view.frame_selection"), "Frame Selection is palette-runnable");
+        assert!(ids.contains(&"select.all"), "Select All is palette-runnable");
+        assert!(ids.contains(&"file.save"), "Save is palette-runnable");
+        assert!(ids.contains(&"object.add"), "Add Object (catalog op) stays listed");
+        assert!(ids.contains(&"object.delete"), "Delete (catalog op) stays listed");
+        // The viewport-/modal-only actions are EXCLUDED (no dead picks).
+        for id in [
+            "transform.move", "transform.rotate", "transform.scale",
+            "transform.axis_x", "transform.axis_y", "transform.axis_z",
+        ] {
+            assert!(!ids.contains(&id), "{id} (viewport-modal) excluded");
+        }
+        // The no-op placeholder + keymap twins (`kmi.*`) + aliases (`*_alias`) are
+        // EXCLUDED so each command appears ONCE with no dead picks. (The Duplicate
+        // keymap twin was a dead pick — dispatch_action doesn't own Duplicate; the
+        // catalog `fixture.duplicate` dialog is the canonical entry.)
+        for id in [
+            "view.camera", "kmi.duplicate", "kmi.duplicate_alias", "kmi.delete",
+            "kmi.patch", "kmi.unpatch", "kmi.add_menu", "edit.redo_alias",
+            "view.frame_all_alias",
+        ] {
+            assert!(!ids.contains(&id), "{id} (twin/alias/no-op) excluded from palette");
+        }
+        assert!(ids.contains(&"fixture.duplicate"), "Duplicate stays via its catalog dialog op");
+        // No two listed commands share an Action — no duplicate rows.
+        let mut seen: Vec<Action> = Vec::new();
+        for c in palette_commands() {
+            assert!(!seen.contains(&c.action), "duplicate palette row for the same action via {}", c.id);
+            seen.push(c.action);
+        }
+        // Strictly larger than the old 5-op catalog.
+        let ops = COMMANDS.iter().filter(|c| c.invoke.is_some()).count();
+        assert!(palette_commands().len() > ops, "palette lists more than the {ops} catalog ops");
+    }
+
+    #[test]
+    fn shortcut_for_resolves_bound_keys() {
+        // A command with a bind resolves to that key's label (live from KEYMAPS); a
+        // command with no bind (a catalog-only op) resolves to None.
+        assert_eq!(shortcut_for("view.frame_selection"), Some(key_label(&Trigger::key(Key::F))));
+        assert_eq!(shortcut_for("file.save"), Some(key_label(&Trigger::key(Key::S).cmd())));
+        assert_eq!(shortcut_for("transform.move"), Some(key_label(&Trigger::key(Key::G))));
+        // object.add / fixture.duplicate have no keymap bind (palette/menu only).
+        assert_eq!(shortcut_for("object.add"), None);
+        assert_eq!(shortcut_for("fixture.duplicate"), None);
     }
 
     // --- C1 unified-command registry parity (#9 / #14) -------------------
