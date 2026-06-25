@@ -1101,6 +1101,9 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     if std::env::var("PREVIZ_UI_OPS").is_ok() {
         state.ui.debug_open_op_search();
     }
+    if std::env::var("PREVIZ_UI_PIE").is_ok() {
+        state.ui.debug_open_view_pie();
+    }
     if std::env::var("PREVIZ_UI_PROFILE").is_ok() {
         state.ui.debug_open_profile(&state.scene);
     }

@@ -3001,6 +3001,19 @@ pub fn viewport(
         );
     }
 
+    // Projection + axis-view tag (Blender's top-left "User Perspective" gizmo
+    // text). Sits just below the FPS HUD when that's shown, else at the top edge.
+    {
+        let y = if prefs.show_fps { 24.0 } else { 6.0 };
+        ui.painter().text(
+            rect.left_top() + egui::vec2(8.0, y),
+            egui::Align2::LEFT_TOP,
+            camera.view_tag(),
+            egui::FontId::monospace(12.0),
+            theme::ink(!ui.visuals().dark_mode).tertiary,
+        );
+    }
+
     // The display Mode + Exposure controls (and the Grid / Beam-gizmo toggles)
     // now live in the per-editor Viewport HEADER (`ui::editor`), migrated off the
     // old floating "viewport-display-overlay" Area (§2.2). Advanced look settings

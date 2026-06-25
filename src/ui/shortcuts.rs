@@ -302,6 +302,23 @@ pub static VIEWPORT: &[Kmi] = &[
     kmi(Trigger::key(Key::D).shift(), Action::Duplicate, Category::Object, "Duplicate (alias)"),
     kmi(Trigger::key(Key::N), Action::ToggleNPanel, Category::View, "Toggle N-panel (sidebar)"),
     kmi(Trigger::key(Key::T), Action::ToggleTPanel, Category::View, "Toggle T-panel (tool rail)"),
+    // --- Numpad camera navigation (Blender view3d_navigate_axis*.cc). egui maps
+    // the numpad digits onto the same Num* variants as the top-row digits, so
+    // these fire on either; the Viewport context + text-field guard keep them out
+    // of the way. Ctrl flips an axis view to its opposite (Front↔Back, etc.). ---
+    kmi(Trigger::key(Key::Num1), Action::View(CameraView::Front), Category::View, "Front view"),
+    kmi(Trigger::key(Key::Num1).cmd(), Action::View(CameraView::Back), Category::View, "Back view"),
+    kmi(Trigger::key(Key::Num3), Action::View(CameraView::Right), Category::View, "Right view"),
+    kmi(Trigger::key(Key::Num3).cmd(), Action::View(CameraView::Left), Category::View, "Left view"),
+    kmi(Trigger::key(Key::Num7), Action::View(CameraView::Top), Category::View, "Top view"),
+    kmi(Trigger::key(Key::Num7).cmd(), Action::View(CameraView::Bottom), Category::View, "Bottom view"),
+    kmi(Trigger::key(Key::Num5), Action::ToggleOrtho, Category::View, "Toggle ortho/persp"),
+    kmi(Trigger::key(Key::Num8), Action::OrbitStep(0.0, 15.0), Category::View, "Orbit up"),
+    kmi(Trigger::key(Key::Num2), Action::OrbitStep(0.0, -15.0), Category::View, "Orbit down"),
+    kmi(Trigger::key(Key::Num4), Action::OrbitStep(-15.0, 0.0), Category::View, "Orbit left"),
+    kmi(Trigger::key(Key::Num6), Action::OrbitStep(15.0, 0.0), Category::View, "Orbit right"),
+    // `~` opens the radial View pie at the cursor (wired in a later stage).
+    kmi(Trigger::key(Key::Backtick), Action::ViewPie, Category::View, "View pie (radial)"),
 ];
 
 /// The Modal transform keymap — only active while a G/R/S op owns the viewport.

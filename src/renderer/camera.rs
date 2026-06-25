@@ -124,6 +124,31 @@ impl OrbitCamera {
         self.ortho = !self.ortho;
     }
 
+    /// The corner viewport tag, Blender-style: projection + axis-view name when the
+    /// current orbit angles snap to a canned axis view (e.g. "Ortho · Front"), else
+    /// just the projection + "User" (free orbit). Used by the viewport overlay.
+    pub fn view_tag(&self) -> String {
+        let proj = if self.ortho { "Ortho" } else { "Persp" };
+        // Match the current yaw/pitch against the canned axis views (small epsilon).
+        const EPS: f32 = 0.02;
+        let approx = |a: f32, b: f32| (a - b).abs() < EPS;
+        let name = CameraView::ALL.iter().copied().find(|&v| {
+            if v == CameraView::Perspective {
+                return false;
+            }
+            let probe = {
+                let mut c = self.clone();
+                c.set_view(v);
+                c
+            };
+            approx(probe.yaw, self.yaw) && approx(probe.pitch, self.pitch)
+        });
+        match name {
+            Some(v) => format!("{proj} · {}", v.label()),
+            None => format!("{proj} · User"),
+        }
+    }
+
     /// numpad 2/4/6/8: orbit by a fixed step (degrees). Reuses `orbit()`'s sign
     /// convention by feeding pixel-equivalent deltas (deg→rad / SENSITIVITY).
     pub fn orbit_step(&mut self, yaw_deg: f32, pitch_deg: f32) {
@@ -325,6 +350,37 @@ mod tests {
         assert!((d0 - fwd).length() < 1e-4, "dir not forward: {d0} vs {fwd}");
         // Distinct origins across the image plane.
         assert!((o0 - o1).length() > 0.1, "origins not spread: {o0} vs {o1}");
+    }
+
+    /// orbit_step nudges the angles by the requested degrees (the numpad path).
+    #[test]
+    fn orbit_step_changes_angles_by_degrees() {
+        let mut cam = OrbitCamera::default();
+        let (y0, p0) = (cam.yaw, cam.pitch);
+        cam.orbit_step(0.0, 15.0);
+        // pitch up by 15°; yaw unchanged.
+        assert!((cam.pitch - (p0 + 15.0_f32.to_radians())).abs() < 1e-4);
+        assert!((cam.yaw - y0).abs() < 1e-4);
+        cam.orbit_step(-15.0, 0.0);
+        // orbit() subtracts yaw, but orbit_step feeds a deg→delta that, with the
+        // negative arg, increases yaw by 15°.
+        assert!((cam.yaw - (y0 + 15.0_f32.to_radians())).abs() < 1e-4);
+    }
+
+    /// The corner tag reports the projection + the snapped axis-view name (or User).
+    #[test]
+    fn view_tag_reports_proj_and_view() {
+        let mut cam = OrbitCamera::default();
+        cam.set_view(CameraView::Front);
+        assert_eq!(cam.view_tag(), "Ortho · Front");
+        cam.toggle_ortho();
+        assert_eq!(cam.view_tag(), "Persp · Front");
+        cam.set_view(CameraView::Perspective);
+        assert_eq!(cam.view_tag(), "Persp · User");
+        // A free orbit off any axis reads as User.
+        cam.set_view(CameraView::Top);
+        cam.orbit_step(7.0, 0.0);
+        assert!(cam.view_tag().ends_with("User"));
     }
 
     /// An ortho ray through the image centre still hits geometry at the target

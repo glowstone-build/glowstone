@@ -6,6 +6,7 @@ mod editor;
 mod gizmo;
 pub(crate) mod op;
 mod panels;
+mod pie;
 pub use panels::ScreenSources;
 pub mod project;
 mod share_window;
@@ -450,6 +451,9 @@ pub struct Ui {
     /// The Aim tool's in-flight drag (§2.4) — `active()` while a head-aim drag is
     /// underway, so the pending undo snapshot is kept alive across the drag frames.
     aim: panels::AimState,
+    /// The `~` radial View pie (cursor-anchored axis-view / projection / frame
+    /// picker). Opened by the ViewPie action at the pointer; closed on pick/cancel.
+    view_pie: pie::PieState,
 }
 
 /// Open state for the viewport's side regions — the N-panel (Item/Transform
@@ -530,6 +534,7 @@ impl Ui {
             active_tool: ActiveTool::default(),
             measure: panels::MeasureState::default(),
             aim: panels::AimState::default(),
+            view_pie: pie::PieState::default(),
         }
     }
 
@@ -1635,9 +1640,53 @@ impl Ui {
             scene,
             &mut self.selection,
         );
+        // The `~` radial View pie (above the dock, anchored at the cursor). On a
+        // pick it applies straight to the camera; cancel / Esc just closes it.
+        self.view_pie(ctx, camera, scene);
+
         // The welcome / recover splash sits above everything (it's the first
         // thing on a fresh launch).
         self.splash_window(ctx, scene, camera, dmx);
+    }
+
+    /// Draw + resolve the `~` View pie. Sectors are laid out clock-face from the
+    /// top so the cardinal axis views land where the user expects (Top up, Bottom
+    /// down, Left/Right to the sides); the diagonals carry Front/Back, the
+    /// Persp/Ortho toggle, and Frame Selected. A pick applies to the camera.
+    fn view_pie(&mut self, ctx: &egui::Context, camera: &mut OrbitCamera, scene: &Scene) {
+        use theme::icon;
+
+        // One sector per entry; index == sector. Order = clockwise from straight up.
+        #[derive(Clone, Copy)]
+        enum Choice {
+            View(CameraView),
+            ToggleOrtho,
+            FrameSelected,
+        }
+        let items = [
+            (icon::VIEWPORT, "Top", Choice::View(CameraView::Top)),
+            (icon::VIEWPORT, "Right", Choice::View(CameraView::Right)),
+            (icon::CAMERA, "Persp/Ortho", Choice::ToggleOrtho),
+            (icon::VIEWPORT, "Back", Choice::View(CameraView::Back)),
+            (icon::VIEWPORT, "Bottom", Choice::View(CameraView::Bottom)),
+            (icon::FRAME, "Frame Sel.", Choice::FrameSelected),
+            (icon::VIEWPORT, "Front", Choice::View(CameraView::Front)),
+            (icon::VIEWPORT, "Left", Choice::View(CameraView::Left)),
+        ];
+        let sectors: Vec<pie::PieItem> =
+            items.iter().map(|(ic, lbl, _)| pie::PieItem::new(ic, *lbl)).collect();
+        let accent = theme::accent(&self.prefs);
+        if let Some(i) = pie::Pie::new(&sectors).accent(accent).show(ctx, &mut self.view_pie) {
+            match items[i].2 {
+                Choice::View(v) => camera.set_view(v),
+                Choice::ToggleOrtho => camera.toggle_ortho(),
+                Choice::FrameSelected => {
+                    if let Some((lo, hi)) = self.frame_bounds(scene, true) {
+                        camera.frame_aabb(lo, hi);
+                    }
+                }
+            }
+        }
     }
 
     /// Force the quick-select palette open (headless screenshot hook).
@@ -1648,6 +1697,11 @@ impl Ui {
     /// Force the F3 operator-search palette open (headless screenshot hook).
     pub fn debug_open_op_search(&mut self) {
         self.op_search.show();
+    }
+
+    /// Open the `~` View pie at the screen centre (headless screenshot hook).
+    pub fn debug_open_view_pie(&mut self) {
+        self.view_pie.open_at(egui::Pos2::new(750.0, 475.0));
     }
 
     /// Open the online Fixture Library window (headless hook). `demo` injects fake
@@ -1814,7 +1868,22 @@ impl Ui {
                     }
                 }
                 Action::View(view) => camera.set_view(view),
+                // numpad-5: pure persp↔ortho toggle (no angle change).
+                Action::ToggleOrtho => camera.toggle_ortho(),
+                // numpad 2/4/6/8: orbit by a fixed step (yaw_deg, pitch_deg).
+                Action::OrbitStep(yaw, pitch) => camera.orbit_step(yaw, pitch),
                 Action::ViewCamera => {} // registered for the cheat sheet; no-op.
+                // `~` — open the radial View pie at the cursor (axis views +
+                // projection toggle + frame selected). The keymap stack already
+                // gates this to a focused viewport with no live transform / text
+                // field, so no extra guard here. The pie itself is drawn + resolved
+                // after the dock, in `show`.
+                Action::ViewPie => {
+                    #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
+                    let anchor =
+                        ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
+                    self.view_pie.open_at(anchor);
+                }
                 Action::Preferences => self.show_prefs = true,
                 // Context gating (Viewport `S` = Scale masks this when the viewport
                 // is focused) means QuickSelect only reaches here when it should.
