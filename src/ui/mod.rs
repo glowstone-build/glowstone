@@ -4,6 +4,7 @@
 mod cues;
 mod editor;
 mod gizmo;
+mod notify;
 pub(crate) mod op;
 mod panels;
 mod pie;
@@ -237,12 +238,12 @@ impl TransformOp {
 }
 
 impl TransformOp {
-    /// The on-viewport status line shown while the op is in progress.
-    pub fn hint(&self) -> String {
-        let ax = match self.active_axis() {
-            Some(a) => format!(" · axis {}", a.label()),
-            None => String::new(),
-        };
+    /// The on-viewport status line shown while the op is in progress. `keys` is the
+    /// live structured key hint from the keymap (`shortcuts::modal_hint_keys`) —
+    /// passed in (not built here) so the registry stays the one source of truth for
+    /// which keys do what (#23). While the user is typing a value the hint switches
+    /// to the Blender-style typed readout and the key cluster is suppressed.
+    pub fn hint(&self, keys: &str) -> String {
         if self.num.active {
             // Blender-style typed readout: "Move X: 4.0 m" / "Rotate Z: -45°" /
             // "Scale: 2.0x". Axis label is blank when unconstrained.
@@ -257,11 +258,12 @@ impl TransformOp {
             };
             return format!("{}{}: {}{}", self.kind.label(), axl, val, unit);
         }
-        format!(
-            "{}{}   type number · X/Y/Z lock · click/Enter confirm · Esc cancel",
-            self.kind.label(),
-            ax
-        )
+        let ax = match self.active_axis() {
+            Some(a) => format!(" · axis {}", a.label()),
+            None => String::new(),
+        };
+        // "Move · axis X    X/Y/Z lock · type number · Enter confirm · Esc cancel"
+        format!("{}{}    {keys}", self.kind.label(), ax)
     }
 }
 
@@ -454,6 +456,17 @@ pub struct Ui {
     /// The `~` radial View pie (cursor-anchored axis-view / projection / frame
     /// picker). Opened by the ViewPie action at the pointer; closed on pick/cancel.
     view_pie: pie::PieState,
+    /// Transient toasts + the persistent report log (§2.10). Every user-facing
+    /// save / open / import / DMX-connect / undo moment reports here so it surfaces
+    /// as a fading toast instead of a silent `log::*`. Ticked + drawn in `show()`.
+    notify: notify::Notifier,
+    /// Handle-based status-bar message stack (#21): a transient slot pushed/popped
+    /// by handle, layered over the selection/units/fps content. Last push wins.
+    status_msgs: notify::StatusStack,
+    /// Was the DMX I/O running last frame? Used to detect the connect/disconnect
+    /// edge in `show()` (the actual start/stop happens on the DMX worker) and emit
+    /// one toast per transition rather than every frame.
+    dmx_was_running: bool,
 }
 
 /// Open state for the viewport's side regions — the N-panel (Item/Transform
@@ -535,6 +548,9 @@ impl Ui {
             measure: panels::MeasureState::default(),
             aim: panels::AimState::default(),
             view_pie: pie::PieState::default(),
+            notify: notify::Notifier::default(),
+            status_msgs: notify::StatusStack::default(),
+            dmx_was_running: false,
         }
     }
 
@@ -570,6 +586,8 @@ impl Ui {
     /// Step back one edit, restoring scene + patch + cues + groups + selection.
     /// (Field-disjoint borrows: `self.undo` vs the other `self` fields.)
     fn do_undo(&mut self, scene: &mut Scene, dmx: &mut crate::dmx::DmxIo) {
+        // Toast what we reversed (read the name BEFORE undo moves the cursor).
+        let name = self.undo.undo_name().map(str::to_owned);
         self.undo.undo(
             scene,
             dmx.patch_mut(),
@@ -577,10 +595,15 @@ impl Ui {
             &mut self.groups,
             &mut self.selection,
         );
+        match name {
+            Some(n) => self.notify.info(format!("Undo: {n}")),
+            None => self.notify.info("Nothing to undo"),
+        }
     }
 
     /// Step forward one edit (the redo direction).
     fn do_redo(&mut self, scene: &mut Scene, dmx: &mut crate::dmx::DmxIo) {
+        let name = self.undo.redo_name().map(str::to_owned);
         self.undo.redo(
             scene,
             dmx.patch_mut(),
@@ -588,6 +611,10 @@ impl Ui {
             &mut self.groups,
             &mut self.selection,
         );
+        match name {
+            Some(n) => self.notify.info(format!("Redo: {n}")),
+            None => self.notify.info("Nothing to redo"),
+        }
     }
 
     /// Run a closure-operator (the lightweight path the four migrated mutators
@@ -1018,9 +1045,10 @@ impl Ui {
                 self.current_path = Some(path.to_path_buf());
                 project::push_recent(path);
                 self.recent = project::load_recent();
-                log::info!("saved project: {}", path.display());
+                let name = path.file_name().map(|s| s.to_string_lossy().into_owned());
+                self.notify.success(format!("Saved {}", name.as_deref().unwrap_or("project")));
             }
-            Err(e) => log::error!("save project: {e}"),
+            Err(e) => self.notify.error(format!("Save failed: {e}")),
         }
     }
 
@@ -1054,9 +1082,14 @@ impl Ui {
                 project::push_recent(path);
                 self.recent = project::load_recent();
                 self.show_splash = false;
-                log::info!("opened project: {}", path.display());
+                let name = path.file_name().map(|s| s.to_string_lossy().into_owned());
+                self.notify.success(format!(
+                    "Opened {} · {} fixtures",
+                    name.as_deref().unwrap_or("project"),
+                    scene.fixtures.len()
+                ));
             }
-            Err(e) => log::error!("open project {}: {e}", path.display()),
+            Err(e) => self.notify.error(format!("Open failed: {e}")),
         }
     }
 
@@ -1089,7 +1122,7 @@ impl Ui {
                         a
                     }
                     Err(e) => {
-                        log::error!("re-parse GDTF {spec}: {e}");
+                        self.notify.warn(format!("Could not re-link GDTF {spec}: {e}"));
                         continue;
                     }
                 }
@@ -1147,7 +1180,7 @@ impl Ui {
         }
         if let Some(path) = project::autosave_path() {
             if let Err(e) = self.write_project(&path, scene, camera, dmx) {
-                log::warn!("autosave: {e}");
+                self.notify.warn(format!("Autosave failed: {e}"));
             }
         }
     }
@@ -1323,6 +1356,20 @@ impl Ui {
     ) {
         // Theme/accent/DPI live every frame (cheap; egui dedups).
         self.prefs.apply_theme(ctx);
+        // Age + retire expired toasts (dt from egui — `show()` takes no dt param).
+        self.notify.tick(ctx.input(|i| i.stable_dt));
+        // DMX connect/disconnect edge: the actual bind happens on the DMX worker,
+        // so we detect the running-state transition here and toast it ONCE per edge
+        // (not every frame). `is_running()` reflects the worker's current state.
+        let dmx_running = dmx.is_running();
+        if dmx_running != self.dmx_was_running {
+            if dmx_running {
+                self.notify.success("DMX input connected");
+            } else {
+                self.notify.info("DMX input stopped");
+            }
+            self.dmx_was_running = dmx_running;
+        }
         // Global shortcuts + drag-dropped .gdtf/.mvr files.
         self.handle_shortcuts(ctx, scene, camera);
         // Apply any arrow-key nudge collected above (here the patch is reachable, so
@@ -1643,6 +1690,19 @@ impl Ui {
         // The `~` radial View pie (above the dock, anchored at the cursor). On a
         // pick it applies straight to the camera; cancel / Esc just closes it.
         self.view_pie(ctx, camera, scene);
+
+        // Passive status-bar hint (#21 grey slot): advertise an in-flight modal
+        // transform; clear it otherwise so the hint never goes stale. (The bar was
+        // already drawn this frame; the slot is read again next frame — a one-frame
+        // lag that's imperceptible for a passive hint.)
+        match &self.transform {
+            Some(op) => self.status_msgs.set_hint(format!("{} in progress", op.kind.label())),
+            None => self.status_msgs.clear_hint(),
+        }
+
+        // Transient toasts overlay the dock (foreground order), below only the
+        // modal splash so a fresh launch isn't cluttered.
+        self.notify.draw(ctx);
 
         // The welcome / recover splash sits above everything (it's the first
         // thing on a fresh launch).
@@ -1998,20 +2058,25 @@ impl Ui {
                 Some(ext) if ext == "gdtf" => match self.library.import_gdtf(&path) {
                     Ok(idx) => {
                         let arc = self.library.gdtf[idx].clone();
+                        let name = arc.name.clone();
                         let f = scene.add_gdtf(arc, Vec3::new(0.0, 4.0, 0.0));
                         self.selection = Selection::fixture(f);
+                        self.notify.success(format!("Imported {name}"));
                     }
-                    Err(e) => log::error!("drop GDTF: {e}"),
+                    Err(e) => self.notify.error(format!("Import GDTF failed: {e}")),
                 },
                 Some(ext) if ext == "mvr" => match crate::mvr::MvrImport::load_path(&path) {
                     Ok(import) => {
+                        let before = scene.fixtures.len();
                         scene.import_mvr(import);
                         if let Some((c, r)) = scene.scene_frame() {
                             camera.frame(c, r * 1.15);
                         }
                         self.selection = Selection::default();
+                        self.notify
+                            .success(format!("Imported MVR · {} fixtures", scene.fixtures.len() - before));
                     }
-                    Err(e) => log::error!("drop MVR: {e}"),
+                    Err(e) => self.notify.error(format!("Import MVR failed: {e}")),
                 },
                 _ => {}
             }
@@ -2092,8 +2157,9 @@ impl Ui {
                     let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
                     if ui.add_enabled(can_export, egui::Button::new(format!("{}  Export MVR Scene…", icon::EXPORT))).clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("MVR", &["mvr"]).set_file_name("scene.mvr").save_file() {
-                            if let Err(e) = crate::mvr::export_path(scene, &path) {
-                                log::error!("export MVR: {e}");
+                            match crate::mvr::export_path(scene, &path) {
+                                Ok(()) => self.notify.success("Exported MVR scene"),
+                                Err(e) => self.notify.error(format!("Export MVR failed: {e}")),
                             }
                         }
                         ui.close();
@@ -2249,17 +2315,33 @@ impl Ui {
         fps: f32,
     ) {
         egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
+            let pal = theme::Palette::get(ui);
             ui.horizontal(|ui| {
-                let sel = match self.selection.fixtures.len() {
-                    0 => "nothing selected".to_string(),
-                    1 => scene
-                        .fixtures
-                        .get(self.selection.fixtures[0])
-                        .map(|f| format!("{} · {}", f.name, f.profile))
-                        .unwrap_or_default(),
-                    n => format!("{n} fixtures selected"),
-                };
-                ui.label(sel);
+                // Left slot precedence (Unreal `PushStatusBarMessage` model): a
+                // pushed transient message (top of the handle stack) MASKS the
+                // selection summary; otherwise the selection summary shows. The grey
+                // passive hint is appended after, separated by a thin rule.
+                match self.status_msgs.top() {
+                    Some(msg) => {
+                        ui.colored_label(pal.accent, msg);
+                    }
+                    None => {
+                        let sel = match self.selection.fixtures.len() {
+                            0 => "nothing selected".to_string(),
+                            1 => scene
+                                .fixtures
+                                .get(self.selection.fixtures[0])
+                                .map(|f| format!("{} · {}", f.name, f.profile))
+                                .unwrap_or_default(),
+                            n => format!("{n} fixtures selected"),
+                        };
+                        ui.label(sel);
+                    }
+                }
+                if let Some(hint) = self.status_msgs.hint() {
+                    ui.separator();
+                    ui.colored_label(pal.ink_tertiary, hint);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("{fps:.0} fps"));
                     ui.separator();

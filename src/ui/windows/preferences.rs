@@ -130,7 +130,17 @@ pub fn preferences_window(
                             ui.end_row();
 
                             ui.label("UI scale");
-                            ui.add(Slider::new(&mut prefs.ui_scale, 0.7..=2.0));
+                            // One continuous density control: drives the egui
+                            // zoom (fonts + every pixel literal) in theme::apply,
+                            // which snaps to whole device pixels for crisp 1px
+                            // hairlines. Shown as a percentage of the 1.0 base.
+                            ui.add(
+                                Slider::new(&mut prefs.ui_scale, 0.7..=2.0)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .custom_parser(|s| {
+                                        s.trim().trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
+                                    }),
+                            );
                             ui.end_row();
                         });
                     hint(ui, "Scales the entire interface — fonts, controls and spacing.");

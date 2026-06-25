@@ -1084,6 +1084,8 @@ fn apply_cam_env(camera: &mut OrbitCamera) {
     if let Some(d) = envf("PREVIZ_CAM_DIST") {
         camera.distance = d;
     }
+    // Headless one-shot: land on the final pose, never mid-transition.
+    camera.skip_anim();
 }
 
 fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
@@ -1123,6 +1125,9 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     if let Ok(n) = std::env::var("PREVIZ_UI_SELECT_N") {
         state.ui.debug_select_n(&state.scene, n.parse().unwrap_or(4));
     }
+    // Headless one-shot: any startup frame()/set_view() started a transition; land
+    // on its final pose so the screenshot isn't captured mid-animation.
+    state.camera.skip_anim();
     let mut jobs: Vec<egui::ClippedPrimitive> = Vec::new();
     let mut sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
     for i in 0..3 {
@@ -1293,6 +1298,11 @@ impl State {
         // overrides the rest state) and BEFORE motion advance (so its pan/tilt
         // feeds this frame's slew).
         self.ui.tick_cues(&mut self.scene, dt);
+
+        // Advance any in-flight eased camera transition (canned-view / frame /
+        // pie jump). The app already drives continuous redraws, so a running
+        // transition simply settles over the next handful of frames.
+        self.camera.advance(dt);
 
         // Advance time-based wheel motion once per real frame (not in the
         // renderer, which also runs for headless capture).

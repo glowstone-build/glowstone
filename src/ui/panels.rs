@@ -2192,6 +2192,9 @@ pub fn viewport(
     );
 
     let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
+    // Record the live viewport aspect so frame-selected widens its fit radius for
+    // wide viewports (the aspect-correction rule in OrbitCamera::frame_aabb).
+    camera.set_aspect(rect.width() / rect.height().max(1.0));
     ui.painter().image(
         texture,
         rect,
@@ -2560,13 +2563,24 @@ pub fn viewport(
             if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
                 apply_transform(op, scene, camera, cur);
             }
-            let hint = op.hint();
+            // The key cluster (X/Y/Z · type number · Enter/Esc) is read LIVE from
+            // the keymap so the pill can never drift from the binds (#23). When an
+            // axis is locked the pill tints to that axis's colour so the constraint
+            // is unmistakable; otherwise the neutral amber.
+            let hint = op.hint(&shortcuts::modal_hint_keys());
+            let tint = op
+                .active_axis()
+                .map(|a| {
+                    let [r, g, b] = a.color();
+                    egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+                })
+                .unwrap_or(egui::Color32::from_rgb(255, 220, 120));
             theme::overlay_label(
                 &ui.painter_at(rect),
                 rect.center_top() + egui::vec2(0.0, 10.0),
                 egui::Align2::CENTER_TOP,
                 &hint,
-                Some(egui::Color32::from_rgb(255, 220, 120)),
+                Some(tint),
             );
             if confirm {
                 *transform = None;
@@ -2651,7 +2665,18 @@ pub fn viewport(
     if !consumed && response.contains_pointer() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
-            camera.zoom(scroll * 0.01);
+            // Zoom-to-cursor: anchor the dolly on the world point under the
+            // pointer. Prefer the nearest picked surface; fall back to where the
+            // cursor ray meets the ground plane (y=0). If neither resolves (cursor
+            // off into the sky), pass None → plain dolly toward the target.
+            let aspect = rect.width() / rect.height().max(1.0);
+            let anchor = ui.input(|i| i.pointer.hover_pos()).and_then(|pos| {
+                let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+                let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+                let (ro, rd) = camera.ray(ndc, aspect);
+                pick_world_point(scene, ro, rd)
+            });
+            camera.zoom(scroll * 0.01, anchor);
         }
     }
 
@@ -2968,8 +2993,9 @@ pub fn viewport(
                     .map(|a| format!("{}.{:03}", a.universe(), a.channel()))
                     .unwrap_or_else(|| "—".into()),
             };
+            // Selected label takes the accent; others sit quiet over the canvas.
             let col = if selected {
-                egui::Color32::from_rgb(120, 200, 255)
+                theme::Palette::get(ui).accent
             } else {
                 egui::Color32::from_white_alpha(180)
             };
@@ -2983,14 +3009,15 @@ pub fn viewport(
         }
     }
 
-    // FPS HUD (top-left), color-coded.
+    // FPS HUD (top-left), color-coded off the semantic status tokens.
     if prefs.show_fps {
+        let pal = theme::Palette::get(ui);
         let color = if fps >= 55.0 {
-            egui::Color32::from_rgb(120, 230, 120)
+            pal.ok
         } else if fps >= 30.0 {
-            egui::Color32::from_rgb(235, 215, 110)
+            pal.warn
         } else {
-            egui::Color32::from_rgb(235, 120, 110)
+            pal.conflict
         };
         ui.painter().text(
             rect.left_top() + egui::vec2(8.0, 6.0),
@@ -3047,11 +3074,11 @@ pub fn connectivity(
                 (false, false) => "no sockets bound",
             };
             ui.colored_label(
-                Color32::from_rgb(120, 210, 120),
+                theme::OK,
                 format!("● {bound} · {} source(s)", status.sources.len()),
             );
         } else {
-            ui.colored_label(Color32::from_gray(140), "○ stopped");
+            ui.colored_label(theme::IDLE, "○ stopped");
         }
     });
     ui.separator();
@@ -3073,7 +3100,7 @@ pub fn connectivity(
                 egui::TextEdit::singleline(bind_ip_text)
                     .desired_width(150.0)
                     .hint_text("0.0.0.0")
-                    .text_color_opt(valid.is_err().then_some(Color32::from_rgb(230, 120, 110))),
+                    .text_color_opt(valid.is_err().then_some(theme::CONFLICT)),
             );
             if resp.changed()
                 && let Ok(ip) = bind_ip_text.parse::<std::net::IpAddr>()
@@ -3158,11 +3185,11 @@ pub fn connectivity(
                     ui.label(RichText::new(format_universes(&s.universes)).small());
                     ui.label(RichText::new(s.priority.to_string()).small());
                     let fps_col = if s.fps >= 30.0 {
-                        Color32::from_rgb(120, 210, 120)
+                        theme::OK
                     } else if s.fps >= 10.0 {
-                        Color32::from_rgb(230, 210, 110)
+                        theme::WARN
                     } else {
-                        Color32::from_rgb(230, 120, 110)
+                        theme::CONFLICT
                     };
                     ui.colored_label(fps_col, RichText::new(format!("{:.0}", s.fps)).small());
                     ui.label(RichText::new(s.seq_errors.to_string()).small());

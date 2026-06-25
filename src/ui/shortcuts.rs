@@ -435,6 +435,44 @@ pub fn poll_modal(ctx: &egui::Context) -> Vec<ModalAction> {
     })
 }
 
+/// The live key label bound to a [`ModalAction`] in the [`MODAL`] keymap, for the
+/// in-viewport transform hint pill (#23). The axis-lock keys are read from the
+/// registry so a rebind there flows straight into the on-screen hint (no drift
+/// between what the app does and what the pill advertises). Confirm/Cancel aren't
+/// in the keymap table (they read Enter/Space/Esc directly in [`poll_modal`]), so
+/// they return their fixed glyphs.
+pub fn modal_key_label(action: ModalAction) -> String {
+    let want_axis = match action {
+        ModalAction::ConstrainX => Some(Axis::X),
+        ModalAction::ConstrainY => Some(Axis::Y),
+        ModalAction::ConstrainZ => Some(Axis::Z),
+        ModalAction::Confirm => return "Enter".into(),
+        ModalAction::Cancel => return "Esc".into(),
+    };
+    // Find the MODAL item whose AxisLock matches and label its trigger.
+    MODAL
+        .iter()
+        .find_map(|k| match k.action {
+            Action::AxisLock(ax) if Some(ax) == want_axis => Some(key_label(&k.trigger)),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The structured modal-transform hint segments (#23): the live axis-lock keys
+/// joined as one "X/Y/Z" cluster plus the confirm/cancel glyphs, all read from
+/// the keymap so the pill never drifts from the binds. Returns the constraint
+/// hint string the viewport composes into the transform pill, e.g.
+/// `"X/Y/Z lock · type number · Enter confirm · Esc cancel"`.
+pub fn modal_hint_keys() -> String {
+    let x = modal_key_label(ModalAction::ConstrainX);
+    let y = modal_key_label(ModalAction::ConstrainY);
+    let z = modal_key_label(ModalAction::ConstrainZ);
+    let confirm = modal_key_label(ModalAction::Confirm);
+    let cancel = modal_key_label(ModalAction::Cancel);
+    format!("{x}/{y}/{z} lock · type number · {confirm} confirm · {cancel} cancel")
+}
+
 /// A human-readable label for a trigger, used by the cheat sheet. Uses Cmd glyph
 /// on macOS, "Ctrl" elsewhere; special-cases the named keys (arrows, Numpad…).
 pub fn key_label(t: &Trigger) -> String {
@@ -489,6 +527,22 @@ mod tests {
         assert_eq!(key_label(&Trigger::key(Key::F)), "F");
         assert!(key_label(&Trigger::key(Key::F).shift()).contains("Shift"));
         assert_eq!(key_label(&Trigger::key(Key::Home)), "Home");
+    }
+
+    #[test]
+    fn modal_hint_reads_live_keys() {
+        // The axis-lock labels come from the MODAL keymap (so a rebind flows into
+        // the on-screen pill); confirm/cancel are the fixed Enter/Esc glyphs.
+        assert_eq!(modal_key_label(ModalAction::ConstrainX), "X");
+        assert_eq!(modal_key_label(ModalAction::ConstrainY), "Y");
+        assert_eq!(modal_key_label(ModalAction::ConstrainZ), "Z");
+        assert_eq!(modal_key_label(ModalAction::Confirm), "Enter");
+        assert_eq!(modal_key_label(ModalAction::Cancel), "Esc");
+        // The composed hint advertises every modal key + the typed-number path.
+        let h = modal_hint_keys();
+        assert!(h.contains("X/Y/Z lock"), "axis cluster present: {h}");
+        assert!(h.contains("type number"));
+        assert!(h.contains("Enter confirm") && h.contains("Esc cancel"));
     }
 
     #[test]
