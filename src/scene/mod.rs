@@ -322,6 +322,10 @@ impl Selection {
     }
 
     /// Toggle a fixture in/out of the selection (for ctrl/cmd-click multi-select).
+    /// Click selection now flows through the pure [`apply_select`] truth table
+    /// (#24); kept for selection-API symmetry with `toggle_geometry`/`_screen`
+    /// (still used by the outliner) and any direct caller.
+    #[allow(dead_code)]
     pub fn toggle_fixture(&mut self, i: usize) {
         self.world = false;
         self.environment = None;
@@ -370,10 +374,178 @@ impl Selection {
     }
 }
 
+/// One entity the viewport can pick / marquee, addressed by its current kind +
+/// index. The unified currency of the [`SelectOp`] model: click yields zero or
+/// one of these; a box-select yields many. `Environment`/`World` are single-only
+/// kinds (no multi-select), so the apply rules below collapse them to a replace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelItem {
+    Fixture(usize),
+    Geometry(usize),
+    Screen(usize),
+    Environment(usize),
+    /// The World node — a single-only selection (the viewport doesn't pick it
+    /// yet; the outliner's ⌘-click path will yield it). Carried in the enum now so
+    /// `apply_select` already handles it, mirroring `Selection::toggle_world`.
+    #[allow(dead_code)]
+    World,
+}
+
+/// How a set of freshly-picked [`SelItem`]s combines with the current
+/// [`Selection`] — Blender's `eSelectOp` indirection, so click / box / (later)
+/// lasso share ONE truth table instead of duplicating per-Hit modifier arms.
+/// The UI maps keyboard modifiers to one of these (UE/CAD convention):
+/// plain = [`Replace`], Shift = [`Add`], ⌘/Ctrl = [`Toggle`] (click) or
+/// [`Subtract`] (box).
+///
+/// [`Replace`]: SelectOp::Replace
+/// [`Add`]: SelectOp::Add
+/// [`Toggle`]: SelectOp::Toggle
+/// [`Subtract`]: SelectOp::Subtract
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectOp {
+    /// Discard the old selection; the hits become the whole selection. An empty
+    /// hit set clears (click on empty space).
+    Replace,
+    /// Union the hits into the current selection (Shift).
+    Add,
+    /// Remove the hits from the current selection (Ctrl in a box drag).
+    Subtract,
+    /// Flip each hit's membership (⌘/Ctrl click).
+    Toggle,
+}
+
+/// Pure selection algebra: fold `hits` into `current` under `op`, returning the
+/// NEW selection (no mutation, no undo — selection changes are undo-free). This
+/// is the single source the viewport click + box-select both call.
+///
+/// Heterogeneous rule: fixtures, geometry and screens are the three multi-select
+/// kinds and stay mutually exclusive (the existing `toggle_*` invariant — a
+/// scene has at most one *kind* of selection at a time so the Inspector/gizmo
+/// have one unambiguous target). For [`Add`]/[`Toggle`]/[`Subtract`] we operate
+/// within the kind already selected when there is one (so Shift+box keeps
+/// growing a fixture set and ignores stray geometry hits); otherwise the hits'
+/// own kind wins. [`Environment`]/[`World`] are single-only → always a replace.
+///
+/// [`Add`]: SelectOp::Add
+/// [`Toggle`]: SelectOp::Toggle
+/// [`Subtract`]: SelectOp::Subtract
+/// [`Environment`]: SelItem::Environment
+/// [`World`]: SelItem::World
+pub fn apply_select(current: &Selection, hits: &[SelItem], op: SelectOp) -> Selection {
+    // The kind we operate within: the active multi-select kind for additive ops
+    // (so Shift/Ctrl extend the existing set), else the dominant kind among the
+    // hits (fixtures > geometry > screens), else None.
+    let active_kind = if !current.fixtures.is_empty() {
+        Some(0u8)
+    } else if !current.geometry.is_empty() {
+        Some(1)
+    } else if !current.screens.is_empty() {
+        Some(2)
+    } else {
+        None
+    };
+    let hit_kind = |k: u8| -> Vec<usize> {
+        hits.iter()
+            .filter_map(|h| match (k, h) {
+                (0, SelItem::Fixture(i)) | (1, SelItem::Geometry(i)) | (2, SelItem::Screen(i)) => {
+                    Some(*i)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    // A single Environment/World hit is a single-only kind: any op replaces.
+    if hits.len() == 1 {
+        match hits[0] {
+            SelItem::Environment(i) => return Selection::environment(i),
+            SelItem::World => return Selection::world(),
+            _ => {}
+        }
+    }
+
+    match op {
+        SelectOp::Replace => {
+            // Hits define the whole new selection (empty → cleared). Multi-kind
+            // hit sets collapse to the dominant kind (fixtures > geometry > screens).
+            for k in [0u8, 1, 2] {
+                let v = hit_kind(k);
+                if !v.is_empty() {
+                    let mut s = Selection::default();
+                    match k {
+                        0 => s.fixtures = v,
+                        1 => s.geometry = v,
+                        _ => s.screens = v,
+                    }
+                    return s;
+                }
+            }
+            Selection::default()
+        }
+        SelectOp::Add | SelectOp::Subtract | SelectOp::Toggle => {
+            // A single Ctrl-click (Toggle) on an item of a DIFFERENT kind than the
+            // current selection SWITCHES kinds — matching the old toggle_fixture/
+            // toggle_geometry/toggle_screen, which cleared the other kind. (Box-select
+            // Add/Subtract deliberately stay within the active kind; conflating the two
+            // was the regression.) Same-kind toggles fall through to the normal path.
+            if matches!(op, SelectOp::Toggle) && hits.len() == 1 {
+                let hk = match hits[0] {
+                    SelItem::Fixture(_) => Some(0u8),
+                    SelItem::Geometry(_) => Some(1),
+                    SelItem::Screen(_) => Some(2),
+                    _ => None,
+                };
+                if hk.is_some() && hk != active_kind {
+                    return apply_select(current, hits, SelectOp::Replace);
+                }
+            }
+            // Operate within the active kind (extend the existing set) or, if
+            // nothing is selected yet, the hits' dominant kind.
+            let kind = active_kind.or_else(|| {
+                [0u8, 1, 2].into_iter().find(|&k| !hit_kind(k).is_empty())
+            });
+            let Some(kind) = kind else { return current.clone() };
+            let mut set: Vec<usize> = match kind {
+                0 => current.fixtures.clone(),
+                1 => current.geometry.clone(),
+                _ => current.screens.clone(),
+            };
+            for i in hit_kind(kind) {
+                let pos = set.iter().position(|&x| x == i);
+                match (op, pos) {
+                    (SelectOp::Add, None) => set.push(i),
+                    (SelectOp::Add, Some(_)) => {}
+                    (SelectOp::Subtract, Some(p)) => {
+                        set.remove(p);
+                    }
+                    (SelectOp::Subtract, None) => {}
+                    (SelectOp::Toggle, Some(p)) => {
+                        set.remove(p);
+                    }
+                    (SelectOp::Toggle, None) => set.push(i),
+                    (SelectOp::Replace, _) => unreachable!(),
+                }
+            }
+            let mut s = Selection::default();
+            match kind {
+                0 => s.fixtures = set,
+                1 => s.geometry = set,
+                _ => s.screens = set,
+            }
+            s
+        }
+    }
+}
+
 /// Resolve a fixture click into a selection update given the keyboard modifiers
 /// and a shift-range `anchor`. Shared by the scene outliner and the 3D viewport
 /// so list-click and viewport-click behave identically: plain = replace,
 /// ⌘/Ctrl = toggle, Shift = range from the anchor.
+///
+/// The plain/toggle paths defer to the unified [`apply_select`] truth table so
+/// there is one selection algebra; Shift = inclusive index range stays special
+/// (it needs the `anchor`, which the pure fn has no notion of).
 pub fn apply_fixture_click(
     selection: &mut Selection,
     anchor: &mut Option<usize>,
@@ -391,11 +563,9 @@ pub fn apply_fixture_click(
         let a = anchor.unwrap_or(i);
         selection.set_fixture_range(a, i);
         // keep the anchor so chained shift-clicks grow/shrink from it
-    } else if toggle {
-        selection.toggle_fixture(i);
-        *anchor = Some(i);
     } else {
-        *selection = Selection::fixture(i);
+        let op = if toggle { SelectOp::Toggle } else { SelectOp::Replace };
+        *selection = apply_select(selection, &[SelItem::Fixture(i)], op);
         *anchor = Some(i);
     }
 }
@@ -516,13 +686,23 @@ impl Scene {
         }
     }
 
-    /// Add a fixture from a library profile; returns its new index.
+    /// Add a fixture from a library profile at the legacy default pose (a few
+    /// metres up, aimed down); returns its new index. Prefer [`add_fixture_at`]
+    /// for the place-at-cursor path (#19). Kept as the convenience default-pose
+    /// entry point (the demo + tests use it; the UI now always supplies a point).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn add_fixture(&mut self, profile: &FixtureProfile) -> usize {
+        self.add_fixture_at(profile, Vec3::new(0.0, 4.0, 0.0))
+    }
+
+    /// Add a fixture from a library profile at `position`; returns its new index.
+    /// The place-at-cursor entry point — `position` is the viewport cursor's
+    /// ground/ray hit (see `panels::placement_point`).
+    pub fn add_fixture_at(&mut self, profile: &FixtureProfile, position: Vec3) -> usize {
         let n = self.fixtures.iter().filter(|f| f.profile == profile.name).count() + 1;
         let name = format!("{} {}", profile.name, n);
-        // Place new fixtures a few metres up, aimed down.
-        let mut fixture = Fixture::from_profile(profile, name, Vec3::new(0.0, 4.0, 0.0));
-        fixture.tilt = 30.0;
+        let mut fixture = Fixture::from_profile(profile, name, position);
+        fixture.tilt = 30.0; // aimed down
         fixture.snap_movement(); // appear at the placed pose, not slewing from 0
         fixture.id = self.alloc_id();
         self.fixtures.push(fixture);
@@ -631,29 +811,46 @@ impl Scene {
         self.fixtures.len() - 1
     }
 
-    /// Add an LED screen from a library component; returns its new index. The
-    /// wall stands upright at the back of the stage, facing +Z toward the
-    /// audience, lifted so its base sits on the floor.
+    /// Add an LED screen from a library component at the legacy default pose
+    /// (upstage, facing the audience); returns its new index. Prefer
+    /// [`add_screen_at`] for the place-at-cursor path (#19).
     pub fn add_screen(&mut self, profile: &ScreenProfile) -> usize {
+        self.add_screen_at(profile, Vec3::new(0.0, 0.0, -4.0))
+    }
+
+    /// Add an LED screen from a library component standing upright over the
+    /// `ground` point (its base rests on the floor), facing +Z; returns its new
+    /// index. `ground.y` is ignored — the wall always sits on the floor.
+    pub fn add_screen_at(&mut self, profile: &ScreenProfile, ground: Vec3) -> usize {
         let n = self.screens.len() + 1;
         let name = format!("LED Wall {n}");
         // A default 4×2 array; lift it so the bottom edge rests near the floor and
-        // push it a few metres upstage (−Z) of the origin.
+        // stand it over the cursor's ground point.
         let proto = LedScreen::from_profile(profile, name.clone(), Mat4::IDENTITY);
         let [_, h] = proto.size_m();
-        let transform = Mat4::from_translation(Vec3::new(0.0, h * 0.5 + 0.2, -4.0));
+        let transform = Mat4::from_translation(Vec3::new(ground.x, h * 0.5 + 0.2, ground.z));
         let mut screen = LedScreen::from_profile(profile, name, transform);
         screen.id = self.alloc_id();
         self.screens.push(screen);
         self.screens.len() - 1
     }
 
-    /// Add an environment from a library profile; returns its new index.
+    /// Add an environment from a library profile at the origin; returns its new
+    /// index. Prefer [`add_environment_at`] for the place-at-cursor path (#19).
+    /// Kept as the convenience origin entry point (demo + tests use it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn add_environment(&mut self, profile: &EnvironmentProfile) -> usize {
+        self.add_environment_at(profile, Vec3::ZERO)
+    }
+
+    /// Add an environment box from a library profile resting on the floor over the
+    /// `ground` point; returns its new index. `ground.y` is ignored — the box
+    /// always rests on the floor so it doesn't sink below ground.
+    pub fn add_environment_at(&mut self, profile: &EnvironmentProfile, ground: Vec3) -> usize {
         let n = self.environments.len() + 1;
         let name = format!("{} {}", profile.name, n);
         // Rest the box on the floor (see Scene::demo) so it doesn't sink below ground.
-        let on_floor = Vec3::new(0.0, profile.default_size[1] * 0.5, 0.0);
+        let on_floor = Vec3::new(ground.x, profile.default_size[1] * 0.5, ground.z);
         let idx = {
             self.environments
                 .push(Environment::from_profile(profile, name, on_floor));
@@ -804,6 +1001,91 @@ mod tests {
         let new_id = scene.fixtures[new_idx].id;
         assert!(!ids.contains(&new_id), "fresh id is never a previously-used id");
         assert_ne!(new_id, removed_id);
+    }
+
+    // --- SelectOp truth table (#24) ---------------------------------------
+
+    fn fsel(idx: &[usize]) -> Selection {
+        let mut s = Selection::default();
+        s.fixtures = idx.to_vec();
+        s
+    }
+
+    #[test]
+    fn select_replace_from_empty_and_nonempty() {
+        // Replace with one hit: whole selection becomes that hit.
+        let s = apply_select(&Selection::default(), &[SelItem::Fixture(3)], SelectOp::Replace);
+        assert_eq!(s, fsel(&[3]));
+        // Replace over an existing multi-selection discards the old set.
+        let s = apply_select(&fsel(&[0, 1, 2]), &[SelItem::Fixture(7)], SelectOp::Replace);
+        assert_eq!(s, fsel(&[7]));
+        // Replace with NO hits clears (empty-space click).
+        let s = apply_select(&fsel(&[0, 1]), &[], SelectOp::Replace);
+        assert_eq!(s, Selection::default());
+        // Replace with a multi-hit box keeps every hit.
+        let s = apply_select(
+            &Selection::default(),
+            &[SelItem::Fixture(1), SelItem::Fixture(4)],
+            SelectOp::Replace,
+        );
+        assert_eq!(s, fsel(&[1, 4]));
+    }
+
+    #[test]
+    fn select_add_subtract_toggle_within_kind() {
+        let cur = fsel(&[0, 1]);
+        // Add: union, dedup (1 already present).
+        let s = apply_select(&cur, &[SelItem::Fixture(1), SelItem::Fixture(2)], SelectOp::Add);
+        assert_eq!(s, fsel(&[0, 1, 2]));
+        // Subtract: remove the hit, keep the rest.
+        let s = apply_select(&cur, &[SelItem::Fixture(1)], SelectOp::Subtract);
+        assert_eq!(s, fsel(&[0]));
+        // Subtract a non-member is a no-op.
+        let s = apply_select(&cur, &[SelItem::Fixture(9)], SelectOp::Subtract);
+        assert_eq!(s, cur);
+        // Toggle flips membership per hit (1 off, 5 on).
+        let s = apply_select(&cur, &[SelItem::Fixture(1), SelItem::Fixture(5)], SelectOp::Toggle);
+        assert_eq!(s, fsel(&[0, 5]));
+        // Add from empty seeds the hits' own kind.
+        let s = apply_select(&Selection::default(), &[SelItem::Fixture(2)], SelectOp::Add);
+        assert_eq!(s, fsel(&[2]));
+    }
+
+    #[test]
+    fn select_additive_ops_stay_within_active_kind() {
+        // A fixture selection + a box that hit a geometry object: Add ignores the
+        // off-kind hit (keeps the one-kind-at-a-time invariant).
+        let s = apply_select(&fsel(&[0]), &[SelItem::Geometry(3)], SelectOp::Add);
+        assert_eq!(s, fsel(&[0]));
+        // But Replace switches kind to the (dominant) hit kind.
+        let s = apply_select(&fsel(&[0]), &[SelItem::Geometry(3)], SelectOp::Replace);
+        let mut want = Selection::default();
+        want.geometry = vec![3];
+        assert_eq!(s, want);
+    }
+
+    #[test]
+    fn select_toggle_offkind_single_switches_kind() {
+        // A single Ctrl-click (Toggle, ONE hit) on an OFF-kind item switches the
+        // selection to it (matching the old toggle_geometry/screen clear-and-switch),
+        // instead of no-op'ing because the active kind was fixtures (the regression).
+        let s = apply_select(&fsel(&[0, 1]), &[SelItem::Geometry(3)], SelectOp::Toggle);
+        let mut want = Selection::default();
+        want.geometry = vec![3];
+        assert_eq!(s, want);
+        // A SAME-kind single Toggle still toggles within the set (deselects one).
+        let s = apply_select(&fsel(&[0, 1]), &[SelItem::Fixture(1)], SelectOp::Toggle);
+        assert_eq!(s, fsel(&[0]));
+    }
+
+    #[test]
+    fn select_single_only_kinds_always_replace() {
+        // Environment + World are single-only: even a Toggle/Add resolves to a
+        // clean replace of that node.
+        let s = apply_select(&fsel(&[0, 1]), &[SelItem::Environment(2)], SelectOp::Toggle);
+        assert_eq!(s, Selection::environment(2));
+        let s = apply_select(&fsel(&[0]), &[SelItem::World], SelectOp::Add);
+        assert_eq!(s, Selection::world());
     }
 
     #[test]

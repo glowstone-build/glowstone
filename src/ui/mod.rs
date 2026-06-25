@@ -4,6 +4,7 @@
 mod cues;
 mod editor;
 mod gizmo;
+mod lib_prefs;
 mod notify;
 pub(crate) mod op;
 mod panels;
@@ -17,6 +18,8 @@ mod tools;
 mod tree;
 pub use tools::ActiveTool;
 mod windows;
+mod xform;
+pub use xform::{PivotMode, SnapSettings, TransformPrefs};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -226,6 +229,13 @@ pub struct TransformOp {
     /// Modal numeric entry. Default = empty/inactive (mouse drives). Never
     /// serialized (TransformOp is never persisted).
     pub num: NumInput,
+    /// Pivot policy (#5). When `false` (Median/Active/3D-Cursor) rotate/scale pivot
+    /// about the single world `pivot`; when `true` (Individual Origins) each element
+    /// pivots about ITS OWN origin/centre, captured per-element in `start`/`geo_start`.
+    pub individual: bool,
+    /// Grid/increment snap settings (#4) captured at op start — `apply_transform`
+    /// quantizes the committed amount when `snap.on` (XOR the live Ctrl invert).
+    pub snap: SnapSettings,
 }
 
 impl TransformOp {
@@ -447,6 +457,18 @@ pub struct Ui {
     /// screen-space xform gizmo; Select is plain click-select). Set from the T-panel
     /// tool rail. Default [`ActiveTool::Select`].
     active_tool: ActiveTool,
+    /// Transform-tool options (§2.4 #4/#5): grid/increment snap + pivot-point mode.
+    /// Read by the gizmo + modal G/R/S blocks when building a [`TransformOp`];
+    /// written by the viewport header + N-panel. Transient (not save-persisted).
+    xform: TransformPrefs,
+    /// The world 3D-cursor point — the [`PivotMode::Cursor3d`] pivot (§2.4 #5).
+    /// Starts at the origin; movable later (Shift-right-click etc., a follow-up).
+    /// Transient for now (no save-format bump); the viewport draws it.
+    cursor_3d: Vec3,
+    /// Persistent content-library prefs (§3 #20): the Recent + Favourites lists
+    /// shared by the Library browser and the Add menu. Loaded once at startup,
+    /// saved (synchronously, tiny payload) on each add/star toggle.
+    lib_prefs: lib_prefs::LibraryPrefs,
     /// The Measure tool's two-point ruler (§2.4) — a read-only viewport measurement
     /// that persists across frames; cleared when the Measure tool isn't active.
     measure: panels::MeasureState,
@@ -545,6 +567,9 @@ impl Ui {
             autosave_timer: 0.0,
             viewport_regions: ViewportRegions::default(),
             active_tool: ActiveTool::default(),
+            xform: TransformPrefs::default(),
+            cursor_3d: Vec3::ZERO,
+            lib_prefs: lib_prefs::LibraryPrefs::load(),
             measure: panels::MeasureState::default(),
             aim: panels::AimState::default(),
             view_pie: pie::PieState::default(),
@@ -1493,6 +1518,9 @@ impl Ui {
             screen_sources: &self.screen_sources,
             viewport_regions: &mut self.viewport_regions,
             active_tool: &mut self.active_tool,
+            xform: &mut self.xform,
+            cursor_3d: &mut self.cursor_3d,
+            lib_prefs: &mut self.lib_prefs,
             measure: &mut self.measure,
             aim: &mut self.aim,
         };
@@ -1632,9 +1660,24 @@ impl Ui {
             self.run_catalog_op(ctx, id, scene, dmx);
         }
         // The Shift+A Add menu: on a pick, drop the entity into the scene + select
-        // it (the menu itself stays library-only, decoupled from the mutation).
-        if let Some(action) = windows::add_menu_window(ctx, &self.library, &mut self.add_menu) {
-            self.run_op(
+        // it (the menu itself stays library-only, decoupled from the mutation). The
+        // menu also owns starring (mutates + persists `lib_prefs` directly).
+        if let Some(action) =
+            windows::add_menu_window(ctx, &self.library, &mut self.add_menu, &mut self.lib_prefs)
+        {
+            use windows::AddAction;
+            // #19: drop at the viewport cursor/camera anchor, not the origin.
+            let place = panels::placement_point(scene, camera);
+            // #20: the stable key to record in Recent (resolved against the live
+            // library so an index can't drift it to the wrong entry).
+            let item = match action {
+                AddAction::Fixture(i) => lib_prefs::LibItem::Fixture(i),
+                AddAction::Gdtf(i) => lib_prefs::LibItem::Gdtf(i),
+                AddAction::Screen(i) => lib_prefs::LibItem::Screen(i),
+                AddAction::Environment(i) => lib_prefs::LibItem::Env(i),
+            };
+            let key = lib_prefs::entry_key(&self.library, item);
+            let status = self.run_op(
                 "object.add",
                 "Add",
                 op::OpFlags::UNDO | op::OpFlags::REGISTER,
@@ -1642,32 +1685,31 @@ impl Ui {
                 dmx,
                 true,
                 |cx| {
-                    use windows::AddAction;
                     let new: Option<Selection> = match action {
                         AddAction::Fixture(i) => cx
                             .library
                             .fixtures
                             .get(i)
                             .cloned()
-                            .map(|p| Selection::fixture(cx.scene.add_fixture(&p))),
+                            .map(|p| Selection::fixture(cx.scene.add_fixture_at(&p, place))),
                         AddAction::Gdtf(i) => cx
                             .library
                             .gdtf
                             .get(i)
                             .cloned()
-                            .map(|g| Selection::fixture(cx.scene.add_gdtf(g, Vec3::new(0.0, 4.0, 0.0)))),
+                            .map(|g| Selection::fixture(cx.scene.add_gdtf(g, place))),
                         AddAction::Screen(i) => cx
                             .library
                             .screens
                             .get(i)
                             .cloned()
-                            .map(|p| Selection::screen(cx.scene.add_screen(&p))),
+                            .map(|p| Selection::screen(cx.scene.add_screen_at(&p, place))),
                         AddAction::Environment(i) => cx
                             .library
                             .environments
                             .get(i)
                             .cloned()
-                            .map(|p| Selection::environment(cx.scene.add_environment(&p))),
+                            .map(|p| Selection::environment(cx.scene.add_environment_at(&p, place))),
                     };
                     match new {
                         Some(sel) => {
@@ -1678,6 +1720,11 @@ impl Ui {
                     }
                 },
             );
+            if status == op::OpStatus::Finished
+                && let Some(k) = key
+            {
+                self.lib_prefs.push_recent(&k);
+            }
         }
         share_window::fixture_library_window(
             ctx,
@@ -2690,6 +2737,15 @@ struct PanelViewer<'a> {
     /// The viewport's active tool (§2.4) — the T-panel rail sets it; `viewport()`
     /// reads `shows_xform_gizmo()` to gate the screen-space move gizmo.
     active_tool: &'a mut ActiveTool,
+    /// Transform-tool options (§2.4 #4/#5): snap + pivot mode. The header writes
+    /// them; `viewport()` reads them when building a [`TransformOp`].
+    xform: &'a mut TransformPrefs,
+    /// The world 3D-cursor point ([`PivotMode::Cursor3d`] pivot, §2.4 #5).
+    cursor_3d: &'a mut Vec3,
+    /// Persistent content-library prefs (§3 #20): Recent + Favourites for the
+    /// Library browser. `library_browser()` reads them to render the pinned
+    /// sections and writes (front-insert on add, star toggle) through them.
+    lib_prefs: &'a mut lib_prefs::LibraryPrefs,
     /// The Measure tool's persistent two-point ruler (§2.4); `viewport()` reads/writes
     /// it when the Measure tool is active and clears it otherwise.
     measure: &'a mut panels::MeasureState,
@@ -2799,6 +2855,8 @@ impl TabViewer for PanelViewer<'_> {
                     self.transform_started,
                     self.transform_finished,
                     *self.active_tool,
+                    *self.xform,
+                    self.cursor_3d,
                     self.measure,
                     self.aim,
                 );
@@ -2824,6 +2882,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.selection,
                 self.camera,
                 self.lib,
+                self.lib_prefs,
                 self.open_share,
             ),
             Tab::Inspector => {

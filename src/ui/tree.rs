@@ -79,6 +79,7 @@ const PAD_X: f32 = 4.0; // left gutter before depth 0
 const DISCLOSURE_W: f32 = 15.0; // disclosure-triangle cell width (≈ one indent step)
 const ICON_DX: f32 = 5.0; // gap between disclosure cell and the type icon
 const TEXT_DX: f32 = 21.0; // gap between icon origin and the name text
+const PATCH_COL: f32 = 50.0; // far-left fixture patch-address column (uni.addr / none)
 
 /// What a flattened row represents (carries the data-array index for leaves).
 #[derive(Clone, Copy)]
@@ -402,7 +403,7 @@ fn build_rows(
             let f = &scene.fixtures[i];
             let patch_tag = match patch.get(i).filter(|p| p.enabled) {
                 Some(p) => format!("{}.{:03}", p.universe, p.address),
-                None => "unpatched".into(),
+                None => "none".into(),
             };
             let row_icon = if f.is_laser { icon::COLOR } else { icon::FIXTURE };
             rows.push(TreeRow {
@@ -509,6 +510,27 @@ fn count_str(n: usize) -> String {
     if n == 0 { "empty".into() } else { format!("{n}") }
 }
 
+/// The fixture's colour in the DMX universe grid (golden-ratio hue) — reused on the
+/// outliner's far-left patch column so a fixture reads the SAME colour in both
+/// places. Mirrors `panels::fixture_tint`/`hsv_to_color`; kept local to avoid a
+/// cross-module `pub` (fold into a shared colour util later).
+fn fixture_tint(i: usize) -> Color32 {
+    let h = (i as f32 * 0.618_034).fract();
+    let (s, v) = (0.55_f32, 0.95_f32);
+    let hh = (h * 6.0).floor();
+    let f = h * 6.0 - hh;
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - f * s), v * (1.0 - (1.0 - f) * s));
+    let (r, g, b) = match (hh as i32).rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
 /// Draw + interact one flattened row. Selection edits happen in-widget; hide /
 /// rename are deferred via `action`.
 #[allow(clippy::too_many_arguments)]
@@ -529,7 +551,6 @@ fn draw_row(
     visible_screens: &[usize],
     action: &mut TreeAction,
 ) {
-    let _ = index;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(full_w, ROW_H), Sense::click());
     if !ui.is_rect_visible(rect) {
         return;
@@ -540,6 +561,18 @@ fn draw_row(
     let (selected, active) = row_selection_state(row, selection);
 
     // ---- background ----
+    // Even/odd zebra striping (Blender outliner `TH_ROW_ALTERNATE`): a whisper-quiet
+    // tint on odd rows so long fixture lists are easy to scan. Selection + hover paint
+    // OVER it. Keyed by the ABSOLUTE visible-row index so the banding stays stable as
+    // the virtualized list scrolls.
+    if index % 2 == 1 {
+        let zebra = if ui.visuals().dark_mode {
+            Color32::from_white_alpha(16)
+        } else {
+            Color32::from_black_alpha(20)
+        };
+        painter.rect_filled(rect, 0.0, zebra);
+    }
     if selected {
         painter.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
         let w = if active { 1.5 } else { 1.0 };
@@ -557,8 +590,40 @@ fn draw_row(
     }
     let dim = if row.vis.dim() { 0.45 } else { 1.0 };
 
-    // ---- geometry ----
-    let content_x = rect.left() + PAD_X + row.depth as f32 * INDENT;
+    // ---- far-left patch column (fixtures): "uni.addr" in the fixture's DMX-pane
+    // colour, or "none" (italic, muted) when unpatched; red when the address
+    // conflicts. Uses the same golden-ratio tint as the DMX universe grid so a
+    // fixture reads the same colour in both places.
+    if !row.patch_tag.is_empty() {
+        let px = rect.left() + 6.0;
+        if row.patch_tag == "none" {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                "none",
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(10.0),
+                    color: ink.muted,
+                    italics: true,
+                    ..Default::default()
+                },
+            );
+            let galley = painter.layout_job(job);
+            painter.galley(egui::pos2(px, rect.center().y - galley.size().y * 0.5), galley, ink.muted);
+        } else {
+            let col = if row.conflict {
+                theme::CONFLICT
+            } else if let RowKind::Fixture(i) = row.kind {
+                fixture_tint(i)
+            } else {
+                ink.tertiary
+            };
+            painter.text(egui::pos2(px, rect.center().y), egui::Align2::LEFT_CENTER, &row.patch_tag, egui::FontId::monospace(10.0), col);
+        }
+    }
+
+    // ---- geometry ---- (tree content starts AFTER the far-left patch column)
+    let content_x = rect.left() + PATCH_COL + PAD_X + row.depth as f32 * INDENT;
     let disc_rect = egui::Rect::from_min_size(egui::pos2(content_x, rect.top()), egui::vec2(DISCLOSURE_W, ROW_H));
     let icon_x = content_x + DISCLOSURE_W + ICON_DX;
     let text_x = icon_x + TEXT_DX;
@@ -668,27 +733,17 @@ fn draw_row(
         }
     }
 
-    // ---- right info column (left of the eye), single line, centered ----
-    // A conflict IS a patch problem, so the warning REPLACES the patch tag (they
-    // never stack — that was the old two-line collision). Both are read here, so no
-    // dead-field warnings.
-    let info_x = rect.right() - right_edge - 4.0;
-    if row.conflict {
+    // ---- right info column (left of the eye): the fixture's CHANNEL COUNT ("47ch").
+    // The patch address moved to the far-left column (an address conflict shows there
+    // in red); the type icon already conveys the kind, so this slot is the footprint.
+    if let RowKind::Fixture(i) = row.kind {
+        let chans = crate::dmx::patch::footprint_for(&scene.fixtures[i], scene.fixtures[i].mode_index);
         painter.text(
-            egui::pos2(info_x, rect.center().y),
+            egui::pos2(rect.right() - right_edge - 4.0, rect.center().y),
             egui::Align2::RIGHT_CENTER,
-            theme::icon::WARNING,
-            egui::FontId::proportional(12.0),
-            theme::CONFLICT,
-        );
-    } else if !row.patch_tag.is_empty() {
-        let unpatched = row.patch_tag == "unpatched";
-        painter.text(
-            egui::pos2(info_x, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            &row.patch_tag,
+            format!("{chans}ch"),
             egui::FontId::monospace(10.0),
-            if unpatched { ink.muted } else { ink.tertiary },
+            ink.tertiary.gamma_multiply(dim),
         );
     }
 

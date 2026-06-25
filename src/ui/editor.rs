@@ -10,7 +10,7 @@
 
 use egui::RichText;
 
-use super::{PanelViewer, Tab};
+use super::{PanelViewer, PivotMode, Tab};
 use crate::scene::ViewportMode;
 use crate::ui::theme;
 
@@ -62,6 +62,13 @@ fn viewport_controls(ui: &mut egui::Ui, viewer: &mut PanelViewer) {
     }
     ui.separator();
 
+    // Transform-tool options (§2.4 #4/#5): pivot-point selector + grid/increment
+    // snap toggle & step. Drawn here (right_to_left) so they read, left→right:
+    // [pivot ▾] [⊞ Snap] [step]. The gizmo + modal G/R/S read these when building a
+    // TransformOp. Borrow ends before the next `viewer` use.
+    transform_options(ui, &mut *viewer.xform);
+    ui.separator();
+
     let settings = &mut *viewer.settings;
     // Beam gizmos + grid toggles (right-most).
     ui.checkbox(&mut settings.show_beam_wireframes, RichText::new("Beam").small())
@@ -86,4 +93,66 @@ fn viewport_controls(ui: &mut egui::Ui, viewer: &mut PanelViewer) {
             settings.mode = *m;
         }
     }
+}
+
+/// The transform-tool options cluster (§2.4 #4 snap, #5 pivot). Right-to-left, so
+/// declared in reverse on-screen order: the snap-increments menu (right), the Snap
+/// toggle, then the pivot-point combo (left). All three per-type increments
+/// (Move m / Rotate ° / Scale ×) live behind a compact "Step" menu so the dense
+/// header stays uncluttered; the toggle + pivot are the constant-reach controls.
+fn transform_options(ui: &mut egui::Ui, xform: &mut super::TransformPrefs) {
+    // Per-type snap increments — tucked behind a menu (greyed while Snap is off).
+    ui.add_enabled_ui(xform.snap.on, |ui| {
+        ui.menu_button(RichText::new("Step").small(), |ui| {
+            ui.label(RichText::new("Snap increments").small().weak());
+            ui.add(
+                egui::DragValue::new(&mut xform.snap.move_step)
+                    .speed(0.05)
+                    .range(0.001..=1000.0)
+                    .prefix("Move  ")
+                    .suffix(" m"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut xform.snap.rotate_deg)
+                    .speed(1.0)
+                    .range(0.1..=180.0)
+                    .prefix("Rotate  ")
+                    .suffix("°"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut xform.snap.scale_step)
+                    .speed(0.01)
+                    .range(0.001..=10.0)
+                    .prefix("Scale  ")
+                    .suffix("×"),
+            );
+        })
+        .response
+        .on_hover_text("Per-type snap increments (Move / Rotate / Scale)");
+    });
+    // Snap toggle (Ctrl held mid-drag inverts it — see apply_transform).
+    if ui
+        .selectable_label(xform.snap.on, RichText::new(format!("{} Snap", theme::icon::SNAP)).small())
+        .on_hover_text("Grid/increment snap — hold Ctrl mid-drag to invert")
+        .clicked()
+    {
+        xform.snap.on = !xform.snap.on;
+    }
+    // Pivot-point selector.
+    egui::ComboBox::from_id_salt("viewport-pivot")
+        .selected_text(RichText::new(xform.pivot.label()).small())
+        .width(120.0)
+        .show_ui(ui, |ui| {
+            for m in PivotMode::ALL {
+                if ui
+                    .selectable_label(xform.pivot == m, m.label())
+                    .on_hover_text(m.hint())
+                    .clicked()
+                {
+                    xform.pivot = m;
+                }
+            }
+        })
+        .response
+        .on_hover_text("Pivot point — what rotate/scale transforms about");
 }

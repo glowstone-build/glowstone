@@ -12,8 +12,8 @@ use super::shortcuts;
 use super::theme;
 use super::windows::{LabelMode, Preferences, ProfileEditor};
 use super::{
-    ActiveTool, Axis, DuplicateDialog, GdtfTextures, NumInput, SelectionGroup, TransformKind,
-    TransformOp,
+    ActiveTool, Axis, DuplicateDialog, GdtfTextures, NumInput, PivotMode, SelectionGroup,
+    TransformKind, TransformOp, TransformPrefs,
 };
 use crate::dmx::patch::channel_map;
 use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
@@ -22,7 +22,7 @@ use crate::optics::{self, OpticField, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
 use crate::scene::screen::{LedScreen, PixelShape, ScreenContent, TestPattern};
-use crate::scene::{apply_fixture_click, Fixture, Library, Scene, Selection};
+use crate::scene::{apply_fixture_click, apply_select, Fixture, Library, Scene, SelItem, SelectOp, Selection};
 
 /// Universe is considered live if it updated within this window.
 const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -354,11 +354,25 @@ impl Default for LibState {
 }
 
 /// One library entry — what it is, plus display metadata.
+#[derive(Clone, Copy)]
 enum LibKind {
     Gdtf(usize),
     Fixture(usize),
     Env(usize),
     Screen(usize),
+}
+
+impl LibKind {
+    /// The lib-prefs identity for Recent/Favourites keying (#20).
+    fn item(self) -> crate::ui::lib_prefs::LibItem {
+        use crate::ui::lib_prefs::LibItem;
+        match self {
+            LibKind::Gdtf(i) => LibItem::Gdtf(i),
+            LibKind::Fixture(i) => LibItem::Fixture(i),
+            LibKind::Env(i) => LibItem::Env(i),
+            LibKind::Screen(i) => LibItem::Screen(i),
+        }
+    }
 }
 
 struct LibRow {
@@ -424,16 +438,19 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
     rows
 }
 
-/// Instantiate a library row into the scene; returns the resulting selection.
-fn add_library_row(row: &LibRow, library: &Library, scene: &mut Scene) -> Selection {
+/// Instantiate a library row into the scene at `place` (the viewport
+/// cursor/camera anchor, #19); returns the resulting selection.
+fn add_library_row(row: &LibRow, library: &Library, scene: &mut Scene, place: Vec3) -> Selection {
     match row.kind {
         LibKind::Gdtf(i) => {
             let arc = library.gdtf[i].clone();
-            Selection::fixture(scene.add_gdtf(arc, glam::Vec3::new(0.0, 4.0, 0.0)))
+            Selection::fixture(scene.add_gdtf(arc, place))
         }
-        LibKind::Fixture(i) => Selection::fixture(scene.add_fixture(&library.fixtures[i])),
-        LibKind::Env(i) => Selection::environment(scene.add_environment(&library.environments[i])),
-        LibKind::Screen(i) => Selection::screen(scene.add_screen(&library.screens[i])),
+        LibKind::Fixture(i) => Selection::fixture(scene.add_fixture_at(&library.fixtures[i], place)),
+        LibKind::Env(i) => {
+            Selection::environment(scene.add_environment_at(&library.environments[i], place))
+        }
+        LibKind::Screen(i) => Selection::screen(scene.add_screen_at(&library.screens[i], place)),
     }
 }
 
@@ -447,8 +464,10 @@ pub fn library_browser(
     selection: &mut Selection,
     camera: &mut OrbitCamera,
     lib: &mut LibState,
+    lib_prefs: &mut crate::ui::lib_prefs::LibraryPrefs,
     open_share: &mut bool,
 ) {
+    use crate::ui::lib_prefs;
     use theme::icon;
 
     // --- header: import / export toolbar (icon buttons) ---
@@ -520,38 +539,75 @@ pub fn library_browser(
         }
     });
 
-    // --- build, filter, sort ---
-    let mut rows = library_rows(library);
+    // --- build, fuzzy-filter, sort ---
+    // The full catalog (in catalog order), each row tagged with its stable
+    // lib-prefs key so Recent/Favourites can resolve + render it.
+    let all_rows = library_rows(library);
+    let key_of = |row: &LibRow| lib_prefs::entry_key(library, row.kind.item()).unwrap_or_default();
+
+    let mut rows = all_rows;
     let q = lib.search.trim().to_lowercase();
-    if !q.is_empty() {
-        rows.retain(|r| {
-            r.name.to_lowercase().contains(&q)
-                || r.meta.to_lowercase().contains(&q)
-                || r.category.to_lowercase().contains(&q)
-        });
-    }
-    match lib.sort {
-        LibSort::Name => rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-        LibSort::Manufacturer => rows.sort_by(|a, b| {
-            a.category.to_lowercase().cmp(&b.category.to_lowercase()).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        }),
-        LibSort::Category => {} // keep build order (already category-grouped)
+    let fuzzy = !q.is_empty();
+    if fuzzy {
+        // Fuzzy + recency scorer (#20, shared `lib_prefs::fuzzy_score`): score the
+        // best of name/meta/category, drop non-matches, best-first.
+        let mut scored: Vec<(i32, LibRow)> = rows
+            .into_iter()
+            .filter_map(|r| {
+                let s = [&r.name, &r.meta, &r.category]
+                    .iter()
+                    .filter_map(|h| lib_prefs::fuzzy_score(&q, &h.to_lowercase()))
+                    .max();
+                s.map(|s| (s, r))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        rows = scored.into_iter().map(|(_, r)| r).collect();
+    } else {
+        match lib.sort {
+            LibSort::Name => rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            LibSort::Manufacturer => rows.sort_by(|a, b| {
+                a.category.to_lowercase().cmp(&b.category.to_lowercase()).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+            LibSort::Category => {} // keep build order (already category-grouped)
+        }
     }
     lib.selected.retain(|&i| i < rows.len());
 
+    // Pinned Recent + Favourites rows, resolved from prefs against the live
+    // catalog. Only shown when not searching (a query searches the full list).
+    let pinned = !fuzzy;
+    let recent_rows: Vec<LibRow> = if pinned {
+        lib_prefs
+            .recent
+            .iter()
+            .filter_map(|k| rows.iter().find(|r| &key_of(r) == k).map(clone_lib_row))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let fav_rows: Vec<LibRow> = if pinned {
+        rows.iter().filter(|r| lib_prefs.is_favourite(&key_of(r))).map(clone_lib_row).collect()
+    } else {
+        Vec::new()
+    };
+
     // --- batch-add affordance ---
+    let mut add_keys: Vec<String> = Vec::new(); // recent keys to record after the borrow ends
     let n_sel = lib.selected.len();
     ui.horizontal(|ui| {
         let label = if n_sel > 1 { format!("{}  Add {n_sel}", icon::ADD) } else { format!("{}  Add", icon::ADD) };
-        if ui.add_enabled(n_sel > 0, egui::Button::new(label)).on_hover_text("Add the selected templates to the scene (Enter)").clicked()
+        if ui.add_enabled(n_sel > 0, egui::Button::new(label)).on_hover_text("Add the selected templates to the scene at the cursor (Enter)").clicked()
             || (n_sel > 0 && ui.input(|i| i.key_pressed(egui::Key::Enter)))
         {
+            let place = placement_point(scene, camera);
             let mut idxs = lib.selected.clone();
             idxs.sort_unstable();
             let mut last = None;
             for &ri in &idxs {
                 if let Some(row) = rows.get(ri) {
-                    last = Some(add_library_row(row, library, scene));
+                    last = Some(add_library_row(row, library, scene, place));
+                    add_keys.push(key_of(row));
                 }
             }
             if let Some(sel) = last {
@@ -565,35 +621,86 @@ pub fn library_browser(
     // --- the list (rich, selectable rows; shift = range, ⌘/Ctrl = toggle) ---
     let ink = theme::ink(!ui.visuals().dark_mode);
     let accent = ui.visuals().selection.stroke.color;
+    // Channels drained after the scroll closure (it can't borrow library/scene mut).
+    let mut add_now: Option<LibRow> = None; // a pinned/double-click add (owns the row)
+    let mut clicked: Option<(usize, egui::Modifiers)> = None;
+    let mut toggle_fav: Option<String> = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Pinned pseudo-categories: Recent + Favourites (#20).
+        for (title, items) in [("RECENT", &recent_rows), ("FAVOURITES", &fav_rows)] {
+            if items.is_empty() {
+                continue;
+            }
+            ui.add_space(4.0);
+            ui.label(RichText::new(title).size(10.0).strong().color(ink.tertiary));
+            for row in items {
+                let key = key_of(row);
+                let starred = lib_prefs.is_favourite(&key);
+                let (resp, star) = library_row_widget(ui, row, false, starred, &ink, accent);
+                if star {
+                    toggle_fav = Some(key);
+                } else if resp.clicked() || resp.double_clicked() {
+                    add_now = Some(clone_lib_row(row));
+                }
+            }
+            ui.add_space(2.0);
+            ui.separator();
+        }
+
+        // The full catalog (category-grouped when sorted by Category + not searching).
         let mut last_cat = String::new();
-        let mut add_now: Option<usize> = None;
-        let mut clicked: Option<(usize, egui::Modifiers)> = None;
         for (ri, row) in rows.iter().enumerate() {
-            if lib.sort == LibSort::Category && row.category != last_cat {
+            if !fuzzy && lib.sort == LibSort::Category && row.category != last_cat {
                 last_cat = row.category.clone();
                 ui.add_space(4.0);
                 ui.label(RichText::new(row.category.to_uppercase()).size(10.0).strong().color(ink.tertiary));
             }
+            let key = key_of(row);
             let selected = lib.selected.contains(&ri);
-            let row_resp = library_row_widget(ui, row, selected, &ink, accent);
-            if row_resp.clicked() {
+            let starred = lib_prefs.is_favourite(&key);
+            let (row_resp, star) = library_row_widget(ui, row, selected, starred, &ink, accent);
+            if star {
+                toggle_fav = Some(key);
+            } else if row_resp.clicked() {
                 clicked = Some((ri, ui.input(|i| i.modifiers)));
             }
             if row_resp.double_clicked() {
-                add_now = Some(ri);
+                add_now = Some(clone_lib_row(row));
             }
         }
-        // Apply a click (after the loop so we don't borrow rows mutably mid-iter).
+        // Apply a select-click (after the loop so we don't borrow rows mid-iter).
         if let Some((ri, mods)) = clicked {
             apply_lib_click(lib, ri, &mods, rows.len());
         }
-        if let Some(ri) = add_now
-            && let Some(row) = rows.get(ri)
-        {
-            *selection = add_library_row(row, library, scene);
-        }
     });
+
+    // Drain the deferred channels now the scroll closure's borrows are released.
+    if let Some(key) = toggle_fav {
+        lib_prefs.toggle_favourite(&key);
+    }
+    if let Some(row) = add_now {
+        let place = placement_point(scene, camera);
+        *selection = add_library_row(&row, library, scene, place);
+        add_keys.push(key_of(&row));
+    }
+    for k in add_keys {
+        if !k.is_empty() {
+            lib_prefs.push_recent(&k);
+        }
+    }
+}
+
+/// Shallow clone of a `LibRow` (so a pinned/recent reference can outlive the
+/// borrow of the catalog vector). `LibKind` is Copy; the strings clone.
+fn clone_lib_row(r: &LibRow) -> LibRow {
+    LibRow {
+        kind: r.kind,
+        icon: r.icon,
+        name: r.name.clone(),
+        meta: r.meta.clone(),
+        category: r.category.clone(),
+        accent: r.accent,
+    }
 }
 
 /// Range/toggle/replace selection logic for the library list.
@@ -643,14 +750,17 @@ pub(super) fn paint_truncated(
 
 
 /// One library row: icon + name (strong) + dim meta, full-width clickable, with
-/// selection highlight + hover. Returns the row response.
+/// selection highlight + hover + a trailing Favourites star (#20). Returns the row
+/// response plus whether the *star* (rather than the row body) was clicked — the
+/// caller routes a star click to a fav-toggle instead of a select/add.
 fn library_row_widget(
     ui: &mut egui::Ui,
     row: &LibRow,
     selected: bool,
+    starred: bool,
     ink: &theme::Ink,
     accent: Color32,
-) -> egui::Response {
+) -> (egui::Response, bool) {
     let h = 34.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
     let painter = ui.painter_at(rect);
@@ -669,20 +779,187 @@ fn library_row_widget(
         egui::FontId::proportional(16.0),
         icon_color,
     );
-    let text_w = (rect.width() - 30.0 - 22.0).max(40.0);
+    let text_w = (rect.width() - 30.0 - 40.0).max(40.0);
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), &row.name, 13.0, ink.primary, text_w);
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, text_w);
-    // A "+" affordance on hover, right-aligned.
+    // A "+" affordance on hover (left of the star), right-aligned.
     if resp.hovered() {
         painter.text(
-            rect.right_center() + egui::vec2(-9.0, 0.0),
+            rect.right_center() + egui::vec2(-30.0, 0.0),
             egui::Align2::RIGHT_CENTER,
             theme::icon::ADD,
             egui::FontId::proportional(15.0),
             ink.secondary,
         );
     }
-    resp.on_hover_text("Click to select · double-click to add · Shift = range")
+    // The star: always visible when starred, on hover otherwise. Its hit zone is
+    // the right ~24px of the row; a click there toggles the favourite.
+    let star_zone = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - 24.0, rect.top()),
+        rect.right_bottom(),
+    );
+    let mut star_clicked = false;
+    if starred || resp.hovered() {
+        let tint = if starred { accent } else { ink.tertiary };
+        painter.text(
+            rect.right_center() + egui::vec2(-10.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            theme::icon::STAR,
+            egui::FontId::proportional(14.0),
+            tint,
+        );
+    }
+    if resp.clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+        && star_zone.contains(p)
+    {
+        star_clicked = true;
+    }
+    (resp.on_hover_text("Click to select · double-click to add · star = favourite"), star_clicked)
+}
+
+// ============================================================================
+// Inspector property infrastructure (§2.2 — Unreal's per-property reset-to-default
+// + Simple/Advanced split, Blender's auto-dim). These are shared, presentation-only
+// helpers; they mutate the borrowed value in place (matching the inspector's
+// established direct-edit model — slider/drag edits here are already non-undoable).
+// ============================================================================
+
+/// Float equality with a tolerance, so a value the user dragged back onto its
+/// default doesn't keep showing the revert arrow from f32 dust.
+fn approx(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 1e-4
+}
+
+/// Whether two RGB triples match (per-channel `approx`).
+fn approx_rgb(a: [f32; 3], b: [f32; 3]) -> bool {
+    approx(a[0], b[0]) && approx(a[1], b[1]) && approx(a[2], b[2])
+}
+
+/// Multi-edit value reduction (#7): the common value across a selection, or
+/// `None` when they differ ("mixed"). `Some(v)` ⇒ all equal (within `approx`) ⇒
+/// show the live widget seeded with `v`; `None` ⇒ show a "Multiple" placeholder.
+/// Mirrors Unreal's `GetReadAddress` / `bAllValuesTheSame`. Empty ⇒ `None`.
+fn common_f32(values: impl IntoIterator<Item = f32>) -> Option<f32> {
+    let mut it = values.into_iter();
+    let first = it.next()?;
+    it.all(|v| approx(v, first)).then_some(first)
+}
+
+/// RGB variant of [`common_f32`] for the colour rows.
+fn common_rgb(values: impl IntoIterator<Item = [f32; 3]>) -> Option<[f32; 3]> {
+    let mut it = values.into_iter();
+    let first = it.next()?;
+    it.all(|v| approx_rgb(v, first)).then_some(first)
+}
+
+/// One multi-edit numeric row (#7): when the selection agrees, render the
+/// `widget` (a [`DragValue`]/[`Slider`] built over the seed) and write the edited
+/// value back to ALL via `write`; when it's mixed, draw a quiet "Multiple" button
+/// that, on click, adopts the seed across the whole selection (so the next frame
+/// shows a real widget). Only the touched field is written — siblings keep theirs.
+fn bulk_f32_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    common: Option<f32>,
+    seed: f32,
+    widget: impl FnOnce(&mut egui::Ui, &mut f32) -> egui::Response,
+    mut write: impl FnMut(f32),
+) {
+    ui.label(label);
+    match common {
+        Some(mut v) => {
+            if widget(ui, &mut v).changed() {
+                write(v);
+            }
+        }
+        None => {
+            // Mixed: a placeholder that unifies on click (adopts the seed value).
+            if ui
+                .add(egui::Button::new(RichText::new("— Multiple —").small().weak()))
+                .on_hover_text("Values differ — click to set all to the active value")
+                .clicked()
+            {
+                write(seed);
+            }
+        }
+    }
+    ui.end_row();
+}
+
+/// The "revert to default" gutter button (#6). Drawn ONLY when `differs` — a
+/// quiet circular-arrow that snaps the field back to its template value. When the
+/// value already matches its default, an equal-width blank keeps the label column
+/// from jumping. Returns `true` on click (the caller does the reset, so it stays
+/// one mutation). The default source is the GDTF/library template for fixtures,
+/// `Default` for env/geometry — resolved by the caller.
+fn reset_arrow(ui: &mut egui::Ui, differs: bool) -> bool {
+    if differs {
+        ui.add(egui::Button::new(RichText::new(theme::icon::UNDO).small()).frame(false))
+            .on_hover_text("Reset to default")
+            .clicked()
+    } else {
+        // Reserve the same footprint so labels don't shift when the arrow appears.
+        ui.add_space(14.0);
+        false
+    }
+}
+
+/// A Grid label cell with a leading reset gutter (#6): `[↺] Label`. Returns
+/// `true` when the revert arrow was clicked this frame. Pair it with the value
+/// widget in the next column; the caller resets on a `true` return.
+fn prop_label(ui: &mut egui::Ui, label: &str, differs: bool) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        clicked = reset_arrow(ui, differs);
+        ui.label(label);
+    });
+    clicked
+}
+
+/// A nested "Advanced ▾" disclosure inside an inspector category (#8): the common
+/// rows are shown by the caller unconditionally; the power-user rows go in `body`,
+/// tucked behind this quiet, default-collapsed caret. `salt` disambiguates the
+/// (per-category) collapse state.
+fn advanced_section(ui: &mut egui::Ui, salt: &str, body: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(2.0);
+    egui::CollapsingHeader::new(RichText::new("Advanced").small().weak())
+        .id_salt(("inspector-advanced", salt))
+        .default_open(false)
+        .show(ui, body);
+}
+
+/// The editable-property defaults for a placed fixture — the values the per-row
+/// revert arrow snaps back to (#6). Sourced from the fixture's GDTF/library
+/// template where it's recoverable from the instance, else the neutral
+/// [`OpticalControls::default`]/struct constants. Fields whose template value
+/// can't be recovered from the instance alone (e.g. a built-in fixture's beam
+/// angle after the profile is gone) are `None` → no arrow shown for them.
+struct FixtureDefaults {
+    pan: f32,
+    tilt: f32,
+    dimmer: f32,
+    beam: f32,
+    beam_angle: Option<f32>,
+    color: Option<[f32; 3]>,
+}
+
+impl FixtureDefaults {
+    fn for_fixture(f: &Fixture) -> Self {
+        // GDTF fixtures recover their template beam angle from the parsed profile;
+        // both kinds share the neutral optics + level/beam constants.
+        let beam_angle = f.gdtf.as_ref().map(|g| g.beam_angle.max(1.0));
+        Self {
+            pan: 0.0,
+            tilt: 0.0,
+            dimmer: OpticalControls::default().dimmer,
+            beam: 1.0,
+            beam_angle,
+            // The emitted-colour default is white for GDTF (the master tint rest
+            // value); a built-in's library tint isn't stored on the instance.
+            color: f.gdtf.is_some().then_some([1.0, 1.0, 1.0]),
+        }
+    }
 }
 
 /// Right tab: editable parameters for the current selection. Edits flow
@@ -811,22 +1088,24 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("bulk-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                let mut pan = scene.fixtures[primary].pan;
-                ui.label("Pan");
-                if ui.add(DragValue::new(&mut pan).speed(0.5).range(-270.0..=270.0).suffix("°")).changed() {
-                    for &i in ids {
-                        scene.fixtures[i].pan = pan;
-                    }
-                }
-                ui.end_row();
-                let mut tilt = scene.fixtures[primary].tilt;
-                ui.label("Tilt");
-                if ui.add(DragValue::new(&mut tilt).speed(0.5).range(-180.0..=180.0).suffix("°")).changed() {
-                    for &i in ids {
-                        scene.fixtures[i].tilt = tilt;
-                    }
-                }
-                ui.end_row();
+                let pan = common_f32(ids.iter().map(|&i| scene.fixtures[i].pan));
+                bulk_f32_row(
+                    ui,
+                    "Pan",
+                    pan,
+                    scene.fixtures[primary].pan,
+                    |ui, v| ui.add(DragValue::new(v).speed(0.5).range(-270.0..=270.0).suffix("°")),
+                    |v| ids.iter().for_each(|&i| scene.fixtures[i].pan = v),
+                );
+                let tilt = common_f32(ids.iter().map(|&i| scene.fixtures[i].tilt));
+                bulk_f32_row(
+                    ui,
+                    "Tilt",
+                    tilt,
+                    scene.fixtures[primary].tilt,
+                    |ui, v| ui.add(DragValue::new(v).speed(0.5).range(-180.0..=180.0).suffix("°")),
+                    |v| ids.iter().for_each(|&i| scene.fixtures[i].tilt = v),
+                );
             });
             ui.add_space(4.0);
             ui.label(RichText::new("Nudge position (all)").small().strong());
@@ -852,31 +1131,48 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("bulk-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                let mut dimmer = scene.fixtures[primary].optics.dimmer;
-                ui.label("Dimmer");
-                if ui.add(Slider::new(&mut dimmer, 0.0..=1.0)).changed() {
-                    for &i in ids {
-                        scene.fixtures[i].optics.dimmer = dimmer;
-                    }
-                }
-                ui.end_row();
-                let mut beam = scene.fixtures[primary].beam;
-                ui.label("Beam");
-                if ui
-                    .add(Slider::new(&mut beam, 0.0..=4.0).text("vol"))
-                    .on_hover_text("Volumetric beam intensity (0 = off)")
-                    .changed()
-                {
-                    for &i in ids {
-                        scene.fixtures[i].beam = beam;
-                    }
-                }
-                ui.end_row();
-                let mut color = scene.fixtures[primary].color;
+                let dimmer = common_f32(ids.iter().map(|&i| scene.fixtures[i].optics.dimmer));
+                bulk_f32_row(
+                    ui,
+                    "Dimmer",
+                    dimmer,
+                    scene.fixtures[primary].optics.dimmer,
+                    |ui, v| ui.add(Slider::new(v, 0.0..=1.0)),
+                    |v| ids.iter().for_each(|&i| scene.fixtures[i].optics.dimmer = v),
+                );
+                let beam = common_f32(ids.iter().map(|&i| scene.fixtures[i].beam));
+                bulk_f32_row(
+                    ui,
+                    "Beam",
+                    beam,
+                    scene.fixtures[primary].beam,
+                    |ui, v| {
+                        ui.add(Slider::new(v, 0.0..=4.0).text("vol"))
+                            .on_hover_text("Volumetric beam intensity (0 = off)")
+                    },
+                    |v| ids.iter().for_each(|&i| scene.fixtures[i].beam = v),
+                );
+                // Colour: same mixed/unify pattern, but the widget is a colour well.
                 ui.label("Color");
-                if ui.color_edit_button_rgb(&mut color).changed() {
-                    for &i in ids {
-                        scene.fixtures[i].color = color;
+                match common_rgb(ids.iter().map(|&i| scene.fixtures[i].color)) {
+                    Some(mut color) => {
+                        if ui.color_edit_button_rgb(&mut color).changed() {
+                            for &i in ids {
+                                scene.fixtures[i].color = color;
+                            }
+                        }
+                    }
+                    None => {
+                        let seed = scene.fixtures[primary].color;
+                        if ui
+                            .add(egui::Button::new(RichText::new("— Multiple —").small().weak()))
+                            .on_hover_text("Colours differ — click to set all to the active colour")
+                            .clicked()
+                        {
+                            for &i in ids {
+                                scene.fixtures[i].color = seed;
+                            }
+                        }
                     }
                 }
                 ui.end_row();
@@ -950,30 +1246,40 @@ fn bulk_wheel(
 ) {
     // Seed from the first selected fixture that actually has this wheel (the
     // union may include wheels the primary doesn't have).
-    let Some((mut value, mut spin)) = ids
+    let Some((seed_value, seed_spin)) = ids
         .iter()
         .find_map(|&i| scene.fixtures[i].wheel_control_mut(kind, number).map(|w| (w.value, w.spin)))
     else {
         return;
     };
-    ui.label(label);
-    if ui.add(Slider::new(&mut value, 0.0..=1.0)).changed() {
+    // Mixed-value detection (#7) over only the fixtures that HAVE this wheel.
+    let value = common_f32(
+        ids.iter().filter_map(|&i| scene.fixtures[i].wheel_control_mut(kind, number).map(|w| w.value)),
+    );
+    bulk_f32_row(ui, label, value, seed_value, |ui, v| ui.add(Slider::new(v, 0.0..=1.0)), |v| {
         for &i in ids {
             if let Some(w) = scene.fixtures[i].wheel_control_mut(kind, number) {
-                w.value = value;
+                w.value = v;
             }
         }
-    }
-    ui.end_row();
-    ui.label(format!("{label} spin"));
-    if ui.add(Slider::new(&mut spin, 0.0..=1.0).text("0.5=stop")).changed() {
-        for &i in ids {
-            if let Some(w) = scene.fixtures[i].wheel_control_mut(kind, number) {
-                w.spin = spin;
+    });
+    let spin = common_f32(
+        ids.iter().filter_map(|&i| scene.fixtures[i].wheel_control_mut(kind, number).map(|w| w.spin)),
+    );
+    bulk_f32_row(
+        ui,
+        &format!("{label} spin"),
+        spin,
+        seed_spin,
+        |ui, v| ui.add(Slider::new(v, 0.0..=1.0).text("0.5=stop")),
+        |v| {
+            for &i in ids {
+                if let Some(w) = scene.fixtures[i].wheel_control_mut(kind, number) {
+                    w.spin = v;
+                }
             }
-        }
-    }
-    ui.end_row();
+        },
+    );
 }
 
 /// One bulk optics slider for an [`OpticField`], written to every selected
@@ -986,14 +1292,24 @@ fn bulk_opt_field(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], f: OpticF
         .copied()
         .find(|&i| scene.fixtures[i].gdtf.as_ref().is_some_and(|g| f.supported(g)))
         .unwrap_or(ids[0]);
-    let mut v = f.get(&scene.fixtures[seed].optics);
-    ui.label(f.label());
-    if ui.add(Slider::new(&mut v, f.range())).changed() {
-        for &i in ids {
-            f.set(&mut scene.fixtures[i].optics, v);
-        }
-    }
-    ui.end_row();
+    // Mixed-value detection (#7) over only the fixtures that EXPOSE this field.
+    let common = common_f32(
+        ids.iter()
+            .filter(|&&i| scene.fixtures[i].gdtf.as_ref().is_some_and(|g| f.supported(g)))
+            .map(|&i| f.get(&scene.fixtures[i].optics)),
+    );
+    bulk_f32_row(
+        ui,
+        f.label(),
+        common,
+        f.get(&scene.fixtures[seed].optics),
+        |ui, v| ui.add(Slider::new(v, f.range())),
+        |v| {
+            for &i in ids {
+                f.set(&mut scene.fixtures[i].optics, v);
+            }
+        },
+    );
 }
 
 fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture) {
@@ -1003,23 +1319,36 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture) {
     ui.label(RichText::new(format!("{} · {}", fixture.category, fixture.profile)).weak().small());
     ui.separator();
 
+    let def = FixtureDefaults::for_fixture(fixture);
+
     egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("fx-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Position");
-                ui.horizontal(|ui| {
-                    ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                    ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                    ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
-                });
-                ui.end_row();
-                ui.label("Pan");
+                // Common: pan/tilt (the live-aim controls); each gets a revert
+                // arrow back to its rest angle (0). Position has no template
+                // default → kept arrow-free, in the Advanced disclosure below.
+                if prop_label(ui, "Pan", !approx(fixture.pan, def.pan)) {
+                    fixture.pan = def.pan;
+                }
                 ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"));
                 ui.end_row();
-                ui.label("Tilt");
+                if prop_label(ui, "Tilt", !approx(fixture.tilt, def.tilt)) {
+                    fixture.tilt = def.tilt;
+                }
                 ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-180.0..=180.0).suffix("°"));
                 ui.end_row();
+            });
+            advanced_section(ui, "fx-transform", |ui| {
+                Grid::new("fx-transform-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Position");
+                    ui.horizontal(|ui| {
+                        ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
+                        ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
+                        ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                    });
+                    ui.end_row();
+                });
             });
         });
 
@@ -1027,19 +1356,41 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture) {
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("fx-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Dimmer");
+                // Common: the everyday level + colour controls.
+                if prop_label(ui, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer)) {
+                    fixture.optics.dimmer = def.dimmer;
+                }
                 ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
                 ui.end_row();
-                ui.label("Beam");
-                ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
-                    .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
-                ui.end_row();
-                ui.label("Beam angle");
-                ui.add(DragValue::new(&mut fixture.beam_angle).speed(0.2).range(2.0..=90.0).suffix("°"));
-                ui.end_row();
-                ui.label("Color");
+                // Colour only shows a revert arrow when its template is known
+                // (GDTF white-master); a built-in's library tint isn't stored.
+                let color_differs = def.color.is_some_and(|d| !approx_rgb(fixture.color, d));
+                if prop_label(ui, "Color", color_differs) {
+                    if let Some(d) = def.color {
+                        fixture.color = d;
+                    }
+                }
                 ui.color_edit_button_rgb(&mut fixture.color);
                 ui.end_row();
+            });
+            // Advanced: the volumetric / cone tuning a designer touches rarely.
+            advanced_section(ui, "fx-fixture", |ui| {
+                Grid::new("fx-fixture-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    if prop_label(ui, "Beam", !approx(fixture.beam, def.beam)) {
+                        fixture.beam = def.beam;
+                    }
+                    ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
+                        .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
+                    ui.end_row();
+                    let ba_differs = def.beam_angle.is_some_and(|d| !approx(fixture.beam_angle, d));
+                    if prop_label(ui, "Beam angle", ba_differs) {
+                        if let Some(d) = def.beam_angle {
+                            fixture.beam_angle = d;
+                        }
+                    }
+                    ui.add(DragValue::new(&mut fixture.beam_angle).speed(0.2).range(2.0..=90.0).suffix("°"));
+                    ui.end_row();
+                });
             });
         });
 }
@@ -1075,31 +1426,51 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment) {
     egui::CollapsingHeader::new(format!("{}  Volume", theme::icon::ENVIRONMENT))
         .default_open(true)
         .show(ui, |ui| {
+            // Env defaults = the `from_profile` rest constants (density's template
+            // lives on the profile, which the instance doesn't keep → no arrow).
+            const D_COLOR: [f32; 3] = [0.7, 0.72, 0.78];
+            const D_ANISO: f32 = 0.25;
+            const D_UNIFORM: f32 = 0.6;
+            const D_CLUSTER: f32 = 0.0;
             Grid::new("env-volume").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                // Common: the two controls a designer reaches for first.
                 ui.label("Density");
                 ui.add(DragValue::new(&mut env.density).speed(0.005).range(0.0..=4.0));
                 ui.end_row();
-                ui.label("Anisotropy");
-                ui.add(DragValue::new(&mut env.anisotropy).speed(0.005).range(-0.95..=0.95))
-                    .on_hover_text("Henyey-Greenstein g (forward scattering > 0)");
-                ui.end_row();
-                ui.label("Uniformity");
-                ui.add(egui::Slider::new(&mut env.uniformity, 0.0..=1.0))
-                    .on_hover_text(
-                        "1 = smooth even haze · 0 = clusters of smoke/clouds (dense \
-                         pockets scatter brighter, with clear gaps between)",
-                    );
-                ui.end_row();
-                ui.label("Cluster contrast");
-                ui.add(egui::Slider::new(&mut env.cluster_contrast, 0.0..=1.0))
-                    .on_hover_text(
-                        "How much brighter/denser the clusters are vs the haze (and how \
-                         clear the gaps). Higher = pockets pop harder. Pairs with low density.",
-                    );
-                ui.end_row();
-                ui.label("Tint");
+                if prop_label(ui, "Tint", !approx_rgb(env.color, D_COLOR)) {
+                    env.color = D_COLOR;
+                }
                 ui.color_edit_button_rgb(&mut env.color);
                 ui.end_row();
+            });
+            // Advanced: the scattering-model knobs.
+            advanced_section(ui, "env-volume", |ui| {
+                Grid::new("env-volume-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    if prop_label(ui, "Anisotropy", !approx(env.anisotropy, D_ANISO)) {
+                        env.anisotropy = D_ANISO;
+                    }
+                    ui.add(DragValue::new(&mut env.anisotropy).speed(0.005).range(-0.95..=0.95))
+                        .on_hover_text("Henyey-Greenstein g (forward scattering > 0)");
+                    ui.end_row();
+                    if prop_label(ui, "Uniformity", !approx(env.uniformity, D_UNIFORM)) {
+                        env.uniformity = D_UNIFORM;
+                    }
+                    ui.add(egui::Slider::new(&mut env.uniformity, 0.0..=1.0))
+                        .on_hover_text(
+                            "1 = smooth even haze · 0 = clusters of smoke/clouds (dense \
+                             pockets scatter brighter, with clear gaps between)",
+                        );
+                    ui.end_row();
+                    if prop_label(ui, "Cluster contrast", !approx(env.cluster_contrast, D_CLUSTER)) {
+                        env.cluster_contrast = D_CLUSTER;
+                    }
+                    ui.add(egui::Slider::new(&mut env.cluster_contrast, 0.0..=1.0))
+                        .on_hover_text(
+                            "How much brighter/denser the clusters are vs the haze (and how \
+                             clear the gaps). Higher = pockets pop harder. Pairs with low density.",
+                        );
+                    ui.end_row();
+                });
             });
         });
 }
@@ -1156,14 +1527,25 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
                     pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
                 });
                 ui.end_row();
-                ui.label("Rotation");
+                // Rotation reverts to identity (0/0/0), scale to unit — the
+                // geometry "default" (struct-Default intent for a placed object).
+                let rot_differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
+                if prop_label(ui, "Rotation", rot_differs) {
+                    ex = 0.0;
+                    ey = 0.0;
+                    ez = 0.0;
+                    rs_changed = true;
+                }
                 ui.horizontal(|ui| {
                     rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
                     rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
                     rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
                 });
                 ui.end_row();
-                ui.label("Scale");
+                if prop_label(ui, "Scale", !approx(uscale, 1.0)) {
+                    uscale = 1.0;
+                    rs_changed = true;
+                }
                 rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
                 ui.end_row();
             });
@@ -1637,29 +2019,42 @@ fn gdtf_inspector(
     }
 
     ui.separator();
+    let def = FixtureDefaults::for_fixture(fixture);
     egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("gdtf-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Position");
-                ui.horizontal(|ui| {
-                    ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                    ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                    ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
-                });
-                ui.end_row();
-                ui.label("Pan");
+                // Common: the live-aim angles (each reverts to 0).
+                if prop_label(ui, "Pan", !approx(fixture.pan, def.pan)) {
+                    fixture.pan = def.pan;
+                }
                 ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"))
                     .on_hover_text(format!("commanded · now {:.0}°", fixture.pan_actual));
                 ui.end_row();
-                ui.label("Tilt");
+                if prop_label(ui, "Tilt", !approx(fixture.tilt, def.tilt)) {
+                    fixture.tilt = def.tilt;
+                }
                 ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-135.0..=135.0).suffix("°"))
                     .on_hover_text(format!("commanded · now {:.0}°", fixture.tilt_actual));
                 ui.end_row();
-                ui.label("Move speed")
-                    .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
-                ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0));
-                ui.end_row();
+            });
+            // Advanced: hang position + motor speed (rarely retouched live).
+            advanced_section(ui, "gdtf-transform", |ui| {
+                Grid::new("gdtf-transform-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Position");
+                    ui.horizontal(|ui| {
+                        ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
+                        ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
+                        ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                    });
+                    ui.end_row();
+                    if prop_label(ui, "Move speed", !approx(fixture.move_speed, 0.0)) {
+                        fixture.move_speed = 0.0;
+                    }
+                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
+                        .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
+                    ui.end_row();
+                });
             });
         });
 
@@ -1667,16 +2062,29 @@ fn gdtf_inspector(
         .default_open(true)
         .show(ui, |ui| {
             Grid::new("gdtf-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Dimmer");
+                if prop_label(ui, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer)) {
+                    fixture.optics.dimmer = def.dimmer;
+                }
                 ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
                 ui.end_row();
-                ui.label("Beam");
-                ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
-                    .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
-                ui.end_row();
-                ui.label("Color");
+                let color_differs = def.color.is_some_and(|d| !approx_rgb(fixture.color, d));
+                if prop_label(ui, "Color", color_differs) {
+                    if let Some(d) = def.color {
+                        fixture.color = d;
+                    }
+                }
                 ui.color_edit_button_rgb(&mut fixture.color);
                 ui.end_row();
+            });
+            advanced_section(ui, "gdtf-fixture", |ui| {
+                Grid::new("gdtf-fixture-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    if prop_label(ui, "Beam", !approx(fixture.beam, def.beam)) {
+                        fixture.beam = def.beam;
+                    }
+                    ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
+                        .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
+                    ui.end_row();
+                });
             });
         });
 
@@ -1758,13 +2166,25 @@ fn gdtf_inspector(
 fn optic_field_row(
     ui: &mut egui::Ui,
     o: &mut OpticalControls,
+    def: &OpticalControls,
     f: OpticField,
     enabled: bool,
     text: Option<String>,
 ) {
-    let resp = ui.label(f.label());
+    // Per-property reset (#6): the arrow shows when this control left its neutral
+    // default and is reachable (an unsupported/greyed row never differs anyway).
+    let differs = enabled && !approx(f.get(o), f.get(def));
+    let resp = ui.horizontal(|ui| {
+        let reset = reset_arrow(ui, differs);
+        let lbl = ui.label(f.label());
+        (reset, lbl)
+    });
+    let (reset, lbl) = resp.inner;
+    if reset {
+        f.set(o, f.get(def));
+    }
     if f == OpticField::Green {
-        resp.on_hover_text("Plus/minus-green (CC axis): −1 magenta … +1 green");
+        lbl.on_hover_text("Plus/minus-green (CC axis): −1 magenta … +1 green");
     }
     let mut v = f.get(o);
     let mut slider = Slider::new(&mut v, f.range());
@@ -1809,22 +2229,48 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
                         });
                 });
             }
+            let def = OpticalControls::default();
             let o = &mut fixture.optics;
             // Data-driven rows (gated by the fixture's GDTF attributes) so single
             // and bulk editing enumerate the SAME control set — see `OpticField`.
+            // Simple/Advanced split (#8): the everyday controls show up front; the
+            // power-user shaping (chromatic ab. / shutter / strobe / ±green tint)
+            // tucks behind a per-section "Advanced" caret.
+            const BEAM_COMMON: [OpticField; 3] =
+                [OpticField::Zoom, OpticField::Focus, OpticField::Iris];
+            const BEAM_ADV: [OpticField; 3] =
+                [OpticField::Ca, OpticField::Shutter, OpticField::Strobe];
+            const COLOR_COMMON: [OpticField; 4] =
+                [OpticField::Cto, OpticField::Cyan, OpticField::Magenta, OpticField::Yellow];
+            const COLOR_ADV: [OpticField; 1] = [OpticField::Green];
+
             ui.label(RichText::new("BEAM SHAPING").small().strong());
             Grid::new("optics-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                for f in OpticField::BEAM {
-                    optic_field_row(ui, o, f, f.supported(gdtf), (f == OpticField::Zoom).then(|| format!("{zoom_deg:.0}°")));
+                for f in BEAM_COMMON {
+                    optic_field_row(ui, o, &def, f, f.supported(gdtf), (f == OpticField::Zoom).then(|| format!("{zoom_deg:.0}°")));
                 }
+            });
+            advanced_section(ui, "optics-beam", |ui| {
+                Grid::new("optics-beam-adv").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
+                    for f in BEAM_ADV {
+                        optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                    }
+                });
             });
 
             ui.add_space(4.0);
             ui.label(RichText::new("COLOR MIXING").small().strong());
             Grid::new("optics-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                for f in OpticField::COLOR {
-                    optic_field_row(ui, o, f, f.supported(gdtf), None);
+                for f in COLOR_COMMON {
+                    optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
                 }
+            });
+            advanced_section(ui, "optics-color", |ui| {
+                Grid::new("optics-color-adv").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
+                    for f in COLOR_ADV {
+                        optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                    }
+                });
             });
 
             // One block per wheel component, generated from the GDTF chain.
@@ -1937,8 +2383,74 @@ fn frame_selection(scene: &Scene, selection: &Selection, camera: &mut OrbitCamer
 
 /// Apply an in-progress modal transform to the scene from the current mouse
 /// position. Reads the snapshot in `op.start`, so it's idempotent — called every
+/// The world origin/centre of one selected fixture (its position) or geometry (its
+/// world-bounds centre, falling back to the transform's translation). The single
+/// per-element anchor both the pivot computation and Individual-Origins read.
+fn fixture_anchor(scene: &Scene, i: usize) -> Option<Vec3> {
+    scene.fixtures.get(i).map(|f| f.position)
+}
+fn geometry_anchor(scene: &Scene, i: usize) -> Option<Vec3> {
+    scene.geometry.get(i).map(|g| {
+        g.world_bounds().map(|(lo, hi)| (lo + hi) * 0.5).unwrap_or_else(|| g.transform.w_axis.truncate())
+    })
+}
+
+/// Compute the single world pivot the rotate/scale spins/grows about, per the
+/// chosen [`PivotMode`] (#5). `fids`/`gids` are the (validated) selected indices in
+/// selection order, so `fids[0]`/`gids[0]` is the active element. Individual-Origins
+/// has no single pivot — the applier uses each element's own anchor — so it returns
+/// the Median like the others (a harmless fallback the applier ignores when
+/// `op.individual`). Empty selection → origin.
+fn compute_pivot(
+    scene: &Scene,
+    fids: &[usize],
+    gids: &[usize],
+    mode: PivotMode,
+    cursor_3d: Vec3,
+) -> Vec3 {
+    match mode {
+        PivotMode::Cursor3d => cursor_3d,
+        PivotMode::Active => {
+            // The primary element = the first selected (fixtures take precedence
+            // over geometry when both kinds are present, matching the gizmo order).
+            fids.first()
+                .and_then(|&i| fixture_anchor(scene, i))
+                .or_else(|| gids.first().and_then(|&i| geometry_anchor(scene, i)))
+                .unwrap_or(Vec3::ZERO)
+        }
+        // Median + Individual both seed from the centroid (Individual's per-element
+        // pivots are applied in apply_transform via `op.individual`).
+        PivotMode::Median | PivotMode::Individual => {
+            let mut sum = Vec3::ZERO;
+            let mut n = 0.0_f32;
+            for &i in fids {
+                if let Some(a) = fixture_anchor(scene, i) {
+                    sum += a;
+                    n += 1.0;
+                }
+            }
+            for &i in gids {
+                if let Some(a) = geometry_anchor(scene, i) {
+                    sum += a;
+                    n += 1.0;
+                }
+            }
+            if n > 0.0 { sum / n } else { Vec3::ZERO }
+        }
+    }
+}
+
 /// frame the op is live; cancelling restores from the same snapshot.
-fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cur: egui::Pos2) {
+fn apply_transform(
+    op: &TransformOp,
+    scene: &mut Scene,
+    camera: &OrbitCamera,
+    cur: egui::Pos2,
+    // Live snap-enabled state (#4): `op.snap.on` XOR a held-Ctrl invert, resolved by
+    // the caller this frame. Quantizes the COMMITTED amount (delta / angle / factor),
+    // never the raw mouse delta — so it composes with the numeric entry too.
+    snap_on: bool,
+) {
     // Position/orientation are read directly by the renderer, so they need no
     // snap_movement() — and calling it every frame would freeze each fixture's
     // wheel-motion phase. (Cancel restores from the same snapshot the same way.)
@@ -1953,7 +2465,7 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
     let typed = op.num.active;
     match op.kind {
         TransformKind::Move => {
-            let world = if typed {
+            let mut world = if typed {
                 // Metres along the active axis; no lock → global X (Blender's
                 // single-value-no-constraint behaviour).
                 let a = axis.map(|a| a.vec()).unwrap_or(Vec3::X);
@@ -1967,6 +2479,8 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
                 }
                 w
             };
+            // #4: quantize the world delta per-axis (composes with the typed path).
+            world = op.snap.snap_move(world, snap_on);
             for (i, p0, _q) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
                     f.position = *p0 + world;
@@ -1979,37 +2493,49 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
             }
         }
         TransformKind::Rotate => {
-            // Typed degrees override the mouse-derived angle (radians).
+            // Typed degrees override the mouse-derived angle (radians); #4 snaps the
+            // committed angle to the rotate increment (e.g. nearest 15°).
             let angle = if typed { amount.to_radians() } else { d.x * 0.01 };
+            let angle = op.snap.snap_angle(angle, snap_on);
             let raxis = axis.map(|a| a.vec()).unwrap_or(Vec3::Y);
             let rot = Quat::from_axis_angle(raxis, angle);
             for (i, p0, q0) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
-                    f.position = op.pivot + rot * (*p0 - op.pivot);
+                    // Individual Origins (#5): each fixture spins about ITS OWN origin
+                    // (p0), so its position is unchanged and only orientation turns;
+                    // else everything orbits the shared pivot.
+                    let pivot = if op.individual { *p0 } else { op.pivot };
+                    f.position = pivot + rot * (*p0 - pivot);
                     f.orientation = rot * *q0;
                 }
             }
-            if !op.geo_start.is_empty() {
-                let about = Mat4::from_translation(op.pivot)
+            for (i, m0) in &op.geo_start {
+                // Individual Origins: pivot = each piece's own world-bounds centre at
+                // op start (read off m0); else the shared pivot.
+                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let about = Mat4::from_translation(pivot)
                     * Mat4::from_quat(rot)
-                    * Mat4::from_translation(-op.pivot);
-                for (i, m0) in &op.geo_start {
-                    if let Some(g) = scene.geometry.get_mut(*i) {
-                        g.transform = about * *m0;
-                    }
+                    * Mat4::from_translation(-pivot);
+                if let Some(g) = scene.geometry.get_mut(*i) {
+                    g.transform = about * *m0;
                 }
             }
         }
         TransformKind::Scale => {
-            // Typed 1 → ×1 (identity); clamp >0 (Blender NUM_NO_ZERO).
+            // Typed 1 → ×1 (identity); clamp >0 (Blender NUM_NO_ZERO). #4 snaps the
+            // committed factor to the scale increment (never to 0 → no collapse).
             let factor = if typed {
                 amount.max(0.0001)
             } else {
                 (1.0 + d.x * 0.005).max(0.01)
             };
+            let factor = op.snap.snap_scale(factor, snap_on);
             for (i, p0, _q) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
-                    let off = *p0 - op.pivot;
+                    // Individual Origins: scaling a point about ITSELF is a no-op, so
+                    // a scattered fixture rig stays put (only geometry visibly grows).
+                    let pivot = if op.individual { *p0 } else { op.pivot };
+                    let off = *p0 - pivot;
                     let new = if let Some(ax) = op.axis {
                         let a = ax.vec();
                         let comp = a * off.dot(a);
@@ -2017,27 +2543,34 @@ fn apply_transform(op: &TransformOp, scene: &mut Scene, camera: &OrbitCamera, cu
                     } else {
                         off * factor
                     };
-                    f.position = op.pivot + new;
+                    f.position = pivot + new;
                 }
             }
-            if !op.geo_start.is_empty() {
-                // Scale about the pivot in world space — uniform, or only the
-                // locked axis.
-                let s = match op.axis {
-                    Some(ax) => Vec3::ONE + ax.vec() * (factor - 1.0),
-                    None => Vec3::splat(factor),
-                };
-                let about = Mat4::from_translation(op.pivot)
+            // Scale about the pivot in world space — uniform, or only the locked axis.
+            let s = match op.axis {
+                Some(ax) => Vec3::ONE + ax.vec() * (factor - 1.0),
+                None => Vec3::splat(factor),
+            };
+            for (i, m0) in &op.geo_start {
+                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let about = Mat4::from_translation(pivot)
                     * Mat4::from_scale(s)
-                    * Mat4::from_translation(-op.pivot);
-                for (i, m0) in &op.geo_start {
-                    if let Some(g) = scene.geometry.get_mut(*i) {
-                        g.transform = about * *m0;
-                    }
+                    * Mat4::from_translation(-pivot);
+                if let Some(g) = scene.geometry.get_mut(*i) {
+                    g.transform = about * *m0;
                 }
             }
         }
     }
+}
+
+/// The world-space translation of a geometry transform (its origin) — the
+/// Individual-Origins pivot for static geometry. Uses the transform's own
+/// translation (cheap, stable across the live drag; the AABB centre would drift as
+/// the piece scales, which is wrong for an about-its-own-origin pivot).
+#[inline]
+fn geo_world_centre(m: Mat4) -> Vec3 {
+    m.w_axis.truncate()
 }
 
 /// Live state for the Measure tool (§2.4) — a read-only two-point ruler that never
@@ -2133,6 +2666,31 @@ fn pick_world_point(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Vec3> {
     }
 }
 
+/// Resolve where a newly-added object should land (#19 — place at cursor/camera,
+/// not origin). Casts the viewport-centre ray (NDC `0,0`) into the scene and
+/// returns its ground/surface hit (via [`pick_world_point`]); if that misses
+/// (e.g. the camera looks at the sky), falls back to a point a sensible distance
+/// in front of the camera; if even that degenerates, the origin. The whole
+/// add+place is wrapped in ONE undo op by the caller. We use the view-centre ray
+/// (not the mouse) because both add entry points — the Library "Add" button and
+/// the Shift+A menu — fire from outside the viewport draw, where the live mouse
+/// position relative to the viewport rect isn't reachable; the framed centre is
+/// the stable, predictable "where I'm looking" anchor Unreal's PlacementMode uses.
+pub fn placement_point(scene: &Scene, camera: &OrbitCamera) -> Vec3 {
+    let aspect = camera.last_aspect;
+    let (ro, rd) = camera.ray(Vec2::ZERO, aspect);
+    if let Some(p) = pick_world_point(scene, ro, rd) {
+        return p;
+    }
+    // Ground/surface miss → place in front of the camera at the orbit distance.
+    let front = ro + rd * camera.distance.max(1.0);
+    if front.is_finite() {
+        front
+    } else {
+        Vec3::ZERO
+    }
+}
+
 /// Central tab: the 3D scene, rendered offscreen and shown as a texture.
 /// Drag to orbit, shift+drag to pan, scroll to zoom, click to select, `d` to
 /// duplicate the selected fixture; G/R/S to move/rotate/scale the selection.
@@ -2168,6 +2726,13 @@ pub fn viewport(
     // click-select. The spring-loaded modal G/R/S transforms stay available under
     // every tool — they OWN the viewport once started, regardless of the rail.
     active_tool: ActiveTool,
+    // Transform-tool options (§2.4 #4/#5): grid/increment snap + pivot-point mode.
+    // Read when building a TransformOp (gizmo + modal G/R/S) so the snap policy and
+    // pivot are baked into the op; the header/N-panel write them.
+    xform: TransformPrefs,
+    // The world 3D-cursor point — the PivotMode::Cursor3d pivot (§2.4 #5). Drawn as a
+    // small target marker; movable later. &mut so a future Shift-RMB can reposition it.
+    cursor_3d: &mut Vec3,
     // The Measure tool's two-point ruler state (§2.4). Persists across frames so a
     // completed measurement stays drawn; only the Measure tool reads/writes it.
     measure: &mut MeasureState,
@@ -2212,6 +2777,25 @@ pub fn viewport(
 
     let aspect = rect.width() / rect.height().max(1.0);
 
+    // --- 3D cursor (§2.4 #5) -------------------------------------------------
+    // The world cursor point — the PivotMode::Cursor3d pivot. Drawn always (like
+    // Blender's 3D cursor) as a small red/white crosshair-ring so the user can see
+    // where a Cursor-pivot transform will spin/grow about. Read-only here (movable
+    // is a follow-up); behind every interactive overlay so it never eats clicks.
+    if let Some(sc) = OrbitCamera::project_to_screen(*cursor_3d, camera.view_proj(aspect), rect) {
+        let p = ui.painter_at(rect);
+        let r = 7.0;
+        // Dashed-look crosshair: two short ticks per arm, in cursor red + white.
+        let red = egui::Color32::from_rgb(230, 70, 70);
+        let white = egui::Color32::from_rgb(235, 235, 235);
+        p.circle_stroke(sc, r, egui::Stroke::new(1.0, red));
+        for (i, (dx, dy)) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+            let col = if i % 2 == 0 { red } else { white };
+            let dir = egui::vec2(*dx, *dy);
+            p.line_segment([sc + dir * (r - 1.0), sc + dir * (r + 5.0)], egui::Stroke::new(1.0, col));
+        }
+    }
+
     // --- Interactive transform-gizmo group (§2.4 GizmoGroup) ---
     // The ACTIVE TOOL selects which gizmo draws at the selection pivot: Move→arrows,
     // Rotate→rings, Scale→boxes (gizmo::for_tool is the single tool→group map; Select
@@ -2229,28 +2813,17 @@ pub fn viewport(
     if gizmo_targets
         && let Some(group) = gizmo::for_tool(active_tool)
     {
-        // Centroid of every selected target (fixture origins + geometry bbox centres).
-        let mut sum = Vec3::ZERO;
-        let mut n = 0.0_f32;
-        for &i in &selection.fixtures {
-            if let Some(f) = scene.fixtures.get(i) {
-                sum += f.position;
-                n += 1.0;
-            }
-        }
-        for &i in &selection.geometry {
-            if let Some(g) = scene.geometry.get(i) {
-                let c = g
-                    .world_bounds()
-                    .map(|(lo, hi)| (lo + hi) * 0.5)
-                    .unwrap_or_else(|| g.transform.w_axis.truncate());
-                sum += c;
-                n += 1.0;
-            }
-        }
+        // #5: the gizmo draws at the mode-resolved pivot (Median centroid / Active /
+        // 3D-cursor; Individual Origins also draws at the median, matching Blender).
+        let fids: Vec<usize> =
+            selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+        let gids: Vec<usize> =
+            selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
+        let n = (fids.len() + gids.len()) as f32;
         if n > 0.0 {
+            let gizmo_pivot = compute_pivot(scene, &fids, &gids, xform.pivot, *cursor_3d);
             let cx = GizmoCtx {
-                pivot: sum / n,
+                pivot: gizmo_pivot,
                 vp: camera.view_proj(aspect),
                 rect,
                 // Arm/ring size scales with camera distance so handles stay a
@@ -2270,18 +2843,8 @@ pub fn viewport(
                 && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
             {
                 let start_spec = group.invoke(handle);
-                let fids: Vec<usize> = selection
-                    .fixtures
-                    .iter()
-                    .copied()
-                    .filter(|&i| i < scene.fixtures.len())
-                    .collect();
-                let gids: Vec<usize> = selection
-                    .geometry
-                    .iter()
-                    .copied()
-                    .filter(|&i| i < scene.geometry.len())
-                    .collect();
+                // `fids`/`gids` are the validated, selection-order indices computed
+                // above for the pivot — reused here for the per-element snapshots.
                 let start: Vec<(usize, Vec3, Quat)> = fids
                     .iter()
                     .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
@@ -2305,6 +2868,8 @@ pub fn viewport(
                     },
                     from_gizmo: true,
                     num: NumInput::default(),
+                    individual: xform.pivot.is_individual(),
+                    snap: xform.snap,
                 });
                 *transform_started = true;
             }
@@ -2561,7 +3126,12 @@ pub fn viewport(
             *transform = None;
         } else {
             if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
-                apply_transform(op, scene, camera, cur);
+                // #4: snap is `op.snap.on` INVERTED while Ctrl/⌘ is held (Blender's
+                // Ctrl-toggles-snap, Unreal's transient grid gate) — resolved live
+                // each frame so a mid-drag Ctrl tap flips quantization on/off.
+                let ctrl = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                let snap_on = op.snap.on ^ ctrl;
+                apply_transform(op, scene, camera, cur, snap_on);
             }
             // The key cluster (X/Y/Z · type number · Enter/Esc) is read LIVE from
             // the keymap so the pill can never drift from the binds (#23). When an
@@ -2611,32 +3181,16 @@ pub fn viewport(
             let gids: Vec<usize> =
                 selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
             if !fids.is_empty() || !gids.is_empty() {
-                // Pivot = centroid of every selected target (fixture origins +
-                // geometry bbox centres).
-                let mut sum = Vec3::ZERO;
-                let mut n = 0.0_f32;
+                // #5: pivot per the chosen mode (Median / Active / 3D-Cursor; the
+                // Individual flag makes apply_transform pivot each element about its
+                // own origin). Per-element snapshots for the live re-apply / cancel.
+                let pivot = compute_pivot(scene, &fids, &gids, xform.pivot, *cursor_3d);
                 let start: Vec<(usize, Vec3, Quat)> = fids
                     .iter()
-                    .map(|&i| {
-                        sum += scene.fixtures[i].position;
-                        n += 1.0;
-                        (i, scene.fixtures[i].position, scene.fixtures[i].orientation)
-                    })
+                    .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
                     .collect();
-                let geo_start: Vec<(usize, Mat4)> = gids
-                    .iter()
-                    .map(|&i| {
-                        let g = &scene.geometry[i];
-                        let c = g
-                            .world_bounds()
-                            .map(|(lo, hi)| (lo + hi) * 0.5)
-                            .unwrap_or_else(|| g.transform.w_axis.truncate());
-                        sum += c;
-                        n += 1.0;
-                        (i, g.transform)
-                    })
-                    .collect();
-                let pivot = if n > 0.0 { sum / n } else { Vec3::ZERO };
+                let geo_start: Vec<(usize, Mat4)> =
+                    gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
                 *transform = Some(TransformOp {
                     kind,
                     axis: None,
@@ -2647,9 +3201,85 @@ pub fn viewport(
                     gizmo_hovered_axis: None,
                     from_gizmo: false,
                     num: NumInput::default(),
+                    individual: xform.pivot.is_individual(),
+                    snap: xform.snap,
                 });
                 *transform_started = true;
                 consumed = true;
+            }
+        }
+    }
+
+    // --- Box / marquee select (#25) ------------------------------------------
+    // ORBIT-vs-BOX RULE (matches Blender's Box-Select tool + UE marquee, adapted
+    // to our LMB-orbit nav): under the SELECT tool, a left-drag that BEGAN over
+    // EMPTY space (no gizmo handle — Select shows none — and nothing `pick()`s
+    // under the press origin) rubber-bands a marquee; a drag that began over an
+    // object, or a drag under ANY other tool, stays plain orbit/pan. So orbit is
+    // always reachable: switch off the Select tool, or start the drag on an
+    // object. The box-active decision is latched on drag-start (egui temp memory,
+    // keyed by the viewport id) so mid-drag the cursor leaving empty space can't
+    // flip it back to orbit. Modifiers: plain = Replace, Shift = Add, ⌘/Ctrl =
+    // Subtract — ONE undo-free selection change committed on release.
+    // Latched across the drag's frames in egui temp memory (keyed by viewport id):
+    // the marquee anchor (press origin) once box-select has begun. `None` = not
+    // currently marqueeing. Stashing the anchor here makes the release computation
+    // independent of egui's `press_origin()` lifetime (cleared at button-up).
+    let box_anchor_id = ui.id().with("viewport_box_anchor");
+    let mut box_anchor: Option<egui::Pos2> = ui.data(|d| d.get_temp(box_anchor_id));
+    if !consumed
+        && active_tool == ActiveTool::Select
+        && transform.is_none()
+        && *viewport_focused
+    {
+        if response.drag_started()
+            && let Some(press) = ui.input(|i| i.pointer.press_origin())
+        {
+            // Box only when the press landed on empty space; an object under the
+            // press leaves the drag to orbit (no tweak-move under Select yet).
+            let uv = (press - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+            let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+            let (ro, rd) = camera.ray(ndc, aspect);
+            box_anchor = (rect.contains(press) && pick(scene, ro, rd).is_none()).then_some(press);
+            ui.data_mut(|d| d.insert_temp(box_anchor_id, box_anchor));
+        }
+        if let Some(anchor) = box_anchor {
+            let cur = ui.input(|i| i.pointer.latest_pos()).unwrap_or(anchor);
+            let marquee = egui::Rect::from_two_pos(anchor, cur);
+            if response.dragged() {
+                // Draw the rubber-band from the anchor to the live cursor.
+                let accent = theme::Palette::get(ui).accent;
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(marquee, 0.0, accent.gamma_multiply(0.10));
+                painter.rect_stroke(
+                    marquee,
+                    0.0,
+                    egui::Stroke::new(1.0, accent),
+                    egui::StrokeKind::Inside,
+                );
+                consumed = true; // suppress orbit/pan while marqueeing
+            }
+            if response.drag_stopped() {
+                // Ignore a sub-pixel "drag" (really a click) — the click handler
+                // below owns single-pick selection.
+                if marquee.width() > 2.0 || marquee.height() > 2.0 {
+                    let m = ui.input(|i| i.modifiers);
+                    // Modifier → op (UE/CAD): plain = Replace, Shift = Add,
+                    // ⌘/Ctrl = Subtract — ONE undo-free selection change.
+                    let op = if m.command || m.ctrl {
+                        SelectOp::Subtract
+                    } else if m.shift {
+                        SelectOp::Add
+                    } else {
+                        SelectOp::Replace
+                    };
+                    let vp = camera.view_proj(aspect);
+                    let hits = marquee_hits(scene, vp, rect, marquee);
+                    *selection = apply_select(selection, &hits, op);
+                    *scene_anchor = None;
+                    consumed = true; // don't also fire click-select this frame
+                }
+                ui.data_mut(|d| d.remove_temp::<egui::Pos2>(box_anchor_id));
             }
         }
     }
@@ -2694,27 +3324,30 @@ pub fn viewport(
         let (ro, rd) = camera.ray(ndc, aspect);
         let m = ui.input(|i| i.modifiers);
         let toggle = m.command || m.ctrl;
-        match pick(scene, ro, rd) {
-            Some(Hit::Fixture(i)) => apply_fixture_click(selection, scene_anchor, i, m.shift, toggle, scene.fixtures.len()),
-            Some(Hit::Geometry(i)) => {
-                if toggle {
-                    selection.toggle_geometry(i);
-                } else {
-                    *selection = Selection::geometry(i);
-                }
-                *scene_anchor = None;
-            }
-            Some(Hit::Screen(i)) => {
-                if toggle {
-                    selection.toggle_screen(i);
-                } else {
-                    *selection = Selection::screen(i);
-                }
-                *scene_anchor = None;
-            }
-            Some(Hit::Environment(i)) => *selection = Selection::environment(i),
-            None if !(toggle || m.shift) => *selection = Selection::default(),
-            None => {}
+        let hit = pick(scene, ro, rd);
+        // Fixtures keep the anchor-based Shift = inclusive-range click (it needs
+        // the shared `scene_anchor` the pure SelectOp has no notion of); every
+        // other case routes through the ONE `apply_select` truth table (#24).
+        if let Some(Hit::Fixture(i)) = hit {
+            apply_fixture_click(selection, scene_anchor, i, m.shift, toggle, scene.fixtures.len());
+        } else {
+            // Modifier → op: plain = replace, ⌘/Ctrl = toggle, Shift = add.
+            let op = if toggle {
+                SelectOp::Toggle
+            } else if m.shift {
+                SelectOp::Add
+            } else {
+                SelectOp::Replace
+            };
+            let hits: &[SelItem] = match hit {
+                Some(Hit::Geometry(i)) => &[SelItem::Geometry(i)],
+                Some(Hit::Screen(i)) => &[SelItem::Screen(i)],
+                Some(Hit::Environment(i)) => &[SelItem::Environment(i)],
+                Some(Hit::Fixture(_)) => unreachable!("fixture handled above"),
+                None => &[],
+            };
+            *selection = apply_select(selection, hits, op);
+            *scene_anchor = None;
         }
     }
 
@@ -3808,6 +4441,42 @@ fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
     env.map(|(_, i)| Hit::Environment(i))
 }
 
+/// Gather every visible fixture / geometry object / LED screen whose
+/// screen-projected anchor point falls inside the marquee `marquee` (#25). The
+/// rule is **loose** (Blender's default: an object is hit if its *centre* lands
+/// in the rect — fixtures use their origin, geometry/screens their world-bounds
+/// centre), which is forgiving for the many tiny fixture dots in a rig. Hidden
+/// and behind-camera entities are skipped (`project_to_screen` returns `None`
+/// when `w <= 0`). Environments are excluded — they're single-only volumes the
+/// marquee shouldn't sweep up. Pure given `vp`/`rect`, so it's unit-testable.
+fn marquee_hits(scene: &Scene, vp: glam::Mat4, rect: egui::Rect, marquee: egui::Rect) -> Vec<SelItem> {
+    let mut hits = Vec::new();
+    let inside = |p: Vec3| {
+        OrbitCamera::project_to_screen(p, vp, rect)
+            .is_some_and(|s| marquee.contains(s))
+    };
+    for (i, f) in scene.fixtures.iter().enumerate() {
+        if !f.hidden && inside(f.position) {
+            hits.push(SelItem::Fixture(i));
+        }
+    }
+    for (i, g) in scene.geometry.iter().enumerate() {
+        let c = g
+            .world_bounds()
+            .map(|(lo, hi)| (lo + hi) * 0.5)
+            .unwrap_or_else(|| g.transform.w_axis.truncate());
+        if !g.hidden && inside(c) {
+            hits.push(SelItem::Geometry(i));
+        }
+    }
+    for (i, s) in scene.screens.iter().enumerate() {
+        if !s.hidden && inside(s.world_center()) {
+            hits.push(SelItem::Screen(i));
+        }
+    }
+    hits
+}
+
 /// Nearest positive ray–sphere intersection distance, if any.
 fn ray_sphere(ro: Vec3, rd: Vec3, center: Vec3, radius: f32) -> Option<f32> {
     let oc = ro - center;
@@ -3883,6 +4552,41 @@ mod pick_tests {
     }
 
     #[test]
+    fn marquee_selects_projected_in_rect() {
+        // Project a fixture to screen with the default camera, draw a marquee
+        // around its projected dot, and assert it's caught (#25). A marquee in the
+        // opposite corner must NOT catch it (loose centre-in-rect rule).
+        let scene = Scene::demo(); // one fixture at (0,4,0)
+        let cam = OrbitCamera::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let aspect = rect.width() / rect.height();
+        let vp = cam.view_proj(aspect);
+        let dot = OrbitCamera::project_to_screen(scene.fixtures[0].position, vp, rect)
+            .expect("fixture projects in front of the camera");
+
+        // A 40px box centred on the dot encloses its centre → hit.
+        let around = egui::Rect::from_center_size(dot, egui::vec2(40.0, 40.0));
+        let hits = marquee_hits(&scene, vp, rect, around);
+        assert!(hits.contains(&SelItem::Fixture(0)), "dot-in-rect → selected");
+
+        // A tiny box far from the dot → no hit.
+        let far = egui::Rect::from_min_size(
+            dot + egui::vec2(300.0, 300.0),
+            egui::vec2(8.0, 8.0),
+        );
+        let none = marquee_hits(&scene, vp, rect, far);
+        assert!(!none.contains(&SelItem::Fixture(0)), "off-dot rect → not selected");
+
+        // A hidden fixture is skipped even when its dot is inside the marquee.
+        let mut hidden = Scene::demo();
+        hidden.fixtures[0].hidden = true;
+        assert!(
+            marquee_hits(&hidden, vp, rect, around).is_empty(),
+            "hidden fixtures are not marquee-pickable"
+        );
+    }
+
+    #[test]
     fn measure_point_falls_back_to_ground_plane() {
         // An empty scene: a downward ray from y=10 must land on y=0 (the floor).
         let mut scene = Scene::demo();
@@ -3895,6 +4599,38 @@ mod pick_tests {
         let p = pick_world_point(&scene, ro, rd).expect("ground hit");
         assert!((p.y - 0.0).abs() < 1e-3, "expected y=0, got {}", p.y);
         assert!((p.x - 2.0).abs() < 1e-3 && (p.z - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn placement_point_lands_on_ground_when_looking_down() {
+        // A camera angled down at an empty scene: the centre ray hits the y=0
+        // floor (#19 — place at the ground hit, not the origin).
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        scene.screens.clear();
+        scene.geometry.clear();
+        scene.environments.clear();
+        let mut cam = OrbitCamera::default();
+        cam.set_view(crate::renderer::camera::CameraView::Top); // straight down
+        cam.set_aspect(16.0 / 9.0);
+        let p = placement_point(&scene, &cam);
+        assert!(p.y.abs() < 1e-2, "expected a ground (y≈0) hit, got y={}", p.y);
+    }
+
+    #[test]
+    fn placement_point_falls_back_in_front_when_ray_misses_ground() {
+        // A camera tilted UP so the centre ray never meets the floor: placement
+        // must fall back to a finite point in front of the camera, not panic/origin.
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        scene.screens.clear();
+        scene.geometry.clear();
+        scene.environments.clear();
+        let mut cam = OrbitCamera::default();
+        cam.pitch = -1.2; // look upward, away from the floor
+        cam.set_aspect(16.0 / 9.0);
+        let p = placement_point(&scene, &cam);
+        assert!(p.is_finite(), "placement must be finite, got {p:?}");
     }
 
     #[test]
@@ -3920,10 +4656,10 @@ mod pick_tests {
 #[cfg(test)]
 mod transform_tests {
     use super::*;
-    use crate::ui::Axis;
+    use crate::ui::{Axis, SnapSettings};
 
     fn make_op(kind: TransformKind, axis: Option<Axis>, pivot: Vec3, idx: usize, p0: Vec3) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)], geo_start: Vec::new(), gizmo_hovered_axis: None, from_gizmo: false, num: NumInput::default() }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), pivot, start: vec![(idx, p0, Quat::IDENTITY)], geo_start: Vec::new(), gizmo_hovered_axis: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default() }
     }
 
     #[test]
@@ -3932,7 +4668,7 @@ mod transform_tests {
         let p0 = scene.fixtures[0].position;
         let cam = OrbitCamera::default();
         let o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
-        apply_transform(&o, &mut scene, &cam, egui::pos2(120.0, 40.0));
+        apply_transform(&o, &mut scene, &cam, egui::pos2(120.0, 40.0), false);
         let d = scene.fixtures[0].position - p0;
         assert!(d.y.abs() < 1e-4, "y leaked: {}", d.y);
         assert!(d.z.abs() < 1e-4, "z leaked: {}", d.z);
@@ -3944,7 +4680,7 @@ mod transform_tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 + Vec3::new(2.0, 0.0, 0.0);
         let o = make_op(TransformKind::Rotate, Some(Axis::Y), pivot, 0, p0);
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(80.0, 0.0));
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(80.0, 0.0), false);
         let before = (p0 - pivot).length();
         let after = (scene.fixtures[0].position - pivot).length();
         assert!((before - after).abs() < 1e-3, "radius changed {before} -> {after}");
@@ -3957,7 +4693,7 @@ mod transform_tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
         let o = make_op(TransformKind::Scale, None, pivot, 0, p0);
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(200.0, 0.0));
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(200.0, 0.0), false);
         let before = (p0 - pivot).length();
         let after = (scene.fixtures[0].position - pivot).length();
         assert!(after > before, "expected expansion {before} -> {after}");
@@ -3969,7 +4705,7 @@ mod transform_tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
         let o = make_op(TransformKind::Scale, None, pivot, 0, p0);
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(-100000.0, 0.0));
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(-100000.0, 0.0), false);
         let after = (scene.fixtures[0].position - pivot).length();
         assert!(after > 0.0, "geometry collapsed to the pivot");
     }
@@ -4001,7 +4737,7 @@ mod transform_tests {
         let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
         o.num = NumInput { str: "4".into(), sign: false, active: true };
         // A wild mouse position must be ignored once numinput is active.
-        apply_transform(&o, &mut scene, &cam, egui::pos2(9999.0, -9999.0));
+        apply_transform(&o, &mut scene, &cam, egui::pos2(9999.0, -9999.0), false);
         let d = scene.fixtures[0].position - p0;
         assert!((d.x - 4.0).abs() < 1e-4, "expected +4 on X, got {}", d.x);
         assert!(d.y.abs() < 1e-4 && d.z.abs() < 1e-4, "leaked off X: {d:?}");
@@ -4013,7 +4749,7 @@ mod transform_tests {
         let p0 = scene.fixtures[0].position;
         let mut o = make_op(TransformKind::Move, None, p0, 0, p0);
         o.num = NumInput { str: "2.5".into(), sign: true, active: true };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0));
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
         let d = scene.fixtures[0].position - p0;
         assert!((d.x + 2.5).abs() < 1e-4, "expected -2.5 on X, got {}", d.x);
     }
@@ -4026,7 +4762,7 @@ mod transform_tests {
         let pivot = p0 - Vec3::new(1.0, 0.0, 0.0); // fixture sits at pivot + X
         let mut o = make_op(TransformKind::Rotate, Some(Axis::Y), pivot, 0, p0);
         o.num = NumInput { str: "90".into(), sign: false, active: true };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0));
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
         let off = scene.fixtures[0].position - pivot;
         // +X (1,0,0) rotated 90° about +Y → (0,0,-1) in glam's RH convention.
         assert!((off.x).abs() < 1e-4, "x not zeroed: {}", off.x);
@@ -4040,9 +4776,185 @@ mod transform_tests {
         let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
         let mut o = make_op(TransformKind::Scale, None, pivot, 0, p0);
         o.num = NumInput { str: "2".into(), sign: false, active: true };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(12345.0, 0.0));
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(12345.0, 0.0), false);
         let before = (p0 - pivot).length();
         let after = (scene.fixtures[0].position - pivot).length();
         assert!((after - before * 2.0).abs() < 1e-4, "expected ×2, {before} -> {after}");
+    }
+
+    // --- #4 snap: quantization composes with the typed-amount apply path ------
+    #[test]
+    fn snap_move_quantizes_typed_amount() {
+        // G,X,"1.4",Enter with a 1 m snap grid → lands on exactly +1 m (round).
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
+        o.num = NumInput { str: "1.4".into(), sign: false, active: true };
+        o.snap = SnapSettings { on: true, move_step: 1.0, ..Default::default() };
+        // snap_on = true (caller would XOR Ctrl; here passed directly).
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), true);
+        let d = scene.fixtures[0].position - p0;
+        assert!((d.x - 1.0).abs() < 1e-4, "expected snapped +1 m, got {}", d.x);
+    }
+
+    #[test]
+    fn snap_off_passes_typed_amount_through() {
+        // Same op but snap_on=false (e.g. Ctrl inverted it off) → exact 1.4 m.
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
+        o.num = NumInput { str: "1.4".into(), sign: false, active: true };
+        o.snap = SnapSettings { on: true, move_step: 1.0, ..Default::default() };
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        let d = scene.fixtures[0].position - p0;
+        assert!((d.x - 1.4).abs() < 1e-4, "expected exact 1.4 m, got {}", d.x);
+    }
+
+    #[test]
+    fn snap_rotate_quantizes_to_15_degrees() {
+        // R,Y,"20",Enter with a 15° grid → snaps to 15° (quarter-ish turn).
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let pivot = p0 - Vec3::new(1.0, 0.0, 0.0);
+        let mut o = make_op(TransformKind::Rotate, Some(Axis::Y), pivot, 0, p0);
+        o.num = NumInput { str: "20".into(), sign: false, active: true };
+        o.snap = SnapSettings { on: true, rotate_deg: 15.0, ..Default::default() };
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), true);
+        // Offset length is preserved by rotation; check the snapped angle: +X (len 1)
+        // rotated 15° about +Y → z = -sin(15°).
+        let off = scene.fixtures[0].position - pivot;
+        let expect_z = -(15f32.to_radians()).sin();
+        assert!((off.z - expect_z).abs() < 1e-3, "expected 15° snap (z={expect_z}), got {}", off.z);
+    }
+
+    // --- #5 Individual Origins: each element transforms about its OWN origin ----
+    #[test]
+    fn individual_origins_rotate_keeps_each_position() {
+        // Two fixtures at different spots. With Individual Origins, a rotate spins
+        // each about ITSELF: positions are UNCHANGED, only orientations turn. A
+        // Median pivot, by contrast, would orbit both about their centroid.
+        let mut scene = Scene::demo();
+        // Ensure a second fixture exists at a distinct position.
+        scene.duplicate_fixture(0, Vec3::new(6.0, 0.0, 0.0), 0.0, 1).expect("dup");
+        assert!(scene.fixtures.len() >= 2);
+        let p0a = scene.fixtures[0].position;
+        let p0b = scene.fixtures[1].position;
+        let q0a = scene.fixtures[0].orientation;
+        // Median of the two — the pivot the op carries (ignored when individual).
+        let median = (p0a + p0b) * 0.5;
+        let mut o = TransformOp {
+            kind: TransformKind::Rotate,
+            axis: Some(Axis::Y),
+            start_screen: egui::pos2(0.0, 0.0),
+            pivot: median,
+            start: vec![(0, p0a, q0a), (1, p0b, scene.fixtures[1].orientation)],
+            geo_start: Vec::new(),
+            gizmo_hovered_axis: None,
+            from_gizmo: false,
+            num: NumInput { str: "90".into(), sign: false, active: true },
+            individual: true,
+            snap: SnapSettings::default(),
+        };
+        o.num.active = true;
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        // Positions unchanged (each spun about itself)...
+        assert!((scene.fixtures[0].position - p0a).length() < 1e-4, "fixture 0 moved");
+        assert!((scene.fixtures[1].position - p0b).length() < 1e-4, "fixture 1 moved");
+        // ...but the orientation DID rotate.
+        assert!(
+            scene.fixtures[0].orientation.angle_between(q0a) > 0.1,
+            "orientation did not rotate"
+        );
+    }
+
+    #[test]
+    fn median_rotate_orbits_about_centroid() {
+        // Same two fixtures, but Median pivot → both ORBIT the shared centroid, so
+        // their positions move (the contrast to Individual Origins above).
+        let mut scene = Scene::demo();
+        scene.duplicate_fixture(0, Vec3::new(6.0, 0.0, 0.0), 0.0, 1).expect("dup");
+        let p0a = scene.fixtures[0].position;
+        let p0b = scene.fixtures[1].position;
+        let median = (p0a + p0b) * 0.5;
+        let o = TransformOp {
+            kind: TransformKind::Rotate,
+            axis: Some(Axis::Y),
+            start_screen: egui::pos2(0.0, 0.0),
+            pivot: median,
+            start: vec![
+                (0, p0a, scene.fixtures[0].orientation),
+                (1, p0b, scene.fixtures[1].orientation),
+            ],
+            geo_start: Vec::new(),
+            gizmo_hovered_axis: None,
+            from_gizmo: false,
+            num: NumInput { str: "90".into(), sign: false, active: true },
+            individual: false,
+            snap: SnapSettings::default(),
+        };
+        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        // At least one position moved (they orbited the centroid).
+        assert!(
+            (scene.fixtures[0].position - p0a).length() > 0.1
+                || (scene.fixtures[1].position - p0b).length() > 0.1,
+            "median rotate did not orbit"
+        );
+    }
+}
+
+/// S3-properties (#6 reset-to-default, #7 multi-edit mixed detection): the pure
+/// reductions + default resolution the inspector rows render off of.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+
+    #[test]
+    fn common_f32_agrees_only_when_all_equal() {
+        // All equal (within tolerance) → Some(value).
+        assert_eq!(common_f32([1.0, 1.0, 1.0]), Some(1.0));
+        assert_eq!(common_f32([0.5, 0.5 + 5e-5]), Some(0.5));
+        // Any divergence → None ("mixed" placeholder).
+        assert_eq!(common_f32([1.0, 0.0]), None);
+        // Empty selection → None (no value to seed).
+        assert_eq!(common_f32(std::iter::empty()), None);
+        // Single value → that value.
+        assert_eq!(common_f32([0.3]), Some(0.3));
+    }
+
+    #[test]
+    fn common_rgb_per_channel() {
+        assert_eq!(common_rgb([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]), Some([1.0, 0.0, 0.0]));
+        // One channel differs → mixed.
+        assert_eq!(common_rgb([[1.0, 0.0, 0.0], [1.0, 0.0, 0.5]]), None);
+    }
+
+    #[test]
+    fn non_gdtf_fixture_defaults_have_no_recoverable_template() {
+        // A built-in fixture can't recover its profile beam-angle/colour from the
+        // instance alone → those reset arrows stay hidden (None), but the level /
+        // beam constants are always known.
+        let f = &Scene::demo().fixtures[0];
+        assert!(!f.is_gdtf());
+        let d = FixtureDefaults::for_fixture(f);
+        assert_eq!(d.beam_angle, None);
+        assert_eq!(d.color, None);
+        assert_eq!(d.dimmer, OpticalControls::default().dimmer);
+        assert_eq!(d.beam, 1.0);
+        assert_eq!(d.pan, 0.0);
+        assert_eq!(d.tilt, 0.0);
+    }
+
+    #[test]
+    fn reset_differs_predicate_matches_default() {
+        // The arrow-visibility predicate the rows use: shows iff the live value
+        // left its default (tolerant equality avoids f32-dust false positives).
+        let def = OpticalControls::default();
+        let mut o = def.clone();
+        assert!(!(!approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def))));
+        OpticField::Zoom.set(&mut o, def.zoom + 0.2);
+        assert!(!approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def)));
+        // Reset writes the default back → predicate clears.
+        OpticField::Zoom.set(&mut o, OpticField::Zoom.get(&def));
+        assert!(!(!approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def))));
     }
 }

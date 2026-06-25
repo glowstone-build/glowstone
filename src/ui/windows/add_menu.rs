@@ -11,6 +11,7 @@
 //! the new object can also be selected).
 
 use crate::scene::library::Library;
+use crate::ui::lib_prefs::{self, LibItem, LibraryPrefs};
 use crate::ui::theme;
 
 /// Which group of addable things the menu is showing.
@@ -89,69 +90,122 @@ impl AddMenuState {
     }
 }
 
-/// One flattened, filtered, displayable entry: its label + the action it commits.
+/// Map an [`AddAction`] to the [`LibItem`] used to key it in Recent/Favourites.
+fn action_item(a: &AddAction) -> LibItem {
+    match *a {
+        AddAction::Fixture(i) => LibItem::Fixture(i),
+        AddAction::Gdtf(i) => LibItem::Gdtf(i),
+        AddAction::Screen(i) => LibItem::Screen(i),
+        AddAction::Environment(i) => LibItem::Env(i),
+    }
+}
+
+/// One flattened, filtered, displayable entry: its label + the action it commits,
+/// the search-rank score, and the lib-prefs key (so the menu can star it / mark
+/// it recent).
 struct Entry {
     icon: &'static str,
     label: String,
     action: AddAction,
+    /// Fuzzy-search score (higher = better; 0 when the query is empty).
+    score: i32,
+    /// Stable lib-prefs key, for the star toggle + Recent matching.
+    key: String,
 }
 
-/// Build the (filtered) entry list for the active category. GDTF fixtures are
-/// listed first (most specific), then the built-in profiles.
-fn entries(library: &Library, state: &AddMenuState) -> Vec<Entry> {
-    let q = state.search.trim().to_lowercase();
-    let matches = |hay: &str| q.is_empty() || hay.to_lowercase().contains(&q);
+/// Every addable entry in the active category, unfiltered, in catalog order.
+/// (GDTF fixtures first — most specific — then the built-in profiles.)
+fn category_entries(library: &Library, category: AddCategory) -> Vec<Entry> {
     let mut out = Vec::new();
-    match state.category {
+    let mk = |action: AddAction, icon: &'static str, label: String| {
+        let key = lib_prefs::entry_key(library, action_item(&action)).unwrap_or_default();
+        Entry { icon, label, action, score: 0, key }
+    };
+    match category {
         AddCategory::Fixtures => {
             for (gi, g) in library.gdtf.iter().enumerate() {
-                let hay = format!("{} {}", g.manufacturer, g.name);
-                if matches(&hay) {
-                    out.push(Entry {
-                        icon: theme::icon::FIXTURE,
-                        label: format!("{} · {}", g.manufacturer, g.name),
-                        action: AddAction::Gdtf(gi),
-                    });
-                }
+                out.push(mk(
+                    AddAction::Gdtf(gi),
+                    theme::icon::FIXTURE,
+                    format!("{} · {}", g.manufacturer, g.name),
+                ));
             }
             for (pi, p) in library.fixtures.iter().enumerate() {
-                let hay = format!("{} {}", p.category, p.name);
-                if matches(&hay) {
-                    let icon = if p.laser { theme::icon::COLOR } else { theme::icon::FIXTURE };
-                    out.push(Entry {
-                        icon,
-                        label: format!("{} · {}", p.category, p.name),
-                        action: AddAction::Fixture(pi),
-                    });
-                }
+                let icon = if p.laser { theme::icon::COLOR } else { theme::icon::FIXTURE };
+                out.push(mk(AddAction::Fixture(pi), icon, format!("{} · {}", p.category, p.name)));
             }
         }
         AddCategory::Screens => {
             for (si, s) in library.screens.iter().enumerate() {
-                let hay = format!("{} {}", s.category, s.name);
-                if matches(&hay) {
-                    out.push(Entry {
-                        icon: theme::icon::SCREEN,
-                        label: format!("{} · {}", s.category, s.name),
-                        action: AddAction::Screen(si),
-                    });
-                }
+                out.push(mk(
+                    AddAction::Screen(si),
+                    theme::icon::SCREEN,
+                    format!("{} · {}", s.category, s.name),
+                ));
             }
         }
         AddCategory::Environment => {
             for (ei, e) in library.environments.iter().enumerate() {
-                let hay = format!("{} {}", e.category, e.name);
-                if matches(&hay) {
-                    out.push(Entry {
-                        icon: theme::icon::ENVIRONMENT,
-                        label: format!("{} · {}", e.category, e.name),
-                        action: AddAction::Environment(ei),
-                    });
-                }
+                out.push(mk(
+                    AddAction::Environment(ei),
+                    theme::icon::ENVIRONMENT,
+                    format!("{} · {}", e.category, e.name),
+                ));
             }
         }
     }
     out
+}
+
+/// Build the filtered + fuzzy-ranked entry list for the active category. An empty
+/// query keeps catalog order; a non-empty query fuzzy-scores against the label and
+/// drops non-matches, best-first.
+fn entries(library: &Library, state: &AddMenuState) -> Vec<Entry> {
+    let q = state.search.trim().to_lowercase();
+    let mut out = category_entries(library, state.category);
+    if q.is_empty() {
+        return out;
+    }
+    out.retain_mut(|e| match lib_prefs::fuzzy_score(&q, &e.label.to_lowercase()) {
+        Some(s) => {
+            e.score = s;
+            true
+        }
+        None => false,
+    });
+    // Stable sort by descending score keeps catalog order among ties.
+    out.sort_by(|a, b| b.score.cmp(&a.score));
+    out
+}
+
+/// Recent + Favourites pinned entries, resolved from `prefs` against the live
+/// library across ALL categories (so a starred screen shows even while the
+/// Fixtures tab is active). Recent keeps prefs order (most-recent first);
+/// Favourites is rendered in catalog order. Only shown when the search box is
+/// empty (a query searches the full catalog, Blender-style).
+fn pinned_entries(library: &Library, prefs: &LibraryPrefs) -> (Vec<Entry>, Vec<Entry>) {
+    // Flatten every category once, indexed by key, to resolve prefs keys → Entry.
+    let mut all: Vec<Entry> = Vec::new();
+    for c in AddCategory::ORDER {
+        all.extend(category_entries(library, c));
+    }
+    let find = |key: &str| all.iter().find(|e| e.key == key).map(clone_entry);
+    let recent: Vec<Entry> = prefs.recent.iter().filter_map(|k| find(k)).collect();
+    let favourites: Vec<Entry> =
+        all.iter().filter(|e| prefs.is_favourite(&e.key)).map(clone_entry).collect();
+    (recent, favourites)
+}
+
+/// Shallow clone of an Entry (AddAction isn't Clone — it's a plain index enum, so
+/// reconstruct it from the variant).
+fn clone_entry(e: &Entry) -> Entry {
+    let action = match e.action {
+        AddAction::Fixture(i) => AddAction::Fixture(i),
+        AddAction::Gdtf(i) => AddAction::Gdtf(i),
+        AddAction::Screen(i) => AddAction::Screen(i),
+        AddAction::Environment(i) => AddAction::Environment(i),
+    };
+    Entry { icon: e.icon, label: e.label.clone(), action, score: e.score, key: e.key.clone() }
 }
 
 /// Draw the Add menu if open. Returns the chosen action (and auto-closes) on a
@@ -160,6 +214,7 @@ pub fn add_menu_window(
     ctx: &egui::Context,
     library: &Library,
     state: &mut AddMenuState,
+    prefs: &mut LibraryPrefs,
 ) -> Option<AddAction> {
     if !state.open {
         return None;
@@ -206,8 +261,15 @@ pub fn add_menu_window(
     } else {
         state.idx %= list.len();
     }
+    // Pinned Recent + Favourites sections show only when the search box is empty
+    // (a query searches the full catalog). Resolved across all categories.
+    let show_pinned = state.search.trim().is_empty();
+    let (recent, favourites) =
+        if show_pinned { pinned_entries(library, prefs) } else { (Vec::new(), Vec::new()) };
 
     let mut picked: Option<usize> = None; // index into `list`
+    let mut picked_action: Option<AddAction> = None; // a pinned-section click
+    let mut toggle_fav: Option<String> = None; // a star click → key to toggle
     let mut keep_open = true;
 
     let resp = egui::Window::new("add-menu")
@@ -249,19 +311,33 @@ pub fn add_menu_window(
                     egui::ScrollArea::vertical().max_height(280.0).auto_shrink([false, false]).show(
                         ui,
                         |ui| {
+                            // Pinned pseudo-categories (#20): Recent + Favourites,
+                            // each a small caption header + its own clickable rows
+                            // with a star toggle. Empty sections are skipped.
+                            for (title, items) in [("RECENT", &recent), ("FAVOURITES", &favourites)] {
+                                if items.is_empty() {
+                                    continue;
+                                }
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(title).weak().small());
+                                for e in items {
+                                    if let Some(a) = pinned_row(ui, e, prefs, &mut toggle_fav) {
+                                        picked_action = Some(a);
+                                    }
+                                }
+                                ui.add_space(2.0);
+                                ui.separator();
+                            }
+
                             if list.is_empty() {
                                 ui.label(egui::RichText::new("no match").weak().small());
                             }
                             for (li, e) in list.iter().enumerate() {
                                 let sel = li == state.idx;
-                                let row = ui.selectable_label(
-                                    sel,
-                                    format!("{}  {}", e.icon, e.label),
-                                );
-                                if sel {
-                                    row.scroll_to_me(None);
-                                }
-                                if row.clicked() {
+                                if let Some(a) =
+                                    catalog_row(ui, e, sel, prefs, &mut toggle_fav)
+                                {
+                                    picked_action = Some(a);
                                     picked = Some(li);
                                 }
                             }
@@ -286,19 +362,102 @@ pub fn add_menu_window(
         }
     }
 
-    // Resolve a keyboard Enter against the highlighted row.
-    if commit && !list.is_empty() {
-        picked = Some(state.idx.min(list.len() - 1));
+    // Apply a star toggle (mutates + persists prefs); does NOT commit/close.
+    if let Some(key) = toggle_fav {
+        prefs.toggle_favourite(&key);
     }
 
-    if let Some(li) = picked {
-        state.open = false;
-        // Move the chosen entry out of the list (it owns the AddAction).
+    // Resolve a keyboard Enter against the highlighted catalog row.
+    if commit && picked_action.is_none() && !list.is_empty() {
+        picked = Some(state.idx.min(list.len() - 1));
+    }
+    if picked_action.is_none()
+        && let Some(li) = picked
+    {
         let mut list = list;
-        return Some(list.swap_remove(li).action);
+        picked_action = Some(list.swap_remove(li).action);
+    }
+
+    if let Some(a) = picked_action {
+        state.open = false;
+        return Some(a);
     }
     if !keep_open {
         state.open = false;
     }
     None
+}
+
+/// Draw one pinned (Recent/Favourites) row: icon + label + a trailing star
+/// toggle. Returns the action when the row body is clicked. A star click sets
+/// `toggle_fav` and does NOT commit.
+fn pinned_row(
+    ui: &mut egui::Ui,
+    e: &Entry,
+    prefs: &LibraryPrefs,
+    toggle_fav: &mut Option<String>,
+) -> Option<AddAction> {
+    row_with_star(ui, e, false, prefs, toggle_fav)
+}
+
+/// Draw one catalog row (keyboard-highlightable) with a trailing star toggle.
+fn catalog_row(
+    ui: &mut egui::Ui,
+    e: &Entry,
+    selected: bool,
+    prefs: &LibraryPrefs,
+    toggle_fav: &mut Option<String>,
+) -> Option<AddAction> {
+    row_with_star(ui, e, selected, prefs, toggle_fav)
+}
+
+/// Shared row: a full-width selectable label + a right-aligned star button.
+/// Returns `Some(action)` when the label is clicked; a star click only flips
+/// `toggle_fav`. The starred state is read live from `prefs`.
+fn row_with_star(
+    ui: &mut egui::Ui,
+    e: &Entry,
+    selected: bool,
+    prefs: &LibraryPrefs,
+    toggle_fav: &mut Option<String>,
+) -> Option<AddAction> {
+    let starred = !e.key.is_empty() && prefs.is_favourite(&e.key);
+    let mut out = None;
+    ui.horizontal(|ui| {
+        // Star toggle — accent-tinted when favourited, dim otherwise. (The
+        // Regular Phosphor set has no separate filled glyph, so colour carries
+        // the state.)
+        let star = theme::icon::STAR;
+        let tint = if starred {
+            ui.visuals().selection.stroke.color
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        if ui
+            .add(egui::Button::new(egui::RichText::new(star).color(tint)).frame(false))
+            .on_hover_text(if starred { "Unstar" } else { "Add to Favourites" })
+            .clicked()
+            && !e.key.is_empty()
+        {
+            *toggle_fav = Some(e.key.clone());
+        }
+        let row = ui.selectable_label(selected, format!("{}  {}", e.icon, e.label));
+        if selected {
+            row.scroll_to_me(None);
+        }
+        if row.clicked() {
+            out = action_of(e);
+        }
+    });
+    out
+}
+
+/// Reconstruct the [`AddAction`] of an entry (the enum is plain index variants).
+fn action_of(e: &Entry) -> Option<AddAction> {
+    Some(match e.action {
+        AddAction::Fixture(i) => AddAction::Fixture(i),
+        AddAction::Gdtf(i) => AddAction::Gdtf(i),
+        AddAction::Screen(i) => AddAction::Screen(i),
+        AddAction::Environment(i) => AddAction::Environment(i),
+    })
 }

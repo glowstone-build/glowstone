@@ -79,6 +79,9 @@ pub mod icon {
     pub const TOOL_SCALE: &str = p::RESIZE;
     pub const TOOL_AIM: &str = p::TARGET;
     pub const TOOL_MEASURE: &str = p::RULER;
+    // Transform-tool options (§2.4): grid/increment snap toggle + 3D-cursor pivot.
+    pub const SNAP: &str = p::MAGNET;
+    pub const CURSOR_3D: &str = p::CROSSHAIR_SIMPLE;
     // Status glyphs (toasts / reports — `ui::notify`). Aliases keep the notify
     // module reading semantic names (WARN/ERROR) rather than raw Phosphor consts.
     pub const WARNING: &str = p::WARNING;
