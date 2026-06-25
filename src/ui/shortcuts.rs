@@ -464,12 +464,37 @@ pub fn command(id: &str) -> Option<&'static Command> {
 /// `"⌘S"` or `"F"`, resolved live from [`KEYMAPS`] so a rebind flows straight into
 /// the palette row. Returns the FIRST bind found (registry/keymap order); `None`
 /// when no key is bound to that command (it's palette- or menu-only).
-pub fn shortcut_for(id: &str) -> Option<String> {
+pub fn shortcut_for(id: &str, ov: &KeymapOverrides) -> Option<String> {
+    // A disabled (and not rebound) command has no live key. A rebind replaces the
+    // default label; an added bind is found via the per-keymap effective items.
+    if ov.disabled.contains(id) && !ov.rebind.contains_key(id) {
+        // Still allow an `added` bind to surface a label for it.
+        for a in &ov.added {
+            if a.cmd == id
+                && let Some(t) = a.trigger.to_trigger()
+            {
+                return Some(key_label(&t));
+            }
+        }
+        return None;
+    }
+    if let Some(st) = ov.rebind.get(id) {
+        return st.to_trigger().map(|t| key_label(&t));
+    }
+    // No rebind/disable for this id: the FIRST static bind (registry order), then
+    // fall back to any added bind that targets it.
     KEYMAPS
         .iter()
         .flat_map(|km| km.items.iter())
         .find(|kmi| kmi.cmd == id)
         .map(|kmi| key_label(&kmi.trigger))
+        .or_else(|| {
+            ov.added
+                .iter()
+                .find(|a| a.cmd == id)
+                .and_then(|a| a.trigger.to_trigger())
+                .map(|t| key_label(&t))
+        })
 }
 
 /// The Global keymap — fires whenever the egui context has keyboard focus and no
@@ -572,6 +597,410 @@ pub static KEYMAPS: &[KeyMap] = &[
     KeyMap { id: KeymapId::Modal, items: MODAL },
 ];
 
+// ===========================================================================
+// Keymap overrides (S1) — a runtime layer over the static defaults.
+//
+// The static [`KEYMAPS`] above are the shipped defaults; this layer lets a user
+// rebind a command's trigger, disable a default bind, or add a brand-new bind —
+// all persisted to `keymap.json` in the config dir (mirroring `lib_prefs`). The
+// EFFECTIVE binding for a command is: its override trigger if rebound, else the
+// static default; a disabled command's default trigger never fires; an added
+// bind fires in its keymap. CRITICAL invariant: with EMPTY overrides the
+// resolved behaviour is byte-identical to the static defaults — every existing
+// parity test still passes because [`effective_items`] returns the unchanged
+// static slice (no rebind/disable/add to apply).
+// ===========================================================================
+
+/// A serde-friendly mirror of [`Trigger`]: [`egui::Key`] isn't `Serialize` in
+/// this build (the crate's `serde` feature is off), so we persist the key by its
+/// stable [`egui::Key::name`] and the modifiers as plain bools. Round-trips via
+/// [`egui::Key::from_name`]. Only the modifiers a default trigger pins are
+/// recorded; the rest stay "must be released" (matching the table's exact-match
+/// convention — see [`Mods::none`]).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerTrigger {
+    /// The key's stable name (`egui::Key::name`), e.g. `"S"`, `"ArrowLeft"`.
+    pub key: String,
+    #[serde(default)]
+    pub command: bool,
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub alt: bool,
+    /// The input event; defaults to `Press` (the only event keyboard binds use).
+    #[serde(default)]
+    pub event: SerEvent,
+}
+
+/// Serde mirror of [`Event`] (the in-crate enum is `Copy` but we keep a tiny
+/// owned twin so the JSON stays human-readable + version-stable).
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SerEvent {
+    #[default]
+    Press,
+    Release,
+    Click,
+    Drag,
+}
+
+impl SerEvent {
+    fn to_event(self) -> Event {
+        match self {
+            SerEvent::Press => Event::Press,
+            SerEvent::Release => Event::Release,
+            SerEvent::Click => Event::Click,
+            SerEvent::Drag => Event::Drag,
+        }
+    }
+    // Used by `SerTrigger::from_trigger` (the editor's record path, S2) — dead in
+    // the non-test build until that consumer lands.
+    #[allow(dead_code)]
+    fn from_event(e: Event) -> Self {
+        match e {
+            Event::Press => SerEvent::Press,
+            Event::Release => SerEvent::Release,
+            Event::Click => SerEvent::Click,
+            Event::Drag => SerEvent::Drag,
+        }
+    }
+}
+
+impl SerTrigger {
+    /// Build from a live [`Trigger`] (records only the modifiers it pins as held).
+    /// The Preferences keymap editor's record path (S2); exercised by the tests.
+    #[allow(dead_code)]
+    pub fn from_trigger(t: &Trigger) -> Self {
+        Self {
+            key: t.key.name().to_string(),
+            command: t.mods.command == Some(true),
+            shift: t.mods.shift == Some(true),
+            alt: t.mods.alt == Some(true),
+            event: SerEvent::from_event(t.event),
+        }
+    }
+    /// Resolve back to a live [`Trigger`], or `None` if the key name is unknown
+    /// (a hand-edited / stale `keymap.json` entry is dropped, not fatal). Mods use
+    /// the same exact-match convention as the static table: a held modifier is
+    /// pinned `Some(true)`, an unset one stays `Some(false)` (must be released).
+    pub fn to_trigger(&self) -> Option<Trigger> {
+        let key = egui::Key::from_name(&self.key)?;
+        let mods = Mods {
+            command: Some(self.command),
+            shift: Some(self.shift),
+            alt: Some(self.alt),
+        };
+        Some(Trigger { key, mods, event: self.event.to_event() })
+    }
+}
+
+/// A user-added bind: a [`KeymapId`] + the [`SerTrigger`] + the command `id` it
+/// fires. Serialized as part of [`KeymapOverrides::added`].
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AddedBind {
+    pub keymap: SerKeymapId,
+    pub trigger: SerTrigger,
+    pub cmd: String,
+}
+
+/// Serde mirror of [`KeymapId`] (kept owned so the JSON is self-describing).
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SerKeymapId {
+    Global,
+    Viewport,
+    Modal,
+}
+
+impl SerKeymapId {
+    fn to_id(self) -> KeymapId {
+        match self {
+            SerKeymapId::Global => KeymapId::Global,
+            SerKeymapId::Viewport => KeymapId::Viewport,
+            SerKeymapId::Modal => KeymapId::Modal,
+        }
+    }
+    /// Tag a [`KeymapId`] for an `added` bind (the S2 editor's add path; tested).
+    #[allow(dead_code)]
+    pub fn from_id(id: KeymapId) -> Self {
+        match id {
+            KeymapId::Global => SerKeymapId::Global,
+            KeymapId::Viewport => SerKeymapId::Viewport,
+            KeymapId::Modal => SerKeymapId::Modal,
+        }
+    }
+}
+
+/// The runtime override layer over the static [`KEYMAPS`]. EMPTY by default — and
+/// when empty, [`effective_items`] returns the unchanged static slices so the app
+/// behaves byte-identically to the shipped defaults. Persisted to `keymap.json`
+/// in the config dir (loaded once at startup, saved on each edit).
+///
+/// - `rebind`: replace a command's *default* trigger with a new one (keyed by the
+///   command `id`; the original default no longer fires, the new trigger does).
+/// - `disabled`: suppress a command's default bind entirely (no trigger fires for
+///   it unless also rebound — a rebind wins over a disable for the same id).
+/// - `added`: brand-new (keymap, trigger, cmd) binds layered on top.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KeymapOverrides {
+    /// cmd_id → replacement trigger for that command's default bind.
+    #[serde(default)]
+    pub rebind: std::collections::BTreeMap<String, SerTrigger>,
+    /// cmd_ids whose default bind is suppressed.
+    #[serde(default)]
+    pub disabled: std::collections::BTreeSet<String>,
+    /// Extra binds with no static default.
+    #[serde(default)]
+    pub added: Vec<AddedBind>,
+}
+
+impl KeymapOverrides {
+    /// `true` when no rebind / disable / add is set — the fast path where the
+    /// effective keymap IS the static default (used to skip all resolution work
+    /// and guarantee byte-identical default behaviour).
+    pub fn is_empty(&self) -> bool {
+        self.rebind.is_empty() && self.disabled.is_empty() && self.added.is_empty()
+    }
+
+    /// Load from disk (config dir); a missing/garbled file yields empty overrides
+    /// (so a fresh install / corrupt file falls back to the static defaults).
+    pub fn load() -> Self {
+        let Some(p) = overrides_path() else { return Self::default() };
+        let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+
+    // The edit + persistence API the S2 Preferences keymap editor drives. Dead in
+    // this stage's build (the editor UI lands in S2); the resolution + round-trip
+    // they feed are covered by this module's tests.
+    /// Persist to disk (best-effort; a write failure is non-fatal).
+    #[allow(dead_code)]
+    pub fn save(&self) {
+        let Some(p) = overrides_path() else { return };
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&p, text);
+        }
+    }
+
+    /// Rebind `cmd_id`'s default trigger to `trigger`, then persist.
+    #[allow(dead_code)]
+    pub fn rebind(&mut self, cmd_id: &str, trigger: &Trigger) {
+        self.rebind.insert(cmd_id.to_string(), SerTrigger::from_trigger(trigger));
+        self.save();
+    }
+
+    /// Suppress `cmd_id`'s default bind, then persist.
+    #[allow(dead_code)]
+    pub fn disable(&mut self, cmd_id: &str) {
+        self.disabled.insert(cmd_id.to_string());
+        self.save();
+    }
+
+    /// Clear all overrides for `cmd_id` (un-rebind + un-disable), then persist.
+    #[allow(dead_code)]
+    pub fn reset(&mut self, cmd_id: &str) {
+        self.rebind.remove(cmd_id);
+        self.disabled.remove(cmd_id);
+        // Also drop any user-added binds that target this command (the editor's
+        // per-row reset clears every override touching the row, added rows too).
+        self.added.retain(|a| a.cmd != cmd_id);
+        self.save();
+    }
+
+    /// Clear EVERY override (rebind/disable/add) — the editor's "Reset all to
+    /// defaults" — then persist. Returns to the byte-identical default fast-path.
+    #[allow(dead_code)]
+    pub fn reset_all(&mut self) {
+        self.rebind.clear();
+        self.disabled.clear();
+        self.added.clear();
+        self.save();
+    }
+
+    /// Toggle `cmd_id`'s disabled state, then persist. A rebind for the same id
+    /// always wins over a disable (see [`effective_items`]), so toggling disable
+    /// on a rebound command is a no-op for dispatch — the editor disables the
+    /// effective row by clearing the rebind first where that's the intent.
+    #[allow(dead_code)]
+    pub fn set_disabled(&mut self, cmd_id: &str, disabled: bool) {
+        if disabled {
+            self.disabled.insert(cmd_id.to_string());
+        } else {
+            self.disabled.remove(cmd_id);
+        }
+        self.save();
+    }
+}
+
+/// The keymap a command's FIRST static default bind lives in (registry/keymap
+/// order), or `None` for a command with no static bind (catalog-/menu-only). The
+/// editor uses this to target a rebind/added bind at the right keymap context and
+/// to group rows by context.
+#[allow(dead_code)]
+pub fn keymap_of(cmd_id: &str) -> Option<KeymapId> {
+    KEYMAPS
+        .iter()
+        .find(|km| km.items.iter().any(|k| k.cmd == cmd_id))
+        .map(|km| km.id)
+}
+
+/// The flat set of command ids involved in ANY effective (keymap, key+mods)
+/// collision under `ov` — the per-row highlight source for the editor (a row is
+/// flagged when its command shares a trigger with another in the same context).
+#[allow(dead_code)]
+pub fn conflicting_ids(ov: &KeymapOverrides) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for (_, _, a, b) in conflicts(ov) {
+        out.insert(a);
+        out.insert(b);
+    }
+    out
+}
+
+/// Capture the next key-chord pressed this frame as a [`Trigger`], for the
+/// editor's "press a key to rebind" affordance. Returns the first non-modifier
+/// key press paired with the modifier state held at that instant. Escape is the
+/// reserved CANCEL key and never captured (returns `None` so the caller aborts
+/// capture). Pure modifier presses (Cmd/Shift/Alt alone) aren't captured — the
+/// caller keeps waiting until a real key lands.
+#[allow(dead_code)]
+pub fn capture_trigger(ctx: &egui::Context) -> Option<Trigger> {
+    ctx.input(|i| {
+        // Esc is reserved for cancelling capture; never bind it here.
+        if i.key_pressed(egui::Key::Escape) {
+            return None;
+        }
+        // Find the first key pressed this frame (events preserve press order), paired
+        // with the modifier state held at that press. A bare modifier press isn't a
+        // Key event, so we simply report nothing and keep capturing until a real key
+        // lands.
+        for ev in &i.events {
+            if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                if *key == egui::Key::Escape {
+                    return None;
+                }
+                let mods = Mods {
+                    command: Some(modifiers.command),
+                    shift: Some(modifiers.shift),
+                    alt: Some(modifiers.alt),
+                };
+                return Some(Trigger { key: *key, mods, event: Event::Press });
+            }
+        }
+        None
+    })
+}
+
+/// The effective [`Kmi`] rows for one keymap under `ov`, most-specific-first
+/// dispatch's per-keymap unit. With empty `ov` this is exactly the static slice
+/// (`Cow::Borrowed`) — zero allocation, byte-identical to today. Otherwise:
+/// each static row is kept as-is unless its command is `disabled` (dropped) or
+/// `rebound` (its trigger swapped); then every `added` bind for this keymap is
+/// appended. Returned owned ([`Vec`]) only when an override actually changed the
+/// set.
+fn effective_items(id: KeymapId, ov: &KeymapOverrides) -> std::borrow::Cow<'static, [Kmi]> {
+    let base = by_id(id);
+    if ov.is_empty() {
+        return std::borrow::Cow::Borrowed(base);
+    }
+    let mut out: Vec<Kmi> = Vec::with_capacity(base.len() + ov.added.len());
+    for k in base {
+        // A rebind WINS over a disable for the same id (it re-enables on a new key),
+        // so check rebind first.
+        if let Some(st) = ov.rebind.get(k.cmd) {
+            if let Some(t) = st.to_trigger() {
+                out.push(Kmi { trigger: t, cmd: k.cmd });
+            }
+            // Stored key name didn't resolve (stale/garbage entry): drop the row
+            // rather than silently keep the old default.
+            continue;
+        }
+        if ov.disabled.contains(k.cmd) {
+            continue; // default bind suppressed
+        }
+        out.push(*k);
+    }
+    for a in &ov.added {
+        if a.keymap.to_id() == id
+            && command(&a.cmd).is_some()
+            && let Some(t) = a.trigger.to_trigger()
+        {
+            // Leak the cmd id to obtain the `&'static str` the `Kmi` field wants.
+            // Bounded by the number of added binds (tiny, user-authored), so the
+            // one-time leak per distinct added id is acceptable for the life of the
+            // process — same trick keymap editors use to keep ids `'static`.
+            let cmd: &'static str = Box::leak(a.cmd.clone().into_boxed_str());
+            out.push(Kmi { trigger: t, cmd });
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// A (keymap, trigger) collision in the EFFECTIVE binds under `ov`: two commands
+/// whose resolved triggers share key + modifiers within one keymap (so a single
+/// keypress would dispatch both). The conflict query the Preferences editor uses
+/// to warn before saving a clashing rebind. Returns `(keymap, key_label,
+/// cmd_id_a, cmd_id_b)` per collision. (Consumed by the S2 editor's pre-save
+/// warning; tested here.)
+#[allow(dead_code)]
+pub fn conflicts(ov: &KeymapOverrides) -> Vec<(KeymapId, String, String, String)> {
+    let mut out = Vec::new();
+    for id in [KeymapId::Global, KeymapId::Viewport, KeymapId::Modal] {
+        let items = effective_items(id, ov);
+        for (i, a) in items.iter().enumerate() {
+            for b in items.iter().skip(i + 1) {
+                if a.trigger.key == b.trigger.key && a.trigger.mods == b.trigger.mods {
+                    out.push((id, key_label(&a.trigger), a.cmd.to_string(), b.cmd.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Active-overrides handle for deep call sites.
+//
+// `poll`/`poll_modal`/`shortcut_for` take `&KeymapOverrides` explicitly (threaded
+// from the `Ui` that owns the loaded overrides). But a few viewport poll sites
+// live inside `panels::viewport`, a free function whose signature is fixed by its
+// (off-limits) app.rs caller — it can't be handed the `&KeymapOverrides`. So the
+// `Ui` publishes its loaded/edited overrides into this process-global snapshot
+// each frame via [`publish_active`]; those sites read it back with [`active`].
+// EMPTY by default ⇒ those sites behave exactly as the static defaults until a
+// user actually overrides something.
+// ---------------------------------------------------------------------------
+
+use std::sync::{Arc, RwLock};
+
+static ACTIVE_OVERRIDES: std::sync::OnceLock<RwLock<Arc<KeymapOverrides>>> = std::sync::OnceLock::new();
+
+fn active_cell() -> &'static RwLock<Arc<KeymapOverrides>> {
+    ACTIVE_OVERRIDES.get_or_init(|| RwLock::new(Arc::new(KeymapOverrides::default())))
+}
+
+/// Publish the `Ui`'s current overrides as the process-wide active set, so the
+/// fixed-signature viewport poll sites (`panels::viewport`) resolve against the
+/// same overrides the `Ui` polls with. Called once per frame from `Ui::show`.
+pub fn publish_active(ov: &KeymapOverrides) {
+    if let Ok(mut g) = active_cell().write() {
+        *g = Arc::new(ov.clone());
+    }
+}
+
+/// A snapshot handle to the active overrides for the deep call sites. Cheap clone
+/// of an `Arc`; EMPTY until [`publish_active`] runs, so the default-behaviour
+/// invariant holds even before the first publish.
+pub fn active() -> Arc<KeymapOverrides> {
+    active_cell().read().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// `<config>/keymap.json` — the per-user override store, alongside `library.json`.
+fn overrides_path() -> Option<std::path::PathBuf> {
+    let d = directories::ProjectDirs::from("dev", "Embedder", "previz")?;
+    let dir = d.config_dir();
+    std::fs::create_dir_all(dir).ok()?;
+    Some(dir.join("keymap.json"))
+}
+
 /// Modal-transform actions, decoded from the [`MODAL`] keymap by [`poll_modal`].
 /// The viewport's live transform block consumes THESE instead of raw key reads
 /// for X/Y/Z/Enter/Esc, so the binds stay in the one registry + cheat sheet.
@@ -620,7 +1049,7 @@ fn gather(cx: ActiveContext) -> &'static [KeymapId] {
 /// (quick-select) on the same physical key is masked. Returns empty while a text
 /// field has keyboard focus (so typing never triggers shortcuts) or while a modal
 /// transform owns the viewport (use [`poll_modal`] there).
-pub fn poll(ctx: &egui::Context, cx: ActiveContext) -> Vec<Action> {
+pub fn poll(ctx: &egui::Context, cx: ActiveContext, ov: &KeymapOverrides) -> Vec<Action> {
     if ctx.egui_wants_keyboard_input() {
         return Vec::new();
     }
@@ -631,7 +1060,9 @@ pub fn poll(ctx: &egui::Context, cx: ActiveContext) -> Vec<Action> {
         // specific map can't re-fire the same key (first match wins).
         let mut claimed: Vec<egui::Key> = Vec::new();
         for id in stack {
-            for kmi in by_id(*id) {
+            // Effective items apply the override layer (rebind/disable/add); with
+            // empty overrides this is the unchanged static slice (no allocation).
+            for kmi in effective_items(*id, ov).iter() {
                 if kmi.trigger.fired(i) && !claimed.contains(&kmi.trigger.key) {
                     claimed.push(kmi.trigger.key);
                     out.push(kmi.action());
@@ -646,10 +1077,11 @@ pub fn poll(ctx: &egui::Context, cx: ActiveContext) -> Vec<Action> {
 /// (X/Y/Z axis lock) come from the registry; Confirm/Cancel are reported too,
 /// reading Enter/Space (confirm) and Esc (cancel) so the viewport can route ALL
 /// modal keys through one call instead of scattered raw `key_pressed` reads.
-pub fn poll_modal(ctx: &egui::Context) -> Vec<ModalAction> {
+pub fn poll_modal(ctx: &egui::Context, ov: &KeymapOverrides) -> Vec<ModalAction> {
+    let modal = effective_items(KeymapId::Modal, ov);
     ctx.input(|i| {
         let mut out: Vec<ModalAction> = Vec::new();
-        for kmi in MODAL {
+        for kmi in modal.iter() {
             if kmi.trigger.fired(i)
                 && let Action::AxisLock(ax) = kmi.action()
             {
@@ -870,13 +1302,14 @@ mod tests {
     #[test]
     fn shortcut_for_resolves_bound_keys() {
         // A command with a bind resolves to that key's label (live from KEYMAPS); a
-        // command with no bind (a catalog-only op) resolves to None.
-        assert_eq!(shortcut_for("view.frame_selection"), Some(key_label(&Trigger::key(Key::F))));
-        assert_eq!(shortcut_for("file.save"), Some(key_label(&Trigger::key(Key::S).cmd())));
-        assert_eq!(shortcut_for("transform.move"), Some(key_label(&Trigger::key(Key::G))));
+        // command with no bind (a catalog-only op) resolves to None. (Empty overrides.)
+        let ov = KeymapOverrides::default();
+        assert_eq!(shortcut_for("view.frame_selection", &ov), Some(key_label(&Trigger::key(Key::F))));
+        assert_eq!(shortcut_for("file.save", &ov), Some(key_label(&Trigger::key(Key::S).cmd())));
+        assert_eq!(shortcut_for("transform.move", &ov), Some(key_label(&Trigger::key(Key::G))));
         // object.add / fixture.duplicate have no keymap bind (palette/menu only).
-        assert_eq!(shortcut_for("object.add"), None);
-        assert_eq!(shortcut_for("fixture.duplicate"), None);
+        assert_eq!(shortcut_for("object.add", &ov), None);
+        assert_eq!(shortcut_for("fixture.duplicate", &ov), None);
     }
 
     // --- C1 unified-command registry parity (#9 / #14) -------------------
@@ -989,5 +1422,235 @@ mod tests {
                 got.is_some()
             );
         }
+    }
+
+    // --- S1 keymap-override layer ----------------------------------------
+
+    /// The command `id` an effective keymap (`id` under `ov`) binds `trig` to —
+    /// the resolution the live `poll` would dispatch (first match per key/mods).
+    fn resolved_cmd(id: KeymapId, trig: &Trigger, ov: &KeymapOverrides) -> Option<&'static str> {
+        effective_items(id, ov)
+            .iter()
+            .find(|k| k.trigger.key == trig.key && k.trigger.mods == trig.mods)
+            .map(|k| k.cmd)
+    }
+
+    #[test]
+    fn empty_overrides_are_byte_identical_to_defaults() {
+        // The CRITICAL invariant: with no rebind/disable/add, `effective_items` is
+        // the unchanged static slice (borrowed, no allocation) for EVERY keymap —
+        // so dispatch behaves exactly like the shipped defaults.
+        let ov = KeymapOverrides::default();
+        assert!(ov.is_empty());
+        for id in [KeymapId::Global, KeymapId::Viewport, KeymapId::Modal] {
+            let eff = effective_items(id, &ov);
+            assert!(matches!(eff, std::borrow::Cow::Borrowed(_)), "{id:?} must borrow the static slice");
+            let base = by_id(id);
+            assert_eq!(eff.len(), base.len());
+            for (a, b) in eff.iter().zip(base.iter()) {
+                assert_eq!(a.cmd, b.cmd);
+                assert!(a.trigger.key == b.trigger.key && a.trigger.mods == b.trigger.mods);
+            }
+        }
+    }
+
+    #[test]
+    fn rebind_moves_the_command_to_the_new_key_and_frees_the_old() {
+        // Rebind Frame-selection from F to J. The new key fires the command; the old
+        // key no longer resolves to it.
+        let mut ov = KeymapOverrides::default();
+        ov.rebind.insert("view.frame_selection".into(), SerTrigger::from_trigger(&Trigger::key(Key::J)));
+        // New key now fires the command.
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &ov), Some("view.frame_selection"));
+        // Old key (F) no longer resolves to it (its default row was swapped out).
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::F), &ov), None);
+    }
+
+    #[test]
+    fn disable_suppresses_the_default_bind() {
+        // Disabling Select-all means plain `A` resolves to nothing in Global.
+        let mut ov = KeymapOverrides::default();
+        // Sanity: it fires by default.
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &KeymapOverrides::default()), Some("select.all"));
+        ov.disabled.insert("select.all".into());
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov), None);
+        // shortcut_for also reports no live key for a disabled command.
+        assert_eq!(shortcut_for("select.all", &ov), None);
+    }
+
+    #[test]
+    fn rebind_wins_over_a_disable_for_the_same_id() {
+        // A command both disabled AND rebound re-enables on the new key (rebind wins).
+        let mut ov = KeymapOverrides::default();
+        ov.disabled.insert("select.all".into());
+        ov.rebind.insert("select.all".into(), SerTrigger::from_trigger(&Trigger::key(Key::Q)));
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::Q), &ov), Some("select.all"));
+        assert_eq!(shortcut_for("select.all", &ov), Some(key_label(&Trigger::key(Key::Q))));
+    }
+
+    #[test]
+    fn added_bind_fires_an_extra_key() {
+        // Add a brand-new Global bind: J → Frame all (no static default on J).
+        let mut ov = KeymapOverrides::default();
+        ov.added.push(AddedBind {
+            keymap: SerKeymapId::from_id(KeymapId::Global),
+            trigger: SerTrigger::from_trigger(&Trigger::key(Key::J)),
+            cmd: "view.frame_all".into(),
+        });
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &ov), Some("view.frame_all"));
+        // The original Shift+F default still fires too (added is purely additive).
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::F).shift(), &ov), Some("view.frame_all"));
+        // An added bind referencing an unknown command id is dropped (no panic, no row).
+        let mut bad = KeymapOverrides::default();
+        bad.added.push(AddedBind {
+            keymap: SerKeymapId::from_id(KeymapId::Global),
+            trigger: SerTrigger::from_trigger(&Trigger::key(Key::J)),
+            cmd: "does.not.exist".into(),
+        });
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &bad), None);
+    }
+
+    #[test]
+    fn ser_trigger_round_trips_through_json() {
+        // SerTrigger preserves key name + every pinned modifier + event across JSON.
+        for t in [
+            Trigger::key(Key::S).cmd().shift(),
+            Trigger::key(Key::ArrowLeft).shift(),
+            Trigger::key(Key::F3),
+            Trigger::key(Key::Comma).cmd(),
+        ] {
+            let st = SerTrigger::from_trigger(&t);
+            let json = serde_json::to_string(&st).unwrap();
+            let back: SerTrigger = serde_json::from_str(&json).unwrap();
+            let rt = back.to_trigger().expect("known key round-trips");
+            assert_eq!(rt.key, t.key);
+            assert!(rt.mods == t.mods, "modifiers must round-trip");
+        }
+        // An unknown key name resolves to None (a stale/hand-edited entry is dropped).
+        let bad = SerTrigger { key: "NotAKey".into(), command: false, shift: false, alt: false, event: SerEvent::Press };
+        assert!(bad.to_trigger().is_none());
+    }
+
+    #[test]
+    fn overrides_round_trip_through_json() {
+        // A full overrides set (rebind + disable + add) survives a JSON round-trip and
+        // resolves identically before/after.
+        let mut ov = KeymapOverrides::default();
+        ov.rebind.insert("view.frame_selection".into(), SerTrigger::from_trigger(&Trigger::key(Key::J)));
+        ov.disabled.insert("select.all".into());
+        ov.added.push(AddedBind {
+            keymap: SerKeymapId::from_id(KeymapId::Viewport),
+            trigger: SerTrigger::from_trigger(&Trigger::key(Key::B)),
+            cmd: "view.toggle_n_panel".into(),
+        });
+        let json = serde_json::to_string_pretty(&ov).unwrap();
+        let back: KeymapOverrides = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_empty());
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &back), Some("view.frame_selection"));
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &back), None);
+        assert_eq!(resolved_cmd(KeymapId::Viewport, &Trigger::key(Key::B), &back), Some("view.toggle_n_panel"));
+        // An empty overrides round-trips to empty (and stays the default fast-path).
+        let empty: KeymapOverrides = serde_json::from_str("{}").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn conflict_query_reports_effective_collisions() {
+        // Default binds have no within-keymap collisions (guarded elsewhere too).
+        assert!(conflicts(&KeymapOverrides::default()).is_empty());
+        // Rebind Frame-selection onto plain `A` (already Select-all in Global): a
+        // collision the editor can warn on.
+        let mut ov = KeymapOverrides::default();
+        ov.rebind.insert("view.frame_selection".into(), SerTrigger::from_trigger(&Trigger::key(Key::A)));
+        let c = conflicts(&ov);
+        assert!(
+            c.iter().any(|(id, _, a, b)| *id == KeymapId::Global
+                && [a.as_str(), b.as_str()].contains(&"select.all")
+                && [a.as_str(), b.as_str()].contains(&"view.frame_selection")),
+            "expected a Global A collision, got {c:?}"
+        );
+    }
+
+    // --- S2 keymap-editor helpers ----------------------------------------
+
+    #[test]
+    fn keymap_of_locates_a_commands_context() {
+        // A command with a static default reports the keymap its FIRST bind lives in.
+        assert_eq!(keymap_of("view.frame_selection"), Some(KeymapId::Global));
+        assert_eq!(keymap_of("transform.move"), Some(KeymapId::Viewport));
+        assert_eq!(keymap_of("transform.axis_x"), Some(KeymapId::Modal));
+        // A catalog-/menu-only command (no keymap bind) reports None.
+        assert_eq!(keymap_of("object.add"), None);
+        assert_eq!(keymap_of("fixture.duplicate"), None);
+    }
+
+    #[test]
+    fn conflicting_ids_flags_both_sides_of_a_collision() {
+        // No conflicts in the shipped defaults.
+        assert!(conflicting_ids(&KeymapOverrides::default()).is_empty());
+        // Rebind Frame-selection onto plain `A` (Select-all in Global): both ids flag.
+        let mut ov = KeymapOverrides::default();
+        ov.rebind.insert("view.frame_selection".into(), SerTrigger::from_trigger(&Trigger::key(Key::A)));
+        let ids = conflicting_ids(&ov);
+        assert!(ids.contains("select.all"));
+        assert!(ids.contains("view.frame_selection"));
+    }
+
+    #[test]
+    fn reset_all_clears_every_override() {
+        let mut ov = KeymapOverrides::default();
+        ov.rebind.insert("select.all".into(), SerTrigger::from_trigger(&Trigger::key(Key::Q)));
+        ov.disabled.insert("view.frame_all".into());
+        ov.added.push(AddedBind {
+            keymap: SerKeymapId::from_id(KeymapId::Global),
+            trigger: SerTrigger::from_trigger(&Trigger::key(Key::J)),
+            cmd: "view.frame_all".into(),
+        });
+        assert!(!ov.is_empty());
+        // Mirror reset_all without persisting (the helper also writes to disk).
+        ov.rebind.clear();
+        ov.disabled.clear();
+        ov.added.clear();
+        assert!(ov.is_empty());
+    }
+
+    #[test]
+    fn reset_one_clears_added_binds_too() {
+        // Per-row reset must drop a user-ADDED bind for that command, not just the
+        // rebind/disable (otherwise a re-bound row couldn't be fully cleared).
+        let mut ov = KeymapOverrides::default();
+        ov.added.push(AddedBind {
+            keymap: SerKeymapId::from_id(KeymapId::Global),
+            trigger: SerTrigger::from_trigger(&Trigger::key(Key::J)),
+            cmd: "object.add".into(),
+        });
+        // Mirror reset("object.add") without persisting.
+        ov.rebind.remove("object.add");
+        ov.disabled.remove("object.add");
+        ov.added.retain(|a| a.cmd != "object.add");
+        assert!(ov.is_empty());
+    }
+
+    #[test]
+    fn set_disabled_toggles_suppression() {
+        let mut ov = KeymapOverrides::default();
+        // Mirror set_disabled(true/false) without persisting.
+        ov.disabled.insert("select.all".into());
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov), None);
+        ov.disabled.remove("select.all");
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov), Some("select.all"));
+    }
+
+    #[test]
+    fn reset_clears_rebind_and_disable() {
+        // `reset(id)` un-rebinds + un-disables so the static default resolves again.
+        let mut ov = KeymapOverrides::default();
+        ov.rebind.insert("select.all".into(), SerTrigger::from_trigger(&Trigger::key(Key::Q)));
+        ov.disabled.insert("select.all".into());
+        // Manual clear (mirrors `reset`, which also persists — not exercised in tests).
+        ov.rebind.remove("select.all");
+        ov.disabled.remove("select.all");
+        assert!(ov.is_empty());
+        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov), Some("select.all"));
     }
 }

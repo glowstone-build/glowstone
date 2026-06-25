@@ -2787,6 +2787,11 @@ pub fn viewport(
 ) {
     *transform_started = false;
     *transform_finished = false;
+    // The active keymap overrides for this frame (published by `Ui::show`). This
+    // free function's signature is fixed by its app.rs caller, so it reads the
+    // process-wide snapshot instead of taking `&KeymapOverrides`. EMPTY by default
+    // ⇒ the poll sites below behave exactly as the static defaults.
+    let ov = shortcuts::active();
     let available = ui.available_size();
     let ppp = ui.pixels_per_point();
 
@@ -2931,7 +2936,7 @@ pub fn viewport(
     if active_tool == ActiveTool::Measure {
         // Esc clears the current measurement (decoded from the shared modal keymap so
         // the bind stays in the one registry, like the transform Cancel).
-        if shortcuts::poll_modal(ui.ctx()).contains(&shortcuts::ModalAction::Cancel) {
+        if shortcuts::poll_modal(ui.ctx(), &ov).contains(&shortcuts::ModalAction::Cancel) {
             measure.clear();
         }
         if !consumed
@@ -3089,7 +3094,7 @@ pub fn viewport(
         // confirm + Esc cancel all decode from `poll_modal`, keeping the binds in
         // the one registry (and out of the plain press-keymaps) — no scattered raw
         // key reads here.
-        let modal = shortcuts::poll_modal(ui.ctx());
+        let modal = shortcuts::poll_modal(ui.ctx(), &ov);
         // --- Modal numeric input (Blender editors/util/numinput.cc) ---
         // Typed digits/'.' OVERRIDE the mouse; '-' toggles sign; Backspace edits
         // and, when it empties the buffer, hands control back to the mouse. Read
@@ -3212,6 +3217,7 @@ pub fn viewport(
         let kind = shortcuts::poll(
             ui.ctx(),
             shortcuts::ActiveContext { viewport_focused: true, transform_active: false },
+            &ov,
         )
         .into_iter()
         .find_map(|a| match a {
@@ -3558,6 +3564,7 @@ pub fn viewport(
     let dup_pressed = shortcuts::poll(
         ui.ctx(),
         shortcuts::ActiveContext { viewport_focused: *viewport_focused, transform_active: false },
+        &ov,
     )
     .iter()
     .any(|a| matches!(a, shortcuts::Action::Duplicate));

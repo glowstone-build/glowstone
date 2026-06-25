@@ -20,7 +20,7 @@ pub use add_menu::{add_menu_window, AddAction, AddMenuState};
 pub use operator_search::{operator_search_window, OperatorSearchState};
 pub use patch_dialog::{patch_dialog_window, PatchDialog};
 pub use perf_overlay::perf_overlay_window;
-pub use preferences::{preferences_window, LabelMode, Preferences};
+pub use preferences::{preferences_window, KeymapEditorState, LabelMode, Preferences};
 pub use profile_editor::{profile_editor_window, ProfileEditor};
 pub use quick_select::quick_select_window;
 pub use shortcuts::shortcuts_window;

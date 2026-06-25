@@ -177,7 +177,7 @@ fn op_row(ui: &mut egui::Ui, c: &Command, highlighted: bool, enabled: bool) -> e
         egui::FontId::monospace(10.0),
         ink.tertiary,
     );
-    if let Some(sc) = shortcuts::shortcut_for(c.id) {
+    if let Some(sc) = shortcuts::shortcut_for(c.id, &shortcuts::active()) {
         painter.text(
             egui::pos2(cat.min.x - 12.0, rect.center().y),
             egui::Align2::RIGHT_CENTER,

@@ -475,6 +475,16 @@ pub struct Ui {
     /// shared by the Library browser and the Add menu. Loaded once at startup,
     /// saved (synchronously, tiny payload) on each add/star toggle.
     lib_prefs: lib_prefs::LibraryPrefs,
+    /// Runtime keymap overrides (S1): a rebind/disable/add layer over the static
+    /// [`shortcuts::KEYMAPS`] defaults, persisted to `keymap.json` in the config
+    /// dir. EMPTY by default ⇒ the app dispatches exactly the shipped binds. Loaded
+    /// once at startup; published to the process-wide active snapshot each frame so
+    /// the fixed-signature viewport poll sites resolve against the same set.
+    keymap_overrides: shortcuts::KeymapOverrides,
+    /// Transient UI state for the Preferences › Keymap editor (S2): the in-flight
+    /// "press a key to rebind" capture target + the command search filter. Held by
+    /// the `Ui` so it persists across frames while the editor waits for a chord.
+    keymap_editor: windows::KeymapEditorState,
     /// The Measure tool's two-point ruler (§2.4) — a read-only viewport measurement
     /// that persists across frames; cleared when the Measure tool isn't active.
     measure: panels::MeasureState,
@@ -522,7 +532,10 @@ impl Ui {
             duplicate: None,
             replace: None,
             pending_replace: false,
-            show_prefs: false,
+            // Debug hook (S2): PREVIZ_UI_PREFS opens the Preferences window at
+            // startup so the headless PREVIZ_UI screenshot can capture the keymap
+            // editor without app.rs (off-limits) needing a dedicated flag.
+            show_prefs: std::env::var_os("PREVIZ_UI_PREFS").is_some(),
             show_about: false,
             show_shortcuts: false,
             show_perf: std::env::var("PREVIZ_PERF").is_ok(),
@@ -578,6 +591,8 @@ impl Ui {
             xform: TransformPrefs::default(),
             cursor_3d: Vec3::ZERO,
             lib_prefs: lib_prefs::LibraryPrefs::load(),
+            keymap_overrides: shortcuts::KeymapOverrides::load(),
+            keymap_editor: windows::KeymapEditorState::default(),
             measure: panels::MeasureState::default(),
             aim: panels::AimState::default(),
             view_pie: pie::PieState::default(),
@@ -1427,6 +1442,11 @@ impl Ui {
             }
             self.dmx_was_running = dmx_running;
         }
+        // Publish the active keymap overrides for this frame so the fixed-signature
+        // viewport poll sites (`panels::viewport`, whose app.rs caller is off-limits)
+        // resolve against the SAME overrides this Ui polls with. EMPTY by default ⇒
+        // those sites see the static defaults, unchanged.
+        shortcuts::publish_active(&self.keymap_overrides);
         // Global shortcuts — ONE poll, ONE dispatch path (S1). `handle_shortcuts`
         // routes every non-modal Action through `dispatch_action` (the single source
         // of truth), which handles File/Patch/Unpatch/Undo/Redo/OperatorSearch/
@@ -1633,6 +1653,8 @@ impl Ui {
             &mut self.prefs,
             &mut self.settings,
             dmx.config_mut(),
+            &mut self.keymap_overrides,
+            &mut self.keymap_editor,
         );
         windows::about_window(ctx, &mut self.show_about);
         windows::shortcuts_window(ctx, &mut self.show_shortcuts);
@@ -1961,7 +1983,7 @@ impl Ui {
         // Reset the per-frame nudge accumulator before dispatch re-fills it; show()
         // applies it where the patch is reachable so a held-key burst coalesces.
         self.pending_nudge = Vec3::ZERO;
-        for a in shortcuts::poll(ctx, cx) {
+        for a in shortcuts::poll(ctx, cx, &self.keymap_overrides) {
             self.dispatch_action(ctx, a, scene, camera, dmx);
         }
     }
