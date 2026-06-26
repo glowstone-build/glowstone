@@ -3534,42 +3534,59 @@ fn replace_window(
                 .max_height(360.0)
                 .show(ui, |ui| {
                 let mut any = false;
-                // GDTF fixtures in the project (imported + already placed) first.
-                let gdtf: Vec<usize> = (0..gdtf_arcs.len())
+                // Grouped EXACTLY like the Library browser: imported GDTFs by
+                // MANUFACTURER, then built-ins by CATEGORY — same `theme::section`
+                // headers (the old "GDTF FIXTURES" / "BUILT-IN" scheme read as a
+                // different categorisation from the Library, which was jarring).
+                let mut gdtf: Vec<usize> = (0..gdtf_arcs.len())
                     .filter(|&gi| matches(&format!("{} {}", gdtf_arcs[gi].manufacturer, gdtf_arcs[gi].name)))
                     .collect();
-                if !gdtf.is_empty() {
+                gdtf.sort_by(|&a, &b| {
+                    let (ga, gb) = (&gdtf_arcs[a], &gdtf_arcs[b]);
+                    ga.manufacturer
+                        .to_lowercase()
+                        .cmp(&gb.manufacturer.to_lowercase())
+                        .then(ga.name.to_lowercase().cmp(&gb.name.to_lowercase()))
+                });
+                let mut last = String::new();
+                for gi in gdtf {
                     any = true;
-                    theme::section(ui, "GDTF FIXTURES");
-                    for gi in gdtf {
-                        let g = &gdtf_arcs[gi];
-                        let label = format!("{}  {} · {}", theme::icon::FIXTURE, g.manufacturer, g.name);
-                        let src = g.source;
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(false, label).clicked() {
-                                picked = Some(Picked::Gdtf(gi));
-                            }
-                            // Colour-coded provenance chip (bug 11) — GDTF Share / MVR /
-                            // Imported read at a glance in the Replace list.
-                            panels::source_chip(ui, src);
-                        });
+                    let g = &gdtf_arcs[gi];
+                    let cat = if g.manufacturer.is_empty() { "Imported".to_string() } else { g.manufacturer.clone() };
+                    if cat != last {
+                        last = cat.clone();
+                        theme::section(ui, &cat.to_uppercase());
                     }
-                    ui.add_space(6.0);
+                    let src = g.source;
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(false, format!("{}  {}", theme::icon::FIXTURE, g.name)).clicked() {
+                            picked = Some(Picked::Gdtf(gi));
+                        }
+                        panels::source_chip(ui, src);
+                    });
                 }
-                // Then the built-in placeholder profiles.
-                let prof: Vec<usize> = (0..library.fixtures.len())
+                // Then the built-in profiles, grouped by category (Generic / Laser / …).
+                let mut prof: Vec<usize> = (0..library.fixtures.len())
                     .filter(|&pi| matches(&format!("{} {}", library.fixtures[pi].category, library.fixtures[pi].name)))
                     .collect();
-                if !prof.is_empty() {
+                prof.sort_by(|&a, &b| {
+                    let (pa, pb) = (&library.fixtures[a], &library.fixtures[b]);
+                    pa.category
+                        .to_lowercase()
+                        .cmp(&pb.category.to_lowercase())
+                        .then(pa.name.to_lowercase().cmp(&pb.name.to_lowercase()))
+                });
+                let mut last_c = String::new();
+                for pi in prof {
                     any = true;
-                    theme::section(ui, "BUILT-IN");
-                    for pi in prof {
-                        let p = &library.fixtures[pi];
-                        let icon = if p.laser { theme::icon::COLOR } else { theme::icon::FIXTURE };
-                        let label = format!("{icon}  {} · {}", p.category, p.name);
-                        if ui.selectable_label(false, label).clicked() {
-                            picked = Some(Picked::Profile(pi));
-                        }
+                    let p = &library.fixtures[pi];
+                    if p.category != last_c {
+                        last_c = p.category.to_string();
+                        theme::section(ui, &p.category.to_uppercase());
+                    }
+                    let icon = if p.laser { theme::icon::COLOR } else { theme::icon::FIXTURE };
+                    if ui.selectable_label(false, format!("{icon}  {}", p.name)).clicked() {
+                        picked = Some(Picked::Profile(pi));
                     }
                 }
                 if !any {

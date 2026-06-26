@@ -260,7 +260,9 @@ pub fn render_tab(ui: &mut egui::Ui, config: &RenderConfig, state: &mut RenderUi
             p.text(
                 center + egui::vec2(0.0, 36.0),
                 egui::Align2::CENTER_CENTER,
-                "Press Render here or in World ▸ Render Properties",
+                // The bundled fonts have no "▸" glyph (renders as a tofu box) — use the
+                // Phosphor caret, which IS in the merged icon font.
+                format!("Press Render here or in World {}  Render Properties", icon::NEXT),
                 egui::FontId::proportional(12.0),
                 pal.ink_muted,
             );

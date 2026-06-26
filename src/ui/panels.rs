@@ -972,14 +972,12 @@ struct LibRow {
     source: Option<crate::gdtf::FixtureSource>,
 }
 
-/// Draw a small colour-coded provenance chip ("• GDTF Share" / "MVR" / …) so a
-/// fixture's origin reads at a glance in the library + Replace lists (bug 11). A
-/// coloured dot + label keeps it legible at small sizes without a heavy box.
+/// The fixture's provenance ("Built-in" / "GDTF Share" / "MVR" / …) as a clean,
+/// colour-coded text tag — no floating dot (the dot-on-a-margin read as awful). Used
+/// in the inspector header + (drawn directly) the library / Replace rows.
 pub(crate) fn source_chip(ui: &mut egui::Ui, source: crate::gdtf::FixtureSource) {
     let [r, g, b] = source.color_rgb();
-    // A clean painter-drawn dot + label (the "•" glyph reads tiny/jammed, and the
-    // bundled fonts ship no round glyph). Identical spec to `super::status_dot`.
-    super::status_dot(ui, Color32::from_rgb(r, g, b), source.label());
+    ui.label(egui::RichText::new(source.label()).size(11.0).color(Color32::from_rgb(r, g, b)));
 }
 
 /// Build the flat row list from the library (Imported GDTF, then built-in
@@ -1325,8 +1323,9 @@ pub fn library_browser(
         for (ri, row) in rows.iter().enumerate() {
             if !fuzzy && lib.sort == LibSort::Category && row.category != last_cat {
                 last_cat = row.category.clone();
-                ui.add_space(4.0);
-                ui.label(RichText::new(row.category.to_uppercase()).size(10.0).strong().color(ink.tertiary));
+                // Same header style as the Replace dialog (theme::section) so the
+                // Library and Replace lists read as one consistent categorisation.
+                theme::section(ui, &row.category.to_uppercase());
             }
             let key = key_of(row);
             let selected = lib.selected.contains(&ri);
@@ -1527,21 +1526,20 @@ fn library_row_widget(
     // gutter (bug 11 + the chip/icon overlap fix): chip ~70px + the 44px gutter.
     let meta_w = if row.source.is_some() { (text_w - 110.0).max(30.0) } else { text_w };
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, meta_w);
-    // Reserve a fixed right-hand gutter for the +/★ action icons so the source
-    // chip (drawn to the LEFT of it) never collides with them (bug: chip + icons
-    // overlapped). The chip sits on the meta line, ending where the gutter begins.
+    // Source provenance: a clean colour-coded TEXT tag (no floating dot), right-
+    // aligned at a fixed gutter and VERTICALLY CENTERED so it reads as a consistent
+    // right-hand column across rows (the dot-on-a-margin looked awful). Sits left of
+    // the +/★ action gutter so they never collide.
     const ACTION_GUTTER: f32 = 44.0;
     if let Some(src) = row.source {
         let [cr, cg, cb] = src.color_rgb();
-        let color = Color32::from_rgb(cr, cg, cb);
-        // Painter-drawn dot + label (the "•" glyph reads tiny/jammed, and the
-        // bundled fonts ship no round glyph). Mirrors the `status_dot` spec: a
-        // small dot, a breathing gap, then the label — right-aligned as a unit.
-        let label_pos = egui::pos2(rect.right() - ACTION_GUTTER, rect.top() + 24.0);
-        let galley = painter.layout_no_wrap(src.label().to_owned(), egui::FontId::proportional(10.0), color);
-        let lw = galley.size().x;
-        painter.galley(egui::pos2(label_pos.x - lw, label_pos.y - galley.size().y / 2.0), galley, color);
-        painter.circle_filled(egui::pos2(label_pos.x - lw - 5.0 - 3.5, label_pos.y), 3.5, color);
+        painter.text(
+            egui::pos2(rect.right() - ACTION_GUTTER, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            src.label(),
+            egui::FontId::proportional(11.0),
+            Color32::from_rgb(cr, cg, cb),
+        );
     }
     // A "+" affordance on hover (left of the star), right-aligned in the gutter.
     if resp.hovered() {
@@ -1841,6 +1839,13 @@ pub fn inspector(
     render_ui: &mut RenderUiState,
     settings: &mut crate::scene::RenderSettings,
 ) {
+    // The dock + category/grid indents give the inspector a LEFT margin, but the
+    // grids / sliders / checkboxes otherwise run FLUSH to the right edge (asymmetric —
+    // the user's repeated note). Reserve a matching RIGHT margin here at the entry
+    // point so it covers the filter/header AND every body path (incl. Render
+    // Properties); the content then breathes the same on the left and the right.
+    const RIGHT_PAD: f32 = 12.0;
+    ui.set_max_width((ui.available_width() - RIGHT_PAD).max(140.0));
     // Filter box (S1): a fuzzy/substring row-label filter across all categories.
     // Sits above the scrolling body so it stays visible while scanning matches.
     ui.horizontal(|ui| {
@@ -4646,6 +4651,9 @@ pub fn viewport(
         }
     }
 
+    // The gizmo's projected screen centre (set when it draws) — the selection-label
+    // pill below reads it so it can DODGE the handles instead of overlapping them.
+    let mut gizmo_screen: Option<egui::Pos2> = None;
     let gizmo_targets: bool = active_tool.shows_xform_gizmo()
         && transform.is_none()
         && *viewport_focused
@@ -4667,6 +4675,7 @@ pub fn viewport(
         let objs = obj_refs(&fids, &gids, &sids, &eids);
         if !objs.is_empty() {
             let gizmo_pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
+            gizmo_screen = OrbitCamera::project_to_screen(gizmo_pivot, camera.view_proj(aspect), rect);
             let cx = GizmoCtx {
                 pivot: gizmo_pivot,
                 vp: camera.view_proj(aspect),
@@ -5600,7 +5609,18 @@ pub fn viewport(
         let pad = egui::vec2(9.0, 5.0);
         let size = galley.size() + pad * 2.0;
         let anchor = rect.right_top() + egui::vec2(-10.0, 10.0);
-        let bg = egui::Align2::RIGHT_TOP.anchor_size(anchor, size);
+        let mut bg = egui::Align2::RIGHT_TOP.anchor_size(anchor, size);
+        // Dodge the move gizmo: if its handles reach the pill's corner, drop the pill
+        // to just below them (the gizmo owns the object, so the label yields). Only
+        // when there's room below — otherwise the opaque pill stays put + readable.
+        if let Some(g) = gizmo_screen {
+            const GIZMO_R: f32 = 60.0; // generous on-screen handle reach
+            let near = egui::Rect::from_center_size(g, egui::vec2(GIZMO_R * 2.0, GIZMO_R * 2.0));
+            let drop_to = g.y + GIZMO_R + 8.0;
+            if bg.expand(4.0).intersects(near) && drop_to + size.y < rect.bottom() {
+                bg = bg.translate(egui::vec2(0.0, drop_to - bg.top()));
+            }
+        }
         // Opaque fill + a hairline so it reads as a solid chip over the gizmo.
         painter.rect_filled(bg, 5.0, egui::Color32::from_rgb(26, 27, 31));
         painter.rect_stroke(
