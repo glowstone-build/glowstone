@@ -1745,21 +1745,71 @@ fn field_row(
         label,
     );
     let value_w = (panel_w - INSPECTOR_LABEL_W - 48.0).max(70.0);
+    // A justified cell of exactly `value_w`: egui's Slider/DragValue/ComboBox are
+    // cross-justify-aware and fill the cell's width — the slider lays out its bar AND
+    // value WITHIN the cell (no glue/overflow), the field fills it. No slider_width /
+    // interact_size overrides (those fought the justify and inflated the slider value).
     ui.allocate_ui_with_layout(
         egui::vec2(value_w, h),
         egui::Layout::top_down_justified(egui::Align::Min),
+        value,
+    );
+    ui.end_row();
+}
+
+/// Like [`field_row`] but for a SLIDER value: a justified cell eats the slider's value
+/// (the bar grabs the whole width), so this lays out left-to-right and sets `slider_width`
+/// to the cell MINUS a readout reserve — the bar + its value both sit INSIDE the cell with
+/// a right margin (no glue, no cutoff, value visible). Same fixed label column as
+/// `field_row`, so sliders line up with the fields.
+fn slider_field_row(
+    ui: &mut egui::Ui,
+    panel_w: f32,
+    label: impl FnOnce(&mut egui::Ui),
+    value: impl FnOnce(&mut egui::Ui),
+) {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(INSPECTOR_LABEL_W, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        label,
+    );
+    let value_w = (panel_w - INSPECTOR_LABEL_W - 48.0).max(70.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(value_w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            // Size the value widget to the cell so it FILLS but never overflows:
-            //  - a Slider's bar is the cell minus a readout reserve, so the number
-            //    isn't glued to (or cut off at) the right edge;
-            //  - a DragValue / ComboBox grows to the cell's min interact width.
-            // (A vec3 row's add_sized fields override interact_size, so they're unaffected.)
-            ui.spacing_mut().slider_width = (value_w - 50.0).max(24.0);
-            ui.spacing_mut().interact_size.x = value_w;
+            ui.spacing_mut().slider_width = (value_w - 52.0).max(24.0);
             value(ui);
         },
     );
     ui.end_row();
+}
+
+/// A filter-aware inspector slider ROW (the [`row`] equivalent for sliders): handles
+/// row visibility + the reset arrow, then lays the slider out via [`slider_field_row`]
+/// so its value stays inside the cell. Returns whether the reset arrow was clicked.
+fn slider_row(
+    ui: &mut egui::Ui,
+    state: &InspectorState,
+    label: &str,
+    differs: bool,
+    value: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    if !state.row_shown(label, differs) {
+        return false;
+    }
+    let mut clicked = false;
+    slider_field_row(
+        ui,
+        state.panel_w,
+        |ui| {
+            clicked = reset_arrow(ui, differs);
+            ui.add(egui::Label::new(label).truncate());
+        },
+        value,
+    );
+    clicked
 }
 
 /// A stacked vector property (Blender-style): the label on the first sub-row, then ONE
@@ -2533,7 +2583,7 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
                     );
                 }
                 // Move speed = the pan/tilt motor slew (0 = snap, 1 = slowest).
-                if row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
+                if slider_row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
                     ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
                         .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
                 }) {
@@ -3284,7 +3334,7 @@ fn gdtf_inspector(
                     fixture.orientation =
                         glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
                 }
-                if row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
+                if slider_row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
                     ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
                         .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
                 }) {
@@ -3504,7 +3554,7 @@ fn optic_field_row(
     }
     let mut reset = false;
     let mut changed = false;
-    field_row(
+    slider_field_row(
         ui,
         state.panel_w,
         |ui| {
@@ -3665,7 +3715,7 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                             .as_deref()
                             .map(|n| format!("{} · {n}", comp.attribute))
                             .unwrap_or_else(|| comp.attribute.clone());
-                        field_row(
+                        slider_field_row(
                             ui,
                             fs.panel_w,
                             |ui| {
@@ -3679,18 +3729,18 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                         // Prism always exposes rotation (index + spin) even when the
                         // profile didn't flag a dedicated Pos/PosRotate function.
                         if comp.has_index || comp.kind == WheelKind::Prism {
-                            field_row(ui, fs.panel_w, |ui| { ui.label("index"); }, |ui| {
+                            slider_field_row(ui, fs.panel_w, |ui| { ui.label("index"); }, |ui| {
                                 ui.add(Slider::new(&mut w.index, 0.0..=1.0).max_decimals(2));
                             });
                         }
                         if comp.has_spin || matches!(comp.kind, WheelKind::Color | WheelKind::Animation | WheelKind::Prism) {
-                            field_row(ui, fs.panel_w, |ui| { ui.label("spin"); }, |ui| {
+                            slider_field_row(ui, fs.panel_w, |ui| { ui.label("spin"); }, |ui| {
                                 ui.add(Slider::new(&mut w.spin, 0.0..=1.0).max_decimals(2))
                                     .on_hover_text("0.5 = stopped · below CCW · above CW");
                             });
                         }
                         if matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) {
-                            field_row(ui, fs.panel_w, |ui| { ui.label("shake"); }, |ui| {
+                            slider_field_row(ui, fs.panel_w, |ui| { ui.label("shake"); }, |ui| {
                                 ui.add(Slider::new(&mut w.shake, 0.0..=1.0).max_decimals(2))
                                     .on_hover_text("Oscillate the indexed element");
                             });

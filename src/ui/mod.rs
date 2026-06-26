@@ -2390,7 +2390,26 @@ impl Ui {
         if let Some(path) = self.dock.find_tab(&tab) {
             self.dock.remove_tab(path);
         } else {
-            self.dock.push_to_focused_leaf(tab);
+            // Re-open on the panel's natural EDGE as a whole side pane — NOT merged as a
+            // tab into the focused (viewport) leaf. So `N` brings the Inspector back as
+            // the right sidebar, Scene/Library return on the left, etc. Splitting the
+            // root spans the full height of that edge.
+            let root = egui_dock::NodeIndex::root();
+            match tab {
+                Tab::Scene | Tab::Library => {
+                    self.dock.main_surface_mut().split_left(root, 0.17, vec![tab]);
+                }
+                Tab::Inspector => {
+                    self.dock.main_surface_mut().split_right(root, 0.80, vec![tab]);
+                }
+                Tab::Patch | Tab::DmxMonitor | Tab::Cues | Tab::Connectivity => {
+                    self.dock.main_surface_mut().split_below(root, 0.7, vec![tab]);
+                }
+                // Viewport / Render: no canonical edge — fall back to the focused leaf.
+                _ => {
+                    self.dock.push_to_focused_leaf(tab);
+                }
+            }
         }
     }
 
@@ -3926,6 +3945,25 @@ mod tests {
     use super::*;
     use crate::dmx::DmxIo;
     use crate::scene::Scene;
+
+    /// N (ToggleNPanel) hides the Inspector, then re-opens it as its OWN side pane —
+    /// NOT merged as a tab into the viewport's leaf (the reported bug: it reopened
+    /// full-screen-as-a-tab over the viewport instead of returning to the sidebar).
+    #[test]
+    fn n_panel_reopens_as_its_own_pane_not_a_viewport_tab() {
+        let mut ui = Ui::new();
+        assert!(ui.dock.find_tab(&Tab::Inspector).is_some(), "default has an Inspector");
+        ui.toggle_tab(Tab::Inspector); // hide
+        assert!(ui.dock.find_tab(&Tab::Inspector).is_none(), "N hides it");
+        ui.toggle_tab(Tab::Inspector); // re-open
+        let insp = ui.dock.find_tab(&Tab::Inspector).expect("N re-opens the Inspector");
+        let vp = ui.dock.find_tab(&Tab::Viewport).expect("viewport present");
+        assert_ne!(
+            (insp.surface, insp.node),
+            (vp.surface, vp.node),
+            "Inspector must reopen in its OWN leaf, not the viewport's tab strip",
+        );
+    }
 
     /// F9 "Adjust Last Operation" must REPLACE the last op's result, not stack a
     /// second one (the Phase-1 review's must-fix). Run a Direct op (unpatch), then
