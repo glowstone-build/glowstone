@@ -3474,9 +3474,14 @@ impl TabViewer for PanelViewer<'_> {
     /// The viewport draws an opaque image and handles its own scroll-to-zoom,
     /// so it must not be wrapped in a scroll area.
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
+        // `[horizontal, vertical]`. The Inspector / outliner / list panels must FIT
+        // their width and never scroll sideways (the inspector horizontal-scroll bug);
+        // only the genuinely WIDE data tables (the 512-channel DMX grid + the Fixtures
+        // schedule) keep horizontal scroll.
         match tab {
-            Tab::Viewport => [false, false],
-            _ => [true, true],
+            Tab::Viewport => [false, false], // draws its own image
+            Tab::DmxMonitor | Tab::Patch => [true, true], // wide tables
+            _ => [false, true], // fit width, vertical scroll only
         }
     }
 }
