@@ -18,6 +18,7 @@ pub mod shortcuts;
 pub mod theme;
 mod tools;
 mod tree;
+mod workspaces;
 pub use tools::ActiveTool;
 mod windows;
 mod xform;
@@ -27,7 +28,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
+use egui_dock::{DockArea, DockState, TabViewer};
 use glam::Vec3;
 
 use crate::renderer::camera::{CameraView, OrbitCamera};
@@ -333,22 +334,6 @@ impl TransformOp {
     }
 }
 
-/// A workspace layout preset, switchable from the Window menu.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Workspace {
-    Design,
-    Patch,
-    Visualize,
-}
-
-impl Workspace {
-    const ALL: [(Workspace, &'static str); 3] = [
-        (Workspace::Design, "Design"),
-        (Workspace::Patch, "Patch"),
-        (Workspace::Visualize, "Visualise"),
-    ];
-}
-
 impl Tab {
     /// Every editor type — the SpaceType registry the header's editor-type
     /// switcher offers (`docs/RESEARCH-blender-framework.md` §2.2).
@@ -439,6 +424,9 @@ pub struct Ui {
     scene_sort: panels::SceneSort,
     /// Scene-outliner name filter (fixtures + objects).
     scene_search: String,
+    /// Scene-outliner type/state filter chips (catalog #62) — composes with the
+    /// name filter to narrow the tree by entity kind + fixture state.
+    scene_filter: tree::OutlinerFilter,
     /// Expanded outliner-tree nodes (absent = collapsed). Group/Root keys are
     /// constant; entity keys are stable EntityIds, so expand-state survives
     /// reorder. Held across frames on `Ui` (the tree is rebuilt each frame).
@@ -543,6 +531,16 @@ pub struct Ui {
     /// startup, saved on each save/delete). Reachable from the Window menu strip +
     /// the registered `view.bookmark_*` commands (F3 palette / keymap).
     bookmarks: bookmarks::Bookmarks,
+    /// User-savable workspaces (S1): the soft "modes" — saved records of
+    /// {dock layout, default tool, overlay flags}. The four built-ins
+    /// (Design/Patch/Focus/Visualise) regenerate when `workspaces.json` is absent.
+    /// Switched from the tab strip / Window menu / `workspace.activate_*` commands;
+    /// activating applies the layout + presets the tool + emphasises overlays — it
+    /// does NOT lock anything (everything stays editable).
+    workspaces: workspaces::Workspaces,
+    /// The open "Save current as workspace…" dialog name buffer, if any. `None` =
+    /// closed.
+    save_workspace: Option<String>,
     /// Runtime keymap overrides (S1): a rebind/disable/add layer over the static
     /// [`shortcuts::KEYMAPS`] defaults, persisted to `keymap.json` in the config
     /// dir. EMPTY by default ⇒ the app dispatches exactly the shipped binds. Loaded
@@ -596,8 +594,15 @@ struct ViewportRegions {
 
 impl Ui {
     pub fn new() -> Self {
+        // Load the user's workspaces (built-ins if the file is absent); the active
+        // one's saved dock layout is the startup layout and its default tool the
+        // startup tool. Overlay flags are deliberately LEFT at the user's saved
+        // Preferences defaults here — they're only re-emphasised on an explicit
+        // workspace ACTIVATION (a user switch), so startup prefs stay deterministic.
+        let workspaces = workspaces::Workspaces::load();
+        let active = workspaces.active().clone();
         Self {
-            dock: Self::default_dock(),
+            dock: active.dock.clone(),
             library: Library::standard(),
             gdtf_textures: HashMap::new(),
             selection: Selection::fixture(0),
@@ -620,6 +625,7 @@ impl Ui {
             scene_anchor: None,
             scene_sort: panels::SceneSort::Patch,
             scene_search: String::new(),
+            scene_filter: tree::OutlinerFilter::default(),
             scene_expanded: {
                 // Sensible default expand-state: the project + its top groups open,
                 // so fixtures are visible at a glance (and the headless screenshot
@@ -664,12 +670,14 @@ impl Ui {
             recent: project::load_recent(),
             autosave_timer: 0.0,
             viewport_regions: ViewportRegions::default(),
-            active_tool: ActiveTool::default(),
+            active_tool: active.default_tool,
             xform: TransformPrefs::default(),
             cursor_3d: Vec3::ZERO,
             cursor_3d_set: false,
             lib_prefs: lib_prefs::LibraryPrefs::load(),
             bookmarks: bookmarks::Bookmarks::load(),
+            workspaces,
+            save_workspace: None,
             keymap_overrides: shortcuts::KeymapOverrides::load(),
             keymap_editor: windows::KeymapEditorState::default(),
             measure: panels::MeasureState::default(),
@@ -1458,39 +1466,46 @@ impl Ui {
     /// makes the new right panel `1 - f`, `split_below` the new bottom `1 - f`.
     /// (The old code passed 0.80 to `split_left` expecting the central to keep
     /// 80% — that made the Scene sidebar 80% wide, the startup-layout bug.)
-    fn default_dock() -> DockState<Tab> {
-        Self::workspace_dock(Workspace::Design)
+    fn default_dock(&self) -> DockState<Tab> {
+        self.workspaces.active().dock.clone()
     }
 
-    /// A workspace layout preset (à la Blender's workspace tabs / depence's
-    /// Construction·ShowControl·Animation presets): each pre-arranges the panels
-    /// for one stage of the lighting workflow.
-    fn workspace_dock(ws: Workspace) -> DockState<Tab> {
-        let mut dock = DockState::new(vec![Tab::Viewport]);
-        let surface = dock.main_surface_mut();
-        match ws {
-            // DESIGN: balanced — outliner + library left, inspector right, the
-            // Fixtures/DMX data as a bottom strip. The everyday layout.
-            Workspace::Design => {
-                let [c, _l] = surface.split_left(NodeIndex::root(), 0.17, vec![Tab::Scene, Tab::Library]);
-                let [c, _i] = surface.split_right(c, 0.79, vec![Tab::Inspector]);
-                surface.split_below(c, 0.70, vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity]);
-            }
-            // PATCH: the systems tech — the Fixtures sheet + DMX dominate (a tall
-            // bottom data area), the viewport just for orientation.
-            Workspace::Patch => {
-                let [c, _l] = surface.split_left(NodeIndex::root(), 0.16, vec![Tab::Scene]);
-                let [c, _i] = surface.split_right(c, 0.80, vec![Tab::Inspector]);
-                surface.split_below(c, 0.42, vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity]);
-            }
-            // VISUALISE: the previz artist — maximise the viewport; thin Scene
-            // (World + outliner) left, Inspector right, no data strip.
-            Workspace::Visualize => {
-                let [c, _l] = surface.split_left(NodeIndex::root(), 0.15, vec![Tab::Scene]);
-                surface.split_right(c, 0.82, vec![Tab::Inspector]);
-            }
-        }
-        dock
+    /// Map a workspace's recorded [`Overlays`] onto the live overlay flags. The
+    /// single source of the field mapping (called on workspace ACTIVATION). NOT a
+    /// lock — the user can still toggle any of these afterward; a workspace just
+    /// presets the emphasis (the design note: soft contexts, no gating).
+    fn apply_overlays(prefs: &mut Preferences, settings: &mut RenderSettings, ov: workspaces::Overlays) {
+        prefs.show_labels = ov.labels;
+        prefs.show_stats = ov.stats;
+        settings.show_grid = ov.grid;
+        prefs.show_gizmos = ov.gizmos;
+    }
+
+    /// Activate the workspace at `idx`: apply its saved dock layout, preset its
+    /// default tool, and emphasise its overlay flags. A no-op for an out-of-range
+    /// index. Records the choice as active (persisted) so the app reopens here. This
+    /// changes the STARTING arrangement only — nothing is locked or gated.
+    fn activate_workspace(&mut self, idx: usize) {
+        let Some(ws) = self.workspaces.items.get(idx).cloned() else { return };
+        self.dock = ws.dock.clone();
+        self.active_tool = ws.default_tool;
+        Self::apply_overlays(&mut self.prefs, &mut self.settings, ws.overlays);
+        self.workspaces.set_active(idx);
+        self.notify.info(format!("Workspace: {}", ws.name));
+    }
+
+    /// Capture the LIVE dock layout + current tool + current overlay flags as a
+    /// workspace named `name` (overwriting a same-named record), then activate it.
+    /// The "Save current as workspace…" commit.
+    fn save_current_workspace(&mut self, name: &str) {
+        let overlays = workspaces::Workspaces::capture_overlays(
+            self.prefs.show_labels,
+            self.prefs.show_stats,
+            self.settings.show_grid,
+            self.prefs.show_gizmos,
+        );
+        let idx = self.workspaces.save_current(name, self.dock.clone(), self.active_tool, overlays);
+        self.notify.success(format!("Saved workspace: {}", self.workspaces.items[idx].name));
     }
 
     /// Build the whole docked UI for one egui frame.
@@ -1544,6 +1559,9 @@ impl Ui {
 
         // Chrome MUST be reserved before the dock (it fills the CentralPanel).
         self.menu_bar(ctx, scene, camera, dmx);
+        // The workspace tab strip (Blender's workspace tabs) — switch the soft "mode"
+        // with one click. Reserved below the menu bar, above the dock.
+        self.workspace_strip(ctx);
         self.status_bar(ctx, scene, dmx, fps);
 
         // Reset the per-frame inspector drag edges before the dock OR-accumulates
@@ -1569,6 +1587,7 @@ impl Ui {
             scene_anchor: &mut self.scene_anchor,
             scene_sort: &mut self.scene_sort,
             scene_search: &mut self.scene_search,
+            scene_filter: &mut self.scene_filter,
             scene_expanded: &mut self.scene_expanded,
             scene_rename: &mut self.scene_rename,
             pending_tree: &mut self.pending_tree,
@@ -1744,6 +1763,9 @@ impl Ui {
         );
         windows::about_window(ctx, &mut self.show_about);
         windows::shortcuts_window(ctx, &mut self.show_shortcuts);
+        // The "Save current as workspace…" modal (S1) — captures the live layout +
+        // tool + overlays under a name when confirmed.
+        self.save_workspace_dialog(ctx);
         // The report-log history window (§2.10 #22) — the persistent companion to
         // the fading toasts drawn below; lists past notifications newest-first.
         self.notify.draw_log_window(ctx, &mut self.show_report_log);
@@ -2236,23 +2258,31 @@ impl Ui {
             // Context gating (Viewport `S` = Scale masks this when the viewport
             // is focused) means QuickSelect only reaches here when it should.
             Action::QuickSelect => self.quick_select = true,
+            // Select All (#88): every item of the ACTIVE kind (fixtures by default;
+            // objects/screens when one of those is the current selection). Mirrors
+            // Blender's `A` acting on the active mode's collection.
             Action::SelectAll => {
-                if !scene.fixtures.is_empty() {
-                    self.selection = Selection {
-                        fixtures: (0..scene.fixtures.len()).collect(),
-                        geometry: Vec::new(),
-                        screens: Vec::new(),
-                        environment: None,
-                        world: false,
-                    };
-                }
+                let counts = (scene.fixtures.len(), scene.geometry.len(), scene.screens.len());
+                let kind = self.selection.active_kind();
+                self.selection.select_all_of(kind, counts);
+                self.scene_anchor = None;
             }
-            // Esc / Deselect: a no-op in dispatch today — the old match sites both
-            // fell through to `_ => {}` for it (Esc is consumed by open dialogs /
-            // the pie / quick-select, never as a global deselect). Kept a no-op to
-            // preserve behaviour exactly; the arm exists so the palette/cheat-sheet
-            // round-trips without a dead match.
-            Action::Deselect => {}
+            // Deselect / None (#88): clear the selection. Bound to Alt+A and Escape;
+            // Escape only reaches here when no dialog / pie / quick-select consumed it
+            // first (the keymap poll is silent while a text field is focused), so this
+            // is the "nothing else wanted it" global clear (Blender's Alt+A).
+            Action::Deselect => {
+                self.selection = Selection::default();
+                self.scene_anchor = None;
+            }
+            // Invert (#88): flip membership within the active kind. Defaults to
+            // fixtures when nothing is selected, so a bare Ctrl+I selects everything.
+            Action::SelectInvert => {
+                let counts = (scene.fixtures.len(), scene.geometry.len(), scene.screens.len());
+                let kind = self.selection.active_kind();
+                self.selection.invert_within(kind, counts);
+                self.scene_anchor = None;
+            }
             Action::Replace => {
                 if self.replace.is_none() && !self.selection.fixtures.is_empty() {
                     self.replace = Some(ReplaceDialog::default());
@@ -2341,6 +2371,16 @@ impl Ui {
             Action::Preferences => self.show_prefs = true,
             // Toggle (not just open) so the same key/palette pick closes it again.
             Action::ToggleReportLog => self.show_report_log = !self.show_report_log,
+            // --- Workspaces (S1) — soft "modes" ---------------------------------
+            // Activate the saved workspace at `idx` (layout + tool + overlay
+            // emphasis; no locking). An out-of-range slot is a clean no-op (fewer
+            // workspaces than the 9 registered commands).
+            Action::ActivateWorkspace(idx) => self.activate_workspace(idx),
+            // Open the "Save current as workspace…" dialog seeded with the active
+            // workspace's name.
+            Action::SaveWorkspace => {
+                self.save_workspace = Some(self.workspaces.active().name.clone());
+            }
             Action::Save => self.save_project(scene, camera, dmx),
             Action::SaveAs => self.save_project_as(scene, camera, dmx),
             Action::Open => self.open_project_dialog(scene, camera, dmx),
@@ -2426,6 +2466,85 @@ impl Ui {
     // `show_inside` needs a Ui, not the root Context — DockArea uses the same
     // path); the ctx-based root panel is still correct here.
     #[allow(deprecated)]
+    /// The workspace tab strip (Blender's workspace tabs / depence's preset row):
+    /// one selectable tab per saved workspace + a "+" to save the current arrangement
+    /// as a new workspace. Clicking a tab activates that workspace (layout + tool +
+    /// overlay emphasis; NO locking). Reserved below the menu bar, above the dock.
+    fn workspace_strip(&mut self, ctx: &egui::Context) {
+        use theme::icon;
+        let active = self.workspaces.active;
+        let mut activate: Option<usize> = None;
+        let mut save_new = false;
+        egui::TopBottomPanel::top("workspace-strip").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(2.0);
+                // Snapshot the names so the activate borrow doesn't overlap iteration.
+                let names: Vec<String> = self.workspaces.items.iter().map(|w| w.name.clone()).collect();
+                for (i, name) in names.into_iter().enumerate() {
+                    #[allow(deprecated)] // egui 0.34 SelectableLabel — Button::selectable migration later
+                    if ui.selectable_label(i == active, name).clicked() {
+                        activate = Some(i);
+                    }
+                }
+                ui.separator();
+                if ui
+                    .small_button(icon::ADD)
+                    .on_hover_text("Save current arrangement as a new workspace")
+                    .clicked()
+                {
+                    save_new = true;
+                }
+            });
+        });
+        if let Some(i) = activate {
+            // Re-activating the current workspace is harmless (re-applies its saved
+            // layout) — a cheap "reset this workspace" gesture.
+            self.activate_workspace(i);
+        }
+        if save_new {
+            self.save_workspace = Some(String::new());
+        }
+    }
+
+    /// The "Save current as workspace…" modal: a name field + Save/Cancel. On Save
+    /// it captures the live layout + tool + overlays under the typed name (overwriting
+    /// a same-named record). Drawn after the dock in `show`.
+    fn save_workspace_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut name) = self.save_workspace.take() else { return };
+        let mut open = true;
+        let mut commit = false;
+        let mut cancel = false;
+        egui::Window::new("Save Workspace")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("Workspace name");
+                let resp = ui.text_edit_singleline(&mut name);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        commit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if commit && !name.trim().is_empty() {
+            self.save_current_workspace(&name);
+            // dialog closed (not re-stored)
+        } else if cancel || !open {
+            // dropped (not re-stored)
+        } else {
+            // Keep the dialog open with the in-progress name.
+            self.save_workspace = Some(name);
+        }
+    }
+
     fn menu_bar(
         &mut self,
         ctx: &egui::Context,
@@ -2557,8 +2676,20 @@ impl Ui {
                         self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
                         ui.close();
                     }
-                    if ui.button(format!("{}  Deselect All", icon::DESELECT)).clicked() {
-                        self.selection = Selection::default();
+                    ui.separator();
+                    // Select All / Invert / None (#88) — route through dispatch_action
+                    // so the menu, the keymap (A / Ctrl+I / Alt+A) and the F3 palette
+                    // all share one effect. These act within the ACTIVE selection kind.
+                    if ui.button(format!("{}  Select All  (A)", icon::TOOL_SELECT)).clicked() {
+                        self.dispatch_action(ctx, shortcuts::Action::SelectAll, scene, camera, dmx);
+                        ui.close();
+                    }
+                    if ui.button(format!("{}  Invert Selection  (Ctrl+I)", icon::TOOL_SELECT)).clicked() {
+                        self.dispatch_action(ctx, shortcuts::Action::SelectInvert, scene, camera, dmx);
+                        ui.close();
+                    }
+                    if ui.button(format!("{}  Deselect All  (Alt+A)", icon::DESELECT)).clicked() {
+                        self.dispatch_action(ctx, shortcuts::Action::Deselect, scene, camera, dmx);
                         ui.close();
                     }
                 });
@@ -2614,11 +2745,44 @@ impl Ui {
                 });
                 ui.menu_button("Window", |ui| {
                     ui.menu_button(format!("{}  Workspace", icon::LAYOUT), |ui| {
-                        for (ws, name) in Workspace::ALL {
-                            if ui.button(name).clicked() {
-                                self.dock = Self::workspace_dock(ws);
-                                ui.close();
-                            }
+                        // Switch to any saved workspace (built-in or user) — applies its
+                        // layout + tool + overlay emphasis (no locking). The active one
+                        // is checkmarked. A delete affordance for user workspaces.
+                        let active = self.workspaces.active;
+                        let mut activate: Option<usize> = None;
+                        let mut delete: Option<usize> = None;
+                        let rows: Vec<(usize, String, bool)> = self
+                            .workspaces
+                            .items
+                            .iter()
+                            .enumerate()
+                            .map(|(i, w)| (i, w.name.clone(), w.builtin))
+                            .collect();
+                        for (i, name, builtin) in rows {
+                            ui.horizontal(|ui| {
+                                let mark = if i == active { "●  " } else { "    " };
+                                if ui.button(format!("{mark}{name}")).clicked() {
+                                    activate = Some(i);
+                                }
+                                if !builtin
+                                    && ui.small_button(icon::TRASH).on_hover_text("Delete workspace").clicked()
+                                {
+                                    delete = Some(i);
+                                }
+                            });
+                        }
+                        ui.separator();
+                        if ui.button(format!("{}  Save Current as Workspace…", icon::EXPORT)).clicked() {
+                            // Seed the name buffer with the active workspace's name.
+                            self.save_workspace = Some(self.workspaces.active().name.clone());
+                            ui.close();
+                        }
+                        if let Some(i) = activate {
+                            self.activate_workspace(i);
+                            ui.close();
+                        }
+                        if let Some(i) = delete {
+                            self.workspaces.delete(i);
                         }
                     });
                     // View bookmarks strip (P1 #34): save the current shot to the next
@@ -2671,7 +2835,10 @@ impl Ui {
                     }
                     ui.separator();
                     if ui.button(format!("{}  Reset Layout", icon::LAYOUT)).clicked() {
-                        self.dock = Self::default_dock();
+                        // Re-apply the active workspace's saved layout (revert any live
+                        // panel dragging) without changing its tool/overlay emphasis.
+                        let dock = self.default_dock();
+                        self.dock = dock;
                         ui.close();
                     }
                 });
@@ -3057,6 +3224,7 @@ struct PanelViewer<'a> {
     scene_anchor: &'a mut Option<usize>,
     scene_sort: &'a mut panels::SceneSort,
     scene_search: &'a mut String,
+    scene_filter: &'a mut tree::OutlinerFilter,
     scene_expanded: &'a mut std::collections::HashSet<tree::NodeKey>,
     scene_rename: &'a mut Option<(tree::NodeKey, String)>,
     pending_tree: &'a mut tree::TreeAction,
@@ -3239,6 +3407,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.scene_anchor,
                 self.scene_sort,
                 self.scene_search,
+                self.scene_filter,
                 self.scene_expanded,
                 self.scene_rename,
                 self.pending_tree,
@@ -3399,9 +3568,20 @@ mod tests {
         // --- Selection ---
         let (ui, _, _, h) = run(Action::QuickSelect, noop);
         assert!(h && ui.quick_select, "QuickSelect arms the menu");
-        let (ui, _, _, h) = run(Action::SelectAll, noop);
-        assert!(h && ui.selection.fixtures == vec![0], "SelectAll selects every fixture");
-        assert!(run(Action::Deselect, noop).3, "Deselect is handled (a no-op today)");
+        let (ui, sc, _, h) = run(Action::SelectAll, noop);
+        assert!(h && ui.selection.fixtures == (0..sc.fixtures.len()).collect::<Vec<_>>(), "SelectAll selects every fixture (active kind)");
+        // Deselect (#88: Alt+A / Esc) now clears the selection.
+        let (ui, _, _, h) = run(Action::Deselect, &sel);
+        assert!(h && ui.selection == Selection::default(), "Deselect clears the selection");
+        // Invert (#88) within the active kind flips membership: from {0} it must
+        // include everything BUT 0; on the single-fixture demo that's empty.
+        let (ui, sc, _, h) = run(Action::SelectInvert, &sel);
+        let want: Vec<usize> = (0..sc.fixtures.len()).filter(|&i| i != 0).collect();
+        assert!(h && ui.selection.fixtures == want, "Invert flips membership within the active kind");
+        // Invert from empty selects all (active kind defaults to fixtures).
+        let clear: &dyn Fn(&mut Ui) = &|ui: &mut Ui| ui.selection = Selection::default();
+        let (ui, sc, _, h) = run(Action::SelectInvert, clear);
+        assert!(h && ui.selection.fixtures == (0..sc.fixtures.len()).collect::<Vec<_>>(), "Invert from empty selects all");
         let (ui, _, _, h) = run(Action::Replace, &sel);
         assert!(h && ui.replace.is_some(), "Replace opens its dialog with a selection");
 

@@ -56,6 +56,14 @@ pub enum Action {
     /// Recall the camera bookmark in the given 1-based slot (eased jump). A
     /// `Recall view bookmark N` command per slot is registered for the palette/keymap.
     RecallBookmark(usize),
+    /// Activate the saved workspace at the given 0-based index (applies its layout +
+    /// default tool + overlay emphasis; no locking). One command per slot is
+    /// registered so each gets a stable id the palette lists + the keymap can bind.
+    /// Impl in `Ui::dispatch_action`.
+    ActivateWorkspace(usize),
+    /// Open the "Save current as workspace…" dialog (captures the live layout + tool
+    /// + overlays under a name). Impl in `Ui::dispatch_action`.
+    SaveWorkspace,
     ToggleLabels,
     /// Toggle the quiet scene-statistics corner overlay (Overlays submenu).
     ToggleStats,
@@ -68,6 +76,8 @@ pub enum Action {
     // Selection.
     SelectAll,
     Deselect,
+    /// Ctrl+I — invert the selection within the active kind (catalog #88).
+    SelectInvert,
     QuickSelect,
     Replace,
     // Object / transform.
@@ -144,6 +154,10 @@ impl Mods {
         self.shift = Some(true);
         self
     }
+    const fn alt(mut self) -> Self {
+        self.alt = Some(true);
+        self
+    }
     /// Does an egui modifier state satisfy this requirement?
     fn matches(&self, m: &egui::Modifiers) -> bool {
         self.command.is_none_or(|w| m.command == w)
@@ -186,6 +200,10 @@ impl Trigger {
     }
     const fn cmd(mut self) -> Self {
         self.mods = self.mods.cmd();
+        self
+    }
+    const fn alt(mut self) -> Self {
+        self.mods = self.mods.alt();
         self
     }
     /// Did this trigger fire this frame? (`Press` reads `key_pressed`; the other
@@ -395,11 +413,13 @@ pub static COMMANDS: &[Command] = &[
     command_row("view.bookmark_recall_9", "Recall view bookmark 9", Category::View, Action::RecallBookmark(9)),
     command_row("view.toggle_n_panel", "Toggle N-panel (sidebar)", Category::View, Action::ToggleNPanel),
     command_row("view.toggle_t_panel", "Toggle T-panel (tool rail)", Category::View, Action::ToggleTPanel),
-    // --- Selection ---
-    command_row("select.all", "Select all fixtures", Category::Selection, Action::SelectAll),
+    // --- Selection (#88: All / None / Invert within the active kind) ---
+    command_row("select.all", "Select all", Category::Selection, Action::SelectAll),
+    command_row("select.invert", "Invert selection", Category::Selection, Action::SelectInvert),
     command_row("select.quick", "Quick-select menu", Category::Selection, Action::QuickSelect),
     command_row("select.replace", "Replace selected fixtures", Category::Selection, Action::Replace),
-    command_row("select.deselect", "Deselect all", Category::Selection, Action::Deselect),
+    // "None" (Alt+A) reuses the canonical Deselect command (also bound to Escape).
+    command_row("select.deselect", "Deselect all (none)", Category::Selection, Action::Deselect),
     // --- Transform: nudge (plain = 0.1 m, Shift = 1.0 m). Each direction has a
     // plain command + a "(1 m)" command; the keymap binds the matching trigger. ---
     command_row("transform.nudge_x_neg", "Nudge -X (Shift = 1 m)", Category::Transform, Action::Nudge(Dir::XNeg, 0.1)),
@@ -459,6 +479,19 @@ pub static COMMANDS: &[Command] = &[
     // --- App ---
     command_row("app.preferences", "Preferences", Category::App, Action::Preferences),
     command_row("window.report_log", "Report Log", Category::App, Action::ToggleReportLog),
+    // --- Workspaces (S1): switch the soft "mode" — apply a saved layout + default
+    // tool + overlay emphasis (no locking). One activate command per slot (so each
+    // gets a stable id the palette lists + the keymap can bind) + a save command. ---
+    command_row("window.save_workspace", "Save current as workspace…", Category::App, Action::SaveWorkspace),
+    command_row("window.workspace_1", "Workspace 1", Category::App, Action::ActivateWorkspace(0)),
+    command_row("window.workspace_2", "Workspace 2", Category::App, Action::ActivateWorkspace(1)),
+    command_row("window.workspace_3", "Workspace 3", Category::App, Action::ActivateWorkspace(2)),
+    command_row("window.workspace_4", "Workspace 4", Category::App, Action::ActivateWorkspace(3)),
+    command_row("window.workspace_5", "Workspace 5", Category::App, Action::ActivateWorkspace(4)),
+    command_row("window.workspace_6", "Workspace 6", Category::App, Action::ActivateWorkspace(5)),
+    command_row("window.workspace_7", "Workspace 7", Category::App, Action::ActivateWorkspace(6)),
+    command_row("window.workspace_8", "Workspace 8", Category::App, Action::ActivateWorkspace(7)),
+    command_row("window.workspace_9", "Workspace 9", Category::App, Action::ActivateWorkspace(8)),
 ];
 
 impl Command {
@@ -557,8 +590,10 @@ pub static GLOBAL: &[Kmi] = &[
     kmi(Trigger::key(Key::Period), "view.frame_selection_alias"),
     kmi(Trigger::key(Key::Home), "view.frame_all_alias"),
     kmi(Trigger::key(Key::L), "view.toggle_labels"),
-    // --- Selection ---
+    // --- Selection (#88: A=All, Alt+A=None, Ctrl+I=Invert within active kind) ---
     kmi(Trigger::key(Key::A), "select.all"),
+    kmi(Trigger::key(Key::A).alt(), "select.deselect"),
+    kmi(Trigger::key(Key::I).cmd(), "select.invert"),
     kmi(Trigger::key(Key::S), "select.quick"),
     kmi(Trigger::key(Key::R).shift(), "select.replace"),
     kmi(Trigger::key(Key::Escape), "select.deselect"),

@@ -30,6 +30,92 @@ use super::theme;
 use crate::dmx::PatchTable;
 use crate::scene::{apply_fixture_click, EntityId, Scene, Selection};
 
+/// The outliner's type-filter chip (catalog #62): which entity kinds the tree
+/// shows. `All` is the unfiltered default; the rest restrict to one collection
+/// (the matching group container still draws so its header reads as the scope).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum TypeChip {
+    #[default]
+    All,
+    Fixtures,
+    Objects,
+    Screens,
+}
+
+impl TypeChip {
+    /// The chip strip's left-to-right order + labels.
+    pub const ORDER: [TypeChip; 4] = [TypeChip::All, TypeChip::Fixtures, TypeChip::Objects, TypeChip::Screens];
+    pub fn label(self) -> &'static str {
+        match self {
+            TypeChip::All => "All",
+            TypeChip::Fixtures => "Fixtures",
+            TypeChip::Objects => "Objects",
+            TypeChip::Screens => "Screens",
+        }
+    }
+    /// Whether the `Fixtures` group + its leaves should be visible.
+    fn fixtures(self) -> bool {
+        matches!(self, TypeChip::All | TypeChip::Fixtures)
+    }
+    fn objects(self) -> bool {
+        matches!(self, TypeChip::All | TypeChip::Objects)
+    }
+    fn screens(self) -> bool {
+        matches!(self, TypeChip::All | TypeChip::Screens)
+    }
+    /// World/Environment only show when the type filter is unrestricted.
+    fn world(self) -> bool {
+        matches!(self, TypeChip::All)
+    }
+}
+
+/// The outliner's STATE-filter chips (catalog #62): orthogonal toggles ANDed onto
+/// the type chip + search. Each restricts a fixture row to a state — unpatched,
+/// in the current selection, or address-conflicting. State chips only constrain
+/// FIXTURES (the only kind carrying patch/conflict state); when any state chip is
+/// on, non-fixture leaves are hidden so the result reads as a focused fixture
+/// list. Multiple state chips compose as AND (Blender's filter stacking).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct StateChips {
+    pub unpatched: bool,
+    pub selected: bool,
+    pub conflicts: bool,
+}
+
+impl StateChips {
+    /// Any state chip active → the tree is in fixture-focus mode.
+    fn any(self) -> bool {
+        self.unpatched || self.selected || self.conflicts
+    }
+}
+
+/// The full outliner chip-filter state held on `Ui` across frames.
+#[derive(Clone, Copy, Default)]
+pub struct OutlinerFilter {
+    pub kind: TypeChip,
+    pub state: StateChips,
+}
+
+impl OutlinerFilter {
+    /// The pure per-fixture predicate (catalog #62) — testable without any egui.
+    /// `patched` = the fixture has an enabled patch entry; `selected` = it's in
+    /// the current selection; `conflict` = its address conflicts. ANDs every
+    /// active state chip; an all-off state passes everything. The type chip is
+    /// applied at the row-building level (whole groups), not here.
+    pub fn fixture_passes(&self, patched: bool, selected: bool, conflict: bool) -> bool {
+        if self.state.unpatched && patched {
+            return false;
+        }
+        if self.state.selected && !selected {
+            return false;
+        }
+        if self.state.conflicts && !conflict {
+            return false;
+        }
+        true
+    }
+}
+
 /// A logical hierarchy node, addressed by a SESSION-STABLE key so expand-state
 /// and the range anchor survive add / delete reordering (Blender's
 /// `TreeStoreElem` identity role). Group / Root keys are constants; entity keys
@@ -162,6 +248,7 @@ pub fn scene_tree(
     anchor: &mut Option<usize>,
     sort: SceneSort,
     search: &str,
+    filter: OutlinerFilter,
     expanded: &mut HashSet<NodeKey>,
     rename: &mut Option<(NodeKey, String)>,
 ) -> TreeAction {
@@ -181,19 +268,46 @@ pub fn scene_tree(
     }
 
     // The fixture data-indices in flattened visible order — the shift-range
-    // domain, and the set a Fixtures-group click selects.
-    let visible_fixtures: Vec<usize> =
-        panels::fixture_order(scene, patch, sort).into_iter().filter(|&i| matches(&scene.fixtures[i].name)).collect();
-    let visible_objects: Vec<usize> =
-        (0..scene.geometry.len()).filter(|&i| matches(&scene.geometry[i].name)).collect();
-    let visible_screens: Vec<usize> =
-        (0..scene.screens.len()).filter(|&i| matches(&scene.screens[i].name)).collect();
-    let visible_envs: Vec<usize> =
-        (0..scene.environments.len()).filter(|&i| matches(&scene.environments[i].name)).collect();
+    // domain, and the set a Fixtures-group click selects. Composes the fuzzy
+    // search with the chip filters (type chip gates the whole kind below; the
+    // per-fixture state chips run through `OutlinerFilter::fixture_passes`).
+    let visible_fixtures: Vec<usize> = if filter.kind.fixtures() {
+        panels::fixture_order(scene, patch, sort)
+            .into_iter()
+            .filter(|&i| matches(&scene.fixtures[i].name))
+            .filter(|&i| {
+                let patched = patch.get(i).is_some_and(|p| p.enabled);
+                let selected = selection.contains_fixture(i);
+                let conflict = conflicted.get(i).copied().unwrap_or(false);
+                filter.fixture_passes(patched, selected, conflict)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Non-fixture kinds carry no patch/conflict/selection-only state, so any
+    // active state chip puts the tree in fixture-focus mode and hides them.
+    let show_others = !filter.state.any();
+    let visible_objects: Vec<usize> = if filter.kind.objects() && show_others {
+        (0..scene.geometry.len()).filter(|&i| matches(&scene.geometry[i].name)).collect()
+    } else {
+        Vec::new()
+    };
+    let visible_screens: Vec<usize> = if filter.kind.screens() && show_others {
+        (0..scene.screens.len()).filter(|&i| matches(&scene.screens[i].name)).collect()
+    } else {
+        Vec::new()
+    };
+    let visible_envs: Vec<usize> = if filter.kind.world() && show_others {
+        (0..scene.environments.len()).filter(|&i| matches(&scene.environments[i].name)).collect()
+    } else {
+        Vec::new()
+    };
 
     let rows = build_rows(
         scene,
         patch,
+        filter,
         expanded,
         &conflicted,
         &visible_fixtures,
@@ -302,6 +416,7 @@ pub fn scene_tree(
 fn build_rows(
     scene: &Scene,
     patch: &PatchTable,
+    filter: OutlinerFilter,
     expanded: &HashSet<NodeKey>,
     conflicted: &[bool],
     visible_fixtures: &[usize],
@@ -340,47 +455,118 @@ fn build_rows(
         return rows;
     }
 
-    // 2) World → Environment → environment leaves.
+    // 2) World → Environment → environment leaves. Hidden when a type chip
+    // restricts to one entity kind or any state chip narrows to fixtures.
     let world_has = !scene.environments.is_empty();
-    rows.push(TreeRow {
-        key: NodeKey::World,
-        kind: RowKind::World,
-        depth: 1,
-        icon: icon::WORLD,
-        label: "World".into(),
-        secondary: "HDRI · ambient".into(),
-        has_children: world_has,
-        vis: VisState::fold(scene.environments.iter().map(|e| e.hidden)),
-        patch_tag: String::new(),
-        conflict: false,
-        renameable: false,
-    });
-    if world_has && open(NodeKey::World) {
+    if filter.kind.world() && !filter.state.any() {
         rows.push(TreeRow {
-            key: NodeKey::EnvGroup,
-            kind: RowKind::EnvGroup,
-            depth: 2,
-            icon: icon::ENVIRONMENT,
-            label: "Environment".into(),
-            secondary: count_str(scene.environments.len()),
-            has_children: !scene.environments.is_empty(),
+            key: NodeKey::World,
+            kind: RowKind::World,
+            depth: 1,
+            icon: icon::WORLD,
+            label: "World".into(),
+            secondary: "HDRI · ambient".into(),
+            has_children: world_has,
             vis: VisState::fold(scene.environments.iter().map(|e| e.hidden)),
             patch_tag: String::new(),
             conflict: false,
             renameable: false,
         });
-        if open(NodeKey::EnvGroup) {
-            for &i in visible_envs {
-                let e = &scene.environments[i];
+        if world_has && open(NodeKey::World) {
+            rows.push(TreeRow {
+                key: NodeKey::EnvGroup,
+                kind: RowKind::EnvGroup,
+                depth: 2,
+                icon: icon::ENVIRONMENT,
+                label: "Environment".into(),
+                secondary: count_str(scene.environments.len()),
+                has_children: !scene.environments.is_empty(),
+                vis: VisState::fold(scene.environments.iter().map(|e| e.hidden)),
+                patch_tag: String::new(),
+                conflict: false,
+                renameable: false,
+            });
+            if open(NodeKey::EnvGroup) {
+                for &i in visible_envs {
+                    let e = &scene.environments[i];
+                    rows.push(TreeRow {
+                        key: NodeKey::Entity(e.id),
+                        kind: RowKind::Environment(i),
+                        depth: 3,
+                        icon: icon::ENVIRONMENT,
+                        label: e.name.clone(),
+                        secondary: "Fog volume".into(),
+                        has_children: false,
+                        vis: leaf_vis(e.hidden),
+                        patch_tag: String::new(),
+                        conflict: false,
+                        renameable: true,
+                    });
+                }
+            }
+        }
+    }
+
+    // 3) Fixtures group → fixture leaves (patch tag + conflict badge). Gated by
+    // the Fixtures type chip; state chips filter the leaves (via visible_fixtures).
+    if filter.kind.fixtures() {
+        push_group(
+            &mut rows,
+            GroupKind::Fixtures,
+            icon::FIXTURE,
+            "Fixtures",
+            visible_fixtures.len(),
+            VisState::fold(scene.fixtures.iter().map(|f| f.hidden)),
+        );
+        if open(NodeKey::Group(GroupKind::Fixtures)) {
+            for &i in visible_fixtures {
+                let f = &scene.fixtures[i];
+                let patch_tag = match patch.get(i).filter(|p| p.enabled) {
+                    Some(p) => format!("{}.{:03}", p.universe, p.address),
+                    None => "none".into(),
+                };
+                let row_icon = if f.is_laser { icon::COLOR } else { icon::FIXTURE };
                 rows.push(TreeRow {
-                    key: NodeKey::Entity(e.id),
-                    kind: RowKind::Environment(i),
-                    depth: 3,
-                    icon: icon::ENVIRONMENT,
-                    label: e.name.clone(),
-                    secondary: "Fog volume".into(),
+                    key: NodeKey::Entity(f.id),
+                    kind: RowKind::Fixture(i),
+                    depth: 2,
+                    icon: row_icon,
+                    label: f.name.clone(),
+                    secondary: f.profile.clone(),
                     has_children: false,
-                    vis: leaf_vis(e.hidden),
+                    vis: leaf_vis(f.hidden),
+                    patch_tag,
+                    conflict: conflicted.get(i).copied().unwrap_or(false),
+                    renameable: true,
+                });
+            }
+        }
+    }
+
+    // 4) Objects group → geometry leaves. Hidden by a non-Objects type chip or any
+    // state chip (objects carry no patch/conflict state, so the tree narrows away).
+    if filter.kind.objects() && !filter.state.any() {
+        push_group(
+            &mut rows,
+            GroupKind::Objects,
+            icon::GEOMETRY,
+            "Objects",
+            visible_objects.len(),
+            VisState::fold(scene.geometry.iter().map(|g| g.hidden)),
+        );
+        if open(NodeKey::Group(GroupKind::Objects)) {
+            for &i in visible_objects {
+                let g = &scene.geometry[i];
+                let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
+                rows.push(TreeRow {
+                    key: NodeKey::Entity(g.id),
+                    kind: RowKind::Object(i),
+                    depth: 2,
+                    icon: icon::GEOMETRY,
+                    label: g.name.clone(),
+                    secondary: kind.to_string(),
+                    has_children: false,
+                    vis: leaf_vis(g.hidden),
                     patch_tag: String::new(),
                     conflict: false,
                     renameable: true,
@@ -389,94 +575,34 @@ fn build_rows(
         }
     }
 
-    // 3) Fixtures group → fixture leaves (patch tag + conflict badge).
-    push_group(
-        &mut rows,
-        GroupKind::Fixtures,
-        icon::FIXTURE,
-        "Fixtures",
-        scene.fixtures.len(),
-        VisState::fold(scene.fixtures.iter().map(|f| f.hidden)),
-    );
-    if open(NodeKey::Group(GroupKind::Fixtures)) {
-        for &i in visible_fixtures {
-            let f = &scene.fixtures[i];
-            let patch_tag = match patch.get(i).filter(|p| p.enabled) {
-                Some(p) => format!("{}.{:03}", p.universe, p.address),
-                None => "none".into(),
-            };
-            let row_icon = if f.is_laser { icon::COLOR } else { icon::FIXTURE };
-            rows.push(TreeRow {
-                key: NodeKey::Entity(f.id),
-                kind: RowKind::Fixture(i),
-                depth: 2,
-                icon: row_icon,
-                label: f.name.clone(),
-                secondary: f.profile.clone(),
-                has_children: false,
-                vis: leaf_vis(f.hidden),
-                patch_tag,
-                conflict: conflicted.get(i).copied().unwrap_or(false),
-                renameable: true,
-            });
-        }
-    }
-
-    // 4) Objects group → geometry leaves.
-    push_group(
-        &mut rows,
-        GroupKind::Objects,
-        icon::GEOMETRY,
-        "Objects",
-        scene.geometry.len(),
-        VisState::fold(scene.geometry.iter().map(|g| g.hidden)),
-    );
-    if open(NodeKey::Group(GroupKind::Objects)) {
-        for &i in visible_objects {
-            let g = &scene.geometry[i];
-            let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
-            rows.push(TreeRow {
-                key: NodeKey::Entity(g.id),
-                kind: RowKind::Object(i),
-                depth: 2,
-                icon: icon::GEOMETRY,
-                label: g.name.clone(),
-                secondary: kind.to_string(),
-                has_children: false,
-                vis: leaf_vis(g.hidden),
-                patch_tag: String::new(),
-                conflict: false,
-                renameable: true,
-            });
-        }
-    }
-
-    // 5) Screens group → LED-screen leaves.
-    push_group(
-        &mut rows,
-        GroupKind::Screens,
-        icon::SCREEN,
-        "Screens",
-        scene.screens.len(),
-        VisState::fold(scene.screens.iter().map(|x| x.hidden)),
-    );
-    if open(NodeKey::Group(GroupKind::Screens)) {
-        for &i in visible_screens {
-            let s = &scene.screens[i];
-            let [rx, ry] = s.resolution();
-            rows.push(TreeRow {
-                key: NodeKey::Entity(s.id),
-                kind: RowKind::Screen(i),
-                depth: 2,
-                icon: icon::SCREEN,
-                label: s.name.clone(),
-                secondary: format!("{rx}×{ry} · {}", s.content.label()),
-                has_children: false,
-                vis: leaf_vis(s.hidden),
-                patch_tag: String::new(),
-                conflict: false,
-                renameable: true,
-            });
+    // 5) Screens group → LED-screen leaves. Gated like Objects.
+    if filter.kind.screens() && !filter.state.any() {
+        push_group(
+            &mut rows,
+            GroupKind::Screens,
+            icon::SCREEN,
+            "Screens",
+            visible_screens.len(),
+            VisState::fold(scene.screens.iter().map(|x| x.hidden)),
+        );
+        if open(NodeKey::Group(GroupKind::Screens)) {
+            for &i in visible_screens {
+                let s = &scene.screens[i];
+                let [rx, ry] = s.resolution();
+                rows.push(TreeRow {
+                    key: NodeKey::Entity(s.id),
+                    kind: RowKind::Screen(i),
+                    depth: 2,
+                    icon: icon::SCREEN,
+                    label: s.name.clone(),
+                    secondary: format!("{rx}×{ry} · {}", s.content.label()),
+                    has_children: false,
+                    vis: leaf_vis(s.hidden),
+                    patch_tag: String::new(),
+                    conflict: false,
+                    renameable: true,
+                });
+            }
         }
     }
 
@@ -900,5 +1026,68 @@ fn select_row(
 fn toggle_expand(expanded: &mut HashSet<NodeKey>, key: NodeKey) {
     if !expanded.remove(&key) {
         expanded.insert(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The type chip gates whole entity kinds; `All` shows everything, each kind
+    /// shows only itself, and World/Environment only appear under `All`.
+    #[test]
+    fn type_chip_gates_kinds() {
+        assert!(TypeChip::All.fixtures() && TypeChip::All.objects() && TypeChip::All.screens() && TypeChip::All.world());
+        assert!(TypeChip::Fixtures.fixtures() && !TypeChip::Fixtures.objects() && !TypeChip::Fixtures.world());
+        assert!(TypeChip::Objects.objects() && !TypeChip::Objects.fixtures());
+        assert!(TypeChip::Screens.screens() && !TypeChip::Screens.fixtures());
+        assert!(!TypeChip::Fixtures.world(), "World only shows under the All chip");
+    }
+
+    /// No state chip → every fixture passes (the predicate is the identity).
+    #[test]
+    fn state_chips_off_pass_all() {
+        let f = OutlinerFilter::default();
+        for &patched in &[true, false] {
+            for &sel in &[true, false] {
+                for &conf in &[true, false] {
+                    assert!(f.fixture_passes(patched, sel, conf));
+                }
+            }
+        }
+    }
+
+    /// Each state chip restricts to its state; the chips compose as AND.
+    #[test]
+    fn state_chips_filter_and_compose() {
+        let unpatched = OutlinerFilter { state: StateChips { unpatched: true, ..Default::default() }, ..Default::default() };
+        assert!(unpatched.fixture_passes(false, false, false), "an unpatched fixture passes the Unpatched chip");
+        assert!(!unpatched.fixture_passes(true, false, false), "a patched fixture fails the Unpatched chip");
+
+        let selected = OutlinerFilter { state: StateChips { selected: true, ..Default::default() }, ..Default::default() };
+        assert!(selected.fixture_passes(false, true, false));
+        assert!(!selected.fixture_passes(false, false, false), "an unselected fixture fails the Selected chip");
+
+        let conflicts = OutlinerFilter { state: StateChips { conflicts: true, ..Default::default() }, ..Default::default() };
+        assert!(conflicts.fixture_passes(false, false, true));
+        assert!(!conflicts.fixture_passes(false, false, false));
+
+        // AND composition: Selected + Conflicts needs BOTH.
+        let both = OutlinerFilter {
+            state: StateChips { selected: true, conflicts: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(both.fixture_passes(false, true, true), "passes only when selected AND conflicting");
+        assert!(!both.fixture_passes(false, true, false));
+        assert!(!both.fixture_passes(false, false, true));
+    }
+
+    /// A state chip puts the tree in fixture-focus mode (`any()` is true), which the
+    /// row builder uses to hide non-fixture kinds.
+    #[test]
+    fn any_state_chip_signals_fixture_focus() {
+        assert!(!StateChips::default().any());
+        assert!(StateChips { unpatched: true, ..Default::default() }.any());
+        assert!(StateChips { conflicts: true, ..Default::default() }.any());
     }
 }

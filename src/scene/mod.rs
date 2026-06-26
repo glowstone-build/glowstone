@@ -238,6 +238,18 @@ impl Default for RenderSettings {
     }
 }
 
+/// The active multi-select KIND — whichever of the three mutually-exclusive
+/// multi-select collections currently holds the selection (fixtures > objects >
+/// screens, mirroring `apply_select`'s precedence). Fixtures is the default
+/// when nothing is selected, so a bare Select-All / Invert acts on fixtures
+/// (the catalog #88 "within the active kind" target).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelKind {
+    Fixtures,
+    Objects,
+    Screens,
+}
+
 /// What the UI currently has selected. Drives the Inspector and the
 /// highlight/wireframe emphasis in the viewport. Supports multi-select of
 /// fixtures (for bulk editing); the environment selection is single.
@@ -371,6 +383,54 @@ impl Selection {
         self.geometry.clear();
         self.screens.clear();
         self.fixtures = (a.min(b)..=a.max(b)).collect();
+    }
+
+    /// The active multi-select KIND (catalog #88): whichever multi-select
+    /// collection currently holds the selection, fixtures-first (matching
+    /// `apply_select`'s precedence). Defaults to [`SelKind::Fixtures`] when the
+    /// selection is empty / single-only (World/Environment), so a bare
+    /// Select-All / Invert with nothing selected acts on fixtures.
+    pub fn active_kind(&self) -> SelKind {
+        if !self.geometry.is_empty() {
+            SelKind::Objects
+        } else if !self.screens.is_empty() {
+            SelKind::Screens
+        } else {
+            SelKind::Fixtures
+        }
+    }
+
+    /// Replace the selection with EVERY item of `kind` (Select All, catalog #88).
+    /// Clears the other kinds + World/Environment to keep the single-target
+    /// invariant. The `counts` are the scene's entity totals for each kind.
+    pub fn select_all_of(&mut self, kind: SelKind, counts: (usize, usize, usize)) {
+        let (nf, no, ns) = counts;
+        *self = Selection::default();
+        match kind {
+            SelKind::Fixtures => self.fixtures = (0..nf).collect(),
+            SelKind::Objects => self.geometry = (0..no).collect(),
+            SelKind::Screens => self.screens = (0..ns).collect(),
+        }
+    }
+
+    /// Invert membership WITHIN `kind` (catalog #88): every item of that kind not
+    /// currently selected becomes selected, and vice-versa. Other kinds +
+    /// World/Environment are cleared (selection stays single-kind). The result is
+    /// kept ascending so range/anchor logic and equality stay stable.
+    pub fn invert_within(&mut self, kind: SelKind, counts: (usize, usize, usize)) {
+        let (nf, no, ns) = counts;
+        let (total, had): (usize, &[usize]) = match kind {
+            SelKind::Fixtures => (nf, &self.fixtures),
+            SelKind::Objects => (no, &self.geometry),
+            SelKind::Screens => (ns, &self.screens),
+        };
+        let inverted: Vec<usize> = (0..total).filter(|i| !had.contains(i)).collect();
+        *self = Selection::default();
+        match kind {
+            SelKind::Fixtures => self.fixtures = inverted,
+            SelKind::Objects => self.geometry = inverted,
+            SelKind::Screens => self.screens = inverted,
+        }
     }
 }
 
@@ -1009,6 +1069,61 @@ mod tests {
         let mut s = Selection::default();
         s.fixtures = idx.to_vec();
         s
+    }
+
+    // --- Select All / None / Invert within the active kind (#88) ----------
+
+    #[test]
+    fn active_kind_follows_the_selected_collection() {
+        assert_eq!(Selection::default().active_kind(), SelKind::Fixtures, "empty defaults to fixtures");
+        assert_eq!(fsel(&[1, 2]).active_kind(), SelKind::Fixtures);
+        assert_eq!(Selection::geometry(0).active_kind(), SelKind::Objects);
+        assert_eq!(Selection::screen(0).active_kind(), SelKind::Screens);
+        // Single-only kinds (World) fall back to the fixtures default.
+        assert_eq!(Selection::world().active_kind(), SelKind::Fixtures);
+    }
+
+    #[test]
+    fn select_all_of_fills_one_kind_and_clears_others() {
+        let counts = (3, 2, 4);
+        let mut s = Selection::geometry(0);
+        s.select_all_of(SelKind::Fixtures, counts);
+        assert_eq!(s.fixtures, vec![0, 1, 2]);
+        assert!(s.geometry.is_empty() && s.screens.is_empty(), "other kinds cleared");
+
+        let mut s = Selection::default();
+        s.select_all_of(SelKind::Screens, counts);
+        assert_eq!(s.screens, vec![0, 1, 2, 3]);
+        assert!(s.fixtures.is_empty());
+    }
+
+    #[test]
+    fn invert_within_toggles_membership() {
+        let counts = (4, 0, 0);
+        // {0,2} → {1,3} within fixtures.
+        let mut s = fsel(&[0, 2]);
+        s.invert_within(SelKind::Fixtures, counts);
+        assert_eq!(s.fixtures, vec![1, 3]);
+        // Invert again restores the original set (ascending).
+        s.invert_within(SelKind::Fixtures, counts);
+        assert_eq!(s.fixtures, vec![0, 2]);
+        // Empty → all.
+        let mut e = Selection::default();
+        e.invert_within(SelKind::Fixtures, counts);
+        assert_eq!(e.fixtures, vec![0, 1, 2, 3]);
+        // All → empty.
+        let mut full = fsel(&[0, 1, 2, 3]);
+        full.invert_within(SelKind::Fixtures, counts);
+        assert!(full.fixtures.is_empty());
+    }
+
+    #[test]
+    fn invert_within_objects_uses_object_count_not_fixtures() {
+        let counts = (1, 3, 0); // 1 fixture, 3 objects
+        let mut s = Selection::geometry(1);
+        s.invert_within(SelKind::Objects, counts);
+        assert_eq!(s.geometry, vec![0, 2], "inverts over the OBJECT domain");
+        assert!(s.fixtures.is_empty(), "fixtures untouched");
     }
 
     #[test]

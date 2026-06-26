@@ -27,7 +27,7 @@ use crate::ui::theme;
 
 /// The viewport's active tool (Blender's `bToolRef`, one per viewport). Decides
 /// what a press/drag does + which gizmo draws; default is [`ActiveTool::Select`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum ActiveTool {
     /// Plain click-select, no transform gizmo (the fallback tool).
     #[default]

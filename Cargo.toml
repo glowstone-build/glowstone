@@ -16,7 +16,7 @@ wgpu = "29.0"
 egui = "0.34"
 egui-wgpu = "0.34"
 egui-winit = "0.34"
-egui_dock = "0.19"
+egui_dock = { version = "0.19", features = ["serde"] }
 glam = { version = "0.33", features = ["bytemuck", "serde"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"

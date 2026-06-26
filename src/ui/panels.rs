@@ -212,6 +212,7 @@ pub fn scene_outliner(
     anchor: &mut Option<usize>,
     sort: &mut SceneSort,
     search: &mut String,
+    filter: &mut super::tree::OutlinerFilter,
     expanded: &mut std::collections::HashSet<super::tree::NodeKey>,
     rename: &mut Option<(super::tree::NodeKey, String)>,
     pending: &mut super::tree::TreeAction,
@@ -244,6 +245,45 @@ pub fn scene_outliner(
             search.clear();
         }
     });
+
+    // Type + state FILTER CHIPS (catalog #62): a compact toggle row that narrows
+    // the tree by entity kind (All/Fixtures/Objects/Screens — mutually exclusive)
+    // and by fixture state (Unpatched/Selected/Conflicts — composable toggles),
+    // ANDed onto the fuzzy search above. Matches the dense console look (small
+    // selectable labels, no emoji).
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for chip in super::tree::TypeChip::ORDER {
+            if ui.selectable_label(filter.kind == chip, RichText::new(chip.label()).small()).clicked() {
+                filter.kind = chip;
+            }
+        }
+        ui.separator();
+        // State chips: each toggles a fixture-state predicate. A muted tint + the
+        // CONFLICT colour on the Conflicts chip keep them readable at a glance.
+        if ui
+            .selectable_label(filter.state.unpatched, RichText::new("Unpatched").small())
+            .on_hover_text("Only fixtures with no enabled patch")
+            .clicked()
+        {
+            filter.state.unpatched = !filter.state.unpatched;
+        }
+        if ui
+            .selectable_label(filter.state.selected, RichText::new("Selected").small())
+            .on_hover_text("Only the current selection")
+            .clicked()
+        {
+            filter.state.selected = !filter.state.selected;
+        }
+        let conflict_txt = if filter.state.conflicts {
+            RichText::new("Conflicts").small().color(theme::CONFLICT)
+        } else {
+            RichText::new("Conflicts").small()
+        };
+        if ui.selectable_label(filter.state.conflicts, conflict_txt).on_hover_text("Only address-conflicting fixtures").clicked() {
+            filter.state.conflicts = !filter.state.conflicts;
+        }
+    });
     ui.separator();
 
     // The project HIERARCHY: one custom recursive tree under a single "Scene"
@@ -261,7 +301,7 @@ pub fn scene_outliner(
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(4, 4))
         .show(ui, |ui| {
-            let act = super::tree::scene_tree(ui, scene, selection, patch, anchor, *sort, search, expanded, rename);
+            let act = super::tree::scene_tree(ui, scene, selection, patch, anchor, *sort, search, *filter, expanded, rename);
             // Defer hide/rename (need an undo step) to the post-dock consumer.
             if !matches!(act, super::tree::TreeAction::None) {
                 *pending = act;
