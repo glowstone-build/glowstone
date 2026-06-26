@@ -1551,10 +1551,19 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
         ui.separator();
     }
 
-    // --- TRANSFORM ---
+    // --- TRANSFORM (every selected fixture; Individual Origins) ---
+    // Pan/Tilt SET the same head angle on all. Position + Rotation (rig hang) show
+    // the ACTIVE fixture's value and apply the DELTA to every selected fixture about
+    // its OWN origin — so a bulk move keeps the rig's relative arrangement and a bulk
+    // rotate tilts each fixture in place (it never collapses them onto one point).
     egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
         .default_open(true)
         .show(ui, |ui| {
+            ui.label(
+                RichText::new("Pan/Tilt set all · Position/Rotation apply a delta to all (individual origins)")
+                    .weak()
+                    .small(),
+            );
             Grid::new("bulk-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 let pan = common_f32(ids.iter().map(|&i| scene.fixtures[i].pan));
                 bulk_f32_row(
@@ -1574,21 +1583,45 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
                     |ui, v| ui.add(DragValue::new(v).speed(0.5).range(-180.0..=180.0).suffix("°")),
                     |v| ids.iter().for_each(|&i| scene.fixtures[i].tilt = v),
                 );
-            });
-            ui.add_space(4.0);
-            ui.label(RichText::new("Nudge position (all)").small().strong());
-            ui.horizontal(|ui| {
-                let mut delta = glam::Vec3::ZERO;
-                // Drag from zero applies a delta; the field snaps back each frame.
-                for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
-                    let mut v = 0.0f32;
-                    if ui.add(DragValue::new(&mut v).speed(0.05).prefix(format!("{label} "))).changed() {
-                        delta[axis] += v;
+
+                // Position — active fixture's value; edit applies the delta to all.
+                let mut pos = scene.fixtures[primary].position;
+                let old_pos = pos;
+                let mut pos_changed = false;
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
+                    pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
+                    pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                });
+                ui.end_row();
+                if pos_changed {
+                    let d = pos - old_pos;
+                    for &i in ids {
+                        scene.fixtures[i].position += d;
                     }
                 }
-                if delta != glam::Vec3::ZERO {
+
+                // Rotation (rig hang) — active fixture's euler; edit applies the delta
+                // rotation to EACH fixture about its own origin (orientation only, so
+                // positions are untouched = individual origins).
+                let rot0 = scene.fixtures[primary].orientation;
+                let (ry, rx, rz) = rot0.to_euler(glam::EulerRot::YXZ);
+                let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
+                let mut rot_changed = false;
+                ui.label("Rotation");
+                ui.horizontal(|ui| {
+                    rot_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                    rot_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                    rot_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                });
+                ui.end_row();
+                if rot_changed {
+                    let new_rot =
+                        glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
+                    let delta = new_rot * rot0.inverse();
                     for &i in ids {
-                        scene.fixtures[i].position += delta;
+                        scene.fixtures[i].orientation = (delta * scene.fixtures[i].orientation).normalize();
                     }
                 }
             });
@@ -1812,7 +1845,7 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
                     fixture.tilt = def.tilt;
                 }
             });
-            advanced_section_filtered(ui, fs, "fx-transform", &["Position"], |ui| {
+            advanced_section_filtered(ui, fs, "fx-transform", &["Position", "Rotation"], |ui| {
                 Grid::new("fx-transform-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     row(ui, fs, "Position", false, |ui| {
                         ui.horizontal(|ui| {
@@ -1821,6 +1854,34 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
                             ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
                         });
                     });
+                    // Rotation = the rig HANG (how the fixture is mounted), separate from
+                    // the live Pan/Tilt above. Euler for display; recomposed only on edit
+                    // (revert arrow → identity). Previously only reachable via viewport R.
+                    let rot0 = fixture.orientation;
+                    let (ry, rx, rz) = rot0.to_euler(glam::EulerRot::YXZ);
+                    let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
+                    let mut rot_changed = false;
+                    let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
+                    if row(ui, fs, "Rotation", differs, |ui| {
+                        ui.horizontal(|ui| {
+                            rot_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                            rot_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                            rot_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                        });
+                    }) {
+                        ex = 0.0;
+                        ey = 0.0;
+                        ez = 0.0;
+                        rot_changed = true;
+                    }
+                    if rot_changed {
+                        fixture.orientation = glam::Quat::from_euler(
+                            glam::EulerRot::YXZ,
+                            ey.to_radians(),
+                            ex.to_radians(),
+                            ez.to_radians(),
+                        );
+                    }
                 });
             });
         },
