@@ -25,7 +25,7 @@ use std::collections::HashSet;
 
 use egui::{Color32, Sense};
 
-use super::panels::{self, SceneSort};
+use super::outliner::{self, SceneSort};
 use super::theme;
 use crate::dmx::PatchTable;
 use crate::scene::{apply_fixture_click, EntityId, Scene, Selection};
@@ -279,7 +279,7 @@ pub fn scene_tree(
     // search with the chip filters (type chip gates the whole kind below; the
     // per-fixture state chips run through `OutlinerFilter::fixture_passes`).
     let visible_fixtures: Vec<usize> = if filter.kind.fixtures() {
-        panels::fixture_order(scene, patch, sort)
+        outliner::fixture_order(scene, patch, sort)
             .into_iter()
             .filter(|&i| matches(&scene.fixtures[i].name))
             .filter(|&i| {

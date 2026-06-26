@@ -7,9 +7,11 @@ mod editor;
 mod gizmo;
 mod inspector;
 mod lib_prefs;
+mod library;
 pub mod nav_gizmo;
 mod notify;
 pub(crate) mod op;
+mod outliner;
 mod panels;
 mod pie;
 mod render_panel;
@@ -23,6 +25,7 @@ pub mod shortcuts;
 pub mod theme;
 mod tools;
 mod tree;
+mod viewport_math;
 mod workspaces;
 pub use tools::ActiveTool;
 mod windows;
@@ -527,11 +530,11 @@ pub struct Ui {
     show_perf: bool,
     profile: Option<ProfileEditor>,
     /// Library panel state (search / sort / multi-select).
-    lib: panels::LibState,
+    lib: library::LibState,
     /// Anchor index for shift-range selection of scene fixtures (list + 3D).
     scene_anchor: Option<usize>,
     /// Sort order for the Scene panel's Fixtures folder.
-    scene_sort: panels::SceneSort,
+    scene_sort: outliner::SceneSort,
     /// Scene-outliner name filter (fixtures + objects).
     scene_search: String,
     /// Scene-outliner type/state filter chips (catalog #62) — composes with the
@@ -740,9 +743,9 @@ impl Ui {
             show_shortcuts: false,
             show_perf: std::env::var("PREVIZ_PERF").is_ok(),
             profile: None,
-            lib: panels::LibState::default(),
+            lib: library::LibState::default(),
             scene_anchor: None,
-            scene_sort: panels::SceneSort::Patch,
+            scene_sort: outliner::SceneSort::Patch,
             scene_search: String::new(),
             scene_filter: tree::OutlinerFilter::default(),
             scene_expanded: {
@@ -1966,7 +1969,7 @@ impl Ui {
             self.pending_lib_add = false;
             if let Some(active) = self.lib.active.clone() {
                 let cursor = self.cursor_3d_set.then_some(self.cursor_3d);
-                if let Some(sel) = panels::add_active_library_item(&self.library, scene, camera, &active, cursor) {
+                if let Some(sel) = library::add_active_library_item(&self.library, scene, camera, &active, cursor) {
                     self.selection = sel;
                 }
             }
@@ -3696,9 +3699,9 @@ struct PanelViewer<'a> {
     viewport_focused: &'a mut bool,
     duplicate: &'a mut Option<DuplicateDialog>,
     profile: &'a mut Option<ProfileEditor>,
-    lib: &'a mut panels::LibState,
+    lib: &'a mut library::LibState,
     scene_anchor: &'a mut Option<usize>,
-    scene_sort: &'a mut panels::SceneSort,
+    scene_sort: &'a mut outliner::SceneSort,
     scene_search: &'a mut String,
     scene_filter: &'a mut tree::OutlinerFilter,
     scene_expanded: &'a mut std::collections::HashSet<tree::NodeKey>,
@@ -3863,7 +3866,7 @@ impl TabViewer for PanelViewer<'_> {
                     self.aim,
                 );
             }
-            Tab::Scene => panels::scene_outliner(
+            Tab::Scene => outliner::scene_outliner(
                 ui,
                 self.scene,
                 self.selection,
@@ -3878,7 +3881,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.groups,
                 self.group_name,
             ),
-            Tab::Library => panels::library_browser(
+            Tab::Library => library::library_browser(
                 ui,
                 self.library,
                 self.scene,

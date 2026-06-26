@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::cues::CueEngine;
-use super::panels::SceneSort;
+use super::outliner::SceneSort;
 use super::windows::Preferences;
 use super::SelectionGroup;
 use crate::dmx::{DmxConfig, PatchTable};
