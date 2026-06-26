@@ -3600,47 +3600,45 @@ fn replace_window(
         });
 
     if let Some(p) = picked {
-        // A full replace RENAMES each fixture to the new type (bug 12 — replacing a
-        // fixture should read as its new type, not keep the stale name). Mesh-only
-        // keeps the old name + DMX patch/mode.
-        let new_base = match &p {
-            Picked::Gdtf(gi) => gdtf_arcs[*gi].name.to_string(),
-            Picked::Profile(pi) => library.fixtures[*pi].name.to_string(),
-        };
-        let many = targets.len() > 1;
-        for (j, &i) in targets.iter().enumerate() {
-            // Snapshot the placement + level (+ identity, for mesh-only) to carry across.
-            let (pos, orient, pan, tilt, old_name, dimmer, mode_index, optics) = {
-                let f = &scene.fixtures[i];
-                (f.position, f.orientation, f.pan, f.tilt, f.name.clone(), f.optics.dimmer, f.mode_index, f.optics.clone())
+        if d.mesh_only {
+            // "Mesh/model only": borrow JUST the picked GDTF's 3D MODEL and leave
+            // EVERYTHING else on each target untouched — its profile, channels, DMX
+            // patch + address, mode, name and optics all stay. For a fixture that has
+            // all its data but no real 3D mesh, this finally gives it a model. A
+            // built-in pick has no rich GDTF model to lend, so it clears the override.
+            let model: Option<Arc<crate::gdtf::GdtfFixture>> = match &p {
+                Picked::Gdtf(gi) => Some(gdtf_arcs[*gi].clone()),
+                Picked::Profile(_) => None,
             };
-            let name = if d.mesh_only {
-                old_name
-            } else if many {
-                format!("{new_base} {}", j + 1)
-            } else {
-                new_base.clone()
-            };
-            let mut nf = match &p {
-                Picked::Gdtf(gi) => crate::scene::Fixture::from_gdtf(gdtf_arcs[*gi].clone(), name, pos),
-                Picked::Profile(pi) => crate::scene::Fixture::from_profile(&library.fixtures[*pi], name, pos),
-            };
-            nf.orientation = orient;
-            nf.pan = pan;
-            nf.tilt = tilt;
-            if d.mesh_only {
-                // Keep the patched fixture's DMX identity: same mode + optical state,
-                // and DON'T re-patch (address/footprint stay). sync_mode clamps the
-                // mode if the new model exposes fewer.
-                nf.mode_index = mode_index;
-                nf.optics = optics;
-                nf.sync_mode();
-            } else {
-                nf.optics.dimmer = dimmer; // keep it lit at the level it had
+            for &i in &targets {
+                scene.fixtures[i].model_src = model.clone();
             }
-            nf.snap_movement();
-            scene.fixtures[i] = nf;
-            if !d.mesh_only {
+        } else {
+            // Full replace RENAMES each fixture to the new type (bug 12 — it should
+            // read as its new type) and re-patches; only placement, aim + level carry
+            // across. The rebuilt fixture's `model_src` defaults None, dropping any
+            // previously-borrowed model.
+            let new_base = match &p {
+                Picked::Gdtf(gi) => gdtf_arcs[*gi].name.to_string(),
+                Picked::Profile(pi) => library.fixtures[*pi].name.to_string(),
+            };
+            let many = targets.len() > 1;
+            for (j, &i) in targets.iter().enumerate() {
+                let (pos, orient, pan, tilt, dimmer) = {
+                    let f = &scene.fixtures[i];
+                    (f.position, f.orientation, f.pan, f.tilt, f.optics.dimmer)
+                };
+                let name = if many { format!("{new_base} {}", j + 1) } else { new_base.clone() };
+                let mut nf = match &p {
+                    Picked::Gdtf(gi) => crate::scene::Fixture::from_gdtf(gdtf_arcs[*gi].clone(), name, pos),
+                    Picked::Profile(pi) => crate::scene::Fixture::from_profile(&library.fixtures[*pi], name, pos),
+                };
+                nf.orientation = orient;
+                nf.pan = pan;
+                nf.tilt = tilt;
+                nf.optics.dimmer = dimmer; // keep it lit at the level it had
+                nf.snap_movement();
+                scene.fixtures[i] = nf;
                 patch.replace_at(i, &scene.fixtures[i]);
             }
         }

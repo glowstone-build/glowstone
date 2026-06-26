@@ -96,6 +96,10 @@ pub struct DocSnapshot {
     /// Out-of-band parsed-GDTF handles, aligned to `scene.fixtures` order. A
     /// fixture without a GDTF stores `None`. Pointer clones — cheap.
     gdtf: Vec<Option<Arc<GdtfFixture>>>,
+    /// Out-of-band borrowed-model handles (the "mesh/model only" override), aligned to
+    /// `scene.fixtures`. serde-skip like `gdtf`, so undo must reattach it too — else
+    /// any undo would silently clear every fixture's model override.
+    model_src: Vec<Option<Arc<GdtfFixture>>>,
 }
 
 impl DocSnapshot {
@@ -140,6 +144,7 @@ pub fn capture(
         groups: Blob::encode(&groups.to_vec()),
         selection: selection.clone(),
         gdtf: scene.fixtures.iter().map(|f| f.gdtf.clone()).collect(),
+        model_src: scene.fixtures.iter().map(|f| f.model_src.clone()).collect(),
     }
 }
 
@@ -172,8 +177,11 @@ impl DocSnapshot {
         }
         // Reattach the GDTF handles the bincode dropped, in fixture order, then
         // re-align per-mode state (cells / wheels / motion) for each.
-        for (f, saved) in scene.fixtures.iter_mut().zip(self.gdtf.iter()) {
+        for ((f, saved), saved_model) in
+            scene.fixtures.iter_mut().zip(self.gdtf.iter()).zip(self.model_src.iter())
+        {
             f.gdtf = saved.clone();
+            f.model_src = saved_model.clone();
             f.sync_mode();
         }
         *selection = self.selection.clone();

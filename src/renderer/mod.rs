@@ -1956,9 +1956,22 @@ impl Renderer {
             let root = Mat4::from_translation(fixture.position)
                 * Mat4::from_quat(fixture.orientation)
                 * gdtf_to_world;
-            let asm =
+            // BEAM + articulation always come from the fixture's OWN gdtf (its real
+            // optics + mode). The BODY model may be BORROWED from another GDTF (the
+            // Replace dialog's "mesh/model only"): assemble its parts under ITS own
+            // cache key. With `model_src = None` (every normal fixture) this is the
+            // same single assemble + `key` as before — byte-identical, no regression.
+            let mut own =
                 fixture_model::assemble(&gdtf, fixture.mode_index, root, fixture.pan_actual, fixture.tilt_actual);
-            beam_frames[i] = asm.beams;
+            beam_frames[i] = std::mem::take(&mut own.beams);
+            let (asm, key) = match &fixture.model_src {
+                Some(m) => {
+                    let mk = Arc::as_ptr(m) as usize;
+                    self.ensure_gdtf_loaded(mk, m);
+                    (fixture_model::assemble(m, 0, root, fixture.pan_actual, fixture.tilt_actual), mk)
+                }
+                None => (own, key),
+            };
             let selected = if selection.contains_fixture(i) { 1.0 } else { 0.0 };
             let drawn_before = gdtf_draws.len();
             for part in &asm.parts {
