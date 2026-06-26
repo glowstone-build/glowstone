@@ -92,7 +92,7 @@ pub fn profile_editor_window(
     let key = Arc::as_ptr(&gdtf) as usize;
     let tex = gdtf_textures
         .entry(key)
-        .or_insert_with(|| crate::ui::panels::load_gdtf_textures(ctx, &gdtf));
+        .or_insert_with(|| crate::ui::inspector::load_gdtf_textures(ctx, &gdtf));
 
     let mut keep = true;
     #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later

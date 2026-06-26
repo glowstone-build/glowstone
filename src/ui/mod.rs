@@ -5,6 +5,7 @@ mod bookmarks;
 mod cues;
 mod editor;
 mod gizmo;
+mod inspector;
 mod lib_prefs;
 pub mod nav_gizmo;
 mod notify;
@@ -579,7 +580,7 @@ pub struct Ui {
     inspector_edit: panels::InspectorEdit,
     /// Persistent Inspector UI state (property filter + per-category collapse).
     /// Loaded from the config dir on launch; categories self-save on toggle.
-    inspector_state: panels::InspectorState,
+    inspector_state: inspector::InspectorState,
     /// Timestamp of the last arrow-key nudge — a fresh nudge within
     /// [`NUDGE_COALESCE`] of it extends the top undo step instead of pushing a new
     /// one, so holding an arrow key collapses into a single undo. `None` = no
@@ -698,7 +699,7 @@ pub struct Ui {
 }
 
 /// Open state for the viewport's side regions — the N-panel (Item/Transform
-/// sidebar, reuses `panels::inspector` verbatim) and the T-panel (tool-rail shell,
+/// sidebar, reuses `inspector::inspector` verbatim) and the T-panel (tool-rail shell,
 /// Phase 3 fills it with the ActiveTool buttons). Blueprint §2.2 / RGN_TYPE_UI +
 /// RGN_TYPE_TOOLS. Default both off; the lead's note (auto-on in Focus/Visualise
 /// contexts) is a later phase.
@@ -773,7 +774,7 @@ impl Ui {
             transform_finished: false,
             inspector_tx: None,
             inspector_edit: panels::InspectorEdit::default(),
-            inspector_state: panels::InspectorState::load(),
+            inspector_state: inspector::InspectorState::load(),
             last_nudge: None,
             pending_nudge: Vec3::ZERO,
             groups: Vec::new(),
@@ -3581,7 +3582,7 @@ fn replace_window(
                         if ui.selectable_label(false, format!("{}  {}", theme::icon::FIXTURE, g.name)).clicked() {
                             picked = Some(Picked::Gdtf(gi));
                         }
-                        panels::source_chip(ui, src);
+                        inspector::source_chip(ui, src);
                     });
                 }
                 // Then the built-in profiles, grouped by category (Generic / Laser / …).
@@ -3705,7 +3706,7 @@ struct PanelViewer<'a> {
     /// transaction (#13). Read after the dock to begin/finalize `inspector_tx`.
     inspector_edit: &'a mut panels::InspectorEdit,
     /// Persistent Inspector filter + collapse state (the single docked Inspector tab).
-    inspector_state: &'a mut panels::InspectorState,
+    inspector_state: &'a mut inspector::InspectorState,
     groups: &'a mut Vec<SelectionGroup>,
     group_name: &'a mut String,
     cues: &'a mut cues::CueEngine,
@@ -3885,7 +3886,7 @@ impl TabViewer for PanelViewer<'_> {
                 let mut e = panels::InspectorEdit::default();
                 let render_active = self.render_active;
                 ui.add_enabled_ui(!render_active, |ui| {
-                    panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, self.inspector_state, &mut e, self.render, self.settings);
+                    inspector::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, self.inspector_state, &mut e, self.render, self.settings);
                 });
                 self.inspector_edit.started |= e.started;
                 self.inspector_edit.stopped |= e.stopped;

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::scene::library::Library;
 use crate::ui::lib_prefs::{self, LibItem, LibraryPrefs};
-use crate::ui::panels::load_gdtf_textures;
+use crate::ui::inspector::load_gdtf_textures;
 use crate::ui::theme;
 use crate::ui::GdtfTextures;
 
