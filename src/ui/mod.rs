@@ -2295,22 +2295,43 @@ impl Ui {
     }
 
     /// AABB of the current selection (or whole scene if nothing selected),
-    /// padded a little, for the Frame commands.
+    /// padded a little, for the Frame commands. Unified across EVERY placed kind
+    /// (fixtures + geometry + screens + environments) via `Scene::object_world_bounds`,
+    /// so "Frame Selected" works on a lone object/screen/env, not just fixtures.
     fn frame_bounds(&self, scene: &Scene, selection_only: bool) -> Option<(Vec3, Vec3)> {
-        let idx: Vec<usize> = if selection_only && !self.selection.fixtures.is_empty() {
-            self.selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect()
-        } else {
-            (0..scene.fixtures.len()).collect()
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        let mut any = false;
+        let mut grow = |b: Option<(Vec3, Vec3)>| {
+            if let Some((blo, bhi)) = b {
+                lo = lo.min(blo);
+                hi = hi.max(bhi);
+                any = true;
+            }
         };
-        let mut pts: Vec<Vec3> = idx.iter().map(|&i| scene.fixtures[i].position).collect();
-        if !selection_only {
-            pts.extend(scene.geometry.iter().map(|g| g.transform.w_axis.truncate()));
+
+        if selection_only && self.selection.has_object() {
+            // Frame the selection, whatever its kind(s) — union each object's AABB.
+            for r in self.selection.object_refs() {
+                grow(scene.object_world_bounds(r));
+            }
+        } else {
+            // Whole scene: fixtures + placed geometry + screens. Environments (the
+            // fog box) are excluded here — they span the whole set and would zoom
+            // the camera right out; a user framing one explicitly hits the path above.
+            for i in 0..scene.fixtures.len() {
+                grow(scene.object_world_bounds(ObjectRef::Fixture(i)));
+            }
+            for i in 0..scene.geometry.len() {
+                grow(scene.object_world_bounds(ObjectRef::Geometry(i)));
+            }
+            for i in 0..scene.screens.len() {
+                grow(scene.object_world_bounds(ObjectRef::Screen(i)));
+            }
         }
-        let first = *pts.first()?;
-        let (mut lo, mut hi) = (first, first);
-        for p in &pts {
-            lo = lo.min(*p);
-            hi = hi.max(*p);
+
+        if !any {
+            return None;
         }
         let pad = Vec3::splat(1.0);
         Some((lo - pad, hi + pad))

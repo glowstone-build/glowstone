@@ -2311,6 +2311,10 @@ fn bulk_opt_field(ui: &mut egui::Ui, state: &InspectorState, scene: &mut Scene, 
 fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut InspectorState) {
     ui.horizontal(|ui| {
         ui.heading(fixture.name.as_str());
+        // Provenance chip (Built-in / GDTF / MVR) — right-aligned beside the name.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            source_chip(ui, fixture.source);
+        });
     });
     ui.label(RichText::new(format!("{} · {}", fixture.category, fixture.profile)).weak().small());
     ui.separator();
@@ -3007,6 +3011,8 @@ fn gdtf_inspector(
             {
                 *profile = Some(ProfileEditor::new(fixture_id));
             }
+            // Provenance chip (GDTF / MVR) — left of the Profile button.
+            source_chip(ui, fixture.source);
         });
     });
     ui.label(

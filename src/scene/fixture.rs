@@ -103,8 +103,8 @@ pub struct Fixture {
     pub mvr: Option<Box<MvrFixtureMeta>>,
 
     /// Where this fixture came from (built-in / disk import / GDTF Share / MVR).
-    /// Drives the colored provenance chip in the Scene panel + inspector. Read
-    /// via `fixture.source`. A REAL serialized field (so chips survive save /
+    /// Drives the colored provenance chip in the Inspector header (`source_chip`).
+    /// Read via `fixture.source`. A REAL serialized field (so chips survive save /
     /// load), kept LAST in serde order with `#[serde(default)]` so it lands at
     /// the end of the positional bincode layout (see the `.archie` FORMAT bump).
     #[serde(default)]
