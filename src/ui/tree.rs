@@ -159,13 +159,20 @@ pub enum TreeAction {
 }
 
 // --- row metrics -----------------------------------------------------------
-const ROW_H: f32 = 22.0; // single-line row — Blender outliner density (was a 34px two-line row, which made the indentation unreadable)
-const INDENT: f32 = 15.0; // px per depth level
-const PAD_X: f32 = 4.0; // left gutter before depth 0
-const DISCLOSURE_W: f32 = 15.0; // disclosure-triangle cell width (≈ one indent step)
-const ICON_DX: f32 = 5.0; // gap between disclosure cell and the type icon
-const TEXT_DX: f32 = 21.0; // gap between icon origin and the name text
-const PATCH_COL: f32 = 50.0; // far-left fixture patch-address column (uni.addr / none)
+const ROW_H: f32 = 20.0; // single-line row — Blender UI_UNIT_Y density
+const INDENT: f32 = 14.0; // px per depth level (~Blender UI_UNIT_X step)
+const PAD_X: f32 = 6.0; // left gutter before depth 0
+const DISCLOSURE_W: f32 = 14.0; // disclosure-triangle cell, immediately left of the icon
+const ICON_DX: f32 = 3.0; // gap between the disclosure cell and the type icon
+const ICON_W: f32 = 16.0; // type-icon advance width
+const ICON_GAP: f32 = 3.0; // gap between the icon and the name text
+// Right-aligned metadata columns. Blender keeps the left side name-only and right-
+// aligns ALL metadata, so the name reads with room (no truncation). The eye is the
+// only always-present column; the fixture patch + channel chips are measured, so
+// non-fixture rows reserve just EDGE_PAD + EYE_W on the right.
+const EDGE_PAD: f32 = 6.0; // gutter at the very right edge
+const EYE_W: f32 = 18.0; // visibility-eye cell (every row)
+const COL_GAP: f32 = 6.0; // gap between right-aligned chips
 
 /// What a flattened row represents (carries the data-array index for leaves).
 #[derive(Clone, Copy)]
@@ -324,7 +331,7 @@ pub fn scene_tree(
     // slice of the flattened Vec is allocated + interacted each frame, so a fully
     // expanded Objects group with thousands of MVR meshes costs only ~visible-row
     // work, not thousands of widget allocations (the perf gate for large rigs).
-    let line_col = ink.tertiary.gamma_multiply(0.5);
+    let line_col = ink.tertiary.gamma_multiply(0.20);
     let total = rows.len();
     egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("scene-tree").show_rows(
         ui,
@@ -364,8 +371,8 @@ pub fn scene_tree(
                 if last + 1 < range.start || i > range.end + 1 {
                     continue;
                 }
-                let x = left + PAD_X + (r.depth as f32 + 1.0) * INDENT + DISCLOSURE_W * 0.5;
-                let y0 = row_y(i) + ROW_H * 0.5 + ROW_H * 0.30;
+                let x = left + PAD_X + r.depth as f32 * INDENT + DISCLOSURE_W * 0.5;
+                let y0 = row_y(i) + ROW_H * 0.5 + ROW_H * 0.25;
                 let y1 = row_y(last) + ROW_H * 0.5;
                 ui.painter().line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], egui::Stroke::new(1.0, line_col));
             }
@@ -716,43 +723,12 @@ fn draw_row(
     }
     let dim = if row.vis.dim() { 0.45 } else { 1.0 };
 
-    // ---- far-left patch column (fixtures): "uni.addr" in the fixture's DMX-pane
-    // colour, or "none" (italic, muted) when unpatched; red when the address
-    // conflicts. Uses the same golden-ratio tint as the DMX universe grid so a
-    // fixture reads the same colour in both places.
-    if !row.patch_tag.is_empty() {
-        let px = rect.left() + 6.0;
-        if row.patch_tag == "none" {
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                "none",
-                0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::proportional(10.0),
-                    color: ink.muted,
-                    italics: true,
-                    ..Default::default()
-                },
-            );
-            let galley = painter.layout_job(job);
-            painter.galley(egui::pos2(px, rect.center().y - galley.size().y * 0.5), galley, ink.muted);
-        } else {
-            let col = if row.conflict {
-                theme::CONFLICT
-            } else if let RowKind::Fixture(i) = row.kind {
-                fixture_tint(i)
-            } else {
-                ink.tertiary
-            };
-            painter.text(egui::pos2(px, rect.center().y), egui::Align2::LEFT_CENTER, &row.patch_tag, egui::FontId::monospace(10.0), col);
-        }
-    }
-
-    // ---- geometry ---- (tree content starts AFTER the far-left patch column)
-    let content_x = rect.left() + PATCH_COL + PAD_X + row.depth as f32 * INDENT;
+    // ---- left geometry: indent → disclosure → icon → name. No left patch column
+    // (metadata is right-aligned now), so the name reads with Blender-like room.
+    let content_x = rect.left() + PAD_X + row.depth as f32 * INDENT;
     let disc_rect = egui::Rect::from_min_size(egui::pos2(content_x, rect.top()), egui::vec2(DISCLOSURE_W, ROW_H));
     let icon_x = content_x + DISCLOSURE_W + ICON_DX;
-    let text_x = icon_x + TEXT_DX;
+    let name_x = icon_x + ICON_W + ICON_GAP;
 
     // ---- disclosure triangle ----
     if row.has_children {
@@ -761,7 +737,7 @@ fn draw_row(
             disc_rect.center(),
             egui::Align2::CENTER_CENTER,
             glyph,
-            egui::FontId::proportional(13.0),
+            egui::FontId::proportional(12.0),
             ink.tertiary,
         );
     }
@@ -775,9 +751,44 @@ fn draw_row(
         (if selected { accent } else { ink.secondary }).gamma_multiply(dim),
     );
 
-    // ---- far-right visibility eye (own hit-test) ----
-    let eye_rect =
-        egui::Rect::from_min_size(egui::pos2(rect.right() - 27.0, rect.top()), egui::vec2(24.0, ROW_H));
+    // ---- RIGHT-ALIGNED metadata columns, marched leftward from the right edge:
+    // [eye] (always) → [channel "Nch"] → [patch "uni.addr"] (the last two fixtures
+    // only, measured, so non-fixture rows reserve only the eye). `reserved_left`
+    // becomes the right boundary the name must not cross.
+    let mut cursor_r = rect.right() - EDGE_PAD;
+    let eye_rect = egui::Rect::from_min_size(egui::pos2(cursor_r - EYE_W, rect.top()), egui::vec2(EYE_W, ROW_H));
+    cursor_r -= EYE_W;
+
+    if let RowKind::Fixture(i) = row.kind {
+        // Channel footprint ("47ch").
+        let g = painter.layout_no_wrap(
+            format!("{}ch", crate::dmx::patch::footprint_for(&scene.fixtures[i], scene.fixtures[i].mode_index)),
+            egui::FontId::monospace(10.0),
+            ink.tertiary.gamma_multiply(dim),
+        );
+        cursor_r -= COL_GAP + g.size().x;
+        painter.galley(egui::pos2(cursor_r, rect.center().y - g.size().y * 0.5), g, ink.tertiary);
+    }
+    if !row.patch_tag.is_empty() && row.patch_tag != "none" {
+        // Patch "uni.addr" chip in the fixture's DMX-pane tint (same golden-ratio hue
+        // as the DMX grid), conflict-red. Shown ONLY when actually patched — an
+        // unpatched fixture is signalled by the absence of an address (a "none" word
+        // would just crowd the row and push the name into truncation; the Unpatched
+        // filter chip + the DMX pane are where you go looking for unpatched fixtures).
+        let col = if row.conflict {
+            theme::CONFLICT
+        } else if let RowKind::Fixture(i) = row.kind {
+            fixture_tint(i)
+        } else {
+            ink.tertiary
+        };
+        let g = painter.layout_no_wrap(row.patch_tag.clone(), egui::FontId::monospace(10.0), col.gamma_multiply(dim));
+        cursor_r -= COL_GAP + g.size().x;
+        painter.galley(egui::pos2(cursor_r, rect.center().y - g.size().y * 0.5), g, col);
+    }
+    let reserved_left = cursor_r - COL_GAP;
+
+    // ---- visibility eye (own hit-test) ----
     let eye = ui.interact(eye_rect, resp.id.with("eye"), Sense::click());
     // Mixed (some-but-not-all children hidden) keeps the open eye but tints it
     // muted/accent so the parent reads as "partly hidden" (Blender greys the
@@ -800,24 +811,24 @@ fn draw_row(
             }
         }
     };
-    painter.text(eye_rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(14.0), eye_col);
+    painter.text(eye_rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(13.0), eye_col);
     eye.clone().on_hover_text(match row.vis {
         VisState::Hidden => "Hidden — click to show",
         VisState::Mixed => "Partly hidden — click to hide the rest",
         VisState::Shown => "Visible — click to hide",
     });
-    let right_edge = 30.0;
 
-    // ---- name + secondary (or inline rename editor) ----
+    // ---- name (or inline rename editor) ---- elided to the room left of the
+    // right-aligned metadata columns, so it never overflows into them.
     let renaming = rename.as_ref().is_some_and(|(k, _)| *k == row.key);
-    let text_w = (rect.right() - text_x - 56.0 - right_edge).max(40.0);
+    let name_avail = (reserved_left - name_x).max(24.0);
     if renaming {
         // A real allocated TextEdit (painter text can't host a cursor). One live
         // at a time; commit on Enter / focus loss, cancel on Esc.
         if let Some((_, buf)) = rename.as_mut() {
             let edit_rect = egui::Rect::from_min_max(
-                egui::pos2(text_x, rect.top() + 5.0),
-                egui::pos2(rect.right() - right_edge - 4.0, rect.bottom() - 5.0),
+                egui::pos2(name_x, rect.top() + 3.0),
+                egui::pos2(reserved_left, rect.bottom() - 3.0),
             );
             let mut commit = false;
             let mut cancel = false;
@@ -848,29 +859,15 @@ fn draw_row(
         // string moves to the row tooltip instead of a cramped second line.
         super::panels::paint_truncated(
             &painter,
-            egui::pos2(text_x, rect.top() + 4.0),
+            egui::pos2(name_x, rect.top() + 2.0),
             &row.label,
             13.0,
             ink.primary.gamma_multiply(dim),
-            text_w,
+            name_avail,
         );
         if !row.secondary.is_empty() {
             resp.clone().on_hover_text(&row.secondary);
         }
-    }
-
-    // ---- right info column (left of the eye): the fixture's CHANNEL COUNT ("47ch").
-    // The patch address moved to the far-left column (an address conflict shows there
-    // in red); the type icon already conveys the kind, so this slot is the footprint.
-    if let RowKind::Fixture(i) = row.kind {
-        let chans = crate::dmx::patch::footprint_for(&scene.fixtures[i], scene.fixtures[i].mode_index);
-        painter.text(
-            egui::pos2(rect.right() - right_edge - 4.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            format!("{chans}ch"),
-            egui::FontId::monospace(10.0),
-            ink.tertiary.gamma_multiply(dim),
-        );
     }
 
     // ---- interaction ----

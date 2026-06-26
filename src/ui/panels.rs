@@ -1435,8 +1435,8 @@ pub(super) fn paint_truncated(
     job.wrap = TextWrapping {
         max_width: max_w.max(8.0),
         max_rows: 1,
+        break_anywhere: true,
         overflow_character: Some('…'),
-        ..Default::default()
     };
     let galley = painter.layout_job(job);
     painter.galley(top_left, galley, color);
