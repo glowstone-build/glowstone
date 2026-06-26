@@ -2311,6 +2311,13 @@ impl Ui {
         self.selection = Selection::world();
     }
 
+    /// Select the first environment (fog volume). Headless hook (`PREVIZ_UI_ENV`).
+    pub fn debug_select_environment(&mut self, scene: &Scene) {
+        if !scene.environments.is_empty() {
+            self.selection = Selection::environment(0);
+        }
+    }
+
     /// Multi-select up to `n` fixtures sharing the profile of the first fixture
     /// that has a wheel chain (so the bulk Wheels section is exercised); falls
     /// back to the first `n` GDTF fixtures. Headless hook for bulk screenshots.

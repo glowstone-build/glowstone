@@ -14,6 +14,7 @@ use std::sync::Arc;
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
 use glam::{Mat4, Vec3};
 
+mod environment;
 mod fixture;
 mod props;
 pub use props::{Inspect, Props};
@@ -1543,90 +1544,8 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut I
     ui.label(RichText::new(format!("{:?}", env.kind)).weak().small());
     ui.separator();
 
-    category(
-        ui,
-        state,
-        "Transform",
-        format!("{}  Transform", theme::icon::INSPECTOR),
-        true,
-        &["Center", "Size"],
-        |ui, fs| {
-            Grid::new("env-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Stacked X/Y/Z (Blender-style) — readable at any panel width.
-                vec3_rows(
-                    ui, fs, "Center", false, 0.1, "",
-                    &mut env.center.x, &mut env.center.y, &mut env.center.z,
-                );
-                // Size keeps its W/H/D prefixes + range, stacked the same way.
-                if fs.row_shown("Size", true) {
-                    field_row(ui, fs.panel_w, |ui| { ui.label("Size"); }, |ui| {
-                        ui.add(DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("W "));
-                    });
-                    field_row(ui, fs.panel_w, |_ui| {}, |ui| {
-                        ui.add(DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("H "));
-                    });
-                    field_row(ui, fs.panel_w, |_ui| {}, |ui| {
-                        ui.add(DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("D "));
-                    });
-                }
-            });
-        },
-    );
-
-    category(
-        ui,
-        state,
-        "Volume",
-        format!("{}  Volume", theme::icon::ENVIRONMENT),
-        true,
-        &["Density", "Tint", "Anisotropy", "Uniformity", "Cluster contrast"],
-        |ui, fs| {
-            // Env defaults = the `from_profile` rest constants (density's template
-            // lives on the profile, which the instance doesn't keep → no arrow).
-            const D_COLOR: [f32; 3] = [0.7, 0.72, 0.78];
-            const D_ANISO: f32 = 0.25;
-            const D_UNIFORM: f32 = 0.6;
-            const D_CLUSTER: f32 = 0.0;
-            Grid::new("env-volume").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Common: the two controls a designer reaches for first.
-                row(ui, fs, "Density", false, |ui| {
-                    ui.add(DragValue::new(&mut env.density).speed(0.005).range(0.0..=4.0));
-                });
-                if row(ui, fs, "Tint", !approx_rgb(env.color, D_COLOR), |ui| {
-                    ui.color_edit_button_rgb(&mut env.color);
-                }) {
-                    env.color = D_COLOR;
-                }
-            });
-            // Advanced: the scattering-model knobs.
-            advanced_section_filtered(ui, fs, "env-volume", &["Anisotropy", "Uniformity", "Cluster contrast"], |ui| {
-                Grid::new("env-volume-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    if row(ui, fs, "Anisotropy", !approx(env.anisotropy, D_ANISO), |ui| {
-                        ui.add(DragValue::new(&mut env.anisotropy).speed(0.005).range(-0.95..=0.95))
-                            .on_hover_text("Henyey-Greenstein g (forward scattering > 0)");
-                    }) {
-                        env.anisotropy = D_ANISO;
-                    }
-                    if slider_row(ui, fs, "Uniformity", !approx(env.uniformity, D_UNIFORM), |ui| {
-                        ui.add(egui::Slider::new(&mut env.uniformity, 0.0..=1.0)).on_hover_text(
-                            "1 = smooth even haze · 0 = clusters of smoke/clouds (dense \
-                             pockets scatter brighter, with clear gaps between)",
-                        );
-                    }) {
-                        env.uniformity = D_UNIFORM;
-                    }
-                    if slider_row(ui, fs, "Cluster contrast", !approx(env.cluster_contrast, D_CLUSTER), |ui| {
-                        ui.add(egui::Slider::new(&mut env.cluster_contrast, 0.0..=1.0)).on_hover_text(
-                            "How much brighter/denser the clusters are vs the haze (and how \
-                             clear the gaps). Higher = pockets pop harder. Pairs with low density.",
-                        );
-                    }) {
-                        env.cluster_contrast = D_CLUSTER;
-                    }
-                });
-            });
-        },
-    );
+    // Editable grid declared by `impl Inspect for Environment`.
+    props::show(ui, state, env);
 }
 
 /// Inspector for a selected static-geometry object (an imported stage deck,
@@ -1665,47 +1584,31 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
     let (scale0, rot0, _trans0) = g.transform.to_scale_rotation_translation();
     let mut pos = g.transform.w_axis.truncate();
     let mut uscale = ((scale0.x + scale0.y + scale0.z) / 3.0).max(1e-3);
-    let (ry, rx, rz) = rot0.to_euler(glam::EulerRot::YXZ);
-    let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
+    let mut rot = rot0;
+    let bounds = g.world_bounds();
     let mut pos_changed = false;
     let mut rs_changed = false;
 
-    category(
-        ui,
-        state,
-        "Transform",
-        format!("{}  Transform", theme::icon::INSPECTOR),
-        true,
-        &["Position", "Rotation", "Scale"],
-        |ui, fs| {
-            Grid::new("geo-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
-                pos_changed |= vec3_rows(
-                    ui, fs, "Position", false, 0.05, "",
-                    &mut pos.x, &mut pos.y, &mut pos.z,
-                );
-                // Rotation reverts to identity (0/0/0), scale to unit — the geometry
-                // "default" (struct-Default intent for a placed object).
-                let rot_differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-                rs_changed |= vec3_rows(ui, fs, "Rotation", rot_differs, 0.5, "°", &mut ex, &mut ey, &mut ez);
-                if row(ui, fs, "Scale", !approx(uscale, 1.0), |ui| {
-                    rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
-                }) {
-                    uscale = 1.0;
-                    rs_changed = true;
-                }
-            });
-            if let Some((lo, hi)) = g.world_bounds() {
+    // Position is lossless (translation column only); Rotation (→identity) + Scale
+    // (→unit) recompose to a clean uniform basis only when the user edits one.
+    props::with(ui, state, |p| {
+        p.group("Transform", theme::icon::INSPECTOR, true, |p| {
+            pos_changed |= p.vec3("Position", &mut pos).speed(0.05).show();
+            rs_changed |= p.rotation("Rotation", &mut rot);
+            rs_changed |= p
+                .f32("Scale", &mut uscale)
+                .speed(0.005)
+                .range(0.001..=1000.0)
+                .default(1.0)
+                .show();
+            if let Some((lo, hi)) = bounds {
                 let s = hi - lo;
-                ui.label(
-                    RichText::new(format!("size  {:.2} × {:.2} × {:.2} m", s.x, s.y, s.z)).weak().small(),
-                );
+                p.note(format!("size  {:.2} × {:.2} × {:.2} m", s.x, s.y, s.z));
             }
-        },
-    );
+        });
+    });
 
     if rs_changed {
-        let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
         g.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
     } else if pos_changed {
         // Pure move: rewrite only the translation column, keeping the original

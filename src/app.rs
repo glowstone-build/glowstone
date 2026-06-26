@@ -1218,6 +1218,9 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     if std::env::var("PREVIZ_UI_WORLD").is_ok() {
         state.ui.debug_select_world();
     }
+    if std::env::var("PREVIZ_UI_ENV").is_ok() {
+        state.ui.debug_select_environment(&state.scene);
+    }
     if std::env::var("PREVIZ_UI_RENDERTAB").is_ok() {
         state.ui.ensure_render_tab_focused();
     }

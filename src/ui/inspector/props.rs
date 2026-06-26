@@ -47,13 +47,20 @@ pub trait Inspect {
     fn inspect(&mut self, p: &mut Props);
 }
 
-/// Render an [`Inspect`] value's property grid into `ui`. Collapse toggles are applied
-/// to `state` + persisted after the pass (so the builder itself only needs `&state`).
+/// Render an [`Inspect`] value's property grid into `ui`.
 pub fn show(ui: &mut egui::Ui, state: &mut InspectorState, obj: &mut impl Inspect) {
+    with(ui, state, |p| obj.inspect(p));
+}
+
+/// Run an arbitrary closure with a root [`Props`] — for inspectors that need
+/// surrounding imperative logic (e.g. a decomposed transform recomposed afterward)
+/// rather than a clean `impl Inspect`. Collapse toggles are applied to `state` +
+/// persisted after the pass (so the builder itself only needs `&state`).
+pub fn with(ui: &mut egui::Ui, state: &mut InspectorState, body: impl FnOnce(&mut Props)) {
     let mut pending: Vec<(&'static str, bool)> = Vec::new();
     {
         let mut p = Props { state, pending: &mut pending, salt: "", mode: PropMode::Render(ui) };
-        obj.inspect(&mut p);
+        body(&mut p);
     }
     if !pending.is_empty() {
         for (title, open) in pending {
@@ -284,24 +291,37 @@ impl<'a> Props<'a> {
         }
     }
 
-    /// A stacked X/Y/Z vector (Blender-style). Chain `.speed()`/`.suffix()`/`.default()`.
+    /// A stacked X/Y/Z vector (Blender-style). Chain `.speed()`/`.suffix()`/`.range()`/
+    /// `.prefixes()` (e.g. W/H/D for a size).
     pub fn vec3<'p>(&'p mut self, label: &'static str, value: &'p mut glam::Vec3) -> Vec3Field<'p, 'a> {
-        Vec3Field { p: self, label, value, speed: 0.1, suffix: "", shown: false }
+        Vec3Field {
+            p: self,
+            label,
+            value,
+            speed: 0.1,
+            suffix: "",
+            prefixes: ["X", "Y", "Z"],
+            range: None,
+            shown: false,
+        }
     }
 
     /// A rotation, edited as stacked X/Y/Z euler degrees (YXZ) and recomposed to the
-    /// quaternion; the revert arrow snaps back to identity.
-    pub fn rotation(&mut self, label: &'static str, value: &mut glam::Quat) {
+    /// quaternion; the revert arrow snaps back to identity. Returns whether it changed.
+    pub fn rotation(&mut self, label: &'static str, value: &mut glam::Quat) -> bool {
         let (ry, rx, rz) = value.to_euler(glam::EulerRot::YXZ);
         let (mut ex, mut ey, mut ez) = (rx.to_degrees(), ry.to_degrees(), rz.to_degrees());
         let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-        if self.vec3_raw(label, differs, 0.5, "°", &mut ex, &mut ey, &mut ez) {
+        if self.vec3_raw(label, differs, 0.5, "°", ["X", "Y", "Z"], None, &mut ex, &mut ey, &mut ez) {
             *value = glam::Quat::from_euler(
                 glam::EulerRot::YXZ,
                 ey.to_radians(),
                 ex.to_radians(),
                 ez.to_radians(),
             );
+            true
+        } else {
+            false
         }
     }
 
@@ -419,6 +439,8 @@ impl<'a> Props<'a> {
         differs: bool,
         speed: f64,
         suffix: &'static str,
+        prefixes: [&'static str; 3],
+        range: Option<RangeInclusive<f32>>,
         x: &mut f32,
         y: &mut f32,
         z: &mut f32,
@@ -434,11 +456,14 @@ impl<'a> Props<'a> {
                     return false;
                 }
                 let mut changed = false;
-                let comps: [(&str, &mut f32); 3] = [("X", x), ("Y", y), ("Z", z)];
+                let comps: [(&str, &mut f32); 3] = [(prefixes[0], x), (prefixes[1], y), (prefixes[2], z)];
                 let mut reset = false;
                 for (i, (axis, comp)) in comps.into_iter().enumerate() {
                     let r = field_shell(ui, label, if i == 0 { differs } else { false }, i != 0, |ui| {
                         let mut d = DragValue::new(comp).speed(speed).prefix(format!("{axis} "));
+                        if let Some(r) = &range {
+                            d = d.range(r.clone());
+                        }
                         if !suffix.is_empty() {
                             d = d.suffix(suffix);
                         }
@@ -607,6 +632,8 @@ pub struct Vec3Field<'p, 'a> {
     value: &'p mut glam::Vec3,
     speed: f64,
     suffix: &'static str,
+    prefixes: [&'static str; 3],
+    range: Option<RangeInclusive<f32>>,
     shown: bool,
 }
 
@@ -619,19 +646,36 @@ impl<'p, 'a> Vec3Field<'p, 'a> {
         self.suffix = s;
         self
     }
+    /// Per-component prefixes (default X/Y/Z) — e.g. `["W", "H", "D"]` for a size.
+    pub fn prefixes(mut self, p: [&'static str; 3]) -> Self {
+        self.prefixes = p;
+        self
+    }
+    pub fn range(mut self, r: RangeInclusive<f32>) -> Self {
+        self.range = Some(r);
+        self
+    }
 
-    fn render(&mut self) {
+    /// Render now and return whether any component changed.
+    pub fn show(mut self) -> bool {
+        self.render()
+    }
+
+    fn render(&mut self) -> bool {
         if self.shown {
-            return;
+            return false;
         }
         self.shown = true;
-        let (label, speed, suffix) = (self.label, self.speed, self.suffix);
+        let (label, speed, suffix, prefixes) = (self.label, self.speed, self.suffix, self.prefixes);
+        let range = self.range.clone();
         let (mut x, mut y, mut z) = (self.value.x, self.value.y, self.value.z);
-        // A plain vector (Position/Center) has no recoverable default → no revert arrow
-        // (`differs = false`); reset-to-identity rotations go through `Props::rotation`.
-        if self.p.vec3_raw(label, false, speed, suffix, &mut x, &mut y, &mut z) {
+        // A plain vector (Position/Center/Size) has no recoverable default → no revert
+        // arrow (`differs = false`); reset-to-identity rotations go through `Props::rotation`.
+        let changed = self.p.vec3_raw(label, false, speed, suffix, prefixes, range, &mut x, &mut y, &mut z);
+        if changed {
             *self.value = glam::vec3(x, y, z);
         }
+        changed
     }
 }
 
