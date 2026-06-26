@@ -32,9 +32,20 @@ impl Inspect for Fixture {
         });
 
         // FIXTURE = the head's own properties: aim (Pan/Tilt), level, colour, beam.
+        let (pan_now, tilt_now) = (self.pan_actual, self.tilt_actual);
         p.group("Fixture", icon::COLOR, true, |p| {
-            p.f32("Pan", &mut self.pan).speed(0.5).range(-270.0..=270.0).suffix("°").default(def.pan);
-            p.f32("Tilt", &mut self.tilt).speed(0.5).range(tilt_range.clone()).suffix("°").default(def.tilt);
+            p.f32("Pan", &mut self.pan)
+                .speed(0.5)
+                .range(-270.0..=270.0)
+                .suffix("°")
+                .default(def.pan)
+                .tip(format!("commanded · now {pan_now:.0}°"));
+            p.f32("Tilt", &mut self.tilt)
+                .speed(0.5)
+                .range(tilt_range.clone())
+                .suffix("°")
+                .default(def.tilt)
+                .tip(format!("commanded · now {tilt_now:.0}°"));
             p.f32("Dimmer", &mut self.optics.dimmer).speed(0.005).range(0.0..=1.0).default(def.dimmer);
             // Colour only shows a revert arrow when its template is known (GDTF white
             // master); a built-in's library tint isn't stored (def.color = None).

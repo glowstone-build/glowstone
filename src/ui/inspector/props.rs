@@ -502,7 +502,7 @@ pub struct NumField<'p, 'a> {
     default: Option<f32>,
     slider: bool,
     enabled: bool,
-    tip: Option<&'static str>,
+    tip: Option<String>,
     shown: bool,
 }
 
@@ -542,8 +542,10 @@ impl<'p, 'a> NumField<'p, 'a> {
         self.enabled = e;
         self
     }
-    pub fn tip(mut self, t: &'static str) -> Self {
-        self.tip = Some(t);
+    /// A hover tooltip. Accepts a static str or an owned `String` (e.g. a live
+    /// "commanded · now 45°" read-out).
+    pub fn tip(mut self, t: impl Into<String>) -> Self {
+        self.tip = Some(t.into());
         self
     }
 
@@ -572,8 +574,9 @@ impl<'p, 'a> NumField<'p, 'a> {
                 }
                 let value = &mut *self.value;
                 let range = self.range.clone();
-                let (speed, suffix, decimals, slider, enabled, tip) =
-                    (self.speed, self.suffix, self.decimals, self.slider, self.enabled, self.tip);
+                let tip = self.tip.clone();
+                let (speed, suffix, decimals, slider, enabled) =
+                    (self.speed, self.suffix, self.decimals, self.slider, self.enabled);
                 let mut changed = false;
                 let build = |ui: &mut egui::Ui| {
                     let resp = if slider {

@@ -2095,89 +2095,11 @@ fn gdtf_inspector(
     }
 
     ui.separator();
-    let def = FixtureDefaults::for_fixture(fixture);
-    category(
-        ui,
-        state,
-        "Transform",
-        format!("{}  Transform", theme::icon::INSPECTOR),
-        true,
-        &["Position", "Rotation", "Move speed"],
-        |ui, fs| {
-            Grid::new("gdtf-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
-                vec3_rows(
-                    ui, fs, "Position", false, 0.05, "",
-                    &mut fixture.position.x, &mut fixture.position.y, &mut fixture.position.z,
-                );
-                // Rotation = the rig HANG orientation, separate from the live Pan/Tilt.
-                // Euler (YXZ) for display; recomposed on edit; revert arrow → identity.
-                let (ry, rx, rz) = fixture.orientation.to_euler(glam::EulerRot::YXZ);
-                let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
-                let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-                if vec3_rows(ui, fs, "Rotation", differs, 0.5, "°", &mut ex, &mut ey, &mut ez) {
-                    fixture.orientation =
-                        glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
-                }
-                if slider_row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
-                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0).max_decimals(2))
-                        .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
-                }) {
-                    fixture.move_speed = 0.0;
-                }
-            });
-        },
-    );
 
-    category(
-        ui,
-        state,
-        "Fixture",
-        format!("{}  Fixture", theme::icon::COLOR),
-        true,
-        &["Pan", "Tilt", "Dimmer", "Color", "Beam"],
-        |ui, fs| {
-            Grid::new("gdtf-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Pan/Tilt: the live-aim head angles (moved here from Transform — they're
-                // a fixture property, not the rig placement). Each reverts to rest 0.
-                if row(ui, fs, "Pan", !approx(fixture.pan, def.pan), |ui| {
-                    ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"))
-                        .on_hover_text(format!("commanded · now {:.0}°", fixture.pan_actual));
-                }) {
-                    fixture.pan = def.pan;
-                }
-                if row(ui, fs, "Tilt", !approx(fixture.tilt, def.tilt), |ui| {
-                    ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-135.0..=135.0).suffix("°"))
-                        .on_hover_text(format!("commanded · now {:.0}°", fixture.tilt_actual));
-                }) {
-                    fixture.tilt = def.tilt;
-                }
-                if row(ui, fs, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer), |ui| {
-                    ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
-                }) {
-                    fixture.optics.dimmer = def.dimmer;
-                }
-                let color_differs = def.color.is_some_and(|d| !approx_rgb(fixture.color, d));
-                if row(ui, fs, "Color", color_differs, |ui| {
-                    ui.color_edit_button_rgb(&mut fixture.color);
-                }) {
-                    if let Some(d) = def.color {
-                        fixture.color = d;
-                    }
-                }
-            });
-            advanced_section_filtered(ui, fs, "gdtf-fixture", &["Beam"], |ui| {
-                Grid::new("gdtf-fixture-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    if row(ui, fs, "Beam", !approx(fixture.beam, def.beam), |ui| {
-                        ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
-                            .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
-                    }) {
-                        fixture.beam = def.beam;
-                    }
-                });
-            });
-        },
-    );
+    // Transform + Fixture grid: the SAME declarative `impl Inspect for Fixture` the
+    // built-in inspector uses (it is GDTF-aware: ±135° tilt, white-master Color default,
+    // no editable Beam angle, live commanded/now Pan-Tilt tips).
+    props::show(ui, state, fixture);
 
     optics_section(ui, fixture, &gdtf, state);
 
