@@ -88,6 +88,23 @@ pub struct InspectorState {
 /// section uses it so the value column starts at the same x everywhere.
 const INSPECTOR_LABEL_W: f32 = 84.0;
 
+/// Space reserved to the RIGHT of the value column = category indent (~18) + the
+/// label/value grid gap (~12) + a small right margin (~4). Tuned so the value cell
+/// fills nearly to the panel edge (Blender-tight), not the old over-wide gap.
+const INSPECTOR_VALUE_PAD: f32 = 32.0;
+
+/// The shared width of EVERY value cell (field, slider, combo) so they all fill to the
+/// SAME right edge — one consistent column, like Blender. `panel_w` is the captured
+/// [`InspectorState::panel_w`].
+fn inspector_value_w(panel_w: f32) -> f32 {
+    (panel_w - INSPECTOR_LABEL_W - INSPECTOR_VALUE_PAD).max(60.0)
+}
+
+/// Space a slider reserves to the right of its bar for the value readout (item gap +
+/// a ~2-decimal number). Subtracted from the value cell so the bar fills the rest and
+/// the readout's right edge lines up with the fields' right edge.
+const INSPECTOR_SLIDER_READOUT: f32 = 42.0;
+
 impl InspectorState {
     /// Load the persisted collapse map (config dir); missing/garbled ⇒ default.
     pub fn load() -> Self {
@@ -456,15 +473,15 @@ fn world_inspector(ui: &mut egui::Ui, world: &mut crate::scene::World, ink: &the
 
     let enabled = world.hdri.is_some();
     Grid::new("world-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        row(ui, state, "Brightness", false, |ui| {
+        slider_row(ui, state, "Brightness", false, |ui| {
             ui.add_enabled(enabled, Slider::new(&mut world.brightness, 0.0..=4.0))
                 .on_hover_text("Overall world exposure (sky + ambient)");
         });
-        row(ui, state, "Ambient", false, |ui| {
+        slider_row(ui, state, "Ambient", false, |ui| {
             ui.add_enabled(enabled, Slider::new(&mut world.ambient, 0.0..=2.0))
                 .on_hover_text("How strongly the environment lights the geometry");
         });
-        row(ui, state, "Rotation", false, |ui| {
+        slider_row(ui, state, "Rotation", false, |ui| {
             ui.add_enabled(enabled, Slider::new(&mut world.rotation, 0.0..=std::f32::consts::TAU).suffix(" rad"))
                 .on_hover_text("Turn the environment around the vertical axis");
         });
@@ -604,7 +621,7 @@ fn render_properties(
             row(ui, fs, "Resolution Y", false, |ui| {
                 ui.add(DragValue::new(&mut scene.render.res_y).range(16..=8192).speed(2.0).suffix(" px"));
             });
-            row(ui, fs, "Scale", false, |ui| {
+            slider_row(ui, fs, "Scale", false, |ui| {
                 // Range matches RenderConfig::output_size's clamp (up to 400% supersample).
                 ui.add(Slider::new(&mut scene.render.resolution_percentage, 10..=400).suffix(" %"));
             });
@@ -654,7 +671,7 @@ fn render_properties(
         subhead(ui, "Viewport (preview)");
         let auto = settings.auto_resolution;
         Grid::new("render-samp-vp").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            row(ui, fs, "Scale", false, |ui| {
+            slider_row(ui, fs, "Scale", false, |ui| {
                 // Disabled while Auto FPS drives it; range goes down to 25%.
                 ui.add_enabled(
                     !auto,
@@ -751,19 +768,19 @@ fn render_properties(
     category(ui, state, "Color Management", format!("{}  Color Management", icon::COLOR), true, &color_labels, |ui, fs| {
         ui.label(RichText::new("Shared with the viewport — what you preview is what you render.").small().weak().color(ink.muted));
         Grid::new("render-color-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            row(ui, fs, "Exposure", false, |ui| {
+            slider_row(ui, fs, "Exposure", false, |ui| {
                 ui.add(Slider::new(&mut settings.exposure, 0.05..=8.0));
             });
-            row(ui, fs, "Bloom", false, |ui| {
+            slider_row(ui, fs, "Bloom", false, |ui| {
                 ui.add(Slider::new(&mut settings.bloom, 0.0..=2.0));
             });
-            row(ui, fs, "Beam intensity", false, |ui| {
+            slider_row(ui, fs, "Beam intensity", false, |ui| {
                 ui.add(Slider::new(&mut settings.beam_intensity, 0.0..=2000.0));
             });
-            row(ui, fs, "Gobo sharpness", false, |ui| {
+            slider_row(ui, fs, "Gobo sharpness", false, |ui| {
                 ui.add(Slider::new(&mut settings.gobo_sharpness, 0.0..=2.0));
             });
-            row(ui, fs, "Chroma haze", false, |ui| {
+            slider_row(ui, fs, "Chroma haze", false, |ui| {
                 ui.add(Slider::new(&mut settings.chroma_haze, 0.0..=2.0))
                     .on_hover_text("Lift saturated dim hues in haze so they read without going neon");
             });
@@ -776,7 +793,7 @@ fn render_properties(
         world_inspector(ui, &mut scene.world, &ink, fs);
         ui.add_space(4.0);
         Grid::new("render-world-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-            row(ui, fs, "Fog density", false, |ui| {
+            slider_row(ui, fs, "Fog density", false, |ui| {
                 match scene.environments.iter_mut().find(|e| !e.hidden) {
                     Some(env) => {
                         ui.add(Slider::new(&mut env.density, 0.0..=2.0))
@@ -1744,11 +1761,10 @@ fn field_row(
         egui::Layout::left_to_right(egui::Align::Center),
         label,
     );
-    let value_w = (panel_w - INSPECTOR_LABEL_W - 48.0).max(70.0);
-    // A justified cell of exactly `value_w`: egui's Slider/DragValue/ComboBox are
-    // cross-justify-aware and fill the cell's width — the slider lays out its bar AND
-    // value WITHIN the cell (no glue/overflow), the field fills it. No slider_width /
-    // interact_size overrides (those fought the justify and inflated the slider value).
+    let value_w = inspector_value_w(panel_w);
+    // A justified cell of exactly `value_w`: egui's DragValue/ComboBox are
+    // cross-justify-aware and FILL the cell, so every field reaches the same right
+    // edge. (Sliders use `slider_field_row` instead — justify would eat their value.)
     ui.allocate_ui_with_layout(
         egui::vec2(value_w, h),
         egui::Layout::top_down_justified(egui::Align::Min),
@@ -1757,11 +1773,12 @@ fn field_row(
     ui.end_row();
 }
 
-/// Like [`field_row`] but for a SLIDER value: a justified cell eats the slider's value
-/// (the bar grabs the whole width), so this lays out left-to-right and sets `slider_width`
-/// to the cell MINUS a readout reserve — the bar + its value both sit INSIDE the cell with
-/// a right margin (no glue, no cutoff, value visible). Same fixed label column as
-/// `field_row`, so sliders line up with the fields.
+/// Like [`field_row`] but for a SLIDER value. A justified cell eats the slider's value
+/// (the bar grabs the whole width and the value spills past the edge), and `add_sized`
+/// merely CENTERS a slider (egui sliders don't auto-expand). So instead this sets
+/// `slider_width` to the cell MINUS a fixed readout reserve: the bar fills the cell and
+/// the value lands right at the field column's right edge — one consistent column, no
+/// glue, no cutoff. Same fixed label column as `field_row`.
 fn slider_field_row(
     ui: &mut egui::Ui,
     panel_w: f32,
@@ -1774,12 +1791,14 @@ fn slider_field_row(
         egui::Layout::left_to_right(egui::Align::Center),
         label,
     );
-    let value_w = (panel_w - INSPECTOR_LABEL_W - 48.0).max(70.0);
+    let value_w = inspector_value_w(panel_w);
     ui.allocate_ui_with_layout(
         egui::vec2(value_w, h),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.spacing_mut().slider_width = (value_w - 52.0).max(24.0);
+            // bar = cell − (item gap + the ~2-decimal readout) so the value's right edge
+            // lands on the same x as the fields' filled boxes.
+            ui.spacing_mut().slider_width = (value_w - INSPECTOR_SLIDER_READOUT).max(24.0);
             value(ui);
         },
     );
@@ -1788,7 +1807,7 @@ fn slider_field_row(
 
 /// A filter-aware inspector slider ROW (the [`row`] equivalent for sliders): handles
 /// row visibility + the reset arrow, then lays the slider out via [`slider_field_row`]
-/// so its value stays inside the cell. Returns whether the reset arrow was clicked.
+/// so its value lines up with the fields. Returns whether the reset arrow was clicked.
 fn slider_row(
     ui: &mut egui::Ui,
     state: &InspectorState,
@@ -2018,7 +2037,7 @@ pub fn inspector(
     // the user's repeated note). Reserve a matching RIGHT margin here at the entry
     // point so it covers the filter/header AND every body path (incl. Render
     // Properties); the content then breathes the same on the left and the right.
-    const RIGHT_PAD: f32 = 12.0;
+    const RIGHT_PAD: f32 = 6.0;
     ui.set_max_width((ui.available_width() - RIGHT_PAD).max(140.0));
     // Filter box (S1): a fuzzy/substring row-label filter across all categories.
     // Sits above the scrolling body so it stays visible while scanning matches.
@@ -2584,7 +2603,7 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
                 }
                 // Move speed = the pan/tilt motor slew (0 = snap, 1 = slowest).
                 if slider_row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
-                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
+                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0).max_decimals(2))
                         .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
                 }) {
                     fixture.move_speed = 0.0;
@@ -2725,7 +2744,7 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut I
                     }) {
                         env.anisotropy = D_ANISO;
                     }
-                    if row(ui, fs, "Uniformity", !approx(env.uniformity, D_UNIFORM), |ui| {
+                    if slider_row(ui, fs, "Uniformity", !approx(env.uniformity, D_UNIFORM), |ui| {
                         ui.add(egui::Slider::new(&mut env.uniformity, 0.0..=1.0)).on_hover_text(
                             "1 = smooth even haze · 0 = clusters of smoke/clouds (dense \
                              pockets scatter brighter, with clear gaps between)",
@@ -2733,7 +2752,7 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut I
                     }) {
                         env.uniformity = D_UNIFORM;
                     }
-                    if row(ui, fs, "Cluster contrast", !approx(env.cluster_contrast, D_CLUSTER), |ui| {
+                    if slider_row(ui, fs, "Cluster contrast", !approx(env.cluster_contrast, D_CLUSTER), |ui| {
                         ui.add(egui::Slider::new(&mut env.cluster_contrast, 0.0..=1.0)).on_hover_text(
                             "How much brighter/denser the clusters are vs the haze (and how \
                              clear the gaps). Higher = pockets pop harder. Pairs with low density.",
@@ -2985,7 +3004,7 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
                 row(ui, fs, "Gamma", false, |ui| {
                     ui.add(DragValue::new(&mut s.gamma).speed(0.01).range(1.0..=3.0));
                 });
-                row(ui, fs, "Transparency", false, |ui| {
+                slider_row(ui, fs, "Transparency", false, |ui| {
                     let mut transp = 1.0 - s.opacity;
                     if ui.add(Slider::new(&mut transp, 0.0..=1.0)).on_hover_text("See-through / mesh LED").changed() {
                         s.opacity = (1.0 - transp).clamp(0.0, 1.0);
@@ -3335,7 +3354,7 @@ fn gdtf_inspector(
                         glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
                 }
                 if slider_row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
-                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
+                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0).max_decimals(2))
                         .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
                 }) {
                     fixture.move_speed = 0.0;
