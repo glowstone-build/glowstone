@@ -96,6 +96,22 @@ pub struct Fixture {
     /// aligned with the mode's emitters. White at rest; live DMX rewrites it
     /// every frame from the per-cell color layers.
     pub cells: Vec<[f32; 3]>,
+    /// Per-emitter tilt angle in degrees, for fixtures whose individual heads
+    /// tilt independently (e.g. the Clay Paky Volero Wave — eight separately
+    /// tilting bodies). Aligned with the mode's emitters; 0 = the head's rest
+    /// aim. Re-derived from live DMX every frame and resized by [`sync_mode`],
+    /// so it's `#[serde(skip)]` and never bumps the `.archie` layout.
+    ///
+    /// [`sync_mode`]: Self::sync_mode
+    #[serde(skip)]
+    pub cell_tilt: Vec<f32>,
+    /// Per-emitter pan angle in degrees (companion to [`cell_tilt`] for a
+    /// fixture whose heads pan independently). Empty/0 for the common
+    /// single-yoke fixture.
+    ///
+    /// [`cell_tilt`]: Self::cell_tilt
+    #[serde(skip)]
+    pub cell_pan: Vec<f32>,
 
     /// The optical-chain control values (focus / frost / prism / color / gobo /
     /// animation / shutter …). Drives the GDTF optical model; neutral by default.
@@ -151,6 +167,8 @@ impl Fixture {
             beam_angle: profile.default_beam_angle,
             mode_index: 0,
             cells: Vec::new(),
+            cell_tilt: Vec::new(),
+            cell_pan: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: None,
@@ -190,6 +208,8 @@ impl Fixture {
             beam_angle,
             mode_index: 0,
             cells: Vec::new(),
+            cell_tilt: Vec::new(),
+            cell_pan: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: None,
@@ -250,6 +270,8 @@ impl Fixture {
             beam_angle,
             mode_index,
             cells: Vec::new(),
+            cell_tilt: Vec::new(),
+            cell_pan: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: Some(Box::new(imported.meta)),
@@ -297,6 +319,14 @@ impl Fixture {
         }
         if self.cells.len() != mode.emitters.len() {
             self.cells = vec![[1.0, 1.0, 1.0]; mode.emitters.len()];
+        }
+        // Per-emitter articulation arrays (serde-skip → empty after a load):
+        // size them to the emitter count so per-head tilt/pan has a slot each.
+        if self.cell_tilt.len() != mode.emitters.len() {
+            self.cell_tilt = vec![0.0; mode.emitters.len()];
+        }
+        if self.cell_pan.len() != mode.emitters.len() {
+            self.cell_pan = vec![0.0; mode.emitters.len()];
         }
     }
 

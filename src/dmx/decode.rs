@@ -69,6 +69,7 @@ pub fn apply(
             Some(gdtf) => {
                 let Some(mode) = gdtf.modes.get(mode_index) else { continue };
                 fixture.optics.ensure_wheels(mode.components.len());
+                dump_footprint(&fixture.name, p.universe, address, mode.footprint, buf);
                 decode_gdtf(fixture, &gdtf, mode_index, mode, buf, address);
                 live_mask[i] = true;
             }
@@ -78,6 +79,48 @@ pub fn apply(
             }
         }
     }
+}
+
+/// Dev hook: when `PREVIZ_DMX_DUMP` is set, log a live GDTF fixture's raw
+/// footprint bytes (1-based DMX slot → value) whenever they change. Lets a
+/// layered/multi-emitter fixture's real console output be captured and checked
+/// against the decode — the only ground truth for "which channels the desk
+/// drives". Off (zero cost) unless the env var is present.
+fn dump_footprint(name: &str, universe: u16, address: u16, footprint: u32, buf: &[u8; 512]) {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static LAST: RefCell<HashMap<(u16, u16), Vec<u8>>> = RefCell::new(HashMap::new());
+        static ON: bool = std::env::var("PREVIZ_DMX_DUMP").is_ok();
+    }
+    if !ON.with(|on| *on) {
+        return;
+    }
+    let start = address.saturating_sub(1) as usize;
+    let end = (start + footprint as usize).min(512);
+    if start >= end {
+        return;
+    }
+    let slice = buf[start..end].to_vec();
+    LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        if last.get(&(universe, address)) == Some(&slice) {
+            return;
+        }
+        let pairs: Vec<String> = slice
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, v)| *v != 0)
+            .map(|(k, v)| format!("{}:{}", k + 1, v))
+            .collect();
+        log::info!(
+            "DMX_DUMP {name:?} u{universe} @{address} ({} ch) non-zero: {}",
+            footprint,
+            pairs.join(" ")
+        );
+        last.insert((universe, address), slice);
+    });
 }
 
 /// Per-group accumulator for the cell layer model (one `(geometry, instance)`).
@@ -174,6 +217,36 @@ fn decode_gdtf(
             continue;
         }
 
+        // Per-emitter pan/tilt: a fixture whose individual heads articulate
+        // (e.g. the Volero Wave's eight tilting bodies) has one Pan/Tilt channel
+        // PER head, each targeting that head's geometry and covering only its own
+        // cell(s). Route those into the per-cell angle arrays so each head aims
+        // independently; the renderer's `assemble` rotates each head axis by its
+        // own value. A single-yoke fixture's Pan/Tilt covers ALL cells (or the
+        // fixture has one emitter) → it falls through to the fixture-wide handler.
+        if n_cells > 1
+            && !rc.cells.is_empty()
+            && rc.cells.len() < n_cells
+            && matches!(ch.attribute.as_str(), "Pan" | "Tilt")
+        {
+            let pan = ch.attribute == "Pan";
+            let deg = if pan {
+                pan_deg(gdtf, mode_index, v01)
+            } else {
+                tilt_deg(gdtf, mode_index, v01)
+            };
+            let arr = if pan { &mut fixture.cell_pan } else { &mut fixture.cell_tilt };
+            if arr.len() < n_cells {
+                arr.resize(n_cells, 0.0);
+            }
+            for &c in &rc.cells {
+                if (c as usize) < n_cells {
+                    arr[c as usize] = deg;
+                }
+            }
+            continue;
+        }
+
         // Everything else: fixture-master attributes (pan/tilt/zoom/CMY/…).
         apply_gdtf_channel(fixture, gdtf, mode_index, ch, v01);
     }
@@ -198,15 +271,33 @@ fn decode_gdtf(
     };
     let all_cells: Vec<u16> = (0..n_cells as u16).collect();
 
+    // Whether this mode has any PER-CELL colour channel (a true pixel fixture:
+    // a colour layer covering a strict subset of cells, e.g. the Spiider's
+    // Lens1/2/3). Used to tell a pixel fixture (master 0 == blackout) apart from
+    // a layered wash whose heads are lit by FULL-coverage layers only.
+    let has_per_cell_color =
+        groups.iter().any(|g| has_color(g) && !g.cells.is_empty() && g.cells.len() < n_cells);
+    // Whether a FULL-COVERAGE colour layer exists — a colour group covering every
+    // cell (empty `cells` is the authoring shorthand for "all", as is `>= n_cells`).
+    // This is the layer that actually CARRIES the head level in a layered wash
+    // (the Volero's BG/SHP). A colour-LESS multi-emitter fixture — a blinder /
+    // wash bar gated purely by one master Dimmer (e.g. ROXX Cluster "1CH DWE",
+    // four lamps + one Dimmer, no colour) — has NONE, so its master 0 must stay a
+    // real blackout and is NOT overridden below.
+    let has_full_coverage_color =
+        groups.iter().any(|g| has_color(g) && (g.cells.is_empty() || g.cells.len() >= n_cells));
+
     // Master = dimmer/shutter-only group covering every cell. The LAST such
     // group in channel order wins (Robe puts the master after zone dimmers);
     // its shutter keeps the full strobe sub-range decode.
     let mut master_dimmer = false;
+    let mut master_level = 0.0_f32;
     for g in groups.iter().filter(|g| all(g) && !has_color(g)) {
         if let Some(d) = g.dimmer {
             // The DMX Dimmer drives the fixture's dimmer (the level); `intensity`
             // is a UI-only master (left at 1.0). See `apply_gdtf_channel`.
             fixture.optics.dimmer = d;
+            master_level = d;
             master_dimmer = true;
         }
         if let Some((ci, v)) = g.shutter {
@@ -219,6 +310,25 @@ fn decode_gdtf(
     // default (0, to keep an un-driven rig dark) would gate every lit cell to
     // black even at RGB 100%. (Fixtures WITH a master dimmer set it above.)
     if !master_dimmer {
+        fixture.optics.dimmer = 1.0;
+    } else if n_cells > 1 && has_full_coverage_color && !has_per_cell_color && master_level <= 1e-4 {
+        // Layered wash whose heads are lit by a fixture-wide full-coverage colour
+        // layer (e.g. the Volero Wave "Advanced" mode: the eight heads take their
+        // colour from the BG/SHP wash, while a SEPARATE 16-bit "Grand" master sits
+        // parked at 0 unless the console maps it). Letting that parked master gate
+        // the lit heads to black is the "Dimmer reads 0.00, heads dark even though
+        // the desk shows them on" bug. The wash layer already carries the real
+        // per-head level (in `cells`), so treat the parked master as full.
+        //
+        // Both guards are required and neither alone suffices:
+        //  - `has_full_coverage_color`: a colour-LESS multi-emitter fixture (a
+        //    blinder/wash gated only by a master Dimmer, e.g. ROXX "1CH DWE") has
+        //    no wash layer to carry the level — master 0 is a genuine blackout and
+        //    must NOT be overridden (else it blasts white when faded to zero).
+        //  - `!has_per_cell_color`: a true pixel fixture (Spiider/Astera) keeps
+        //    master 0 == blackout, so this never regresses its pixel modes.
+        // (Where a fixture really fades intensity via this master, the wash layer's
+        // own dimmer still blacks the cells out, so blackout stays reachable.)
         fixture.optics.dimmer = 1.0;
     }
 
@@ -957,6 +1067,127 @@ mod tests {
         assert!(c0[0] > 0.95 && (c0[1] - 0.5).abs() < 0.05, "HTP of bg + red pixel: {c0:?}");
 
         eprintln!("Spiider per-cell decode OK: {:?}…", &f.cells[..3]);
+    }
+
+    /// The Clay Paky Volero Wave "Advanced" (37ch) mode: eight INDEPENDENTLY
+    /// tilting heads lit by fixture-wide BG/SHP wash layers, plus a separate
+    /// 16-bit "Grand" master. Covers the two bugs this fixture exposed:
+    ///   1. per-head Tilt — each of the eight Tilt channels drives only its own
+    ///      head (`cell_tilt`), and `assemble` aims each head's beam separately;
+    ///   2. the parked "Grand" master at 0 must NOT black out heads lit by the
+    ///      wash layers (the "Dimmer 0.00, heads dark but the desk shows them on"
+    ///      report). Skips when the GDTF isn't present.
+    #[test]
+    fn volero_advanced_per_head_tilt_and_layered_dimmer() {
+        let path = format!(
+            "{}/Downloads/Clay_Paky@Volero_Wave@ClayPaky_FW_2_0_008_1_0_010.gdtf",
+            std::env::var("HOME").unwrap_or_default()
+        );
+        let Ok(g) = GdtfFixture::load_path(std::path::Path::new(&path)) else {
+            eprintln!("skip: volero gdtf not found");
+            return;
+        };
+        let adv = g.modes.iter().position(|m| m.name == "Advanced").expect("advanced");
+        assert_eq!(g.modes[adv].emitters.len(), 8, "eight heads");
+        let fp = g.modes[adv].footprint as u16;
+        assert_eq!(fp, 37, "37-channel mode");
+        let garc = Arc::new(g);
+
+        // Decode one universe against a fresh Advanced-mode fixture (import default
+        // dimmer 0, like an MVR-imported rig before any live DMX).
+        let run = |levels: [u8; 512]| -> Fixture {
+            let mut fixture = Fixture::from_gdtf(garc.clone(), "V", Vec3::ZERO);
+            fixture.mode_index = adv;
+            fixture.sync_mode();
+            fixture.optics.dimmer = 0.0;
+            let snap = snapshot_with(1, levels);
+            let patch = one_patch(1, 1, fp, adv);
+            let mut fx = vec![fixture];
+            let mut live = Vec::new();
+            apply(&mut fx, &patch, &snap, &mut live, Duration::from_secs(2));
+            fx.pop().unwrap()
+        };
+        let lit = |c: [f32; 3]| c.iter().any(|&v| v > 0.3);
+
+        // --- Per-head tilt: drive each head's Tilt channel (offsets 30..37) to a
+        // distinct value; each head must aim independently. ---
+        let mut a = [0u8; 512];
+        for b in 0..4 { a[b] = 255; } // BG RGBW
+        a[5] = 105; a[6] = 255;       // BG shutter open + dimmer
+        a[7] = 105; a[8] = 255; a[9] = 255; // Base shutter + grand dimmer (16-bit)
+        for h in 0..8 { a[29 + h] = (h as u8) * 30; } // per-head tilts (offsets 30..37)
+        let fa = run(a);
+        assert_eq!(fa.cell_tilt.len(), 8, "one tilt per head");
+        let distinct_tilts: std::collections::HashSet<i32> =
+            fa.cell_tilt.iter().map(|t| t.round() as i32).collect();
+        assert_eq!(distinct_tilts.len(), 8, "eight distinct head tilts: {:?}", fa.cell_tilt);
+        assert!((fa.tilt).abs() < 1e-3, "the bar BODY does not tilt (only heads do): {}", fa.tilt);
+
+        // `assemble` must turn the per-head tilts into eight distinct beam aims.
+        let root = glam::Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        let asm = crate::renderer::fixture_model::assemble(
+            fa.gdtf.as_ref().unwrap(), adv, root, fa.pan_actual, fa.tilt_actual, &fa.cell_pan, &fa.cell_tilt,
+        );
+        let dirs: Vec<Vec3> = asm.beams.iter().map(|b| b.dir).collect();
+        assert_eq!(dirs.len(), 8, "eight emitter frames");
+        let distinct_dirs = dirs.windows(2).filter(|w| w[0].dot(w[1]) < 0.999).count();
+        assert_eq!(distinct_dirs, 7, "every adjacent head aims differently: {dirs:?}");
+
+        // --- Layered dimmer: BG wash driven, Base "Grand" master parked at 0.
+        // The heads must light (the bug was dimmer→0 gating them to black). ---
+        let mut b = [0u8; 512];
+        for k in 0..4 { b[k] = 255; }
+        b[5] = 105; b[6] = 255; // BG shutter + dimmer up
+        b[7] = 105;             // Base shutter open, Base GRAND dimmer left at 0
+        let fb = run(b);
+        assert!(fb.optics.dimmer > 0.5, "parked grand master must not gate lit heads: {}", fb.optics.dimmer);
+        assert!(lit(fb.cells[0]) && lit(fb.cells[7]), "heads lit from the BG wash: {:?}", &fb.cells[..]);
+
+        // --- No colour layer driven (only the grand master up): heads stay dark.
+        // The grand master alone can't conjure colour — correct blackout. ---
+        let mut c = [0u8; 512];
+        c[7] = 105; c[8] = 255; c[9] = 255; // Base shutter + grand dimmer, BG/SHP = 0
+        let fc = run(c);
+        assert!(!lit(fc.cells[0]), "no wash colour driven → heads dark: {:?}", fc.cells[0]);
+    }
+
+    /// A colour-LESS multi-emitter fixture — the ROXX Cluster B4-FC blinder in
+    /// its "1CH DWE" mode (four lamps gated by ONE root `Master` Dimmer, no
+    /// colour) — must keep `master 0 == blackout`. Guards against the layered-
+    /// dimmer fix wrongly forcing a parked master to full on a fixture that has no
+    /// wash layer to carry the level (it would blast white when faded to zero).
+    /// Skips when the test MVR is absent.
+    #[test]
+    fn colorless_blinder_master_zero_is_blackout() {
+        let Some(gdtf) = load_gdtf_from_mvr("ROXX@CLUSTER B4-FC.gdtf") else {
+            eprintln!("skip: Basic Festival MVR not found");
+            return;
+        };
+        let mi = gdtf.modes.iter().position(|m| m.name == "1CH DWE").expect("1CH DWE mode");
+        assert!(gdtf.modes[mi].emitters.len() > 1, "multi-emitter blinder");
+        let fp = gdtf.modes[mi].footprint as u16;
+        let garc = Arc::new(gdtf);
+
+        let dimmer_at = |level: u8| -> f32 {
+            let mut fixture = Fixture::from_gdtf(garc.clone(), "B", Vec3::ZERO);
+            fixture.mode_index = mi;
+            fixture.sync_mode();
+            fixture.optics.dimmer = 0.0;
+            let mut levels = [0u8; 512];
+            levels[0] = level; // the single Master Dimmer channel
+            let snap = snapshot_with(1, levels);
+            let patch = one_patch(1, 1, fp, mi);
+            let mut fx = vec![fixture];
+            let mut live = Vec::new();
+            apply(&mut fx, &patch, &snap, &mut live, Duration::from_secs(2));
+            fx[0].optics.dimmer
+        };
+        // Master parked at 0 must stay a real blackout (the regression: the
+        // layered-dimmer fix forced it to 1.0 and the blinder blasted white).
+        assert!(dimmer_at(0) < 1e-3, "colourless blinder at master 0 must be dark, got {}", dimmer_at(0));
+        // And it must track the master up — no 0→full discontinuity.
+        assert!((dimmer_at(255) - 1.0).abs() < 1e-3, "master full lights it, got {}", dimmer_at(255));
+        assert!((dimmer_at(128) - 128.0 / 255.0).abs() < 1e-2, "master mid tracks linearly, got {}", dimmer_at(128));
     }
 
     /// Load a GDTF member from the Basic Festival MVR (repo `.context` copy first,
