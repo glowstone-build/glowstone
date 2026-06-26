@@ -71,6 +71,16 @@ pub mod icon {
     pub const N_PANEL: &str = p::SIDEBAR_SIMPLE;
     pub const T_PANEL: &str = p::TOOLBOX;
 
+    // Render (still-image / animation render + the Render dock tab).
+    pub const RENDER: &str = p::IMAGE;
+    pub const RENDER_GO: &str = p::PLAY;
+    pub const RENDER_STOP: &str = p::STOP_CIRCLE;
+    pub const ANIMATION: &str = p::FILM_STRIP;
+    pub const SAVE_IMAGE: &str = p::FLOPPY_DISK;
+    pub const FULLSCREEN: &str = p::CORNERS_OUT;
+    pub const FULLSCREEN_EXIT: &str = p::CORNERS_IN;
+    pub const TIMER: &str = p::TIMER;
+
     // Viewport tool rail (§2.4 ActiveTool). X=red/Y=green/Z=blue gizmo handle
     // colours live on `Axis::color` (mod.rs); these are just the rail glyphs.
     pub const TOOL_SELECT: &str = p::CURSOR;

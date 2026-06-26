@@ -10,6 +10,7 @@ mod gdtf;
 mod mvr;
 mod ndi;
 mod optics;
+mod render_job;
 mod renderer;
 mod scene;
 mod share;

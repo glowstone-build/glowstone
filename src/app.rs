@@ -10,6 +10,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
+use crate::render_job::RenderJob;
 use crate::renderer::Renderer;
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::Scene;
@@ -45,6 +46,24 @@ struct State {
     /// would return out-of-date (`Validation` on Vulkan/Windows) every frame and
     /// eventually poison the device — so we skip rendering entirely until restored.
     minimized: bool,
+    /// The scene animation clock (seconds) — the single logical time that drives
+    /// fog drift + beam/wheel motion in the renderer. Advanced by `dt` each live
+    /// frame; FROZEN while a still render converges so the render is a clean
+    /// snapshot (the renderer no longer reads wall-clock time).
+    anim_time: f32,
+    /// Frames to wait before the next dynamic-resolution adjustment, so the
+    /// smoothed fps settles after each scale change instead of hunting.
+    auto_res_cooldown: u32,
+    /// The in-progress still render, if any. While `Some`, the offscreen render
+    /// runs into a separate target + all scene motion + the anim clock are frozen
+    /// so the temporal accumulation converges; cleared on completion/cancel.
+    render_job: Option<RenderJob>,
+    /// Whether the OS window is currently fullscreen (toggled by F11 / the
+    /// viewport header button / View menu).
+    fullscreen: bool,
+    /// The GPU backend selection last persisted to the global pref (so a dropdown
+    /// change writes + toasts once, not every frame). Seeded to the active backend.
+    gpu_pref_written: String,
 }
 
 #[derive(Default)]
@@ -100,7 +119,23 @@ impl ApplicationHandler for App {
             fps: 0.0,
             awake: true,
             minimized: false,
+            anim_time: 0.0,
+            auto_res_cooldown: 0,
+            render_job: None,
+            fullscreen: false,
+            gpu_pref_written: String::new(),
         });
+
+        // Publish the GPU backend + available backends to the UI (the Engine ▸
+        // Backend dropdown), and seed the pref tracker so a later change writes once.
+        {
+            let s = self.state.as_mut().unwrap();
+            let active = s.renderer.active_backend_label().to_string();
+            s.ui.render.gpu_available = s.renderer.available_backend_labels();
+            s.ui.render.gpu_active = active.clone();
+            s.ui.render.gpu_selected = active.clone();
+            s.gpu_pref_written = active;
+        }
 
         // Profiling: PREVIZ_STEPS overrides the volumetric max step budget.
         if let Some(s) = std::env::var("PREVIZ_STEPS").ok().and_then(|s| s.parse().ok()) {
@@ -591,6 +626,43 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // Headless still-render: PREVIZ_RENDER=path.png drives the REAL render-job
+        // path (the dedicated offscreen target + multi-frame temporal accumulation +
+        // readback) end-to-end and writes the result — verifying the F12 render
+        // pipeline without the interactive loop. Honours PREVIZ_RES / PREVIZ_CAM_*.
+        if let Ok(path) = std::env::var("PREVIZ_RENDER") {
+            let state = self.state.as_mut().unwrap();
+            apply_cam_env(&mut state.camera);
+            if let Some((w, h)) = std::env::var("PREVIZ_RES").ok().and_then(|r| {
+                let (w, h) = r.split_once('x')?;
+                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+            }) {
+                state.scene.render.res_x = w.max(16);
+                state.scene.render.res_y = h.max(16);
+                state.scene.render.resolution_percentage = 100;
+            }
+            state.scene.snap_movement();
+            state.camera.skip_anim();
+            let res = state.scene.render.output_size();
+            let settings = state.scene.render.render_settings(&state.ui.settings);
+            let total = state.scene.render.max_samples.max(1);
+            state.renderer.ensure_render_view(res);
+            for _ in 0..total {
+                state.renderer.record_render_view(&state.scene, &state.camera, &settings);
+            }
+            match state.renderer.read_render_view_ldr().and_then(|(w, h, px)| {
+                image::RgbaImage::from_raw(w, h, px).map(|img| (w, h, img))
+            }) {
+                Some((w, h, img)) => match img.save(&path) {
+                    Ok(()) => log::info!("wrote render {path} ({w}x{h}, {total} samples)"),
+                    Err(e) => log::error!("failed to write {path}: {e}"),
+                },
+                None => log::error!("render readback failed"),
+            }
+            event_loop.exit();
+            return;
+        }
+
         // Headless benchmark: PREVIZ_BENCH=N times N offscreen frames.
         if let Ok(n) = std::env::var("PREVIZ_BENCH") {
             let n: u32 = n.parse().unwrap_or(120);
@@ -1008,7 +1080,9 @@ fn render_anim_sequence(state: &mut State, dir: &str) {
         }
     }
     state.scene.snap_movement(); // settle tilt before the (wheel-only) sequence
+    let mut t = 0.0_f32;
     for frame in 0..6 {
+        state.renderer.set_anim_time(t); // fog + beams animate with the sequence
         let (w, h, px) = state
             .renderer
             .capture(&state.scene, &state.camera, &state.ui.settings);
@@ -1018,6 +1092,7 @@ fn render_anim_sequence(state: &mut State, dir: &str) {
         // Advance ~0.33 s of motion between captured frames.
         for _ in 0..3 {
             state.scene.advance(0.11);
+            t += 0.11;
         }
     }
     log::info!("anim: wrote 6 frames to {dir}");
@@ -1058,13 +1133,16 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
     cam.pitch = 0.12;
     cam.distance = 4.2;
     cam.yaw = 0.7;
+    let mut t = 0.0_f32;
     for frame in 0..10 {
+        state.renderer.set_anim_time(t);
         let (w, h, px) = state.renderer.capture(&state.scene, &cam, &state.ui.settings);
         if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
             let _ = img.save(format!("{dir}/wheel_{frame:02}.png"));
         }
         // ~0.05 s between frames → catch the wheel mid-travel (split + gap sweep).
         state.scene.advance(0.05);
+        t += 0.05;
     }
     log::info!("wheel: wrote 10 frames to {dir}");
 }
@@ -1136,6 +1214,36 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     }
     if std::env::var("PREVIZ_UI_SELECT").is_ok() {
         state.ui.debug_select_first_gdtf(&state.scene);
+    }
+    if std::env::var("PREVIZ_UI_WORLD").is_ok() {
+        state.ui.debug_select_world();
+    }
+    if std::env::var("PREVIZ_UI_RENDERTAB").is_ok() {
+        state.ui.ensure_render_tab_focused();
+    }
+    // PREVIZ_UI_RENDERING=<sample> populates a mid-render state on the Render tab so
+    // the Blender-style tile reveal can be screenshotted: render a few frames into
+    // the offscreen target for real content, then publish a Rendering status.
+    if let Ok(s) = std::env::var("PREVIZ_UI_RENDERING") {
+        use crate::ui::{RenderPhase, RenderStatus};
+        state.ui.ensure_render_tab_focused();
+        state.scene.snap_movement();
+        let res = state.scene.render.output_size();
+        let settings = state.scene.render.render_settings(&state.ui.settings);
+        state.renderer.ensure_render_view(res);
+        for _ in 0..8 {
+            state.renderer.record_render_view(&state.scene, &state.camera, &settings);
+        }
+        let total = state.scene.render.max_samples.max(1);
+        let sample = s.parse::<u32>().unwrap_or(total / 2).min(total);
+        state.ui.render.preview_tex = state.renderer.render_view_texture();
+        state.ui.render.status = RenderStatus {
+            phase: RenderPhase::Rendering,
+            sample,
+            total,
+            elapsed_s: 14.0,
+            res,
+        };
     }
     if let Ok(n) = std::env::var("PREVIZ_UI_SELECT_N") {
         state.ui.debug_select_n(&state.scene, n.parse().unwrap_or(4));
@@ -1229,17 +1337,32 @@ impl State {
         }
         let fps = self.fps;
 
+        // A still render is converging: freeze ALL scene motion (DMX decode, live
+        // video, cues, camera + wheel/slew advance) so the camera + rig stay static
+        // and the renderer's temporal accumulation keeps converging instead of
+        // resetting every frame. The job is cleared on completion/cancel, after
+        // which the live preview resumes normally.
+        let job_active = self.render_job.is_some();
+
+        // Dynamic resolution: nudge the live render scale toward the fps target
+        // (live preview only — a still render always uses its own native scale).
+        if !job_active {
+            self.auto_resolution_step();
+        }
+
         // Live DMX: apply any deferred connectivity command, pull the latest
         // universes from the receive thread, and decode them into the fixtures —
         // BEFORE advancing motion, so DMX-driven spin values feed this frame's
         // wheel-motion integration.
         self.dmx.apply_pending();
         self.dmx.poll();
-        self.dmx.decode(&mut self.scene);
+        if !job_active {
+            self.dmx.decode(&mut self.scene);
+        }
 
         // Live CITP/MSEX: pump media-server stream frames onto CITP-sourced LED
         // walls (lazily starting the discovery/stream client on first use).
-        {
+        if !job_active {
             use crate::scene::screen::ScreenContent;
             let citp_sources: Vec<String> = self
                 .scene
@@ -1275,7 +1398,7 @@ impl State {
 
         // Live NDI: pump received frames onto NDI-sourced LED walls (lazily
         // starting the receive client; a no-op stub without the `ndi` feature).
-        {
+        if !job_active {
             use crate::scene::screen::ScreenContent;
             let ndi_sources: Vec<String> = self
                 .scene
@@ -1311,17 +1434,24 @@ impl State {
 
         // Crossfade any in-progress cue AFTER DMX decode (so an offline cue
         // overrides the rest state) and BEFORE motion advance (so its pan/tilt
-        // feeds this frame's slew).
-        self.ui.tick_cues(&mut self.scene, dt);
+        // feeds this frame's slew). Frozen while a still render converges.
+        if !job_active {
+            self.ui.tick_cues(&mut self.scene, dt);
 
-        // Advance any in-flight eased camera transition (canned-view / frame /
-        // pie jump). The app already drives continuous redraws, so a running
-        // transition simply settles over the next handful of frames.
-        self.camera.advance(dt);
+            // Advance any in-flight eased camera transition (canned-view / frame /
+            // pie jump). The app already drives continuous redraws, so a running
+            // transition simply settles over the next handful of frames.
+            self.camera.advance(dt);
 
-        // Advance time-based wheel motion once per real frame (not in the
-        // renderer, which also runs for headless capture).
-        self.scene.advance(dt);
+            // Advance time-based wheel motion once per real frame (not in the
+            // renderer, which also runs for headless capture).
+            self.scene.advance(dt);
+
+            // Advance the renderer's animation clock by the SAME dt, so fog drift +
+            // beam animation track the logical scene time (not wall-clock). Frozen
+            // here while a render converges → the render is a static snapshot.
+            self.anim_time += dt;
+        }
 
         // Crash-recovery autosave (debounced inside; writes to the cache dir).
         self.ui.autosave_tick(&self.scene, &self.camera, &self.dmx, dt);
@@ -1342,6 +1472,10 @@ impl State {
         // fills frame_ms (GPU passes overlap, so the header uses the CPU timer).
         let mut perf_timings = self.renderer.last_timings;
         perf_timings.frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+
+        // Publish render-active state so the UI freezes scene edits while a still
+        // render converges (the inspector goes read-only; deferred mutations wait).
+        self.ui.render_active = self.render_job.is_some();
 
         // Build the UI. The closure borrows the scene/camera/ui fields; egui_ctx
         // is a separate (cloned) handle so there's no borrow conflict.
@@ -1367,8 +1501,30 @@ impl State {
             std::mem::take(&mut full_output.platform_output),
         );
 
-        // Match the offscreen 3D target to the size the viewport panel wants.
-        self.renderer.resize_viewport(self.ui.requested_viewport_px);
+        // Window fullscreen toggle (F11 / header button / View menu) — only the app
+        // can reach the winit window.
+        if std::mem::take(&mut self.ui.pending_fullscreen_toggle) {
+            self.fullscreen = !self.fullscreen;
+            let fs = self
+                .fullscreen
+                .then(|| winit::window::Fullscreen::Borderless(None));
+            self.window.set_fullscreen(fs);
+        }
+
+        // GPU backend dropdown changed — persist the global preference (takes effect
+        // on the next launch; switching backends means recreating the device/surface).
+        let sel = self.ui.render.gpu_selected.clone();
+        if !sel.is_empty() && sel != self.gpu_pref_written {
+            crate::renderer::write_gpu_pref(&sel);
+            self.gpu_pref_written = sel.clone();
+            if sel != self.ui.render.gpu_active {
+                self.ui
+                    .notify_success(format!("GPU backend set to {sel} — restart previz to apply"));
+            }
+        }
+
+        // Render command raised by the UI this frame (inspector / Render tab / F12).
+        self.handle_render_request();
 
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -1376,6 +1532,31 @@ impl State {
             pixels_per_point: full_output.pixels_per_point,
         };
 
+        if let Some(job) = self.render_job.as_ref() {
+            // RENDER PATH: record one frame of the scene into the SEPARATE offscreen
+            // target (the live viewport is untouched — its tab keeps its last frame),
+            // then present egui without re-recording the live scene. Use the camera
+            // SNAPSHOT so live-camera moves can't reset the render's accumulation.
+            let (res, settings, cam, t) = (job.res, job.settings, job.camera.clone(), job.anim_time);
+            // FROZEN animation clock — every accumulation frame renders the fog +
+            // beams at the exact instant the render started (no drift mid-render).
+            self.renderer.set_anim_time(t);
+            self.renderer.ensure_render_view(res);
+            let rendered = self.renderer.record_render_view(&self.scene, &cam, &settings);
+            self.window.pre_present_notify();
+            let presented = self.renderer.present_egui_only(
+                &paint_jobs,
+                &full_output.textures_delta,
+                &screen_descriptor,
+            );
+            self.step_render_job(rendered);
+            return presented;
+        }
+
+        // LIVE PATH: track the viewport panel's requested size + live look, and the
+        // logical animation clock (fog drift + beams advance with the scene time).
+        self.renderer.set_anim_time(self.anim_time);
+        self.renderer.resize_viewport(self.ui.requested_viewport_px);
         self.window.pre_present_notify();
         self.renderer.render(
             &self.scene,
@@ -1386,5 +1567,182 @@ impl State {
             &full_output.textures_delta,
             &screen_descriptor,
         )
+    }
+
+    /// Dynamic resolution: nudge `render_scale` toward the fps target — drop it
+    /// fast when the frame rate sags, recover quality slowly when there's headroom.
+    /// A dead-zone + a short cooldown (so the smoothed fps settles after each change)
+    /// keep it from hunting. Live preview only; clamped to `[0.25, 1.0]`.
+    fn auto_resolution_step(&mut self) {
+        if !self.ui.settings.auto_resolution {
+            return;
+        }
+        if self.auto_res_cooldown > 0 {
+            self.auto_res_cooldown -= 1;
+            return;
+        }
+        let fps = self.fps;
+        if fps <= 1.0 {
+            return; // fps EMA not warmed up yet
+        }
+        let target = self.ui.settings.fps_target.clamp(15.0, 240.0);
+        let scale = self.ui.settings.render_scale;
+        let next = if fps < target * 0.90 {
+            scale - 0.05 // sagging → drop resolution fast
+        } else if fps >= target * 0.98 && scale < 1.0 {
+            scale + 0.05 // comfortable headroom → recover quality
+        } else {
+            scale // inside the dead-zone → hold
+        };
+        let next = (next.clamp(0.25, 1.0) * 20.0).round() / 20.0;
+        if (next - scale).abs() > 1e-4 {
+            self.ui.settings.render_scale = next;
+            self.auto_res_cooldown = 8; // let the fps EMA settle before re-adjusting
+        }
+    }
+
+    /// Act on a render command raised by the UI (Start / Cancel / Save). Start
+    /// snaps the rig to its commanded pose, settles the camera, and spins up a
+    /// fresh [`RenderJob`]; the Render tab is focused by the UI side.
+    fn handle_render_request(&mut self) {
+        use crate::ui::{RenderPhase, RenderRequest, RenderStatus};
+        match self.ui.render.request.take() {
+            Some(RenderRequest::Start) => {
+                self.scene.snap_movement();
+                self.camera.skip_anim();
+                self.ui.render.image = None;
+                self.ui.render.result_tex = None;
+                let job = RenderJob::new(
+                    &self.scene.render,
+                    &self.ui.settings,
+                    &self.camera,
+                    self.anim_time,
+                    Instant::now(),
+                );
+                self.ui.render.status = RenderStatus {
+                    phase: RenderPhase::Rendering,
+                    sample: 0,
+                    total: job.total,
+                    elapsed_s: 0.0,
+                    res: job.res,
+                };
+                self.render_job = Some(job);
+            }
+            Some(RenderRequest::Cancel) => {
+                self.render_job = None;
+                self.renderer.free_render_view();
+                self.ui.render.preview_tex = None;
+                self.ui.render.status = RenderStatus::default();
+            }
+            Some(RenderRequest::Save { copy }) => self.save_render(copy),
+            None => {}
+        }
+    }
+
+    /// Advance the active render job by one rendered frame; on reaching the sample
+    /// target, read the converged plate back, upload it for the preview, optionally
+    /// auto-save it, and freeze a `Complete` status. `rendered` is whether the
+    /// offscreen target actually recorded a frame this tick (it advances the EMA).
+    fn step_render_job(&mut self, rendered: bool) {
+        use crate::ui::{RenderPhase, RenderStatus};
+
+        // Publish the live render-target texture so the Render tab shows the
+        // converging image (with its Blender-style tile reveal driven off the status).
+        self.ui.render.preview_tex = self.renderer.render_view_texture();
+
+        let (sample, total, res, elapsed) = {
+            let job = self.render_job.as_mut().expect("job present");
+            if rendered {
+                job.sample += 1;
+            }
+            (job.sample, job.total, job.res, job.elapsed_s())
+        };
+        // The next frame is re-armed in `about_to_wait` while the window is awake,
+        // so the accumulation keeps converging frame-by-frame without an explicit
+        // (and, per that handler, unreliable) redraw request from in here.
+
+        if sample < total {
+            self.ui.render.status = RenderStatus {
+                phase: RenderPhase::Rendering,
+                sample,
+                total,
+                elapsed_s: elapsed,
+                res,
+            };
+            return;
+        }
+
+        // Done — grab the job's save params, drop it, read back the finished plate
+        // from the OFFSCREEN render target (not the live viewport).
+        let (write_on_done, out_path, format) = {
+            let job = self.render_job.as_ref().expect("job present");
+            (job.write_on_done, job.out_path.clone(), job.format)
+        };
+        self.render_job = None;
+
+        let readback = self.renderer.read_render_view_ldr();
+        self.renderer.free_render_view();
+        self.ui.render.preview_tex = None;
+
+        if let Some((w, h, px)) = readback
+            && let Some(img) = image::RgbaImage::from_raw(w, h, px)
+        {
+            let color =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+            let tex = self
+                .egui_ctx
+                .load_texture("render-result", color, egui::TextureOptions::LINEAR);
+            self.ui.render.result_tex = Some(tex);
+
+            if write_on_done {
+                let path = std::path::PathBuf::from(&out_path);
+                match crate::ui::save_image(&img, &path, format) {
+                    Ok(()) => self.ui.notify_success(format!("Saved render → {}", path.display())),
+                    Err(e) => self.ui.notify_error(format!("Save render failed: {e}")),
+                }
+            }
+            self.ui
+                .notify_success(format!("Render complete — {total} samples · {elapsed:.1}s"));
+            self.ui.render.image = Some(img);
+        } else {
+            self.ui.notify_error("Render readback failed");
+        }
+
+        self.ui.render.status = RenderStatus {
+            phase: RenderPhase::Complete,
+            sample: total,
+            total,
+            elapsed_s: elapsed,
+            res,
+        };
+    }
+
+    /// Save the finished render to a user-chosen file. `copy` = "Save a Copy"
+    /// (don't update the remembered output path). Seeds the dialog from the
+    /// render config's format + remembered path.
+    fn save_render(&mut self, copy: bool) {
+        let Some(img) = self.ui.render.image.clone() else {
+            return;
+        };
+        let fmt = self.scene.render.format;
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter(fmt.label(), &[fmt.ext()])
+            .set_file_name(crate::ui::default_filename(&self.scene.render));
+        if let Some(dir) = std::path::Path::new(&self.scene.render.out_path).parent() {
+            if dir.is_dir() {
+                dialog = dialog.set_directory(dir);
+            }
+        }
+        if let Some(path) = dialog.save_file() {
+            match crate::ui::save_image(&img, &path, fmt) {
+                Ok(()) => {
+                    if !copy {
+                        self.scene.render.out_path = path.to_string_lossy().into_owned();
+                    }
+                    self.ui.notify_success(format!("Saved render → {}", path.display()));
+                }
+                Err(e) => self.ui.notify_error(format!("Save failed: {e}")),
+            }
+        }
     }
 }
