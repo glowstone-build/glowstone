@@ -77,7 +77,16 @@ pub struct InspectorState {
     /// follows the live selection. Per-session — never persisted.
     #[serde(skip)]
     pub pinned: Option<crate::scene::EntityId>,
+    /// Inspector panel content width, captured once per frame (transient). Drives the
+    /// FIXED 2-column row layout (label column `INSPECTOR_LABEL_W` + a value cell that
+    /// fills the rest) so every section's columns line up and nothing overflows.
+    #[serde(skip)]
+    pub panel_w: f32,
 }
+
+/// Width of the inspector's fixed LABEL column (Blender-style 2-column rows). Every
+/// section uses it so the value column starts at the same x everywhere.
+const INSPECTOR_LABEL_W: f32 = 96.0;
 
 impl InspectorState {
     /// Load the persisted collapse map (config dir); missing/garbled ⇒ default.
@@ -1673,10 +1682,17 @@ fn reset_arrow(ui: &mut egui::Ui, differs: bool) -> bool {
 /// widget in the next column; the caller resets on a `true` return.
 fn prop_label(ui: &mut egui::Ui, label: &str, differs: bool) -> bool {
     let mut clicked = false;
-    ui.horizontal(|ui| {
-        clicked = reset_arrow(ui, differs);
-        ui.label(label);
-    });
+    let h = ui.spacing().interact_size.y;
+    // Fixed-width label cell so EVERY section's first column lines up (the Blender
+    // 2-column inspector). Reset gutter + label, the label truncated to the cell.
+    ui.allocate_ui_with_layout(
+        egui::vec2(INSPECTOR_LABEL_W, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            clicked = reset_arrow(ui, differs);
+            ui.add(egui::Label::new(label).truncate());
+        },
+    );
     clicked
 }
 
@@ -1695,10 +1711,46 @@ fn row(
     if !state.row_shown(label, differs) {
         return false;
     }
-    let clicked = prop_label(ui, label, differs);
-    value(ui);
-    ui.end_row();
+    let mut clicked = false;
+    field_row(
+        ui,
+        state.panel_w,
+        |ui| {
+            clicked = reset_arrow(ui, differs);
+            ui.add(egui::Label::new(label).truncate());
+        },
+        value,
+    );
     clicked
+}
+
+/// The fixed 2-column inspector ROW layout (Blender-style): a fixed-width LABEL cell
+/// + a VALUE cell that FILLS its width (justified) — so every section's columns line
+/// up at the same x AND no widget (slider / field / combo) can overflow the panel.
+/// The draggable DragValue/Slider input is untouched; widgets just fill the cell now.
+/// Call inside a 2-column `Grid` (adds both cells + `end_row`); `panel_w` is
+/// [`InspectorState::panel_w`]. Used by `row` AND the optics/wheel sliders that build
+/// their own value widget. 48 ≈ category indent + grid spacing + a right margin, so
+/// the value cell ends ~18px short of the panel edge (symmetric with the left).
+fn field_row(
+    ui: &mut egui::Ui,
+    panel_w: f32,
+    label: impl FnOnce(&mut egui::Ui),
+    value: impl FnOnce(&mut egui::Ui),
+) {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(INSPECTOR_LABEL_W, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        label,
+    );
+    let value_w = (panel_w - INSPECTOR_LABEL_W - 48.0).max(70.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(value_w, h),
+        egui::Layout::top_down_justified(egui::Align::Min),
+        value,
+    );
+    ui.end_row();
 }
 
 /// Render one Inspector **category** (S1): a `CollapsingHeader` whose open/closed
@@ -1933,6 +1985,9 @@ fn inspector_body(
     // slider bar to it (floored so it stays grabbable).
     ui.set_max_width(ui.available_width());
     let avail = ui.available_width();
+    // Capture the panel width once so every fixed 2-column row (label + value cell)
+    // lines up + fits, whatever the section.
+    state.panel_w = avail;
     ui.spacing_mut().slider_width = (avail - 140.0).clamp(60.0, 220.0);
     // Tighten the inter-widget gap + the min interactive width so the multi-field
     // rows (Position/Rotation x/y/z DragValues, the colour well) pack into the
@@ -2388,7 +2443,7 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
             // Size the x/y/z fields to the value column so all THREE fit a narrow
             // inspector (a default DragValue grows to its content, overflowing + clipping
             // z; add_sized pins each field so the row never spills past the panel edge).
-            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
             let fh = ui.spacing().interact_size.y;
             Grid::new("fx-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 // Position has no template default → kept arrow-free.
@@ -2514,7 +2569,7 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut I
         true,
         &["Center", "Size"],
         |ui, fs| {
-            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
             let fh = ui.spacing().interact_size.y;
             Grid::new("env-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 row(ui, fs, "Center", false, |ui| {
@@ -2640,7 +2695,7 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
         true,
         &["Position", "Rotation", "Scale"],
         |ui, fs| {
-            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
             let fh = ui.spacing().interact_size.y;
             Grid::new("geo-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 row(ui, fs, "Position", false, |ui| {
@@ -2732,7 +2787,7 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
         true,
         &["Position", "Rotation", "Scale"],
         |ui, fs| {
-            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
             let fh = ui.spacing().interact_size.y;
             Grid::new("led-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 row(ui, fs, "Position", false, |ui| {
@@ -3189,7 +3244,7 @@ fn gdtf_inspector(
         &["Position", "Rotation", "Move speed"],
         |ui, fs| {
             // Size x/y/z fields to the value column so all three fit a narrow inspector.
-            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
             let fh = ui.spacing().interact_size.y;
             Grid::new("gdtf-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 // Position = the rig HANG placement (Pan/Tilt moved to Fixture).
@@ -3433,31 +3488,37 @@ fn optic_field_row(
     // nothing — e.g. beam shaping with the dimmer at 0) is greyed AND disabled,
     // so it reads as present-but-not-acting rather than absent.
     let enabled = enabled && !inert;
-    let resp = ui.horizontal(|ui| {
-        let reset = reset_arrow(ui, differs);
-        // Grey the label of an inert control so the whole row reads disabled.
-        let text = if inert { RichText::new(f.label()).weak() } else { RichText::new(f.label()) };
-        let lbl = ui.label(text);
-        (reset, lbl)
-    });
-    let (reset, lbl) = resp.inner;
-    if reset {
-        f.set(o, f.get(def));
-    }
-    if inert {
-        lbl.on_hover_text("Inactive at the current settings (no light to shape)");
-    } else if f == OpticField::Green {
-        lbl.on_hover_text("Plus/minus-green (CC axis): −1 magenta … +1 green");
-    }
     let mut v = f.get(o);
     let mut slider = Slider::new(&mut v, f.range());
     if let Some(t) = text {
         slider = slider.text(t);
     }
-    if ui.add_enabled(enabled, slider).changed() {
+    let mut reset = false;
+    let mut changed = false;
+    field_row(
+        ui,
+        state.panel_w,
+        |ui| {
+            reset = reset_arrow(ui, differs);
+            // Grey the label of an inert control so the whole row reads disabled.
+            let text = if inert { RichText::new(f.label()).weak() } else { RichText::new(f.label()) };
+            let lbl = ui.add(egui::Label::new(text).truncate());
+            if inert {
+                lbl.on_hover_text("Inactive at the current settings (no light to shape)");
+            } else if f == OpticField::Green {
+                lbl.on_hover_text("Plus/minus-green (CC axis): −1 magenta … +1 green");
+            }
+        },
+        |ui| {
+            changed = ui.add_enabled(enabled, slider).changed();
+        },
+    );
+    if changed {
         f.set(o, v);
     }
-    ui.end_row();
+    if reset {
+        f.set(o, f.get(def));
+    }
 }
 
 fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, state: &mut InspectorState) {
@@ -3595,26 +3656,33 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                             .as_deref()
                             .map(|n| format!("{} · {n}", comp.attribute))
                             .unwrap_or_else(|| comp.attribute.clone());
-                        ui.label(RichText::new(name).strong());
-                        ui.add(Slider::new(&mut w.value, 0.0..=1.0).text(value_label));
-                        ui.end_row();
+                        field_row(
+                            ui,
+                            fs.panel_w,
+                            |ui| {
+                                ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
+                            },
+                            |ui| {
+                                ui.add(Slider::new(&mut w.value, 0.0..=1.0).text(value_label));
+                            },
+                        );
                         // Prism always exposes rotation (index + spin) even when the
                         // profile didn't flag a dedicated Pos/PosRotate function.
                         if comp.has_index || comp.kind == WheelKind::Prism {
-                            ui.label("  index");
-                            ui.add(Slider::new(&mut w.index, 0.0..=1.0));
-                            ui.end_row();
+                            field_row(ui, fs.panel_w, |ui| { ui.label("index"); }, |ui| {
+                                ui.add(Slider::new(&mut w.index, 0.0..=1.0));
+                            });
                         }
                         if comp.has_spin || matches!(comp.kind, WheelKind::Color | WheelKind::Animation | WheelKind::Prism) {
-                            ui.label("  spin");
-                            ui.add(Slider::new(&mut w.spin, 0.0..=1.0).text("0.5=stop"));
-                            ui.end_row();
+                            field_row(ui, fs.panel_w, |ui| { ui.label("spin"); }, |ui| {
+                                ui.add(Slider::new(&mut w.spin, 0.0..=1.0).text("0.5=stop"));
+                            });
                         }
                         if matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) {
-                            ui.label("  shake");
-                            ui.add(Slider::new(&mut w.shake, 0.0..=1.0))
-                                .on_hover_text("Oscillate the indexed element");
-                            ui.end_row();
+                            field_row(ui, fs.panel_w, |ui| { ui.label("shake"); }, |ui| {
+                                ui.add(Slider::new(&mut w.shake, 0.0..=1.0))
+                                    .on_hover_text("Oscillate the indexed element");
+                            });
                         }
                     }
                 });
@@ -5216,8 +5284,15 @@ pub fn viewport(
     if prefs.show_gizmos {
         // Cluster centre: top-right corner, inset by its radius (+ a little margin)
         // and tucked below the active-selection label that lives up there.
+        // Align the cluster's RIGHT edge with the selection-label pill above it: the
+        // pill sits at `rect.right - 10`, and the rightmost BALL reaches
+        // `center.x + GIZMO_RADIUS + BALL_RADIUS`, so inset by R + BALL_RADIUS + 10.
+        // Dropped further down (R + 46) so the balls clear the pill's bottom.
         let center = rect.right_top()
-            + egui::vec2(-(nav_gizmo::GIZMO_RADIUS + 12.0), nav_gizmo::GIZMO_RADIUS + 34.0);
+            + egui::vec2(
+                -(nav_gizmo::GIZMO_RADIUS + nav_gizmo::BALL_RADIUS + 10.0),
+                nav_gizmo::GIZMO_RADIUS + 46.0,
+            );
         let balls = nav_gizmo::balls(camera, center);
         let hover_pos = ui.input(|i| i.pointer.hover_pos());
         let hovered = hover_pos.and_then(|p| nav_gizmo::hit_test(&balls, p));
