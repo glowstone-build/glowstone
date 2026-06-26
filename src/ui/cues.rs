@@ -296,13 +296,13 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
             engine.go(scene);
         }
         match engine.current.and_then(|c| engine.cues.get(c)) {
-            Some(cue) => ui.label(RichText::new(format!("▶ {}", cue.name)).small().color(accent)),
+            Some(cue) => ui.label(RichText::new(format!("{}  {}", theme::icon::PLAY, cue.name)).small().color(accent)),
             None => ui.label(RichText::new("—").small().weak()),
         };
     });
     if let Some((to, p)) = engine.fading_progress() {
         let name = engine.cues.get(to).map(|c| c.name.as_str()).unwrap_or("");
-        ui.add(egui::ProgressBar::new(p).desired_height(6.0).text(RichText::new(format!("→ {name}")).small()));
+        ui.add(egui::ProgressBar::new(p).desired_height(6.0).text(RichText::new(format!("{}  {name}", theme::icon::ARROW_RIGHT)).small()));
     }
     ui.separator();
 

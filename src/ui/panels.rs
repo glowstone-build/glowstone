@@ -568,13 +568,13 @@ struct LibRow {
     source: Option<crate::gdtf::FixtureSource>,
 }
 
-/// Draw a small colour-coded provenance chip ("● GDTF Share" / "MVR" / …) so a
+/// Draw a small colour-coded provenance chip ("• GDTF Share" / "MVR" / …) so a
 /// fixture's origin reads at a glance in the library + Replace lists (bug 11). A
 /// coloured dot + label keeps it legible at small sizes without a heavy box.
 pub(crate) fn source_chip(ui: &mut egui::Ui, source: crate::gdtf::FixtureSource) {
     let [r, g, b] = source.color_rgb();
     ui.label(
-        egui::RichText::new(format!("● {}", source.label()))
+        egui::RichText::new(format!("• {}", source.label()))
             .size(9.0)
             .color(Color32::from_rgb(r, g, b)),
     );
@@ -1106,7 +1106,7 @@ fn library_row_widget(
         painter.text(
             egui::pos2(rect.right() - 36.0, rect.top() + 24.0),
             egui::Align2::RIGHT_CENTER,
-            format!("● {}", src.label()),
+            format!("• {}", src.label()),
             egui::FontId::proportional(9.0),
             Color32::from_rgb(cr, cg, cb),
         );
@@ -4939,10 +4939,10 @@ pub fn connectivity(
             };
             ui.colored_label(
                 theme::OK,
-                format!("● {bound} · {} source(s)", status.sources.len()),
+                format!("• {bound} · {} source(s)", status.sources.len()),
             );
         } else {
-            ui.colored_label(theme::IDLE, "○ stopped");
+            ui.colored_label(theme::IDLE, "• stopped");
         }
     });
     ui.separator();
@@ -5126,9 +5126,9 @@ pub fn dmx_universe_grid(
             }
             if live {
                 let n = snapshot.frames.get(&u).map(|f| f.sources).unwrap_or(0);
-                ui.colored_label(theme::OK, format!("● {n} src"));
+                ui.colored_label(theme::OK, format!("• {n} src"));
             } else {
-                ui.colored_label(ink.muted, "○ idle");
+                ui.colored_label(ink.muted, "• idle");
             }
         });
     });

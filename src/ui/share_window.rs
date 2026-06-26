@@ -336,8 +336,8 @@ fn row_action(
         }
         RowStatus::Cached => {
             if ui
-                .add(Button::new(RichText::new(format!("{}  Download to library", theme::icon::ADD)).color(egui::Color32::BLACK)).fill(accent))
-                .on_hover_text("Add this fixture to the project Library (already downloaded). Place it from the Library panel.")
+                .add(Button::new(RichText::new(format!("{}  Add to project", theme::icon::ADD)).color(egui::Color32::BLACK)).fill(accent))
+                .on_hover_text("Add this fixture to the project library (already downloaded). Place it from the Library panel.")
                 .clicked()
             {
                 add_clicks.push(rid);
@@ -356,8 +356,8 @@ fn row_action(
         RowStatus::Cloud => {
             let enabled = share.logged_in;
             if ui
-                .add_enabled(enabled, Button::new(format!("{}  Download to library", theme::icon::CLOUD)))
-                .on_hover_text(if enabled { "Download this fixture into the project Library. Place it from the Library panel." } else { "Sign in to download" })
+                .add_enabled(enabled, Button::new(format!("{}  Download", theme::icon::CLOUD)))
+                .on_hover_text(if enabled { "Download this fixture into the project library, then place it from the Library panel." } else { "Sign in to download" })
                 .clicked()
             {
                 add_clicks.push(rid);

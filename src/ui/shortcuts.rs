@@ -1210,10 +1210,10 @@ pub fn key_label(t: &Trigger) -> String {
 /// Display name for a single [`egui::Key`] (the named ones the table uses).
 fn key_name(key: egui::Key) -> String {
     match key {
-        Key::ArrowLeft => "←".into(),
-        Key::ArrowRight => "→".into(),
-        Key::ArrowUp => "↑".into(),
-        Key::ArrowDown => "↓".into(),
+        Key::ArrowLeft => super::theme::icon::ARROW_LEFT.into(),
+        Key::ArrowRight => super::theme::icon::ARROW_RIGHT.into(),
+        Key::ArrowUp => super::theme::icon::ARROW_UP.into(),
+        Key::ArrowDown => super::theme::icon::ARROW_DOWN.into(),
         Key::PageUp => "PageUp".into(),
         Key::PageDown => "PageDown".into(),
         Key::Home => "Home".into(),

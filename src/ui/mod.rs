@@ -2367,7 +2367,7 @@ impl Ui {
                 if let Some(p) = self.selection_median(scene) {
                     self.cursor_3d = p;
                     self.cursor_3d_set = true;
-                    self.notify.info("Cursor → selection");
+                    self.notify.info(format!("Cursor {}  selection", theme::icon::ARROW_RIGHT));
                 }
             }
             // Reset the world cursor to the origin and forget the "set this session"
@@ -2375,7 +2375,7 @@ impl Ui {
             Action::ResetCursor => {
                 self.cursor_3d = Vec3::ZERO;
                 self.cursor_3d_set = false;
-                self.notify.info("Cursor → origin");
+                self.notify.info(format!("Cursor {}  origin", theme::icon::ARROW_RIGHT));
             }
             // --- Edit / history -------------------------------------------------
             Action::Undo => self.do_undo(scene, dmx),
@@ -2801,7 +2801,7 @@ impl Ui {
                     } else {
                         (egui::Color32::from_gray(120), "DMX off")
                     };
-                    ui.colored_label(dot, "●");
+                    ui.colored_label(dot, "•");
                     ui.label(txt);
                     ui.separator();
                     ui.label(if self.prefs.units_feet { "ft" } else { "m" });
