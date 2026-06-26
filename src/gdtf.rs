@@ -14,6 +14,50 @@ use std::path::Path;
 
 use glam::Mat4;
 
+/// Where a fixture came from — drives the colored provenance chip in the UI
+/// (the inspector / scene panel map each variant to a color). Plain data: no
+/// egui dependency here, so the renderer side owns the palette.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum FixtureSource {
+    /// A built-in library profile (PAR can, laser engines).
+    Builtin,
+    /// A `.gdtf` imported from disk (drag-drop / file picker).
+    Import,
+    /// Downloaded from the online GDTF Share catalogue.
+    GdtfShare,
+    /// Brought in as part of an MVR scene import.
+    Mvr,
+}
+
+impl Default for FixtureSource {
+    fn default() -> Self {
+        FixtureSource::Import
+    }
+}
+
+impl FixtureSource {
+    /// Short human label for the provenance chip.
+    pub fn label(self) -> &'static str {
+        match self {
+            FixtureSource::Builtin => "Built-in",
+            FixtureSource::Import => "Imported",
+            FixtureSource::GdtfShare => "GDTF Share",
+            FixtureSource::Mvr => "MVR",
+        }
+    }
+
+    /// An egui-free RGB color hint (`0..=255` per channel) for the chip. The UI
+    /// layer maps this to whatever `Color32`/style it wants.
+    pub fn color_rgb(self) -> [u8; 3] {
+        match self {
+            FixtureSource::Builtin => [120, 144, 156], // slate grey
+            FixtureSource::Import => [79, 195, 247],    // light blue
+            FixtureSource::GdtfShare => [129, 199, 132], // green
+            FixtureSource::Mvr => [255, 167, 38],       // amber
+        }
+    }
+}
+
 /// A parsed GDTF fixture definition. The model is intentionally complete; some
 /// fields are not yet surfaced in the UI.
 #[allow(dead_code)]
@@ -50,6 +94,10 @@ pub struct GdtfFixture {
     /// The original `.gdtf` archive bytes, retained so an imported scene can be
     /// re-bundled on MVR export without re-reading from disk.
     pub raw: Option<std::sync::Arc<Vec<u8>>>,
+    /// Where this definition came from (disk import, GDTF Share, MVR). Copied
+    /// onto each placed [`Fixture`](crate::scene::Fixture) for the UI chip.
+    /// Defaults to [`FixtureSource::Import`]; set by the share/MVR importers.
+    pub source: FixtureSource,
 }
 
 /// The physical light-source + beam optics declared on the GDTF `Beam`
@@ -624,6 +672,7 @@ impl GdtfFixture {
             beam,
             spec: String::new(),
             raw: Some(std::sync::Arc::new(bytes.to_vec())),
+            source: FixtureSource::Import,
         })
     }
 

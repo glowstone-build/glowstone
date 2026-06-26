@@ -54,16 +54,11 @@ fn viewport_controls(ui: &mut egui::Ui, viewer: &mut PanelViewer) {
     }
     ui.separator();
 
-    // N / T region toggles (right-most) — mirror the N/T keys (§2.2). Drawn first
-    // (right_to_left layout) so they sit at the far right edge of the header.
+    // T region toggle (right-most) — mirrors the T key (§2.2). Drawn first
+    // (right_to_left layout) so it sits at the far right edge of the header. (The
+    // N-panel button was removed with the inline inspector; `N` now toggles the
+    // docked Inspector tab.)
     let regions = &mut *viewer.viewport_regions;
-    if ui
-        .selectable_label(regions.n_open, RichText::new(theme::icon::N_PANEL).small())
-        .on_hover_text("N-panel (sidebar) — N")
-        .clicked()
-    {
-        regions.n_open = !regions.n_open;
-    }
     if ui
         .selectable_label(regions.t_open, RichText::new(theme::icon::T_PANEL).small())
         .on_hover_text("T-panel (tool rail) — T")

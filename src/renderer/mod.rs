@@ -328,6 +328,14 @@ pub struct Renderer {
     wall_pipeline: wgpu::RenderPipeline,
     /// Transparent / mesh LED walls (premultiplied alpha, no depth write).
     wall_alpha_pipeline: wgpu::RenderPipeline,
+    /// Selection silhouette: a mask pass marks selected surfaces into a full-res R8
+    /// target (depth-tested, occlusion-correct), then an edge-detect composite adds
+    /// an amber outline into the HDR before bloom. Two mask pipelines cover the two
+    /// instance layouts (MeshInstance: fixtures + scene geometry; WallInstance: LED
+    /// screens). Camera-only pipeline layout (the mask shader reads group 0 only).
+    sel_mask_mesh_pipeline: wgpu::RenderPipeline,
+    sel_mask_wall_pipeline: wgpu::RenderPipeline,
+    sel_outline_pipeline: wgpu::RenderPipeline,
     /// Bind-group layout for a wall's content texture (group 1).
     wall_content_layout: wgpu::BindGroupLayout,
     /// 1×1 placeholder content bound for procedural (solid/test-pattern) walls.
@@ -716,6 +724,15 @@ impl Renderer {
         });
         let wall_pipeline = pipeline::wall_pipeline(&device, &wall_layout);
         let wall_alpha_pipeline = pipeline::wall_alpha_pipeline(&device, &wall_layout);
+        // Selection-mask pipelines: camera-only layout (the mask shader reads only
+        // group 0); the same instance buffers as the forward pass feed them.
+        let sel_mask_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sel-mask-pipeline-layout"),
+            bind_group_layouts: &[Some(&camera_bgl)],
+            immediate_size: 0,
+        });
+        let sel_mask_mesh_pipeline = pipeline::mesh_mask_pipeline(&device, &sel_mask_layout);
+        let sel_mask_wall_pipeline = pipeline::wall_mask_pipeline(&device, &sel_mask_layout);
         let content_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("content-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -902,6 +919,8 @@ impl Renderer {
 
         // --- post (bloom + tonemap) ---
         let single_tex_layout = pipeline::single_tex_bind_group_layout(&device);
+        // Selection silhouette edge-detect composite (samples the R8 mask).
+        let sel_outline_pipeline = pipeline::sel_outline_pipeline(&device, &single_tex_layout);
         let composite_upsample_layout = pipeline::composite_upsample_layout(&device);
         let composite_pipeline = pipeline::composite_pipeline(&device, &composite_upsample_layout);
         let tonemap_layout = pipeline::tonemap_bind_group_layout(&device);
@@ -960,6 +979,9 @@ impl Renderer {
             lens_pipeline,
             wall_pipeline,
             wall_alpha_pipeline,
+            sel_mask_mesh_pipeline,
+            sel_mask_wall_pipeline,
+            sel_outline_pipeline,
             wall_content_layout,
             wall_placeholder_bg,
             wall_placeholder_tex,
@@ -3306,6 +3328,85 @@ impl Renderer {
             }
         }
 
+        // Pass 1.25: SELECTION MASK — mark every selected object's VISIBLE surface
+        // into the R8 sel_mask (1 = selected, depth-tested against the scene depth so
+        // an occluded part doesn't mark it), so the composite below can edge-detect a
+        // true per-object silhouette outline. Re-issues the SAME opaque draw groups as
+        // the forward pass (fixtures, GDTF parts, MVR geometry, placeholder cones, LED
+        // walls); the mask shader discards non-selected fragments, so the draws stay
+        // identical to the forward pass — only the marked subset survives. Skipped
+        // entirely when nothing is selected (the common case → zero added cost).
+        let any_selected = !selection.fixtures.is_empty()
+            || !selection.geometry.is_empty()
+            || !selection.screens.is_empty();
+        if any_selected {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sel-mask-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.viewport.sel_mask_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                // Depth-TEST (LessEqual) against the forward pass's depth, NO write.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.viewport.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                ..Default::default()
+            });
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_pipeline(&self.sel_mask_mesh_pipeline);
+            // Fixtures with a simple primitive body.
+            pass.set_vertex_buffer(1, self.fixture_instances.buffer.slice(..));
+            for (geometry, start, count) in &ranges {
+                let m = self.mesh_for(*geometry);
+                pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
+                pass.draw(0..m.vertex_count, *start..*start + *count);
+            }
+            // GDTF fixture model parts.
+            if !gdtf_groups.is_empty() {
+                pass.set_vertex_buffer(1, self.gdtf_instances.buffer.slice(..));
+                for (key, model, base, count) in &gdtf_groups {
+                    if let Some(mesh) = self.gdtf_cache.get(key).and_then(|m| m.get(model)) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
+                    }
+                }
+            }
+            // Imported MVR static geometry.
+            if !scene_geom_groups.is_empty() {
+                pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
+                for (key, base, count) in &scene_geom_groups {
+                    if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
+                    }
+                }
+            }
+            // Placeholder cones for GDTF fixtures with no baked model.
+            if gdtf_placeholder_count > 0 {
+                pass.set_vertex_buffer(0, self.cone_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.gdtf_placeholder_instances.buffer.slice(..));
+                pass.draw(0..self.cone_mesh.vertex_count, 0..gdtf_placeholder_count);
+            }
+            // LED screens (WallInstance layout; selected = look.w).
+            if !wall_draws.is_empty() {
+                pass.set_pipeline(&self.sel_mask_wall_pipeline);
+                pass.set_vertex_buffer(0, self.quad_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.wall_instances.buffer.slice(..));
+                pass.draw(0..self.quad_mesh.vertex_count, 0..wall_draws.len() as u32);
+            }
+        }
+
         // Pass 1.5: SSAO (Unlit mode) — multiply a depth-based occlusion factor
         // onto the otherwise-flat HDR so geometry gains contact/crevice shading.
         if settings.mode == ViewportMode::Unlit {
@@ -3458,6 +3559,31 @@ impl Renderer {
                 pass.set_bind_group(0, &composite_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
+        }
+
+        // Pass 2.9: SELECTION OUTLINE — edge-detect the sel_mask and ADD a bright
+        // amber silhouette ring into the HDR (blend One/One), BEFORE bloom so the
+        // outline glows slightly. Only when something selectable is selected.
+        if any_selected {
+            let outline_bg = self.single_tex_bg(self.viewport.sel_mask_view());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sel-outline-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.viewport.hdr_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.sel_outline_pipeline);
+            pass.set_bind_group(0, &outline_bg, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         // Pass 3: bloom bright-pass (HDR -> bloom[0]).
@@ -4227,10 +4353,12 @@ fn clip_proj_px(vp: &Mat4, lo: Vec3, hi: Vec3, res: f32) -> Option<f32> {
     Some((maxx - minx).max(maxy - miny) * 0.5 * res)
 }
 
-/// Append a selection gizmo at `p`: RGB world axes plus a small amber marker
-/// box, so the selected fixture's position/orientation is clear in the view.
+/// Append a small RGB world-axes pivot marker at `p`, so the selected object's
+/// position/orientation reads at a glance. The object's actual selection cue is
+/// the screen-space SILHOUETTE OUTLINE (the sel_mask edge-detect composite) — this
+/// is just a complementary pivot indicator, no longer a misleading fixed-size box.
 fn push_selection_gizmo(out: &mut Vec<LineVertex>, p: Vec3) {
-    let len = 0.6;
+    let len = 0.4;
     for (dir, color) in [
         (Vec3::X, [0.95, 0.3, 0.3]),
         (Vec3::Y, [0.4, 0.9, 0.4]),
@@ -4239,8 +4367,6 @@ fn push_selection_gizmo(out: &mut Vec<LineVertex>, p: Vec3) {
         out.push(LineVertex { position: p.to_array(), color });
         out.push(LineVertex { position: (p + dir * len).to_array(), color });
     }
-    let h = Vec3::splat(0.22);
-    mesh::push_box_wireframe(out, (p - h).to_array(), (p + h).to_array(), [1.0, 0.75, 0.2]);
 }
 
 /// Append a wireframe cone showing a beam (axis, end ring, a few generatrices)

@@ -29,7 +29,7 @@ pub const BAR_LABELS: [(&str, &str); BARS] = [
     ("Vol temporal", "EMA accumulate"),
     ("Composite", "upsample + despeckle"),
     ("Bloom", "bright + blur"),
-    ("Tonemap", "HDR → LDR"),
+    ("Tonemap", "HDR to LDR"),
 ];
 
 // Bar indices.

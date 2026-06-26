@@ -47,6 +47,11 @@ pub struct Viewport {
     hdr: Target,
     depth: Target,
     ldr: Target,
+    /// Full-res R8 mask: 1.0 where a selected object's opaque surface is visible,
+    /// 0.0 elsewhere. The edge-detect composite turns its border into the silhouette
+    /// selection outline. Sized to the panel like `hdr`/`depth` (an edge-detect that
+    /// must align with the scene wants full res).
+    sel_mask: Target,
     bloom: [Target; 2],
     vol: Target,
     /// Ping-pong half-res targets holding the TEMPORALLY-ACCUMULATED (EMA) volumetric
@@ -66,6 +71,9 @@ impl Viewport {
     pub const LDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
     /// Half-res volumetric target: scatter.rgb + transmittance.a.
     pub const VOL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+    /// Selected-object coverage mask (1 = selected surface, 0 = not) for the
+    /// silhouette outline edge-detect.
+    pub const SEL_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
     pub fn new(
         device: &wgpu::Device,
@@ -75,7 +83,7 @@ impl Viewport {
         let size = clamp_size(size, device.limits().max_texture_dimension_2d);
         // Diagnostic: confirm whether the very first target allocation succeeds.
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let (hdr, depth, ldr, bloom, vol, vol_ema) = Self::create_targets(device, size);
+        let (hdr, depth, ldr, sel_mask, bloom, vol, vol_ema) = Self::create_targets(device, size);
         match pollster::block_on(scope.pop()) {
             Some(err) => log::error!("Viewport::new alloc FAILED at {size:?}: {err}"),
             None => log::info!("Viewport::new alloc OK at {size:?}"),
@@ -86,6 +94,7 @@ impl Viewport {
             hdr,
             depth,
             ldr,
+            sel_mask,
             bloom,
             vol,
             vol_ema,
@@ -120,10 +129,11 @@ impl Viewport {
             return;
         }
         log::debug!("viewport resized to {size:?}");
-        let (hdr, depth, ldr, bloom, vol, vol_ema) = targets;
+        let (hdr, depth, ldr, sel_mask, bloom, vol, vol_ema) = targets;
         self.hdr = hdr;
         self.depth = depth;
         self.ldr = ldr;
+        self.sel_mask = sel_mask;
         self.bloom = bloom;
         self.vol = vol;
         self.vol_ema = vol_ema;
@@ -144,6 +154,10 @@ impl Viewport {
     }
     pub fn ldr_view(&self) -> &wgpu::TextureView {
         &self.ldr.view
+    }
+    /// The selected-object coverage mask (R8) the silhouette outline edge-detects.
+    pub fn sel_mask_view(&self) -> &wgpu::TextureView {
+        &self.sel_mask.view
     }
     pub fn ldr_texture(&self) -> &wgpu::Texture {
         &self.ldr.texture
@@ -167,7 +181,7 @@ impl Viewport {
     fn create_targets(
         device: &wgpu::Device,
         size: (u32, u32),
-    ) -> (Target, Target, Target, [Target; 2], Target, [Target; 2]) {
+    ) -> (Target, Target, Target, Target, [Target; 2], Target, [Target; 2]) {
         let attach_sample =
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
 
@@ -186,6 +200,13 @@ impl Viewport {
             Self::LDR_FORMAT,
             attach_sample | wgpu::TextureUsages::COPY_SRC,
         );
+        let sel_mask = Target::new(
+            device,
+            "viewport-sel-mask",
+            size,
+            Self::SEL_MASK_FORMAT,
+            attach_sample,
+        );
 
         let half = ((size.0 / 2).max(1), (size.1 / 2).max(1));
         let bloom = [
@@ -201,7 +222,7 @@ impl Viewport {
             Target::new(device, "viewport-vol-ema1", half, Self::VOL_FORMAT, attach_sample),
         ];
 
-        (hdr, depth, ldr, bloom, vol, vol_ema)
+        (hdr, depth, ldr, sel_mask, bloom, vol, vol_ema)
     }
 }
 

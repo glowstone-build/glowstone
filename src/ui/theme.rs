@@ -52,6 +52,13 @@ pub mod icon {
     pub const CLOSE: &str = p::X;
     pub const PREV: &str = p::CARET_LEFT;
     pub const NEXT: &str = p::CARET_RIGHT;
+    // Play + directional arrows — use the Phosphor glyphs (the bundled text fonts
+    // lack the raw Unicode ▶/←/→/↑/↓, which render as tofu squares).
+    pub const PLAY: &str = p::PLAY;
+    pub const ARROW_RIGHT: &str = p::ARROW_RIGHT;
+    pub const ARROW_LEFT: &str = p::ARROW_LEFT;
+    pub const ARROW_UP: &str = p::ARROW_UP;
+    pub const ARROW_DOWN: &str = p::ARROW_DOWN;
     // Outliner-tree disclosure triangles (expanded ▾ / collapsed ▸), Blender-style.
     pub const TREE_OPEN: &str = p::CARET_DOWN;
     pub const TREE_CLOSED: &str = p::CARET_RIGHT;
@@ -383,6 +390,13 @@ pub fn apply(ctx: &egui::Context, prefs: &Preferences) {
     s.interact_size.y = 22.0;
     s.scroll.bar_width = 9.0;
     s.scroll.floating = true;
+
+    // Plain Labels are NOT selectable text in a CAD/console UI: egui defaults
+    // `selectable_labels`/`multi_widget_text_select` to true, which made hovering
+    // or dragging across the UI rubber-band-select every label (the splash bug).
+    // TextEdit / DragValue keep their own selection — this only affects Labels.
+    style.interaction.selectable_labels = false;
+    style.interaction.multi_widget_text_select = false;
 
     ctx.set_style(style);
 

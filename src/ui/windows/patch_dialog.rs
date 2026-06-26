@@ -31,8 +31,11 @@ pub fn patch_dialog_window(ctx: &egui::Context, dlg: &mut PatchDialog) -> bool {
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         close = true;
     }
-    // Enter confirms (unless a text field owns it — the dialog has none).
-    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+    // Enter confirms — but NOT a value-commit Enter leaking from another panel
+    // (bug 8): skip when a text field was focused at frame start, and consume it.
+    if !crate::ui::text_focus_active(ctx)
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+    {
         confirm = true;
     }
 

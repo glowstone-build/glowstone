@@ -61,11 +61,13 @@ pub fn operator_search_window(
     // --- keyboard navigation (read before the window so it works before focus
     // lands on a widget) ---
     let mut commit = false;
-    ctx.input(|i| {
+    ctx.input_mut(|i| {
         if i.key_pressed(egui::Key::Escape) {
             state.open = false;
         }
-        if i.key_pressed(egui::Key::Enter) {
+        // CONSUME the Enter so it both commits the pick AND can't leak to another
+        // reader the same frame (bug 8).
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
             commit = true;
         }
         if i.key_pressed(egui::Key::ArrowDown) {

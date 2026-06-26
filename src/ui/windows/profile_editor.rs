@@ -273,7 +273,7 @@ fn tab_optics(
         modeled(ui);
         ui.end_row();
         let (pmax, tmax) = fixture.max_slew();
-        ui.label(RichText::new("→ pan / tilt").color(ink.tertiary));
+        ui.label(RichText::new(format!("{}  pan / tilt", theme::icon::ARROW_RIGHT)).color(ink.tertiary));
         ui.label(RichText::new(format!("{pmax:.0} / {tmax:.0} °/s")).monospace().color(ink.primary));
         ui.label("");
         ui.end_row();

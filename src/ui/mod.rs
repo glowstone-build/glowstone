@@ -36,7 +36,7 @@ use egui_dock::{DockArea, DockState, TabViewer};
 use glam::Vec3;
 
 use crate::renderer::camera::{CameraView, OrbitCamera};
-use crate::scene::{Library, RenderSettings, Scene, Selection, ViewportMode};
+use crate::scene::{Library, ObjectRef, RenderSettings, Scene, Selection, ViewportMode};
 use windows::{Preferences, ProfileEditor};
 
 /// One effect the `Z` Shading pie can apply: switch the viewport display
@@ -84,13 +84,62 @@ pub struct DuplicateDialog {
     pub count: u32,
 }
 
+/// Remembered Duplicate-dialog values so a fresh Duplicate reuses the LAST ones
+/// instead of a fixed 36°/9 preset (which surprised users with a big fan). Starts
+/// at the identity — zero offset, no fan, a single copy. Held in egui temp memory
+/// so every open site (viewport + menu + catalog) and the confirm share it
+/// without extra plumbing.
+#[derive(Clone, Copy)]
+pub(crate) struct DupDefaults {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub angle: f32,
+    pub count: u32,
+}
+
+impl Default for DupDefaults {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, z: 0.0, angle: 0.0, count: 1 }
+    }
+}
+
+/// Whether a text widget held keyboard focus at the START of this frame (set by
+/// [`Ui::show`]). Global Enter readers (the library batch-add, the patch/unpatch/
+/// add/operator dialogs) check this so committing a value box with Enter can't leak
+/// into them and fire an unintended action (bug 8).
+pub(crate) fn text_focus_active(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("previz.text_focus")).unwrap_or(false))
+}
+
+/// The last-used Duplicate values (or all-zero defaults on first use).
+pub(crate) fn dup_defaults(ctx: &egui::Context) -> DupDefaults {
+    ctx.data(|d| d.get_temp::<DupDefaults>(egui::Id::new("previz.dup.defaults")).unwrap_or_default())
+}
+
+/// Remember the Duplicate values just used, so the next Duplicate reuses them.
+pub(crate) fn set_dup_defaults(ctx: &egui::Context, v: DupDefaults) {
+    ctx.data_mut(|m| m.insert_temp(egui::Id::new("previz.dup.defaults"), v));
+}
+
+/// Build a fresh [`DuplicateDialog`] for `fixture`, seeded from the remembered
+/// last-used values (all-zero on first use — never a preset fan).
+pub(crate) fn duplicate_dialog_for(ctx: &egui::Context, fixture: usize) -> DuplicateDialog {
+    let d = dup_defaults(ctx);
+    DuplicateDialog { fixture, x: d.x, y: d.y, z: d.z, y_angle: d.angle, count: d.count }
+}
+
 /// State of the open Replace-fixtures dialog (Shift+R). Swaps the selected
 /// fixtures' type for a chosen project-library profile, in place (keeping each
-/// fixture's position / aim / level / name). `None` = closed.
+/// fixture's position / aim / level). `None` = closed.
 #[derive(Default)]
 pub struct ReplaceDialog {
     /// Name filter over the project library.
     pub search: String,
+    /// When ON, swap ONLY the visual model/beam and KEEP the fixture's identity —
+    /// name, DMX patch + mode + optical state (bug 12). Default OFF: a full replace
+    /// re-patches AND renames the fixture to the new profile's name.
+    pub mesh_only: bool,
 }
 
 /// What the welcome splash's buttons request (applied after the modal closure,
@@ -256,6 +305,16 @@ pub struct TransformOp {
     /// Original (geometry index, world transform) snapshot — the static-geometry
     /// equivalent of `start`. Empty when transforming fixtures.
     pub geo_start: Vec<(usize, glam::Mat4)>,
+    /// Original (LED-screen index, world transform) snapshot. Screens carry the
+    /// SAME `Mat4` transform as static geometry, so they ride the identical
+    /// move/rotate/scale math — this is what makes screens fully grabbable
+    /// (G/R/S) like every other object. Empty unless screens are selected.
+    pub screen_start: Vec<(usize, glam::Mat4)>,
+    /// Original (environment index, center, size) snapshot. Fog volumes are
+    /// axis-aligned (center + size, no orientation): Move slides the centre,
+    /// Rotate orbits it about the pivot (a no-op for a lone box), and Scale grows
+    /// the size in place. Empty unless an environment is selected.
+    pub env_start: Vec<(usize, Vec3, Vec3)>,
     /// The axis the screen-space move gizmo is currently grabbed on. Takes
     /// precedence over `axis` (keyboard X/Y/Z lock) for the live frame, matching
     /// Blender's "click-a-handle overrides the typed constraint" behaviour. Not
@@ -295,6 +354,21 @@ pub struct TransformOp {
     /// drag), View = the camera basis (`view_basis`, screen-aligned). Shown in the
     /// modal hint.
     pub orientation: TransformOrientation,
+    /// True when this Move op was started by Shift+D (duplicate-then-grab). Two
+    /// effects: the mouse always drives the OFFSET (a typed number is the array
+    /// CLONE-COUNT, not the move amount), and on confirm the extra clones are
+    /// arrayed along the drag vector. The clone itself was already pushed as its
+    /// own undo step before the grab began, so cancel just leaves the copies at
+    /// the source (Blender's Shift+D→Esc).
+    pub from_duplicate: bool,
+    /// The freshly-created copies (this op's targets) — the base set the array
+    /// duplicates from when a clone-count is typed during a duplicate-grab.
+    pub dup_base: Vec<ObjectRef>,
+    /// The LIVE array clones (#2..N) shown while a count is typed mid-drag. Held
+    /// at the END of their kind's scene Vec (LIFO), regenerated each frame from
+    /// `dup_base` + the current drag delta, and dropped on cancel. Empty until a
+    /// count > 1 is typed.
+    pub dup_extra: Vec<ObjectRef>,
 }
 
 impl TransformOp {
@@ -313,6 +387,12 @@ impl TransformOp {
     /// which keys do what (#23). While the user is typing a value the hint switches
     /// to the Blender-style typed readout and the key cluster is suppressed.
     pub fn hint(&self, keys: &str) -> String {
+        // A duplicate-grab reads a typed number as the array clone-COUNT (the mouse
+        // drives the offset), so its hint shows copies, never metres/degrees.
+        if self.from_duplicate {
+            let n = if self.num.active { (self.num.value().round() as i64).max(1) } else { 1 };
+            return format!("Duplicate · {n} cop{}    drag: offset · type: count · Enter confirm · Esc cancel", if n == 1 { "y" } else { "ies" });
+        }
         if self.num.active {
             // Blender-style typed readout: "Move X: 4.0 m" / "Rotate Z: -45°" /
             // "Scale: 2.0x". Axis label is blank when unconstrained.
@@ -497,8 +577,8 @@ pub struct Ui {
     /// Per-frame drag edges the inspector reports (read after the dock) to drive
     /// the `inspector_tx` begin/finalize. Transient — not serialized.
     inspector_edit: panels::InspectorEdit,
-    /// Inspector property-filter box + persisted per-category collapse state (S1).
-    /// Loaded once at startup; the collapse map is saved on each toggle.
+    /// Persistent Inspector UI state (property filter + per-category collapse).
+    /// Loaded from the config dir on launch; categories self-save on toggle.
     inspector_state: panels::InspectorState,
     /// Timestamp of the last arrow-key nudge — a fresh nudge within
     /// [`NUDGE_COALESCE`] of it extends the top undo step instead of pushing a new
@@ -617,7 +697,6 @@ pub struct Ui {
 /// contexts) is a later phase.
 #[derive(Clone, Copy, Default)]
 struct ViewportRegions {
-    n_open: bool,
     t_open: bool,
 }
 
@@ -1057,14 +1136,7 @@ impl Ui {
                 }
                 "fixture.duplicate" => {
                     if let Some(idx) = self.selection.primary_fixture() {
-                        self.duplicate = Some(DuplicateDialog {
-                            fixture: idx,
-                            x: 0.0,
-                            y: 0.0,
-                            z: 0.0,
-                            y_angle: 36.0,
-                            count: 9,
-                        });
+                        self.duplicate = Some(duplicate_dialog_for(ctx, idx));
                     }
                 }
                 "fixture.patch" => {
@@ -1570,6 +1642,14 @@ impl Ui {
     ) {
         // Theme/accent/DPI live every frame (cheap; egui dedups).
         self.prefs.apply_theme(ctx);
+        // Bug 8 — Enter-leak guard: snapshot whether a text widget holds keyboard
+        // focus at the START of the frame (before any widget runs). When the user
+        // commits a value box with Enter, the field is still focused HERE but
+        // surrenders focus mid-frame, leaving the Enter in the event queue; unguarded
+        // global readers (batch-add, dialog confirms) would otherwise see it as a
+        // fresh keypress. They gate on `text_focus_active()` so the commit can't leak.
+        let text_focus = ctx.memory(|m| m.focused().is_some());
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("previz.text_focus"), text_focus));
         // Age + retire expired toasts (dt from egui — `show()` takes no dt param).
         self.notify.tick(ctx.input(|i| i.stable_dt));
         // DMX connect/disconnect edge: the actual bind happens on the DMX worker,
@@ -1599,6 +1679,44 @@ impl Ui {
         // it rides the undo stack — a held-key burst coalesces into one step).
         self.apply_nudge(scene, dmx);
         self.handle_dropped_files(ctx, scene, camera);
+
+        // Shift+D — grab-duplicate (Blender). Clone the selection NOW as its own
+        // undo step (so cancelling the grab leaves the copies at the source, like
+        // Blender's Shift+D→Esc), re-select the copies, then flag the viewport to
+        // start a Move grab on them THIS frame. Done before the dock so the clone
+        // lands before `panels::viewport` reads the flag and snapshots the move's
+        // `before` end. Dispatch_action reports DuplicateGrab unhandled, so this is
+        // its only handler.
+        if self.viewport_focused
+            && self.transform.is_none()
+            && self.selection.has_object()
+            && shortcuts::poll(
+                ctx,
+                shortcuts::ActiveContext { viewport_focused: true, transform_active: false },
+                &shortcuts::active(),
+            )
+            .iter()
+            .any(|a| matches!(a, shortcuts::Action::DuplicateGrab))
+        {
+            let refs = self.selection.object_refs();
+            self.run_op(
+                "object.duplicate_grab",
+                "Duplicate",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    let copies = cx.scene.duplicate_objects(&refs);
+                    if copies.is_empty() {
+                        return op::OpStatus::Cancelled;
+                    }
+                    *cx.selection = Selection::from_object_refs(&copies);
+                    op::OpStatus::Finished
+                },
+            );
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("previz.dupgrab.start"), true));
+        }
 
         // Chrome MUST be reserved before the dock (it fills the CentralPanel).
         self.menu_bar(ctx, scene, camera, dmx);
@@ -1793,6 +1911,8 @@ impl Ui {
         // Duplicate mutates the scene; on confirm, run it through the operator
         // pipeline so the (before, after) undo step is pushed uniformly.
         if let Some(d) = duplicate_window(ctx, &mut self.duplicate) {
+            // Remember these values so the NEXT Duplicate reuses them (bug 3).
+            set_dup_defaults(ctx, DupDefaults { x: d.x, y: d.y, z: d.z, angle: d.y_angle, count: d.count });
             self.run_op(
                 "fixture.duplicate",
                 "Duplicate",
@@ -1933,13 +2053,13 @@ impl Ui {
                 self.lib_prefs.push_recent(&k);
             }
         }
+        // Online GDTF-Share catalogue: stocks the project Library ONLY (no longer
+        // instantiates into the scene — bug 9). So it no longer borrows scene/selection.
         share_window::fixture_library_window(
             ctx,
             &mut self.show_share,
             &mut self.share,
             &mut self.library,
-            scene,
-            &mut self.selection,
         );
         // The `~` radial View pie (above the dock, anchored at the cursor). On a
         // pick it applies straight to the camera; cancel / Esc just closes it.
@@ -2344,9 +2464,9 @@ impl Ui {
             // N / T — toggle the viewport's side regions (§2.2). Viewport-only
             // binds (the keymap stack already gates them to a focused viewport
             // and `poll` is silent while a text field has focus).
-            Action::ToggleNPanel => {
-                self.viewport_regions.n_open = !self.viewport_regions.n_open;
-            }
+            // N now shows/hides the single docked Inspector tab (the inline N-panel
+            // inspector was removed — it duplicated this and stretched the viewport).
+            Action::ToggleNPanel => self.toggle_tab(Tab::Inspector),
             Action::ToggleTPanel => {
                 self.viewport_regions.t_open = !self.viewport_regions.t_open;
             }
@@ -2446,7 +2566,7 @@ impl Ui {
                 if let Some(p) = self.selection_median(scene) {
                     self.cursor_3d = p;
                     self.cursor_3d_set = true;
-                    self.notify.info("Cursor → selection");
+                    self.notify.info(format!("Cursor {}  selection", theme::icon::ARROW_RIGHT));
                 }
             }
             // Reset the world cursor to the origin and forget the "set this session"
@@ -2454,7 +2574,7 @@ impl Ui {
             Action::ResetCursor => {
                 self.cursor_3d = Vec3::ZERO;
                 self.cursor_3d_set = false;
-                self.notify.info("Cursor → origin");
+                self.notify.info(format!("Cursor {}  origin", theme::icon::ARROW_RIGHT));
             }
             // --- Edit / history -------------------------------------------------
             Action::Undo => self.do_undo(scene, dmx),
@@ -2488,7 +2608,9 @@ impl Ui {
             // the palette never offers the modal ones as dead picks. (Duplicate IS
             // a palette op, but via its `fixture.duplicate` dialog catalog entry,
             // not this keymap Action.)
-            Action::Transform(_) | Action::AxisLock(_) | Action::Duplicate => return false,
+            Action::Transform(_) | Action::AxisLock(_) | Action::Duplicate | Action::DuplicateGrab => {
+                return false;
+            }
         }
         true
     }
@@ -2764,7 +2886,7 @@ impl Ui {
                     ui.separator();
                     if ui.add_enabled(self.selection.primary_fixture().is_some(), egui::Button::new(format!("{}  Duplicate / Array…", icon::DUPLICATE))).clicked() {
                         if let Some(idx) = self.selection.primary_fixture() {
-                            self.duplicate = Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
+                            self.duplicate = Some(duplicate_dialog_for(ctx, idx));
                         }
                         ui.close();
                     }
@@ -3044,7 +3166,7 @@ impl Ui {
                     } else {
                         (egui::Color32::from_gray(120), "DMX off")
                     };
-                    ui.colored_label(dot, "●");
+                    ui.colored_label(dot, "•");
                     ui.label(txt);
                     ui.separator();
                     ui.label(if self.prefs.units_feet { "ft" } else { "m" });
@@ -3254,6 +3376,8 @@ fn replace_window(
                     .hint_text(format!("{}  Filter project library…", theme::icon::SEARCH))
                     .desired_width(f32::INFINITY),
             );
+            ui.checkbox(&mut d.mesh_only, "Replace mesh/model only")
+                .on_hover_text("Swap just the visual model + beam; keep the name, DMX patch, mode and levels. Off = full replace (re-patches and renames to the new type).");
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let mut any = false;
@@ -3267,9 +3391,15 @@ fn replace_window(
                     for gi in gdtf {
                         let g = &gdtf_arcs[gi];
                         let label = format!("{}  {} · {}", theme::icon::FIXTURE, g.manufacturer, g.name);
-                        if ui.selectable_label(false, label).clicked() {
-                            picked = Some(Picked::Gdtf(gi));
-                        }
+                        let src = g.source;
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(false, label).clicked() {
+                                picked = Some(Picked::Gdtf(gi));
+                            }
+                            // Colour-coded provenance chip (bug 11) — GDTF Share / MVR /
+                            // Imported read at a glance in the Replace list.
+                            panels::source_chip(ui, src);
+                        });
                     }
                     ui.add_space(6.0);
                 }
@@ -3300,11 +3430,26 @@ fn replace_window(
         });
 
     if let Some(p) = picked {
-        for &i in &targets {
-            // Snapshot the placement + level + name to carry across the swap.
-            let (pos, orient, pan, tilt, name, dimmer) = {
+        // A full replace RENAMES each fixture to the new type (bug 12 — replacing a
+        // fixture should read as its new type, not keep the stale name). Mesh-only
+        // keeps the old name + DMX patch/mode.
+        let new_base = match &p {
+            Picked::Gdtf(gi) => gdtf_arcs[*gi].name.to_string(),
+            Picked::Profile(pi) => library.fixtures[*pi].name.to_string(),
+        };
+        let many = targets.len() > 1;
+        for (j, &i) in targets.iter().enumerate() {
+            // Snapshot the placement + level (+ identity, for mesh-only) to carry across.
+            let (pos, orient, pan, tilt, old_name, dimmer, mode_index, optics) = {
                 let f = &scene.fixtures[i];
-                (f.position, f.orientation, f.pan, f.tilt, f.name.clone(), f.optics.dimmer)
+                (f.position, f.orientation, f.pan, f.tilt, f.name.clone(), f.optics.dimmer, f.mode_index, f.optics.clone())
+            };
+            let name = if d.mesh_only {
+                old_name
+            } else if many {
+                format!("{new_base} {}", j + 1)
+            } else {
+                new_base.clone()
             };
             let mut nf = match &p {
                 Picked::Gdtf(gi) => crate::scene::Fixture::from_gdtf(gdtf_arcs[*gi].clone(), name, pos),
@@ -3313,10 +3458,21 @@ fn replace_window(
             nf.orientation = orient;
             nf.pan = pan;
             nf.tilt = tilt;
-            nf.optics.dimmer = dimmer; // keep it lit at the level it had
+            if d.mesh_only {
+                // Keep the patched fixture's DMX identity: same mode + optical state,
+                // and DON'T re-patch (address/footprint stay). sync_mode clamps the
+                // mode if the new model exposes fewer.
+                nf.mode_index = mode_index;
+                nf.optics = optics;
+                nf.sync_mode();
+            } else {
+                nf.optics.dimmer = dimmer; // keep it lit at the level it had
+            }
             nf.snap_movement();
             scene.fixtures[i] = nf;
-            patch.replace_at(i, &scene.fixtures[i]);
+            if !d.mesh_only {
+                patch.replace_at(i, &scene.fixtures[i]);
+            }
         }
         close = true;
     }
@@ -3361,7 +3517,7 @@ struct PanelViewer<'a> {
     /// Per-frame drag edges the inspector reports for the slider-drag undo
     /// transaction (#13). Read after the dock to begin/finalize `inspector_tx`.
     inspector_edit: &'a mut panels::InspectorEdit,
-    /// Inspector filter + persisted collapse state (S1).
+    /// Persistent Inspector filter + collapse state (the single docked Inspector tab).
     inspector_state: &'a mut panels::InspectorState,
     groups: &'a mut Vec<SelectionGroup>,
     group_name: &'a mut String,
@@ -3480,37 +3636,10 @@ impl TabViewer for PanelViewer<'_> {
                             tool_rail(ui, self.active_tool);
                         });
                 }
-                if self.viewport_regions.n_open {
-                    // N-panel — Item/Transform sidebar; reuses `panels::inspector`
-                    // verbatim ("control belongs where the eyes are", §2.2).
-                    egui::SidePanel::right(id_base.with("n-panel"))
-                        .resizable(true)
-                        .default_width(260.0)
-                        .show_inside(ui, |ui| {
-                            let mut e = panels::InspectorEdit::default();
-                            // Read-only while a still render converges (a stray edit
-                            // would reset the render's accumulation).
-                            ui.add_enabled_ui(!self.render_active, |ui| {
-                                panels::inspector(
-                                    ui,
-                                    self.scene,
-                                    self.selection,
-                                    self.dmx_patch,
-                                    self.gdtf_textures,
-                                    self.profile,
-                                    self.screen_sources,
-                                    self.inspector_state,
-                                    &mut e,
-                                    self.render,
-                                    self.settings,
-                                );
-                            });
-                            // OR into the shared edge flags (N-panel + Inspector
-                            // tab can both render; only one is dragged at a time).
-                            self.inspector_edit.started |= e.started;
-                            self.inspector_edit.stopped |= e.stopped;
-                        });
-                }
+                // (The inline N-panel inspector was REMOVED: it duplicated the docked
+                // Inspector tab AND, as a layout `SidePanel`, shrank the viewport leaf
+                // so opening/resizing it shifted the camera aspect — bug 5. The docked
+                // Inspector is now the single inspector; `N` toggles that tab.)
                 panels::viewport(
                     ui,
                     self.camera,
@@ -3707,8 +3836,8 @@ mod tests {
         assert!(h && ui.view_pie.open, "ViewPie opens the radial pie");
         let (ui, _, _, h) = run(Action::ShadingPie, noop);
         assert!(h && ui.shading_pie.open, "ShadingPie opens the radial shading pie");
-        let (ui, _, _, h) = run(Action::ToggleNPanel, noop);
-        assert!(h && ui.viewport_regions.n_open);
+        let (_ui, _, _, h) = run(Action::ToggleNPanel, noop);
+        assert!(h, "ToggleNPanel handled (toggles the docked Inspector tab)");
         let (ui, _, _, h) = run(Action::ToggleTPanel, noop);
         assert!(h && ui.viewport_regions.t_open);
 

@@ -26,7 +26,11 @@ pub fn unpatch_dialog_window(ctx: &egui::Context, dlg: &mut UnpatchDialog) -> bo
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         close = true;
     }
-    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+    // Enter confirms — but NOT a value-commit Enter leaking from another panel
+    // (bug 8): skip when a text field was focused at frame start, and consume it.
+    if !crate::ui::text_focus_active(ctx)
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+    {
         confirm = true;
     }
 

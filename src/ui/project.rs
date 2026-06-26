@@ -33,7 +33,13 @@ const MAGIC: &[u8] = b"ARCHIE\0";
 /// v5: `Environment` gained `uniformity` (haze cluster control).
 /// v6: `Environment` gained `cluster_contrast`.
 /// v7: `Scene` gained `render: RenderConfig` (the persisted render-target setup).
-pub const FORMAT: u32 = 7;
+/// v8: `Fixture` gained `source` (provenance chip). Field is LAST in serde
+///     order with `#[serde(default)]`. NOTE: `read` rejects any version != FORMAT
+///     up front, so pre-v8 files surface a clean "unsupported version" error
+///     rather than mis-decoding — positional bincode never sees the missing
+///     trailing field. The `#[serde(default)]` keeps the in-memory struct sound
+///     and future-proofs any optional/skipped-field shifts above it.
+pub const FORMAT: u32 = 8;
 /// The project file extension (no dot).
 pub const EXT: &str = "archie";
 

@@ -24,7 +24,7 @@ use crate::optics::{self, OpticField, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
 use crate::scene::screen::{LedScreen, PixelShape, ScreenContent, TestPattern};
-use crate::scene::{apply_fixture_click, apply_select, Fixture, Library, Scene, SelItem, SelectOp, Selection};
+use crate::scene::{apply_fixture_click, apply_select, Fixture, Library, ObjectRef, Scene, SelItem, SelectOp, Selection};
 
 /// Universe is considered live if it updated within this window.
 const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -961,6 +961,21 @@ struct LibRow {
     meta: String,
     category: String,
     accent: bool, // laser/colour entry → tint the icon
+    /// Provenance for the coloured source chip (bug 11). `None` for non-fixture
+    /// rows (environments / screens have no fixture source).
+    source: Option<crate::gdtf::FixtureSource>,
+}
+
+/// Draw a small colour-coded provenance chip ("• GDTF Share" / "MVR" / …) so a
+/// fixture's origin reads at a glance in the library + Replace lists (bug 11). A
+/// coloured dot + label keeps it legible at small sizes without a heavy box.
+pub(crate) fn source_chip(ui: &mut egui::Ui, source: crate::gdtf::FixtureSource) {
+    let [r, g, b] = source.color_rgb();
+    ui.label(
+        egui::RichText::new(format!("• {}", source.label()))
+            .size(9.0)
+            .color(Color32::from_rgb(r, g, b)),
+    );
 }
 
 /// Build the flat row list from the library (Imported GDTF, then built-in
@@ -977,6 +992,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             meta: format!("{} · {} · {} mode{}", g.manufacturer, beam, g.modes.len(), if g.modes.len() == 1 { "" } else { "s" }),
             category: if g.manufacturer.is_empty() { "Imported".into() } else { g.manufacturer.clone() },
             accent: false,
+            source: Some(g.source),
         });
     }
     for (i, p) in library.fixtures.iter().enumerate() {
@@ -987,6 +1003,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             meta: if p.laser { "Laser engine".into() } else { format!("{:.0}° beam", p.default_beam_angle) },
             category: p.category.to_string(),
             accent: p.laser,
+            source: Some(crate::gdtf::FixtureSource::Builtin),
         });
     }
     for (i, p) in library.environments.iter().enumerate() {
@@ -998,6 +1015,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             meta: format!("{w:.0} × {h:.0} × {d:.0} m"),
             category: if p.category.is_empty() { "Environment" } else { p.category }.to_string(),
             accent: false,
+            source: None,
         });
     }
     for (i, p) in library.screens.iter().enumerate() {
@@ -1012,6 +1030,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             ),
             category: p.category.to_string(),
             accent: p.transparent,
+            source: None,
         });
     }
     rows
@@ -1202,7 +1221,9 @@ pub fn library_browser(
     ui.horizontal(|ui| {
         let label = if n_sel > 1 { format!("{}  Add {n_sel}", icon::ADD) } else { format!("{}  Add", icon::ADD) };
         if ui.add_enabled(n_sel > 0, egui::Button::new(label)).on_hover_text("Add the selected templates to the scene at the cursor (Enter)").clicked()
-            || (n_sel > 0 && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            || (n_sel > 0
+                && !super::text_focus_active(ui.ctx())
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)))
         {
             let place = placement_point(scene, camera);
             let mut idxs = lib.selected.clone();
@@ -1372,6 +1393,7 @@ fn clone_lib_row(r: &LibRow) -> LibRow {
         meta: r.meta.clone(),
         category: r.category.clone(),
         accent: r.accent,
+        source: r.source,
     }
 }
 
@@ -1474,7 +1496,19 @@ fn library_row_widget(
     }
     let text_w = (rect.width() - 30.0 - 40.0).max(40.0);
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), &row.name, 13.0, ink.primary, text_w);
-    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, text_w);
+    // Reserve room on the meta line for the colour-coded source chip (bug 11).
+    let meta_w = if row.source.is_some() { (text_w - 72.0).max(30.0) } else { text_w };
+    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, meta_w);
+    if let Some(src) = row.source {
+        let [cr, cg, cb] = src.color_rgb();
+        painter.text(
+            egui::pos2(rect.right() - 36.0, rect.top() + 24.0),
+            egui::Align2::RIGHT_CENTER,
+            format!("• {}", src.label()),
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(cr, cg, cb),
+        );
+    }
     // A "+" affordance on hover (left of the star), right-aligned.
     if resp.hovered() {
         painter.text(
@@ -1984,7 +2018,7 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
         "Transform",
         format!("{}  Transform", theme::icon::INSPECTOR),
         true,
-        &["Pan", "Tilt", "Nudge position"],
+        &["Pan", "Tilt", "Nudge position", "Nudge rotation"],
         |ui, fs| {
             Grid::new("bulk-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 let pan = common_f32(ids.iter().map(|&i| scene.fixtures[i].pan));
@@ -2023,6 +2057,37 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
                     if delta != glam::Vec3::ZERO {
                         for &i in ids {
                             scene.fixtures[i].position += delta;
+                        }
+                    }
+                });
+            }
+            if fs.row_visible("Nudge rotation") {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Nudge rotation (all · individual origins)").small().strong());
+                ui.horizontal(|ui| {
+                    // Drag from zero applies a delta rotation about each fixture's OWN
+                    // origin (orientation only), so the rig keeps its arrangement and
+                    // each head tilts in place — never collapsed onto one pivot.
+                    let mut d = glam::Vec3::ZERO; // euler degrees (x, y, z)
+                    for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
+                        let mut v = 0.0f32;
+                        if ui
+                            .add(DragValue::new(&mut v).speed(0.5).suffix("°").prefix(format!("{label} ")))
+                            .changed()
+                        {
+                            d[axis] += v;
+                        }
+                    }
+                    if d != glam::Vec3::ZERO {
+                        let delta = glam::Quat::from_euler(
+                            glam::EulerRot::YXZ,
+                            d.y.to_radians(),
+                            d.x.to_radians(),
+                            d.z.to_radians(),
+                        );
+                        for &i in ids {
+                            scene.fixtures[i].orientation =
+                                (delta * scene.fixtures[i].orientation).normalize();
                         }
                     }
                 });
@@ -2275,7 +2340,7 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
                     fixture.tilt = def.tilt;
                 }
             });
-            advanced_section_filtered(ui, fs, "fx-transform", &["Position"], |ui| {
+            advanced_section_filtered(ui, fs, "fx-transform", &["Position", "Rotation"], |ui| {
                 Grid::new("fx-transform-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     row(ui, fs, "Position", false, |ui| {
                         ui.horizontal(|ui| {
@@ -2284,6 +2349,34 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
                             ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
                         });
                     });
+                    // Rotation = the rig HANG (how the fixture is mounted), separate from
+                    // the live Pan/Tilt above. Euler for display; recomposed only on edit
+                    // (revert arrow → identity). Previously only reachable via viewport R.
+                    let rot0 = fixture.orientation;
+                    let (ry, rx, rz) = rot0.to_euler(glam::EulerRot::YXZ);
+                    let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
+                    let mut rot_changed = false;
+                    let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
+                    if row(ui, fs, "Rotation", differs, |ui| {
+                        ui.horizontal(|ui| {
+                            rot_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                            rot_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                            rot_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                        });
+                    }) {
+                        ex = 0.0;
+                        ey = 0.0;
+                        ez = 0.0;
+                        rot_changed = true;
+                    }
+                    if rot_changed {
+                        fixture.orientation = glam::Quat::from_euler(
+                            glam::EulerRot::YXZ,
+                            ey.to_radians(),
+                            ex.to_radians(),
+                            ez.to_radians(),
+                        );
+                    }
                 });
             });
         },
@@ -3501,52 +3594,25 @@ fn frame_selection(scene: &Scene, selection: &Selection, camera: &mut OrbitCamer
 /// position. Reads the snapshot in `op.start`, so it's idempotent — called every
 /// The world origin/centre of one selected fixture (its position) or geometry (its
 /// world-bounds centre, falling back to the transform's translation). The single
-/// per-element anchor both the pivot computation and Individual-Origins read.
-fn fixture_anchor(scene: &Scene, i: usize) -> Option<Vec3> {
-    scene.fixtures.get(i).map(|f| f.position)
-}
-fn geometry_anchor(scene: &Scene, i: usize) -> Option<Vec3> {
-    scene.geometry.get(i).map(|g| {
-        g.world_bounds().map(|(lo, hi)| (lo + hi) * 0.5).unwrap_or_else(|| g.transform.w_axis.truncate())
-    })
-}
-
 /// Compute the single world pivot the rotate/scale spins/grows about, per the
-/// chosen [`PivotMode`] (#5). `fids`/`gids` are the (validated) selected indices in
-/// selection order, so `fids[0]`/`gids[0]` is the active element. Individual-Origins
-/// has no single pivot — the applier uses each element's own anchor — so it returns
-/// the Median like the others (a harmless fallback the applier ignores when
-/// `op.individual`). Empty selection → origin.
-fn compute_pivot(
-    scene: &Scene,
-    fids: &[usize],
-    gids: &[usize],
-    mode: PivotMode,
-    cursor_3d: Vec3,
-) -> Vec3 {
+/// chosen [`PivotMode`] (#5). `objs` are the (validated) selected objects in
+/// selection order, so `objs[0]` is the active element. Reads each object's
+/// origin through the unified [`Scene::object_anchor`] so EVERY kind (fixtures,
+/// geometry, screens, environment) contributes — no kind is excluded from the
+/// centroid. Individual-Origins has no single pivot (the applier uses each
+/// element's own anchor) so it returns the Median like the others. Empty
+/// selection → origin.
+fn compute_pivot(scene: &Scene, objs: &[ObjectRef], mode: PivotMode, cursor_3d: Vec3) -> Vec3 {
     match mode {
         PivotMode::Cursor3d => cursor_3d,
-        PivotMode::Active => {
-            // The primary element = the first selected (fixtures take precedence
-            // over geometry when both kinds are present, matching the gizmo order).
-            fids.first()
-                .and_then(|&i| fixture_anchor(scene, i))
-                .or_else(|| gids.first().and_then(|&i| geometry_anchor(scene, i)))
-                .unwrap_or(Vec3::ZERO)
-        }
+        PivotMode::Active => objs.first().and_then(|&o| scene.object_anchor(o)).unwrap_or(Vec3::ZERO),
         // Median + Individual both seed from the centroid (Individual's per-element
         // pivots are applied in apply_transform via `op.individual`).
         PivotMode::Median | PivotMode::Individual => {
             let mut sum = Vec3::ZERO;
             let mut n = 0.0_f32;
-            for &i in fids {
-                if let Some(a) = fixture_anchor(scene, i) {
-                    sum += a;
-                    n += 1.0;
-                }
-            }
-            for &i in gids {
-                if let Some(a) = geometry_anchor(scene, i) {
+            for &o in objs {
+                if let Some(a) = scene.object_anchor(o) {
                     sum += a;
                     n += 1.0;
                 }
@@ -3554,6 +3620,43 @@ fn compute_pivot(
             if n > 0.0 { sum / n } else { Vec3::ZERO }
         }
     }
+}
+
+/// Flatten validated per-kind index slices into the unified [`ObjectRef`] list
+/// (fixtures, then geometry, screens, environment) — the order the pivot's
+/// "active" element and the gizmo read. The single place selection → object list
+/// happens for the transform path.
+fn obj_refs(fids: &[usize], gids: &[usize], sids: &[usize], eids: &[usize]) -> Vec<ObjectRef> {
+    fids.iter()
+        .map(|&i| ObjectRef::Fixture(i))
+        .chain(gids.iter().map(|&i| ObjectRef::Geometry(i)))
+        .chain(sids.iter().map(|&i| ObjectRef::Screen(i)))
+        .chain(eids.iter().map(|&i| ObjectRef::Environment(i)))
+        .collect()
+}
+
+/// Capture the per-kind op-start snapshots for a transform: fixtures keep
+/// (position, orientation); geometry + screens keep their world `Mat4`;
+/// environments keep (centre, size). ONE source for both the gizmo-drag and the
+/// modal G/R/S op-start so every kind is snapshotted — and thus live-applied and
+/// cancel-restored — identically.
+#[allow(clippy::type_complexity)]
+fn snapshot_starts(
+    scene: &Scene,
+    fids: &[usize],
+    gids: &[usize],
+    sids: &[usize],
+    eids: &[usize],
+) -> (Vec<(usize, Vec3, Quat)>, Vec<(usize, Mat4)>, Vec<(usize, Mat4)>, Vec<(usize, Vec3, Vec3)>) {
+    let start = fids
+        .iter()
+        .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
+        .collect();
+    let geo_start = gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
+    let screen_start = sids.iter().map(|&i| (i, scene.screens[i].transform)).collect();
+    let env_start =
+        eids.iter().map(|&i| (i, scene.environments[i].center, scene.environments[i].size)).collect();
+    (start, geo_start, screen_start, env_start)
 }
 
 /// Resolve the transform-orientation (#37) to a 3×3 whose COLUMNS are the X/Y/Z
@@ -3578,10 +3681,11 @@ fn orientation_basis(op: &TransformOp, camera: &OrbitCamera) -> glam::Mat3 {
         }
         TO::Local => {
             // Prefer the active fixture's orientation (its op-start Quat snapshot);
-            // else the first geometry piece's rotation from its op-start matrix.
+            // else the first geometry/screen piece's rotation from its op-start
+            // matrix (screens share geometry's Mat4 transform).
             if let Some((_, _, q)) = op.start.first() {
                 glam::Mat3::from_quat(*q)
-            } else if let Some((_, m0)) = op.geo_start.first() {
+            } else if let Some((_, m0)) = op.geo_start.first().or_else(|| op.screen_start.first()) {
                 let b = glam::Mat3::from_mat4(*m0);
                 // Normalize the columns so non-uniform scale doesn't skew the axes;
                 // a degenerate column falls back to the world axis.
@@ -3758,7 +3862,10 @@ fn apply_transform(
     // returns true). Single value → along the active axis (Move falls back to
     // global X, Rotate to Y, Scale to uniform — matching the mouse-path defaults).
     let amount = op.num.value();
-    let typed = op.num.active;
+    // During a duplicate-grab the mouse ALWAYS drives the offset; a typed number is
+    // the array clone-count (applied on confirm), not the move amount — so don't let
+    // it override the drag here.
+    let typed = op.num.active && !op.from_duplicate;
     // Build a picking ray from a screen position through the op's viewport rect
     // (#40 absolute drag + #71 Vertex/Surface snap both need world rays, not just
     // the pixel delta). Aspect derives from the stored rect.
@@ -3894,6 +4001,18 @@ fn apply_transform(
                     g.transform = Mat4::from_translation(world) * *m0;
                 }
             }
+            // Screens ride the identical Mat4 path as geometry.
+            for (i, m0) in &op.screen_start {
+                if let Some(s) = scene.screens.get_mut(*i) {
+                    s.transform = Mat4::from_translation(world) * *m0;
+                }
+            }
+            // Fog volumes: slide the centre (size unchanged).
+            for (i, c0, _sz) in &op.env_start {
+                if let Some(e) = scene.environments.get_mut(*i) {
+                    e.center = *c0 + world;
+                }
+            }
         }
         TransformKind::Rotate => {
             // Typed degrees override the mouse-derived angle (radians); #4 snaps the
@@ -3930,6 +4049,24 @@ fn apply_transform(
                     * Mat4::from_translation(-pivot);
                 if let Some(g) = scene.geometry.get_mut(*i) {
                     g.transform = about * *m0;
+                }
+            }
+            for (i, m0) in &op.screen_start {
+                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let about = Mat4::from_translation(pivot)
+                    * Mat4::from_quat(rot)
+                    * Mat4::from_translation(-pivot);
+                if let Some(s) = scene.screens.get_mut(*i) {
+                    s.transform = about * *m0;
+                }
+            }
+            for (i, c0, _sz) in &op.env_start {
+                // Axis-aligned fog box: orbit the centre about the pivot (a no-op
+                // for a lone box whose pivot IS its centre); the box stays
+                // axis-aligned, so size is unchanged.
+                let pivot = if op.individual { *c0 } else { op.pivot };
+                if let Some(e) = scene.environments.get_mut(*i) {
+                    e.center = pivot + rot * (*c0 - pivot);
                 }
             }
         }
@@ -3981,6 +4118,24 @@ fn apply_transform(
                     g.transform = about * *m0;
                 }
             }
+            for (i, m0) in &op.screen_start {
+                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let about = Mat4::from_translation(pivot)
+                    * about4
+                    * Mat4::from_translation(-pivot);
+                if let Some(s) = scene.screens.get_mut(*i) {
+                    s.transform = about * *m0;
+                }
+            }
+            for (i, c0, sz0) in &op.env_start {
+                // Fog box: scale the centre about the pivot and grow the size by the
+                // same (directional or uniform) factor — a lone box scales in place.
+                let pivot = if op.individual { *c0 } else { op.pivot };
+                if let Some(e) = scene.environments.get_mut(*i) {
+                    e.center = pivot + scale_mat * (*c0 - pivot);
+                    e.size = (scale_mat * *sz0).abs();
+                }
+            }
         }
     }
 }
@@ -3992,6 +4147,110 @@ fn apply_transform(
 #[inline]
 fn geo_world_centre(m: Mat4) -> Vec3 {
     m.w_axis.truncate()
+}
+
+/// The net world translation the primary copy received during a duplicate-grab —
+/// the spacing the array clone-count repeats along. Reads the primary element's
+/// current origin minus its op-start snapshot (the move is a pure translation).
+fn dup_grab_delta(op: &TransformOp, scene: &Scene) -> Vec3 {
+    if let Some((i, p0, _)) = op.start.first() {
+        scene.fixtures.get(*i).map(|f| f.position - *p0).unwrap_or(Vec3::ZERO)
+    } else if let Some((i, m0)) = op.geo_start.first() {
+        scene.geometry.get(*i).map(|g| (g.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
+    } else if let Some((i, m0)) = op.screen_start.first() {
+        scene.screens.get(*i).map(|s| (s.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
+    } else if let Some((i, c0, _)) = op.env_start.first() {
+        scene.environments.get(*i).map(|e| e.center - *c0).unwrap_or(Vec3::ZERO)
+    } else {
+        Vec3::ZERO
+    }
+}
+
+/// Drop the last `count` objects of `kind`'s Vec — the live Shift+D array clones,
+/// which are always appended at the END (LIFO), so a tail-truncate removes exactly
+/// them (on shrink or cancel) without disturbing the base copies' indices.
+fn truncate_objects(scene: &mut Scene, kind: ObjectRef, count: usize) {
+    match kind {
+        ObjectRef::Fixture(_) => {
+            let l = scene.fixtures.len();
+            scene.fixtures.truncate(l.saturating_sub(count));
+        }
+        ObjectRef::Geometry(_) => {
+            let l = scene.geometry.len();
+            scene.geometry.truncate(l.saturating_sub(count));
+        }
+        ObjectRef::Screen(_) => {
+            let l = scene.screens.len();
+            scene.screens.truncate(l.saturating_sub(count));
+        }
+        ObjectRef::Environment(_) => {
+            let l = scene.environments.len();
+            scene.environments.truncate(l.saturating_sub(count));
+        }
+    }
+}
+
+/// Place live array clone `k` (mirroring base copy `b`) at `base_home[b] + off` —
+/// the base copy's op-start pose translated along the drag vector.
+fn place_array_extra(scene: &mut Scene, op: &TransformOp, k: usize, b: usize, off: Vec3) {
+    match op.dup_extra[k] {
+        ObjectRef::Fixture(e) => {
+            if let (Some((_, p0, q0)), Some(f)) = (op.start.get(b), scene.fixtures.get_mut(e)) {
+                f.position = *p0 + off;
+                f.orientation = *q0;
+                f.snap_movement();
+            }
+        }
+        ObjectRef::Geometry(e) => {
+            if let (Some((_, m0)), Some(g)) = (op.geo_start.get(b), scene.geometry.get_mut(e)) {
+                g.transform = Mat4::from_translation(off) * *m0;
+            }
+        }
+        ObjectRef::Screen(e) => {
+            if let (Some((_, m0)), Some(s)) = (op.screen_start.get(b), scene.screens.get_mut(e)) {
+                s.transform = Mat4::from_translation(off) * *m0;
+            }
+        }
+        ObjectRef::Environment(e) => {
+            if let (Some((_, c0, sz0)), Some(env)) = (op.env_start.get(b), scene.environments.get_mut(e)) {
+                env.center = *c0 + off;
+                env.size = *sz0;
+            }
+        }
+    }
+}
+
+/// Regenerate the LIVE Shift+D array each frame so the WHOLE array follows the
+/// cursor while a clone-count is typed (not just one dragged copy). Grows/shrinks
+/// the clone set to the typed count and repositions every clone along the current
+/// drag vector. Clones live at the END of their kind's Vec (LIFO) so shrink/cancel
+/// tail-truncates them. Skipped on the op's first frame (where the move's `before`
+/// undo snapshot is captured — BEFORE any extras exist — so undo removes them).
+fn update_dup_array(op: &mut TransformOp, scene: &mut Scene) {
+    if !op.from_duplicate || op.dup_base.is_empty() {
+        return;
+    }
+    let base_len = op.dup_base.len();
+    let n = if op.num.active { (op.num.value().round() as i64).clamp(1, 1000) as u32 } else { 1 };
+    let desired = (n.saturating_sub(1) as usize) * base_len; // count of EXTRA clones (#2..N)
+    if op.dup_extra.len() > desired {
+        let remove = op.dup_extra.len() - desired;
+        truncate_objects(scene, op.dup_base[0], remove);
+        op.dup_extra.truncate(desired);
+    }
+    while op.dup_extra.len() < desired {
+        let b = op.dup_extra.len() % base_len;
+        match scene.duplicate_object(op.dup_base[b]) {
+            Some(new) => op.dup_extra.push(new),
+            None => break,
+        }
+    }
+    let delta = dup_grab_delta(op, scene);
+    for k in 0..op.dup_extra.len() {
+        let b = k % base_len;
+        let i = 2 + (k / base_len); // array index (#1 is the base copy)
+        place_array_extra(scene, op, k, b, delta * i as f32);
+    }
 }
 
 /// Live state for the Measure tool (§2.4) — a read-only two-point ruler that never
@@ -4234,11 +4493,68 @@ pub fn viewport(
     // `gizmo_hovered_axis`/`axis` so all three share the live-apply + undo path. The
     // grab is checked BEFORE orbit/select so dragging a handle never orbits the
     // camera; an empty-space press falls through untouched.
+    // Shift+D grab-duplicate hand-off: `Ui::show` already cloned + re-selected the
+    // copies (their own undo step) and set this flag. Pick it up and IMMEDIATELY
+    // start a Move grab on the copies so they follow the cursor and commit on
+    // click / Enter (Esc leaves them at the source, like Blender). A typed number
+    // during the grab becomes the array clone-count (see the confirm path).
+    let dupgrab_start = ui.ctx().data_mut(|d| {
+        let id = egui::Id::new("previz.dupgrab.start");
+        let v = d.get_temp::<bool>(id).unwrap_or(false);
+        if v {
+            d.remove::<bool>(id);
+        }
+        v
+    });
+    if dupgrab_start
+        && transform.is_none()
+        && selection.has_object()
+        && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
+    {
+        let fids: Vec<usize> =
+            selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+        let gids: Vec<usize> =
+            selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
+        let sids: Vec<usize> =
+            selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+        let eids: Vec<usize> =
+            selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+        let objs = obj_refs(&fids, &gids, &sids, &eids);
+        if !objs.is_empty() {
+            let pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
+            let (start, geo_start, screen_start, env_start) =
+                snapshot_starts(scene, &fids, &gids, &sids, &eids);
+            *transform = Some(TransformOp {
+                kind: TransformKind::Move,
+                axis: None,
+                start_screen: cur,
+                viewport: rect,
+                pivot,
+                start,
+                geo_start,
+                screen_start,
+                env_start,
+                gizmo_hovered_axis: None,
+                gizmo_plane_normal: None,
+                gizmo_view: false,
+                from_gizmo: false,
+                num: NumInput::default(),
+                individual: xform.pivot.is_individual(),
+                snap: xform.snap,
+                orientation: xform.orientation,
+                from_duplicate: true,
+                dup_base: objs,
+                dup_extra: Vec::new(),
+            });
+            *transform_started = true;
+        }
+    }
+
     let gizmo_targets: bool = active_tool.shows_xform_gizmo()
         && transform.is_none()
         && *viewport_focused
         && !selection.world
-        && (!selection.fixtures.is_empty() || !selection.geometry.is_empty());
+        && selection.has_object();
     if gizmo_targets
         && let Some(group) = gizmo::for_tool(active_tool)
     {
@@ -4248,9 +4564,13 @@ pub fn viewport(
             selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
         let gids: Vec<usize> =
             selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-        let n = (fids.len() + gids.len()) as f32;
-        if n > 0.0 {
-            let gizmo_pivot = compute_pivot(scene, &fids, &gids, xform.pivot, *cursor_3d);
+        let sids: Vec<usize> =
+            selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+        let eids: Vec<usize> =
+            selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+        let objs = obj_refs(&fids, &gids, &sids, &eids);
+        if !objs.is_empty() {
+            let gizmo_pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
             let cx = GizmoCtx {
                 pivot: gizmo_pivot,
                 vp: camera.view_proj(aspect),
@@ -4275,14 +4595,11 @@ pub fn viewport(
                 && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
             {
                 let start_spec = group.invoke(handle);
-                // `fids`/`gids` are the validated, selection-order indices computed
-                // above for the pivot — reused here for the per-element snapshots.
-                let start: Vec<(usize, Vec3, Quat)> = fids
-                    .iter()
-                    .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
-                    .collect();
-                let geo_start: Vec<(usize, Mat4)> =
-                    gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
+                // `fids`/`gids`/`sids`/`eids` are the validated, selection-order
+                // indices computed above for the pivot — reused here for the
+                // per-element snapshots (every kind, via `snapshot_starts`).
+                let (start, geo_start, screen_start, env_start) =
+                    snapshot_starts(scene, &fids, &gids, &sids, &eids);
                 *transform = Some(TransformOp {
                     kind: start_spec.kind,
                     // Move locks via `gizmo_hovered_axis` (matching P3a); rotate/scale
@@ -4294,6 +4611,8 @@ pub fn viewport(
                     pivot: cx.pivot,
                     start,
                     geo_start,
+                    screen_start,
+                    env_start,
                     gizmo_hovered_axis: if start_spec.kind == TransformKind::Move {
                         start_spec.axis
                     } else {
@@ -4311,6 +4630,8 @@ pub fn viewport(
                     individual: xform.pivot.is_individual(),
                     snap: xform.snap,
                     orientation: xform.orientation,
+                    from_duplicate: false,
+                    dup_base: Vec::new(), dup_extra: Vec::new(),
                 });
                 *transform_started = true;
             }
@@ -4564,6 +4885,26 @@ pub fn viewport(
                     g.transform = *m0;
                 }
             }
+            for (i, m0) in &op.screen_start {
+                if let Some(s) = scene.screens.get_mut(*i) {
+                    s.transform = *m0;
+                }
+            }
+            for (i, c0, sz0) in &op.env_start {
+                if let Some(e) = scene.environments.get_mut(*i) {
+                    e.center = *c0;
+                    e.size = *sz0;
+                }
+            }
+            // Drop the live duplicate-array clones — cancelling a Shift+D grab leaves
+            // only the base copies at the source (Blender). The base clone was its own
+            // undo step (it stands; one undo removes it).
+            if op.from_duplicate
+                && !op.dup_extra.is_empty()
+                && let Some(&kind) = op.dup_base.first()
+            {
+                truncate_objects(scene, kind, op.dup_extra.len());
+            }
             *transform = None;
         } else {
             if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
@@ -4579,6 +4920,13 @@ pub fn viewport(
                 if let Some(target) = snap_preview_point(op, scene, snap_on) {
                     draw_snap_marker(&ui.painter_at(rect), target, camera.view_proj(aspect), rect);
                 }
+            }
+            // LIVE duplicate-array: after the base copies moved, (re)build the array
+            // clones so the WHOLE array follows the cursor while a count is typed (not
+            // just one dragged copy). Skipped on the op's first frame, where the move's
+            // `before` undo snapshot is taken before any extras exist.
+            if op.from_duplicate && !*transform_started {
+                update_dup_array(op, scene);
             }
             // The key cluster (X/Y/Z · type number · Enter/Esc) is read LIVE from
             // the keymap so the pill can never drift from the binds (#23). When an
@@ -4602,12 +4950,21 @@ pub fn viewport(
                 );
             }
             if confirm {
+                // The array is already LIVE (rebuilt each frame above); committing just
+                // selects the whole result (base copies + array clones) so the user can
+                // keep editing them as a unit.
+                if op.from_duplicate {
+                    let mut all = op.dup_base.clone();
+                    all.extend(op.dup_extra.iter().copied());
+                    *selection = Selection::from_object_refs(&all);
+                }
                 *transform = None;
                 *transform_finished = true;
             }
         }
-    } else if *viewport_focused && (!selection.fixtures.is_empty() || !selection.geometry.is_empty()) {
-        // Start a transform on G / R / S (over fixtures and/or static geometry).
+    } else if *viewport_focused && selection.has_object() {
+        // Start a transform on G / R / S (over any placed object — fixtures,
+        // static geometry, LED screens or the environment volume).
         // The binds (and their modifier guards — plain R only, since Shift+R is
         // "Replace") live in the central registry under the Viewport context.
         // Viewport context active, no transform in flight (this is the `else`
@@ -4630,17 +4987,18 @@ pub fn viewport(
                 selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
             let gids: Vec<usize> =
                 selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-            if !fids.is_empty() || !gids.is_empty() {
+            let sids: Vec<usize> =
+                selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+            let eids: Vec<usize> =
+                selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+            let objs = obj_refs(&fids, &gids, &sids, &eids);
+            if !objs.is_empty() {
                 // #5: pivot per the chosen mode (Median / Active / 3D-Cursor; the
                 // Individual flag makes apply_transform pivot each element about its
                 // own origin). Per-element snapshots for the live re-apply / cancel.
-                let pivot = compute_pivot(scene, &fids, &gids, xform.pivot, *cursor_3d);
-                let start: Vec<(usize, Vec3, Quat)> = fids
-                    .iter()
-                    .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
-                    .collect();
-                let geo_start: Vec<(usize, Mat4)> =
-                    gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
+                let pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
+                let (start, geo_start, screen_start, env_start) =
+                    snapshot_starts(scene, &fids, &gids, &sids, &eids);
                 *transform = Some(TransformOp {
                     kind,
                     axis: None,
@@ -4649,6 +5007,8 @@ pub fn viewport(
                     pivot,
                     start,
                     geo_start,
+                    screen_start,
+                    env_start,
                     gizmo_hovered_axis: None,
                     gizmo_plane_normal: None,
                     gizmo_view: false,
@@ -4657,6 +5017,8 @@ pub fn viewport(
                     individual: xform.pivot.is_individual(),
                     snap: xform.snap,
                     orientation: xform.orientation,
+                    from_duplicate: false,
+                    dup_base: Vec::new(), dup_extra: Vec::new(),
                 });
                 *transform_started = true;
                 consumed = true;
@@ -5019,8 +5381,7 @@ pub fn viewport(
                 }
                 if duplicate.is_none() && ui.button(format!("{}  Duplicate / Array…", theme::icon::DUPLICATE)).clicked() {
                     if let Some(idx) = selection.primary_fixture() {
-                        *duplicate =
-                            Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
+                        *duplicate = Some(super::duplicate_dialog_for(ui.ctx(), idx));
                     }
                     ui.close();
                 }
@@ -5065,14 +5426,7 @@ pub fn viewport(
         && dup_pressed
         && let Some(idx) = selection.primary_fixture()
     {
-        *duplicate = Some(DuplicateDialog {
-            fixture: idx,
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            y_angle: 36.0,
-            count: 9,
-        });
+        *duplicate = Some(super::duplicate_dialog_for(ui.ctx(), idx));
     }
 
     // Focus border.
@@ -5317,10 +5671,10 @@ pub fn connectivity(
             };
             ui.colored_label(
                 theme::OK,
-                format!("● {bound} · {} source(s)", status.sources.len()),
+                format!("• {bound} · {} source(s)", status.sources.len()),
             );
         } else {
-            ui.colored_label(theme::IDLE, "○ stopped");
+            ui.colored_label(theme::IDLE, "• stopped");
         }
     });
     ui.separator();
@@ -5504,9 +5858,9 @@ pub fn dmx_universe_grid(
             }
             if live {
                 let n = snapshot.frames.get(&u).map(|f| f.sources).unwrap_or(0);
-                ui.colored_label(theme::OK, format!("● {n} src"));
+                ui.colored_label(theme::OK, format!("• {n} src"));
             } else {
-                ui.colored_label(ink.muted, "○ idle");
+                ui.colored_label(ink.muted, "• idle");
             }
         });
     });
@@ -6311,10 +6665,10 @@ mod pick_tests {
         scene.fixtures.push(demo.fixtures[0].clone());
         scene.fixtures[0].position = Vec3::new(10.0, 0.0, 10.0);
         let cursor = Vec3::new(-3.0, 1.5, 4.0);
-        let pivot = compute_pivot(&scene, &[0], &[], PivotMode::Cursor3d, cursor);
+        let pivot = compute_pivot(&scene, &[ObjectRef::Fixture(0)], PivotMode::Cursor3d, cursor);
         assert_eq!(pivot, cursor, "Cursor3d pivot ignores selection, uses the cursor");
         // The Median pivot, by contrast, is the fixture's own position.
-        let median = compute_pivot(&scene, &[0], &[], PivotMode::Median, cursor);
+        let median = compute_pivot(&scene, &[ObjectRef::Fixture(0)], PivotMode::Median, cursor);
         assert!((median - Vec3::new(10.0, 0.0, 10.0)).length() < 1.0, "median ≠ cursor");
     }
 
@@ -6361,7 +6715,7 @@ mod pick_tests {
 
     // --- library content-class chip predicate (S2c) ---------------------------
     fn row(kind: LibKind, accent: bool) -> LibRow {
-        LibRow { kind, icon: "", name: String::new(), meta: String::new(), category: String::new(), accent }
+        LibRow { kind, icon: "", name: String::new(), meta: String::new(), category: String::new(), accent, source: None }
     }
 
     #[test]
@@ -6429,7 +6783,48 @@ mod transform_tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, gizmo_view: false, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, gizmo_view: false, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), dup_extra: Vec::new(), orientation }
+    }
+
+    #[test]
+    fn shift_d_array_is_live_and_reversible() {
+        let mut scene = Scene::demo(); // one fixture at index 0
+        // Simulate Shift+D's clone: a base copy of fixture 0.
+        let base = scene.duplicate_object(ObjectRef::Fixture(0)).unwrap();
+        let ObjectRef::Fixture(bi) = base else { panic!("expected a fixture") };
+        let home = scene.fixtures[bi].position;
+        let n_before = scene.fixtures.len();
+        // The grab has moved the base copy by `delta` from its op-start home.
+        let delta = Vec3::new(2.0, 0.0, 0.0);
+        scene.fixtures[bi].position = home + delta;
+
+        let mut op = make_op(TransformKind::Move, None, Vec3::ZERO, bi, home);
+        op.from_duplicate = true;
+        op.dup_base = vec![base];
+        // Type "3" → an array of 3 (the base copy #1 + two LIVE extras #2/#3).
+        op.num = NumInput { str: "3".into(), sign: false, active: true };
+
+        update_dup_array(&mut op, &mut scene);
+        assert_eq!(op.dup_extra.len(), 2, "count 3 → 2 extra clones");
+        assert_eq!(scene.fixtures.len(), n_before + 2, "extras pushed onto the scene");
+        let e0 = match op.dup_extra[0] {
+            ObjectRef::Fixture(i) => i,
+            _ => panic!("fixture"),
+        };
+        let e1 = match op.dup_extra[1] {
+            ObjectRef::Fixture(i) => i,
+            _ => panic!("fixture"),
+        };
+        // #1 stays at home+delta; extras are evenly spaced at home+2·delta, home+3·delta.
+        assert!((scene.fixtures[bi].position - (home + delta)).length() < 1e-3);
+        assert!((scene.fixtures[e0].position - (home + delta * 2.0)).length() < 1e-3);
+        assert!((scene.fixtures[e1].position - (home + delta * 3.0)).length() < 1e-3);
+
+        // Shrinking the count back to 1 tail-truncates the live extras cleanly.
+        op.num = NumInput::default();
+        update_dup_array(&mut op, &mut scene);
+        assert!(op.dup_extra.is_empty(), "count 1 → no extras");
+        assert_eq!(scene.fixtures.len(), n_before, "extras removed from the scene");
     }
 
     #[test]
@@ -6461,7 +6856,7 @@ mod transform_tests {
             viewport: rect,
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
-            geo_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: Some(Axis::Z),
             gizmo_view: false,
@@ -6470,6 +6865,8 @@ mod transform_tests {
             individual: false,
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
+            from_duplicate: false,
+            dup_base: Vec::new(), dup_extra: Vec::new(),
         };
         // Drag to a clearly different screen point so the in-plane delta is nonzero.
         apply_transform(&o, &mut scene, &cam, egui::pos2(560.0, 180.0), false);
@@ -6496,6 +6893,8 @@ mod transform_tests {
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
+            screen_start: Vec::new(),
+            env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: true,
@@ -6503,6 +6902,9 @@ mod transform_tests {
             num: NumInput::default(),
             individual: false,
             snap: SnapSettings::default(),
+            from_duplicate: false,
+            dup_base: Vec::new(),
+            dup_extra: Vec::new(),
             orientation: TransformOrientation::Global,
         };
         apply_transform(&o, &mut scene, &cam, egui::pos2(560.0, 180.0), false);
@@ -6530,6 +6932,8 @@ mod transform_tests {
             pivot,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
+            screen_start: Vec::new(),
+            env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: true,
@@ -6537,6 +6941,9 @@ mod transform_tests {
             num: NumInput::default(),
             individual: false,
             snap: SnapSettings::default(),
+            from_duplicate: false,
+            dup_base: Vec::new(),
+            dup_extra: Vec::new(),
             orientation: TransformOrientation::Global,
         };
         apply_transform(&o, &mut scene, &cam, egui::pos2(120.0, 0.0), false);
@@ -6579,6 +6986,8 @@ mod transform_tests {
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
+            screen_start: Vec::new(),
+            env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,
@@ -6586,6 +6995,9 @@ mod transform_tests {
             num: NumInput::default(),
             individual: false,
             snap,
+            from_duplicate: false,
+            dup_base: Vec::new(),
+            dup_extra: Vec::new(),
             orientation: TransformOrientation::Global,
         };
         apply_transform(&o, &mut scene, &cam, cursor, true);
@@ -6773,7 +7185,7 @@ mod transform_tests {
             viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
             pivot: median,
             start: vec![(0, p0a, q0a), (1, p0b, scene.fixtures[1].orientation)],
-            geo_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,
@@ -6782,6 +7194,8 @@ mod transform_tests {
             individual: true,
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
+            from_duplicate: false,
+            dup_base: Vec::new(), dup_extra: Vec::new(),
         };
         o.num.active = true;
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
@@ -6814,7 +7228,7 @@ mod transform_tests {
                 (0, p0a, scene.fixtures[0].orientation),
                 (1, p0b, scene.fixtures[1].orientation),
             ],
-            geo_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,
@@ -6823,6 +7237,8 @@ mod transform_tests {
             individual: false,
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
+            from_duplicate: false,
+            dup_base: Vec::new(), dup_extra: Vec::new(),
         };
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
         // At least one position moved (they orbited the centroid).
