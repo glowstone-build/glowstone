@@ -1733,7 +1733,7 @@ impl Ui {
         // it (the menu itself stays library-only, decoupled from the mutation). The
         // menu also owns starring (mutates + persists `lib_prefs` directly).
         if let Some(action) =
-            windows::add_menu_window(ctx, &self.library, &mut self.add_menu, &mut self.lib_prefs)
+            windows::add_menu_window(ctx, &self.library, &mut self.add_menu, &mut self.lib_prefs, &mut self.gdtf_textures)
         {
             use windows::AddAction;
             // #19: drop at the viewport cursor/camera anchor, not the origin. When the
@@ -2141,6 +2141,10 @@ impl Ui {
                 None => self.notify.info(format!("View bookmark {slot} is empty")),
             },
             Action::ToggleLabels => self.prefs.show_labels = !self.prefs.show_labels,
+            Action::ToggleStats => self.prefs.show_stats = !self.prefs.show_stats,
+            Action::ToggleGrid => self.settings.show_grid = !self.settings.show_grid,
+            Action::ToggleGizmos => self.prefs.show_gizmos = !self.prefs.show_gizmos,
+            Action::ToggleHint => self.prefs.show_hint = !self.prefs.show_hint,
             // N / T — toggle the viewport's side regions (§2.2). Viewport-only
             // binds (the keymap stack already gates them to a focused viewport
             // and `poll` is silent while a text field has focus).
@@ -2502,11 +2506,19 @@ impl Ui {
                         ui.close();
                     }
                     ui.separator();
-                    // Display Mode + Grid + Beam-gizmo toggles now live in the
-                    // per-editor Viewport header (§2.2); the prefs-bound overlays
-                    // (labels / FPS) stay here.
-                    ui.checkbox(&mut self.prefs.show_labels, "Fixture labels");
-                    ui.checkbox(&mut self.prefs.show_fps, "FPS overlay");
+                    // Blender-style Overlays submenu: a coherent set of quiet,
+                    // toggleable viewport HUD bits, each backed by a registered
+                    // command so they're also in the F3 palette / keymap. Grid lives
+                    // in RenderSettings; the rest are prefs-bound overlays.
+                    ui.menu_button(format!("{}  Overlays", icon::EYE), |ui| {
+                        ui.checkbox(&mut self.prefs.show_stats, "Statistics");
+                        ui.checkbox(&mut self.prefs.show_labels, "Fixture labels");
+                        ui.checkbox(&mut self.settings.show_grid, "Grid + axes");
+                        ui.checkbox(&mut self.prefs.show_gizmos, "Navigation gizmo");
+                        ui.checkbox(&mut self.prefs.show_hint, "Transform hint line");
+                        ui.separator();
+                        ui.checkbox(&mut self.prefs.show_fps, "FPS overlay");
+                    });
                 });
                 ui.menu_button("Fixture", |ui| {
                     if ui.button(format!("{}  Online Library…", icon::ONLINE)).clicked() {
@@ -3161,6 +3173,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.lib,
                 self.lib_prefs,
                 self.open_share,
+                self.gdtf_textures,
             ),
             Tab::Inspector => {
                 let mut e = panels::InspectorEdit::default();
@@ -3284,6 +3297,15 @@ mod tests {
         // ToggleLabels flips the pref; ViewPie opens the pie; N/T toggle regions.
         let (ui, _, _, h) = run(Action::ToggleLabels, noop);
         assert!(h && ui.prefs.show_labels != Preferences::default().show_labels);
+        // Overlay toggles (View > Overlays) flip their backing flag.
+        let (ui, _, _, h) = run(Action::ToggleStats, noop);
+        assert!(h && ui.prefs.show_stats != Preferences::default().show_stats);
+        let (ui, _, _, h) = run(Action::ToggleGrid, noop);
+        assert!(h && !ui.settings.show_grid, "ToggleGrid flips the render-settings grid flag");
+        let (ui, _, _, h) = run(Action::ToggleGizmos, noop);
+        assert!(h && ui.prefs.show_gizmos != Preferences::default().show_gizmos);
+        let (ui, _, _, h) = run(Action::ToggleHint, noop);
+        assert!(h && ui.prefs.show_hint != Preferences::default().show_hint);
         let (ui, _, _, h) = run(Action::ViewPie, noop);
         assert!(h && ui.view_pie.open, "ViewPie opens the radial pie");
         let (ui, _, _, h) = run(Action::ToggleNPanel, noop);

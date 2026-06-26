@@ -10,9 +10,14 @@
 //! [`AddAction`] (decoupled from the scene mutation, which the caller performs so
 //! the new object can also be selected).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::scene::library::Library;
 use crate::ui::lib_prefs::{self, LibItem, LibraryPrefs};
+use crate::ui::panels::load_gdtf_textures;
 use crate::ui::theme;
+use crate::ui::GdtfTextures;
 
 /// Which group of addable things the menu is showing.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,15 +116,27 @@ struct Entry {
     score: i32,
     /// Stable lib-prefs key, for the star toggle + Recent matching.
     key: String,
+    /// Decoded GDTF thumbnail (imported fixtures only), drawn in place of the
+    /// glyph when present (S2a).
+    thumb: Option<egui::TextureId>,
 }
 
 /// Every addable entry in the active category, unfiltered, in catalog order.
 /// (GDTF fixtures first — most specific — then the built-in profiles.)
-fn category_entries(library: &Library, category: AddCategory) -> Vec<Entry> {
+fn category_entries(
+    library: &Library,
+    category: AddCategory,
+    thumbs: &HashMap<usize, egui::TextureId>,
+) -> Vec<Entry> {
     let mut out = Vec::new();
     let mk = |action: AddAction, icon: &'static str, label: String| {
         let key = lib_prefs::entry_key(library, action_item(&action)).unwrap_or_default();
-        Entry { icon, label, action, score: 0, key }
+        // Only GDTF imports carry a thumbnail (keyed by catalog index).
+        let thumb = match action {
+            AddAction::Gdtf(i) => thumbs.get(&i).copied(),
+            _ => None,
+        };
+        Entry { icon, label, action, score: 0, key, thumb }
     };
     match category {
         AddCategory::Fixtures => {
@@ -160,9 +177,13 @@ fn category_entries(library: &Library, category: AddCategory) -> Vec<Entry> {
 /// Build the filtered + fuzzy-ranked entry list for the active category. An empty
 /// query keeps catalog order; a non-empty query fuzzy-scores against the label and
 /// drops non-matches, best-first.
-fn entries(library: &Library, state: &AddMenuState) -> Vec<Entry> {
+fn entries(
+    library: &Library,
+    state: &AddMenuState,
+    thumbs: &HashMap<usize, egui::TextureId>,
+) -> Vec<Entry> {
     let q = state.search.trim().to_lowercase();
-    let mut out = category_entries(library, state.category);
+    let mut out = category_entries(library, state.category, thumbs);
     if q.is_empty() {
         return out;
     }
@@ -183,11 +204,15 @@ fn entries(library: &Library, state: &AddMenuState) -> Vec<Entry> {
 /// Fixtures tab is active). Recent keeps prefs order (most-recent first);
 /// Favourites is rendered in catalog order. Only shown when the search box is
 /// empty (a query searches the full catalog, Blender-style).
-fn pinned_entries(library: &Library, prefs: &LibraryPrefs) -> (Vec<Entry>, Vec<Entry>) {
+fn pinned_entries(
+    library: &Library,
+    prefs: &LibraryPrefs,
+    thumbs: &HashMap<usize, egui::TextureId>,
+) -> (Vec<Entry>, Vec<Entry>) {
     // Flatten every category once, indexed by key, to resolve prefs keys → Entry.
     let mut all: Vec<Entry> = Vec::new();
     for c in AddCategory::ORDER {
-        all.extend(category_entries(library, c));
+        all.extend(category_entries(library, c, thumbs));
     }
     let find = |key: &str| all.iter().find(|e| e.key == key).map(clone_entry);
     let recent: Vec<Entry> = prefs.recent.iter().filter_map(|k| find(k)).collect();
@@ -205,7 +230,7 @@ fn clone_entry(e: &Entry) -> Entry {
         AddAction::Screen(i) => AddAction::Screen(i),
         AddAction::Environment(i) => AddAction::Environment(i),
     };
-    Entry { icon: e.icon, label: e.label.clone(), action, score: e.score, key: e.key.clone() }
+    Entry { icon: e.icon, label: e.label.clone(), action, score: e.score, key: e.key.clone(), thumb: e.thumb }
 }
 
 /// Draw the Add menu if open. Returns the chosen action (and auto-closes) on a
@@ -215,9 +240,23 @@ pub fn add_menu_window(
     library: &Library,
     state: &mut AddMenuState,
     prefs: &mut LibraryPrefs,
+    // Shared GDTF texture cache (keyed by Arc pointer, same as the inspector +
+    // library browser) so imported fixtures show their thumbnail here too (S2a).
+    gdtf_textures: &mut HashMap<usize, GdtfTextures>,
 ) -> Option<AddAction> {
     if !state.open {
         return None;
+    }
+
+    // Decode each imported GDTF's thumbnail once into the shared cache, then build
+    // a catalog-index → TextureId lookup the entry rows can read.
+    let mut thumbs: HashMap<usize, egui::TextureId> = HashMap::new();
+    for (gi, g) in library.gdtf.iter().enumerate() {
+        let key = Arc::as_ptr(g) as usize;
+        let tex = gdtf_textures.entry(key).or_insert_with(|| load_gdtf_textures(ctx, g));
+        if let Some(t) = &tex.thumbnail {
+            thumbs.insert(gi, t.id());
+        }
     }
 
     // --- keyboard navigation (read before the window so it works even if focus
@@ -254,7 +293,7 @@ pub fn add_menu_window(
         state.idx = 0;
     }
 
-    let list = entries(library, state);
+    let list = entries(library, state, &thumbs);
     // Wrap/clamp the highlight against the live list length.
     if list.is_empty() {
         state.idx = 0;
@@ -265,7 +304,7 @@ pub fn add_menu_window(
     // (a query searches the full catalog). Resolved across all categories.
     let show_pinned = state.search.trim().is_empty();
     let (recent, favourites) =
-        if show_pinned { pinned_entries(library, prefs) } else { (Vec::new(), Vec::new()) };
+        if show_pinned { pinned_entries(library, prefs, &thumbs) } else { (Vec::new(), Vec::new()) };
 
     let mut picked: Option<usize> = None; // index into `list`
     let mut picked_action: Option<AddAction> = None; // a pinned-section click
@@ -441,7 +480,17 @@ fn row_with_star(
         {
             *toggle_fav = Some(e.key.clone());
         }
-        let row = ui.selectable_label(selected, format!("{}  {}", e.icon, e.label));
+        // A small thumbnail (imported GDTF) sits before the label; the glyph icon
+        // is folded into the label text only when there's no thumbnail.
+        let label = if e.thumb.is_some() {
+            if let Some(id) = e.thumb {
+                ui.add(egui::Image::new((id, egui::vec2(18.0, 18.0))));
+            }
+            e.label.clone()
+        } else {
+            format!("{}  {}", e.icon, e.label)
+        };
+        let row = ui.selectable_label(selected, label);
         if selected {
             row.scroll_to_me(None);
         }

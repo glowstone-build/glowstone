@@ -354,10 +354,74 @@ impl LibSort {
     }
 }
 
+/// A coarse content-class filter chip, composed *with* the fuzzy search +
+/// sort (S2). Unlike the per-maker/category sort, these partition the catalog by
+/// the KIND of thing — what most users reach for first ("just the lasers", "only
+/// screens"). `All` is the no-op default (every row passes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LibChip {
+    /// No filter — the whole catalog.
+    All,
+    /// Built-in + imported beam/profile fixtures (anything that isn't a laser).
+    Fixtures,
+    /// Laser-engine fixtures only.
+    Lasers,
+    /// LED-wall / screen components.
+    Screens,
+    /// Environment volumes.
+    Environments,
+    /// Imported GDTF definitions (vs. the built-in profiles).
+    Imported,
+}
+
+impl LibChip {
+    /// Left-to-right chip order.
+    const ORDER: [LibChip; 6] = [
+        LibChip::All,
+        LibChip::Fixtures,
+        LibChip::Lasers,
+        LibChip::Screens,
+        LibChip::Environments,
+        LibChip::Imported,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            LibChip::All => "All",
+            LibChip::Fixtures => "Fixtures",
+            LibChip::Lasers => "Lasers",
+            LibChip::Screens => "Screens",
+            LibChip::Environments => "Environments",
+            LibChip::Imported => "Imported",
+        }
+    }
+}
+
+/// Whether a catalog row passes the active content-class chip (pure, tested).
+/// `All` admits everything; the rest gate on the row's [`LibKind`]/`accent`
+/// (laser/transparent) flags so the predicate needs nothing but the row itself.
+fn chip_matches(chip: LibChip, row: &LibRow) -> bool {
+    match chip {
+        LibChip::All => true,
+        // Beam/profile fixtures: both imported GDTF and built-in NON-laser profiles.
+        LibChip::Fixtures => match row.kind {
+            LibKind::Gdtf(_) => true,
+            LibKind::Fixture(_) => !row.accent, // accent ⇒ laser
+            _ => false,
+        },
+        LibChip::Lasers => matches!(row.kind, LibKind::Fixture(_)) && row.accent,
+        LibChip::Screens => matches!(row.kind, LibKind::Screen(_)),
+        LibChip::Environments => matches!(row.kind, LibKind::Env(_)),
+        LibChip::Imported => matches!(row.kind, LibKind::Gdtf(_)),
+    }
+}
+
 /// Library panel UI state (search/sort + multi-select with a range anchor).
 pub struct LibState {
     pub search: String,
     pub sort: LibSort,
+    /// Active content-class filter chip (composed with search + sort).
+    pub chip: LibChip,
     /// Selected rows, as indices into the current filtered+sorted list.
     pub selected: Vec<usize>,
     pub anchor: Option<usize>,
@@ -365,7 +429,13 @@ pub struct LibState {
 
 impl Default for LibState {
     fn default() -> Self {
-        Self { search: String::new(), sort: LibSort::Category, selected: Vec::new(), anchor: None }
+        Self {
+            search: String::new(),
+            sort: LibSort::Category,
+            chip: LibChip::All,
+            selected: Vec::new(),
+            anchor: None,
+        }
     }
 }
 
@@ -379,6 +449,14 @@ enum LibKind {
 }
 
 impl LibKind {
+    /// The catalog index into `library.gdtf` for a GDTF row (for thumbnail lookup).
+    fn gdtf_index(self) -> Option<usize> {
+        match self {
+            LibKind::Gdtf(i) => Some(i),
+            _ => None,
+        }
+    }
+
     /// The lib-prefs identity for Recent/Favourites keying (#20).
     fn item(self) -> crate::ui::lib_prefs::LibItem {
         use crate::ui::lib_prefs::LibItem;
@@ -482,9 +560,17 @@ pub fn library_browser(
     lib: &mut LibState,
     lib_prefs: &mut crate::ui::lib_prefs::LibraryPrefs,
     open_share: &mut bool,
+    // Per-GDTF-type decoded textures (thumbnail + wheel media), keyed by the
+    // GDTF Arc pointer — the SAME cache the inspector fills, so a thumbnail
+    // decoded for a library row is reused once the fixture is placed (S2).
+    gdtf_textures: &mut HashMap<usize, GdtfTextures>,
 ) {
     use crate::ui::lib_prefs;
     use theme::icon;
+
+    // The panel's screen rect — a drag released OUTSIDE it (over the viewport)
+    // becomes a drop-to-place (S2b).
+    let panel_rect = ui.max_rect();
 
     // --- header: import / export toolbar (icon buttons) ---
     ui.horizontal(|ui| {
@@ -555,13 +641,27 @@ pub fn library_browser(
         }
     });
 
+    // --- content-class chips (compose with search + sort) ---
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for c in LibChip::ORDER {
+            if ui.selectable_label(lib.chip == c, RichText::new(c.label()).small()).clicked() {
+                lib.chip = c;
+                lib.selected.clear();
+                lib.anchor = None;
+            }
+        }
+    });
+
     // --- build, fuzzy-filter, sort ---
     // The full catalog (in catalog order), each row tagged with its stable
     // lib-prefs key so Recent/Favourites can resolve + render it.
     let all_rows = library_rows(library);
     let key_of = |row: &LibRow| lib_prefs::entry_key(library, row.kind.item()).unwrap_or_default();
 
-    let mut rows = all_rows;
+    // Content-class chip first (cheap partition), THEN fuzzy/sort over what's left.
+    let mut rows: Vec<LibRow> =
+        all_rows.into_iter().filter(|r| chip_matches(lib.chip, r)).collect();
     let q = lib.search.trim().to_lowercase();
     let fuzzy = !q.is_empty();
     if fuzzy {
@@ -590,20 +690,23 @@ pub fn library_browser(
     }
     lib.selected.retain(|&i| i < rows.len());
 
-    // Pinned Recent + Favourites rows, resolved from prefs against the live
-    // catalog. Only shown when not searching (a query searches the full list).
+    // Pinned Recent + Favourites rows, resolved from prefs against the FULL live
+    // catalog (not the chip-filtered subset — a starred screen still shows while
+    // the Lasers chip is active). Only shown when not searching (a query searches
+    // the full list).
     let pinned = !fuzzy;
+    let catalog = if pinned { library_rows(library) } else { Vec::new() };
     let recent_rows: Vec<LibRow> = if pinned {
         lib_prefs
             .recent
             .iter()
-            .filter_map(|k| rows.iter().find(|r| &key_of(r) == k).map(clone_lib_row))
+            .filter_map(|k| catalog.iter().find(|r| &key_of(r) == k).map(clone_lib_row))
             .collect()
     } else {
         Vec::new()
     };
     let fav_rows: Vec<LibRow> = if pinned {
-        rows.iter().filter(|r| lib_prefs.is_favourite(&key_of(r))).map(clone_lib_row).collect()
+        catalog.iter().filter(|r| lib_prefs.is_favourite(&key_of(r))).map(clone_lib_row).collect()
     } else {
         Vec::new()
     };
@@ -634,6 +737,20 @@ pub fn library_browser(
     });
     ui.separator();
 
+    // --- thumbnails: decode every imported GDTF's thumbnail into the SHARED
+    // cache (keyed by the Arc pointer, same as the inspector), then build a cheap
+    // catalog-index → TextureId lookup the row widget can read while `ui` is
+    // borrowed mutably. Decoding is one-shot per type (entry-or-insert). (S2a)
+    let mut thumb_ids: HashMap<usize, egui::TextureId> = HashMap::new();
+    for (gi, g) in library.gdtf.iter().enumerate() {
+        let key = Arc::as_ptr(g) as usize;
+        let tex = gdtf_textures.entry(key).or_insert_with(|| load_gdtf_textures(ui.ctx(), g));
+        if let Some(t) = &tex.thumbnail {
+            thumb_ids.insert(gi, t.id());
+        }
+    }
+    let thumb_of = |row: &LibRow| row.kind.gdtf_index().and_then(|gi| thumb_ids.get(&gi).copied());
+
     // --- the list (rich, selectable rows; shift = range, ⌘/Ctrl = toggle) ---
     let ink = theme::ink(!ui.visuals().dark_mode);
     let accent = ui.visuals().selection.stroke.color;
@@ -641,6 +758,8 @@ pub fn library_browser(
     let mut add_now: Option<LibRow> = None; // a pinned/double-click add (owns the row)
     let mut clicked: Option<(usize, egui::Modifiers)> = None;
     let mut toggle_fav: Option<String> = None;
+    let mut drop_add: Option<LibRow> = None; // a row dragged out into the viewport
+    let mut dragging: Option<String> = None; // label of the row being dragged (cursor pill)
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         // Pinned pseudo-categories: Recent + Favourites (#20).
         for (title, items) in [("RECENT", &recent_rows), ("FAVOURITES", &fav_rows)] {
@@ -652,11 +771,19 @@ pub fn library_browser(
             for row in items {
                 let key = key_of(row);
                 let starred = lib_prefs.is_favourite(&key);
-                let (resp, star) = library_row_widget(ui, row, false, starred, &ink, accent);
+                let (resp, star) = library_row_widget(ui, row, false, starred, &ink, accent, thumb_of(row));
                 if star {
                     toggle_fav = Some(key);
                 } else if resp.clicked() || resp.double_clicked() {
                     add_now = Some(clone_lib_row(row));
+                }
+                if resp.dragged() {
+                    dragging = Some(row.name.clone());
+                }
+                if resp.drag_stopped()
+                    && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !panel_rect.contains(p))
+                {
+                    drop_add = Some(clone_lib_row(row));
                 }
             }
             ui.add_space(2.0);
@@ -674,7 +801,7 @@ pub fn library_browser(
             let key = key_of(row);
             let selected = lib.selected.contains(&ri);
             let starred = lib_prefs.is_favourite(&key);
-            let (row_resp, star) = library_row_widget(ui, row, selected, starred, &ink, accent);
+            let (row_resp, star) = library_row_widget(ui, row, selected, starred, &ink, accent, thumb_of(row));
             if star {
                 toggle_fav = Some(key);
             } else if row_resp.clicked() {
@@ -682,6 +809,16 @@ pub fn library_browser(
             }
             if row_resp.double_clicked() {
                 add_now = Some(clone_lib_row(row));
+            }
+            // Drag-to-place: while a row is dragged show a cursor pill; on release
+            // OUTSIDE the panel (i.e. over the viewport) drop it into the scene.
+            if row_resp.dragged() {
+                dragging = Some(row.name.clone());
+            }
+            if row_resp.drag_stopped()
+                && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !panel_rect.contains(p))
+            {
+                drop_add = Some(clone_lib_row(row));
             }
         }
         // Apply a select-click (after the loop so we don't borrow rows mid-iter).
@@ -698,6 +835,40 @@ pub fn library_browser(
         let place = placement_point(scene, camera);
         *selection = add_library_row(&row, library, scene, place);
         add_keys.push(key_of(&row));
+    }
+    // A row dragged out of the panel and released over the viewport: add it at the
+    // current placement point (one undo step, same as Enter/double-click). egui
+    // doesn't give the viewport the drop position cross-widget, so we drop at the
+    // camera/cursor anchor — consistent with the other add paths (S2b).
+    if let Some(row) = drop_add {
+        let place = placement_point(scene, camera);
+        *selection = add_library_row(&row, library, scene, place);
+        add_keys.push(key_of(&row));
+    }
+    // While dragging a row, show its name in a small pill at the cursor + a "move"
+    // cursor, so the drag-to-place gesture reads as a drag (S2b).
+    if let Some(name) = dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(p) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("lib-drag-pill"),
+            ));
+            let text = format!("{}  {}", icon::ADD, name);
+            let font = egui::FontId::proportional(12.0);
+            let galley = painter.layout_no_wrap(text, font, theme::ink(!ui.visuals().dark_mode).primary);
+            let pad = egui::vec2(8.0, 4.0);
+            let at = p + egui::vec2(14.0, 6.0);
+            let bg = egui::Rect::from_min_size(at, galley.size() + pad * 2.0);
+            painter.rect_filled(bg, 5.0, ui.visuals().widgets.active.bg_fill);
+            painter.rect_stroke(
+                bg,
+                5.0,
+                egui::Stroke::new(1.0, ui.visuals().selection.stroke.color),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(at + pad, galley, Color32::WHITE);
+        }
     }
     for k in add_keys {
         if !k.is_empty() {
@@ -776,9 +947,14 @@ fn library_row_widget(
     starred: bool,
     ink: &theme::Ink,
     accent: Color32,
+    // Decoded GDTF thumbnail for this row, if any — drawn in place of the glyph
+    // icon when present, falling back to the icon otherwise (S2a).
+    thumb: Option<egui::TextureId>,
 ) -> (egui::Response, bool) {
     let h = 34.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
+    // click_and_drag so a row can be DRAGGED out into the viewport to place it
+    // (S2b); a plain click still selects, a double-click still adds.
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
     if selected {
@@ -787,14 +963,30 @@ fn library_row_widget(
     } else if resp.hovered() {
         painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
     }
-    let icon_color = if row.accent { accent } else { ink.secondary };
-    painter.text(
-        rect.left_center() + egui::vec2(9.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        row.icon,
-        egui::FontId::proportional(16.0),
-        icon_color,
-    );
+    // Leading visual: the GDTF thumbnail when we have one, else the kind glyph.
+    match thumb {
+        Some(id) => {
+            let s = 24.0;
+            let tl = egui::pos2(rect.left() + 4.0, rect.center().y - s / 2.0);
+            let img = egui::Rect::from_min_size(tl, egui::vec2(s, s));
+            painter.image(
+                id,
+                img,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        None => {
+            let icon_color = if row.accent { accent } else { ink.secondary };
+            painter.text(
+                rect.left_center() + egui::vec2(9.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                row.icon,
+                egui::FontId::proportional(16.0),
+                icon_color,
+            );
+        }
+    }
     let text_w = (rect.width() - 30.0 - 40.0).max(40.0);
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), &row.name, 13.0, ink.primary, text_w);
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, text_w);
@@ -831,7 +1023,7 @@ fn library_row_widget(
     {
         star_clicked = true;
     }
-    (resp.on_hover_text("Click to select · double-click to add · star = favourite"), star_clicked)
+    (resp.on_hover_text("Click to select · double-click or drag to viewport to add · star = favourite"), star_clicked)
 }
 
 // ============================================================================
@@ -3441,21 +3633,23 @@ pub fn viewport(
             // the keymap so the pill can never drift from the binds (#23). When an
             // axis is locked the pill tints to that axis's colour so the constraint
             // is unmistakable; otherwise the neutral amber.
-            let hint = op.hint(&shortcuts::modal_hint_keys());
-            let tint = op
-                .active_axis()
-                .map(|a| {
-                    let [r, g, b] = a.color();
-                    egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
-                })
-                .unwrap_or(egui::Color32::from_rgb(255, 220, 120));
-            theme::overlay_label(
-                &ui.painter_at(rect),
-                rect.center_top() + egui::vec2(0.0, 10.0),
-                egui::Align2::CENTER_TOP,
-                &hint,
-                Some(tint),
-            );
+            if prefs.show_hint {
+                let hint = op.hint(&shortcuts::modal_hint_keys());
+                let tint = op
+                    .active_axis()
+                    .map(|a| {
+                        let [r, g, b] = a.color();
+                        egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+                    })
+                    .unwrap_or(egui::Color32::from_rgb(255, 220, 120));
+                theme::overlay_label(
+                    &ui.painter_at(rect),
+                    rect.center_top() + egui::vec2(0.0, 10.0),
+                    egui::Align2::CENTER_TOP,
+                    &hint,
+                    Some(tint),
+                );
+            }
             if confirm {
                 *transform = None;
                 *transform_finished = true;
@@ -3599,7 +3793,8 @@ pub fn viewport(
     // `set_view`). Drawn top-right with the egui painter (no extra render pass);
     // hover highlights the ball under the pointer. Hit-tested BEFORE orbit so a
     // click on the cluster snaps the view instead of starting an orbit drag.
-    {
+    // Suppressed (drawn AND click-handled) when the Gizmos overlay is off.
+    if prefs.show_gizmos {
         // Cluster centre: top-right corner, inset by its radius (+ a little margin)
         // and tucked below the active-selection label that lives up there.
         let center = rect.right_top()
@@ -4070,10 +4265,76 @@ pub fn viewport(
         );
     }
 
+    // Scene STATISTICS overlay (Blender's bottom-left stats readout): a quiet,
+    // monospace count of what's in the scene + the live selection. Off by default
+    // (opt-in via View > Overlays > Statistics); kept faint so it never competes
+    // with the canvas. Bottom-left so it clears the top-left FPS/view-tag stack.
+    if prefs.show_stats {
+        let selected = selection.fixtures.len()
+            + selection.geometry.len()
+            + selection.screens.len()
+            + usize::from(selection.environment.is_some());
+        let lines = stats_lines(
+            scene.fixtures.len(),
+            scene.geometry.len(),
+            scene.screens.len(),
+            scene.environments.len(),
+            selected,
+        );
+        let painter = ui.painter_at(rect);
+        let col = theme::ink(!ui.visuals().dark_mode).tertiary;
+        let line_h = 14.0;
+        // Anchor from the bottom edge up, so the block grows upward and the first
+        // line always sits at a fixed bottom inset regardless of line count.
+        let mut y = rect.bottom() - 8.0 - line_h * (lines.len() as f32 - 1.0);
+        for line in &lines {
+            painter.text(
+                egui::pos2(rect.left() + 8.0, y),
+                egui::Align2::LEFT_TOP,
+                line,
+                egui::FontId::monospace(11.0),
+                col,
+            );
+            y += line_h;
+        }
+    }
+
     // The display Mode + Exposure controls (and the Grid / Beam-gizmo toggles)
     // now live in the per-editor Viewport HEADER (`ui::editor`), migrated off the
     // old floating "viewport-display-overlay" Area (§2.2). Advanced look settings
     // (bloom/beam/steps) stay in Preferences.
+}
+
+/// Build the quiet scene-statistics overlay text lines from the scene counts +
+/// the live selection count. A category line is emitted ONLY when its count is
+/// non-zero (so an empty scene shows nothing but "0 selected" stays useful), and
+/// the trailing "selected" line is always present. Pure (no egui) so the count
+/// logic is unit-testable. Order mirrors the outliner: fixtures, objects,
+/// screens, environments, then selected.
+pub(super) fn stats_lines(
+    fixtures: usize,
+    objects: usize,
+    screens: usize,
+    environments: usize,
+    selected: usize,
+) -> Vec<String> {
+    // Singular/plural label for a count (e.g. "1 fixture" / "3 fixtures").
+    let row = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut lines = Vec::new();
+    if fixtures > 0 {
+        lines.push(row(fixtures, "fixture", "fixtures"));
+    }
+    if objects > 0 {
+        lines.push(row(objects, "object", "objects"));
+    }
+    if screens > 0 {
+        lines.push(row(screens, "screen", "screens"));
+    }
+    if environments > 0 {
+        lines.push(row(environments, "environment", "environments"));
+    }
+    lines.push(format!("{selected} selected"));
+    lines
 }
 
 /// Bottom tab: Art-Net / sACN connectivity settings + live source status.
@@ -5103,6 +5364,96 @@ mod pick_tests {
         // The Median pivot, by contrast, is the fixture's own position.
         let median = compute_pivot(&scene, &[0], &[], PivotMode::Median, cursor);
         assert!((median - Vec3::new(10.0, 0.0, 10.0)).length() < 1.0, "median ≠ cursor");
+    }
+
+    /// S1-viewport-overlays: the stats overlay emits a line per non-empty category
+    /// (in outliner order) plus an always-present selected line, with correct
+    /// singular/plural agreement and live counts.
+    #[test]
+    fn stats_lines_counts_and_pluralise() {
+        // Mixed scene: a singular, a plural, a zero (skipped) and selection.
+        let lines = stats_lines(1, 3, 0, 2, 4);
+        assert_eq!(
+            lines,
+            vec![
+                "1 fixture".to_string(),   // singular
+                "3 objects".to_string(),   // plural
+                // screens == 0 → skipped entirely
+                "2 environments".to_string(),
+                "4 selected".to_string(), // always present, last
+            ]
+        );
+    }
+
+    /// An empty scene shows only the "0 selected" line (every category zero ⇒
+    /// skipped), so the overlay never adds noise to a blank canvas.
+    #[test]
+    fn stats_lines_empty_scene_is_just_selected() {
+        assert_eq!(stats_lines(0, 0, 0, 0, 0), vec!["0 selected".to_string()]);
+    }
+
+    /// One of everything reads in the singular and keeps outliner order.
+    #[test]
+    fn stats_lines_singular_order() {
+        assert_eq!(
+            stats_lines(1, 1, 1, 1, 1),
+            vec![
+                "1 fixture".to_string(),
+                "1 object".to_string(),
+                "1 screen".to_string(),
+                "1 environment".to_string(),
+                "1 selected".to_string(),
+            ]
+        );
+    }
+
+    // --- library content-class chip predicate (S2c) ---------------------------
+    fn row(kind: LibKind, accent: bool) -> LibRow {
+        LibRow { kind, icon: "", name: String::new(), meta: String::new(), category: String::new(), accent }
+    }
+
+    #[test]
+    fn chip_all_admits_everything() {
+        for r in [
+            row(LibKind::Gdtf(0), false),
+            row(LibKind::Fixture(0), false),
+            row(LibKind::Fixture(0), true),
+            row(LibKind::Screen(0), false),
+            row(LibKind::Env(0), false),
+        ] {
+            assert!(chip_matches(LibChip::All, &r));
+        }
+    }
+
+    #[test]
+    fn chip_fixtures_includes_gdtf_and_non_laser_profiles_only() {
+        // Imported GDTF + a built-in NON-laser profile pass.
+        assert!(chip_matches(LibChip::Fixtures, &row(LibKind::Gdtf(0), false)));
+        assert!(chip_matches(LibChip::Fixtures, &row(LibKind::Fixture(0), false)));
+        // A laser profile (accent) is NOT a "fixture" under this chip.
+        assert!(!chip_matches(LibChip::Fixtures, &row(LibKind::Fixture(1), true)));
+        // Screens / environments are excluded.
+        assert!(!chip_matches(LibChip::Fixtures, &row(LibKind::Screen(0), false)));
+        assert!(!chip_matches(LibChip::Fixtures, &row(LibKind::Env(0), false)));
+    }
+
+    #[test]
+    fn chip_lasers_is_only_accented_profiles() {
+        assert!(chip_matches(LibChip::Lasers, &row(LibKind::Fixture(0), true)));
+        assert!(!chip_matches(LibChip::Lasers, &row(LibKind::Fixture(0), false)));
+        // A GDTF is never classed as a laser by this chip (accent is irrelevant).
+        assert!(!chip_matches(LibChip::Lasers, &row(LibKind::Gdtf(0), true)));
+    }
+
+    #[test]
+    fn chip_screens_environments_imported_partition_by_kind() {
+        assert!(chip_matches(LibChip::Screens, &row(LibKind::Screen(0), false)));
+        assert!(!chip_matches(LibChip::Screens, &row(LibKind::Env(0), false)));
+        assert!(chip_matches(LibChip::Environments, &row(LibKind::Env(0), false)));
+        assert!(!chip_matches(LibChip::Environments, &row(LibKind::Screen(0), false)));
+        // Imported = GDTF rows only (a built-in profile, even non-laser, is not).
+        assert!(chip_matches(LibChip::Imported, &row(LibKind::Gdtf(0), false)));
+        assert!(!chip_matches(LibChip::Imported, &row(LibKind::Fixture(0), false)));
     }
 }
 

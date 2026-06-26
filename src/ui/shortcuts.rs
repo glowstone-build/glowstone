@@ -52,6 +52,14 @@ pub enum Action {
     /// `Recall view bookmark N` command per slot is registered for the palette/keymap.
     RecallBookmark(usize),
     ToggleLabels,
+    /// Toggle the quiet scene-statistics corner overlay (Overlays submenu).
+    ToggleStats,
+    /// Toggle the origin grid + world axes (Overlays submenu / header).
+    ToggleGrid,
+    /// Toggle the navigation axis gizmo (Overlays submenu).
+    ToggleGizmos,
+    /// Toggle the modal-transform hint line (Overlays submenu).
+    ToggleHint,
     // Selection.
     SelectAll,
     Deselect,
@@ -348,6 +356,11 @@ pub static COMMANDS: &[Command] = &[
     command_row("view.frame_selection", "Frame selection", Category::View, Action::FrameSelection),
     command_row("view.frame_all", "Frame all", Category::View, Action::FrameAll),
     command_row("view.toggle_labels", "Toggle fixture labels", Category::View, Action::ToggleLabels),
+    // --- Overlays (View > Overlays submenu): quiet, toggleable viewport HUD bits. ---
+    command_row("view.toggle_stats", "Toggle scene statistics", Category::View, Action::ToggleStats),
+    command_row("view.toggle_grid", "Toggle grid + world axes", Category::View, Action::ToggleGrid),
+    command_row("view.toggle_gizmos", "Toggle navigation gizmo", Category::View, Action::ToggleGizmos),
+    command_row("view.toggle_hint", "Toggle transform hint line", Category::View, Action::ToggleHint),
     command_row("view.front", "Front view", Category::View, Action::View(CameraView::Front)),
     command_row("view.back", "Back view", Category::View, Action::View(CameraView::Back)),
     command_row("view.right", "Right view", Category::View, Action::View(CameraView::Right)),

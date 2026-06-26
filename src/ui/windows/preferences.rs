@@ -54,6 +54,22 @@ pub struct Preferences {
     pub labels_selected_only: bool,
     pub label_mode: LabelMode,
     pub show_fps: bool,
+    /// Quiet Blender-style scene STATS corner overlay (fixtures / objects /
+    /// screens / environments + selected count). Off by default — it's an opt-in,
+    /// unobtrusive readout (Blender's "Statistics" overlay also ships off).
+    #[serde(default)]
+    pub show_stats: bool,
+    /// The navigation axis gizmo + transform gizmo "Gizmos" overlay toggle. On by
+    /// default (matches the existing always-drawn behaviour).
+    #[serde(default = "default_true")]
+    pub show_gizmos: bool,
+    /// The modal-transform hint line (the G/R/S key-cluster pill). On by default.
+    #[serde(default = "default_true")]
+    pub show_hint: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Preferences {
@@ -67,6 +83,9 @@ impl Default for Preferences {
             labels_selected_only: false,
             label_mode: LabelMode::Name,
             show_fps: true,
+            show_stats: false,
+            show_gizmos: true,
+            show_hint: true,
         }
     }
 }
@@ -179,6 +198,11 @@ pub fn preferences_window(
                     });
                     ui.add_space(2.0);
                     ui.checkbox(&mut prefs.show_fps, "FPS overlay");
+                    ui.add_space(2.0);
+                    ui.checkbox(&mut prefs.show_stats, "Scene statistics");
+                    ui.checkbox(&mut settings.show_grid, "Grid + world axes");
+                    ui.checkbox(&mut prefs.show_gizmos, "Navigation gizmo");
+                    ui.checkbox(&mut prefs.show_hint, "Transform hint line");
                 });
 
             egui::CollapsingHeader::new(format!("{}  {}", theme::icon::INSPECTOR, "Rendering"))
