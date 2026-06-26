@@ -1961,14 +1961,23 @@ impl Renderer {
             // Replace dialog's "mesh/model only"): assemble its parts under ITS own
             // cache key. With `model_src = None` (every normal fixture) this is the
             // same single assemble + `key` as before — byte-identical, no regression.
-            let mut own =
-                fixture_model::assemble(&gdtf, fixture.mode_index, root, fixture.pan_actual, fixture.tilt_actual);
+            let mut own = fixture_model::assemble(
+                &gdtf,
+                fixture.mode_index,
+                root,
+                fixture.pan_actual,
+                fixture.tilt_actual,
+                &fixture.cell_pan,
+                &fixture.cell_tilt,
+            );
             beam_frames[i] = std::mem::take(&mut own.beams);
             let (asm, key) = match &fixture.model_src {
                 Some(m) => {
                     let mk = Arc::as_ptr(m) as usize;
                     self.ensure_gdtf_loaded(mk, m);
-                    (fixture_model::assemble(m, 0, root, fixture.pan_actual, fixture.tilt_actual), mk)
+                    // The borrowed BODY model has no per-head data of its own — it's
+                    // just geometry; its axes (if any) follow the fixture-wide angles.
+                    (fixture_model::assemble(m, 0, root, fixture.pan_actual, fixture.tilt_actual, &[], &[]), mk)
                 }
                 None => (own, key),
             };

@@ -326,7 +326,10 @@ pub struct DmxView<'a> {
 ///   set (no socket) through the real decode path — composes with
 ///   `PREVIZ_SCREENSHOT`/`PREVIZ_SHEET`.
 /// - `PREVIZ_DMX_INJECT="u,ch,val; …"` injects explicit channel values.
-/// - `PREVIZ_DMX_DUMP=1` logs each fixture's decoded state (a non-graphical oracle).
+/// - `PREVIZ_DMX_DUMP=1` logs each fixture's decoded state here (a non-graphical
+///   oracle), AND — on the live decode path — the raw footprint bytes each
+///   console actually drives (see `decode::dump_footprint`), the ground truth
+///   for layered/multi-emitter fixtures like the Volero Wave.
 pub fn apply_env_knobs(dmx: &mut DmxIo, scene: &mut Scene) {
     let env = std::env::var;
 
