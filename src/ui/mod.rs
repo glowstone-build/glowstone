@@ -454,6 +454,9 @@ pub struct Ui {
     /// Per-frame drag edges the inspector reports (read after the dock) to drive
     /// the `inspector_tx` begin/finalize. Transient — not serialized.
     inspector_edit: panels::InspectorEdit,
+    /// Persistent Inspector UI state (property filter + per-category collapse).
+    /// Loaded from the config dir on launch; categories self-save on toggle.
+    inspector_state: panels::InspectorState,
     /// Timestamp of the last arrow-key nudge — a fresh nudge within
     /// [`NUDGE_COALESCE`] of it extends the top undo step instead of pushing a new
     /// one, so holding an arrow key collapses into a single undo. `None` = no
@@ -616,6 +619,7 @@ impl Ui {
             transform_finished: false,
             inspector_tx: None,
             inspector_edit: panels::InspectorEdit::default(),
+            inspector_state: panels::InspectorState::load(),
             last_nudge: None,
             pending_nudge: Vec3::ZERO,
             groups: Vec::new(),
@@ -1542,6 +1546,7 @@ impl Ui {
             transform_started: &mut self.transform_started,
             transform_finished: &mut self.transform_finished,
             inspector_edit: &mut self.inspector_edit,
+            inspector_state: &mut self.inspector_state,
             groups: &mut self.groups,
             group_name: &mut self.group_name,
             cues: &mut self.cues,
@@ -2990,6 +2995,9 @@ struct PanelViewer<'a> {
     /// Per-frame drag edges the inspector reports for the slider-drag undo
     /// transaction (#13). Read after the dock to begin/finalize `inspector_tx`.
     inspector_edit: &'a mut panels::InspectorEdit,
+    /// Persistent Inspector filter + collapse state, shared by the Inspector tab
+    /// and the viewport N-panel (both can render the inspector in one frame).
+    inspector_state: &'a mut panels::InspectorState,
     groups: &'a mut Vec<SelectionGroup>,
     group_name: &'a mut String,
     cues: &'a mut cues::CueEngine,
@@ -3116,6 +3124,7 @@ impl TabViewer for PanelViewer<'_> {
                                 self.gdtf_textures,
                                 self.profile,
                                 self.screen_sources,
+                                self.inspector_state,
                                 &mut e,
                             );
                             // OR into the shared edge flags (N-panel + Inspector
@@ -3177,7 +3186,7 @@ impl TabViewer for PanelViewer<'_> {
             ),
             Tab::Inspector => {
                 let mut e = panels::InspectorEdit::default();
-                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, &mut e);
+                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, self.inspector_state, &mut e);
                 self.inspector_edit.started |= e.started;
                 self.inspector_edit.stopped |= e.stopped;
             }

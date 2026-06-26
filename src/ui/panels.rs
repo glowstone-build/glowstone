@@ -1466,7 +1466,7 @@ fn inspector_body(
 /// Categories are collapsible and the Optics / Wheels rows are **dynamic** — they
 /// show the union of controls the selected fixtures actually expose, not a fixed
 /// hardcoded list.
-fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, ids: &[usize]) {
+fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, ids: &[usize], state: &mut InspectorState) {
     let primary = ids[0];
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{}  {} fixtures", theme::icon::FIXTURE, ids.len())).strong());
@@ -2025,7 +2025,7 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
 /// cabinet grid (with a live derived-resolution readout), surface photometry,
 /// and the content source. Phase 1 covers Test Pattern + Solid Colour content;
 /// the cabinet is editable directly (the panel TYPE is set from the Library).
-fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sources: &ScreenSources) {
+fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sources: &ScreenSources, state: &mut InspectorState) {
     ui.heading(s.name.as_str());
     let [rx, ry] = s.resolution();
     let [mw, mh] = s.size_m();
@@ -2360,6 +2360,7 @@ fn gdtf_inspector(
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
     fixture_id: usize,
     profile: &mut Option<ProfileEditor>,
+    state: &mut InspectorState,
 ) {
     let gdtf = fixture.gdtf.clone().expect("gdtf");
     let key = Arc::as_ptr(&gdtf) as usize;
