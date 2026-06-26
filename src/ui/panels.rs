@@ -43,6 +43,90 @@ pub struct InspectorEdit {
     pub stopped: bool,
 }
 
+/// Persistent + transient Inspector UI state (S1): the property **filter** box and
+/// each category's remembered **open/closed** state.
+///
+/// The filter is a fuzzy/substring match (via [`super::lib_prefs::fuzzy_score`])
+/// run against each property ROW label; categories with no matching row hide
+/// entirely, and an empty filter restores the full layout. The collapse map
+/// remembers, per category title, whether the user has it expanded — so the
+/// inspector reopens the way they left it. Only `collapsed` persists (to a small
+/// JSON in the config dir, mirroring [`super::lib_prefs::LibraryPrefs`]); the
+/// filter is per-session.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InspectorState {
+    /// Live row-label filter (not persisted — a fresh session starts unfiltered).
+    #[serde(skip)]
+    pub filter: String,
+    /// Per-category remembered open state, keyed by the category's stable title
+    /// (e.g. "Transform", "Optics"). Absent ⇒ fall back to the call-site default.
+    #[serde(default)]
+    pub collapsed: std::collections::BTreeMap<String, bool>,
+}
+
+impl InspectorState {
+    /// Load the persisted collapse map (config dir); missing/garbled ⇒ default.
+    pub fn load() -> Self {
+        let Some(p) = inspector_state_path() else { return Self::default() };
+        let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+
+    /// Persist the collapse map (best-effort; a write failure is non-fatal).
+    pub fn save(&self) {
+        let Some(p) = inspector_state_path() else { return };
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&p, text);
+        }
+    }
+
+    /// The trimmed, lowercased active query, or `None` when filtering is off.
+    fn query(&self) -> Option<String> {
+        let q = self.filter.trim().to_lowercase();
+        (!q.is_empty()).then_some(q)
+    }
+
+    /// Whether a single property ROW (identified by its label) should be shown:
+    /// always when no filter is active, else a fuzzy match against the label.
+    pub fn row_visible(&self, label: &str) -> bool {
+        match self.query() {
+            None => true,
+            Some(q) => super::lib_prefs::fuzzy_score(&q, &label.to_lowercase()).is_some(),
+        }
+    }
+
+    /// Whether a CATEGORY (with the given row labels) should be shown: always when
+    /// no filter is active, else only if at least one of its rows matches. An empty
+    /// row set hides under filtering (nothing to match).
+    pub fn category_visible(&self, row_labels: &[&str]) -> bool {
+        match self.query() {
+            None => true,
+            Some(q) => row_labels
+                .iter()
+                .any(|l| super::lib_prefs::fuzzy_score(&q, &l.to_lowercase()).is_some()),
+        }
+    }
+
+    /// The effective open state for a category: the remembered value if the user
+    /// has toggled it, else the call-site `default_open`. While a filter is active
+    /// every visible category force-opens so matches aren't hidden behind a caret.
+    fn open_state(&self, title: &str, default_open: bool) -> bool {
+        if self.query().is_some() {
+            return true;
+        }
+        self.collapsed.get(title).copied().unwrap_or(default_open)
+    }
+}
+
+/// `<config>/inspector.json` — the per-user collapse store, alongside
+/// `library.json` / `recent.json`.
+fn inspector_state_path() -> Option<std::path::PathBuf> {
+    let d = directories::ProjectDirs::from("dev", "Embedder", "previz")?;
+    let dir = d.config_dir();
+    std::fs::create_dir_all(dir).ok()?;
+    Some(dir.join("inspector.json"))
+}
+
 /// Left tab: the scene outliner — every fixture and environment, selectable —
 /// plus the global view/look controls.
 /// Discovered live video sources for the LED-screen content pickers, refreshed
@@ -261,7 +345,7 @@ pub fn scene_outliner(
 /// The World inspector: load an equirectangular HDRI (sky + image-based
 /// ambient), set its brightness, ambient fill, yaw and whether it shows as the
 /// viewport background. Shown in the Inspector when the World node is selected.
-fn world_inspector(ui: &mut egui::Ui, world: &mut crate::scene::World, ink: &theme::Ink) {
+fn world_inspector(ui: &mut egui::Ui, world: &mut crate::scene::World, ink: &theme::Ink, state: &InspectorState) {
     use theme::icon;
     ui.horizontal(|ui| {
         if ui
@@ -297,18 +381,21 @@ fn world_inspector(ui: &mut egui::Ui, world: &mut crate::scene::World, ink: &the
 
     let enabled = world.hdri.is_some();
     Grid::new("world-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        ui.label("Brightness").on_hover_text("Overall world exposure (sky + ambient)");
-        ui.add_enabled(enabled, Slider::new(&mut world.brightness, 0.0..=4.0));
-        ui.end_row();
-        ui.label("Ambient").on_hover_text("How strongly the environment lights the geometry");
-        ui.add_enabled(enabled, Slider::new(&mut world.ambient, 0.0..=2.0));
-        ui.end_row();
-        ui.label("Rotation").on_hover_text("Turn the environment around the vertical axis");
-        ui.add_enabled(enabled, Slider::new(&mut world.rotation, 0.0..=std::f32::consts::TAU).suffix(" rad"));
-        ui.end_row();
-        ui.label("Background");
-        ui.add_enabled(enabled, egui::Checkbox::new(&mut world.show_background, "show sky"));
-        ui.end_row();
+        row(ui, state, "Brightness", false, |ui| {
+            ui.add_enabled(enabled, Slider::new(&mut world.brightness, 0.0..=4.0))
+                .on_hover_text("Overall world exposure (sky + ambient)");
+        });
+        row(ui, state, "Ambient", false, |ui| {
+            ui.add_enabled(enabled, Slider::new(&mut world.ambient, 0.0..=2.0))
+                .on_hover_text("How strongly the environment lights the geometry");
+        });
+        row(ui, state, "Rotation", false, |ui| {
+            ui.add_enabled(enabled, Slider::new(&mut world.rotation, 0.0..=std::f32::consts::TAU).suffix(" rad"))
+                .on_hover_text("Turn the environment around the vertical axis");
+        });
+        row(ui, state, "Background", false, |ui| {
+            ui.add_enabled(enabled, egui::Checkbox::new(&mut world.show_background, "show sky"));
+        });
     });
     if !enabled {
         ui.label(RichText::new("Load a map to light the scene from the environment.").weak().small().color(ink.muted));
@@ -1125,6 +1212,67 @@ fn prop_label(ui: &mut egui::Ui, label: &str, differs: bool) -> bool {
     clicked
 }
 
+/// A filter-aware two-column [`Grid`] ROW (S1). When the active filter excludes
+/// `label`, the row is skipped wholesale (label + value widget, balanced
+/// `end_row`); otherwise it renders the (revert-arrow) label, runs `value` for the
+/// right cell, and returns whether the reset arrow was clicked. Centralizes the
+/// "show this property?" decision so callers don't duplicate the predicate.
+fn row(
+    ui: &mut egui::Ui,
+    state: &InspectorState,
+    label: &str,
+    differs: bool,
+    value: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    if !state.row_visible(label) {
+        return false;
+    }
+    let clicked = prop_label(ui, label, differs);
+    value(ui);
+    ui.end_row();
+    clicked
+}
+
+/// Render one Inspector **category** (S1): a `CollapsingHeader` whose open/closed
+/// state is remembered across sessions in [`InspectorState`] and which hides
+/// entirely when the active filter matches none of its `row_labels`.
+///
+/// `title` is the stable category key (no icon) used both as the persistence key
+/// and the filter scope; `header` is the rendered header text (icon + title +
+/// optional count). Returns `true` if `body` ran (the category was visible) so
+/// callers can chain. The collapse state is forced from the store via `.open(..)`
+/// and the user's header click flips + persists it; while filtering, every visible
+/// category force-opens so matches aren't hidden behind a caret.
+fn category(
+    ui: &mut egui::Ui,
+    state: &mut InspectorState,
+    title: &str,
+    header: impl Into<egui::WidgetText>,
+    default_open: bool,
+    row_labels: &[&str],
+    body: impl FnOnce(&mut egui::Ui, &InspectorState),
+) -> bool {
+    if !state.category_visible(row_labels) {
+        return false;
+    }
+    let open = state.open_state(title, default_open);
+    // Snapshot the filter-active flag before borrowing `state` shared in `body`.
+    let filtering = state.query().is_some();
+    let immut: &InspectorState = state;
+    let resp = egui::CollapsingHeader::new(header)
+        .id_salt(("inspector-cat", title))
+        .open(Some(open))
+        .show(ui, |ui| body(ui, immut));
+    // A header click toggles the remembered state — but only when not filtering
+    // (filtering force-opens; we don't want a click to fight the override).
+    if resp.header_response.clicked() && !filtering {
+        let next = !open;
+        state.collapsed.insert(title.to_string(), next);
+        state.save();
+    }
+    true
+}
+
 /// A nested "Advanced ▾" disclosure inside an inspector category (#8): the common
 /// rows are shown by the caller unconditionally; the power-user rows go in `body`,
 /// tucked behind this quiet, default-collapsed caret. `salt` disambiguates the
@@ -1135,6 +1283,31 @@ fn advanced_section(ui: &mut egui::Ui, salt: &str, body: impl FnOnce(&mut egui::
         .id_salt(("inspector-advanced", salt))
         .default_open(false)
         .show(ui, body);
+}
+
+/// A filter-aware [`advanced_section`] (S1): hides entirely when an active filter
+/// matches none of its `rows`, and force-opens (overriding the default-collapsed
+/// caret) while a filter is active so matched rows aren't buried. Off-filter it
+/// behaves exactly like [`advanced_section`].
+fn advanced_section_filtered(
+    ui: &mut egui::Ui,
+    state: &InspectorState,
+    salt: &str,
+    rows: &[&str],
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let filtering = state.query().is_some();
+    if filtering && !state.category_visible(rows) {
+        return;
+    }
+    ui.add_space(2.0);
+    let mut h = egui::CollapsingHeader::new(RichText::new("Advanced").small().weak())
+        .id_salt(("inspector-advanced", salt))
+        .default_open(false);
+    if filtering {
+        h = h.open(Some(true));
+    }
+    h.show(ui, body);
 }
 
 /// The editable-property defaults for a placed fixture — the values the per-row
@@ -1181,14 +1354,34 @@ pub fn inspector(
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
     profile: &mut Option<ProfileEditor>,
     sources: &ScreenSources,
+    state: &mut InspectorState,
     edit: &mut InspectorEdit,
 ) {
+    // Filter box (S1): a fuzzy/substring row-label filter across all categories.
+    // Sits above the scrolling body so it stays visible while scanning matches.
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(theme::icon::SEARCH).size(13.0));
+        ui.add(
+            egui::TextEdit::singleline(&mut state.filter)
+                .hint_text("Filter properties…")
+                .desired_width(f32::INFINITY),
+        );
+    });
+    if !state.filter.trim().is_empty() {
+        ui.horizontal(|ui| {
+            if ui.small_button(format!("{}  clear", theme::icon::CLOSE)).clicked() {
+                state.filter.clear();
+            }
+        });
+    }
+    ui.separator();
+
     // Render the body in a scope so its content rect is known, then derive the
     // drag edges (#13) from egui's global drag state intersected with that rect —
     // a slider/DragValue drag INSIDE the inspector becomes one undo step without
     // instrumenting every widget. `inspector_body` is the prior function body
     // verbatim (its early returns become early returns from the closure).
-    let resp = ui.scope(|ui| inspector_body(ui, scene, selection, patch, gdtf_textures, profile, sources));
+    let resp = ui.scope(|ui| inspector_body(ui, scene, selection, patch, gdtf_textures, profile, sources, state));
     let content = resp.response.rect;
     let ctx = ui.ctx();
     // A widget id is "in the inspector" when its last-frame rect lies within the
@@ -1211,17 +1404,18 @@ fn inspector_body(
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
     profile: &mut Option<ProfileEditor>,
     sources: &ScreenSources,
+    state: &mut InspectorState,
 ) {
     // World is the top of the hierarchy: its HDRI sky + ambient controls.
     if selection.world {
         let ink = theme::ink(!ui.visuals().dark_mode);
-        world_inspector(ui, &mut scene.world, &ink);
+        world_inspector(ui, &mut scene.world, &ink, state);
         return;
     }
 
     if let Some(env_id) = selection.environment {
         match scene.environments.get_mut(env_id) {
-            Some(env) => environment_inspector(ui, env),
+            Some(env) => environment_inspector(ui, env, state),
             None => {
                 ui.label("Selection is no longer valid.");
             }
@@ -1232,14 +1426,14 @@ fn inspector_body(
     // Static geometry (Objects) takes the Inspector when selected.
     let geo: Vec<usize> = selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
     if !geo.is_empty() {
-        geometry_inspector(ui, scene, &geo);
+        geometry_inspector(ui, scene, &geo, state);
         return;
     }
 
     // LED screens take the Inspector when selected.
     let scr: Vec<usize> = selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
     if let Some(&primary) = scr.first() {
-        led_screen_inspector(ui, &mut scene.screens[primary], scr.len(), sources);
+        led_screen_inspector(ui, &mut scene.screens[primary], scr.len(), sources, state);
         return;
     }
 
@@ -1258,12 +1452,12 @@ fn inspector_body(
             let id = *id;
             let fixture = &mut scene.fixtures[id];
             if fixture.is_gdtf() {
-                gdtf_inspector(ui, fixture, gdtf_textures, id, profile);
+                gdtf_inspector(ui, fixture, gdtf_textures, id, profile, state);
             } else {
-                fixture_inspector(ui, fixture);
+                fixture_inspector(ui, fixture, state);
             }
         }
-        many => bulk_inspector(ui, scene, patch, many),
+        many => bulk_inspector(ui, scene, patch, many, state),
     }
 }
 
@@ -1550,7 +1744,7 @@ fn bulk_opt_field(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], f: OpticF
     );
 }
 
-fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture) {
+fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut InspectorState) {
     ui.horizontal(|ui| {
         ui.heading(fixture.name.as_str());
     });
@@ -1559,111 +1753,134 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture) {
 
     let def = FixtureDefaults::for_fixture(fixture);
 
-    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Transform",
+        format!("{}  Transform", theme::icon::INSPECTOR),
+        true,
+        &["Pan", "Tilt", "Position"],
+        |ui, fs| {
             Grid::new("fx-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 // Common: pan/tilt (the live-aim controls); each gets a revert
                 // arrow back to its rest angle (0). Position has no template
                 // default → kept arrow-free, in the Advanced disclosure below.
-                if prop_label(ui, "Pan", !approx(fixture.pan, def.pan)) {
+                if row(ui, fs, "Pan", !approx(fixture.pan, def.pan), |ui| {
+                    ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"));
+                }) {
                     fixture.pan = def.pan;
                 }
-                ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"));
-                ui.end_row();
-                if prop_label(ui, "Tilt", !approx(fixture.tilt, def.tilt)) {
+                if row(ui, fs, "Tilt", !approx(fixture.tilt, def.tilt), |ui| {
+                    ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-180.0..=180.0).suffix("°"));
+                }) {
                     fixture.tilt = def.tilt;
                 }
-                ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-180.0..=180.0).suffix("°"));
-                ui.end_row();
             });
-            advanced_section(ui, "fx-transform", |ui| {
+            advanced_section_filtered(ui, fs, "fx-transform", &["Position"], |ui| {
                 Grid::new("fx-transform-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    ui.label("Position");
-                    ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                        ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                        ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                    row(ui, fs, "Position", false, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
+                            ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
+                            ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                        });
                     });
-                    ui.end_row();
                 });
             });
-        });
+        },
+    );
 
-    egui::CollapsingHeader::new(format!("{}  Fixture", theme::icon::COLOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Fixture",
+        format!("{}  Fixture", theme::icon::COLOR),
+        true,
+        &["Dimmer", "Color", "Beam", "Beam angle"],
+        |ui, fs| {
             Grid::new("fx-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 // Common: the everyday level + colour controls.
-                if prop_label(ui, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer)) {
+                if row(ui, fs, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer), |ui| {
+                    ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
+                }) {
                     fixture.optics.dimmer = def.dimmer;
                 }
-                ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
-                ui.end_row();
                 // Colour only shows a revert arrow when its template is known
                 // (GDTF white-master); a built-in's library tint isn't stored.
                 let color_differs = def.color.is_some_and(|d| !approx_rgb(fixture.color, d));
-                if prop_label(ui, "Color", color_differs) {
+                if row(ui, fs, "Color", color_differs, |ui| {
+                    ui.color_edit_button_rgb(&mut fixture.color);
+                }) {
                     if let Some(d) = def.color {
                         fixture.color = d;
                     }
                 }
-                ui.color_edit_button_rgb(&mut fixture.color);
-                ui.end_row();
             });
             // Advanced: the volumetric / cone tuning a designer touches rarely.
-            advanced_section(ui, "fx-fixture", |ui| {
+            advanced_section_filtered(ui, fs, "fx-fixture", &["Beam", "Beam angle"], |ui| {
                 Grid::new("fx-fixture-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    if prop_label(ui, "Beam", !approx(fixture.beam, def.beam)) {
+                    if row(ui, fs, "Beam", !approx(fixture.beam, def.beam), |ui| {
+                        ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
+                            .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
+                    }) {
                         fixture.beam = def.beam;
                     }
-                    ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
-                        .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
-                    ui.end_row();
                     let ba_differs = def.beam_angle.is_some_and(|d| !approx(fixture.beam_angle, d));
-                    if prop_label(ui, "Beam angle", ba_differs) {
+                    if row(ui, fs, "Beam angle", ba_differs, |ui| {
+                        ui.add(DragValue::new(&mut fixture.beam_angle).speed(0.2).range(2.0..=90.0).suffix("°"));
+                    }) {
                         if let Some(d) = def.beam_angle {
                             fixture.beam_angle = d;
                         }
                     }
-                    ui.add(DragValue::new(&mut fixture.beam_angle).speed(0.2).range(2.0..=90.0).suffix("°"));
-                    ui.end_row();
                 });
             });
-        });
+        },
+    );
 }
 
-fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment) {
+fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut InspectorState) {
     ui.horizontal(|ui| {
         ui.heading(env.name.as_str());
     });
     ui.label(RichText::new(format!("{:?}", env.kind)).weak().small());
     ui.separator();
 
-    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Transform",
+        format!("{}  Transform", theme::icon::INSPECTOR),
+        true,
+        &["Center", "Size"],
+        |ui, fs| {
             Grid::new("env-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Center");
-                ui.horizontal(|ui| {
-                    ui.add(DragValue::new(&mut env.center.x).speed(0.1).prefix("x "));
-                    ui.add(DragValue::new(&mut env.center.y).speed(0.1).prefix("y "));
-                    ui.add(DragValue::new(&mut env.center.z).speed(0.1).prefix("z "));
+                row(ui, fs, "Center", false, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(DragValue::new(&mut env.center.x).speed(0.1).prefix("x "));
+                        ui.add(DragValue::new(&mut env.center.y).speed(0.1).prefix("y "));
+                        ui.add(DragValue::new(&mut env.center.z).speed(0.1).prefix("z "));
+                    });
                 });
-                ui.end_row();
-                ui.label("Size");
-                ui.horizontal(|ui| {
-                    ui.add(DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("w "));
-                    ui.add(DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("h "));
-                    ui.add(DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("d "));
+                row(ui, fs, "Size", false, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("w "));
+                        ui.add(DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("h "));
+                        ui.add(DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("d "));
+                    });
                 });
-                ui.end_row();
             });
-        });
+        },
+    );
 
-    egui::CollapsingHeader::new(format!("{}  Volume", theme::icon::ENVIRONMENT))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Volume",
+        format!("{}  Volume", theme::icon::ENVIRONMENT),
+        true,
+        &["Density", "Tint", "Anisotropy", "Uniformity", "Cluster contrast"],
+        |ui, fs| {
             // Env defaults = the `from_profile` rest constants (density's template
             // lives on the profile, which the instance doesn't keep → no arrow).
             const D_COLOR: [f32; 3] = [0.7, 0.72, 0.78];
@@ -1672,52 +1889,51 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment) {
             const D_CLUSTER: f32 = 0.0;
             Grid::new("env-volume").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 // Common: the two controls a designer reaches for first.
-                ui.label("Density");
-                ui.add(DragValue::new(&mut env.density).speed(0.005).range(0.0..=4.0));
-                ui.end_row();
-                if prop_label(ui, "Tint", !approx_rgb(env.color, D_COLOR)) {
+                row(ui, fs, "Density", false, |ui| {
+                    ui.add(DragValue::new(&mut env.density).speed(0.005).range(0.0..=4.0));
+                });
+                if row(ui, fs, "Tint", !approx_rgb(env.color, D_COLOR), |ui| {
+                    ui.color_edit_button_rgb(&mut env.color);
+                }) {
                     env.color = D_COLOR;
                 }
-                ui.color_edit_button_rgb(&mut env.color);
-                ui.end_row();
             });
             // Advanced: the scattering-model knobs.
-            advanced_section(ui, "env-volume", |ui| {
+            advanced_section_filtered(ui, fs, "env-volume", &["Anisotropy", "Uniformity", "Cluster contrast"], |ui| {
                 Grid::new("env-volume-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    if prop_label(ui, "Anisotropy", !approx(env.anisotropy, D_ANISO)) {
+                    if row(ui, fs, "Anisotropy", !approx(env.anisotropy, D_ANISO), |ui| {
+                        ui.add(DragValue::new(&mut env.anisotropy).speed(0.005).range(-0.95..=0.95))
+                            .on_hover_text("Henyey-Greenstein g (forward scattering > 0)");
+                    }) {
                         env.anisotropy = D_ANISO;
                     }
-                    ui.add(DragValue::new(&mut env.anisotropy).speed(0.005).range(-0.95..=0.95))
-                        .on_hover_text("Henyey-Greenstein g (forward scattering > 0)");
-                    ui.end_row();
-                    if prop_label(ui, "Uniformity", !approx(env.uniformity, D_UNIFORM)) {
-                        env.uniformity = D_UNIFORM;
-                    }
-                    ui.add(egui::Slider::new(&mut env.uniformity, 0.0..=1.0))
-                        .on_hover_text(
+                    if row(ui, fs, "Uniformity", !approx(env.uniformity, D_UNIFORM), |ui| {
+                        ui.add(egui::Slider::new(&mut env.uniformity, 0.0..=1.0)).on_hover_text(
                             "1 = smooth even haze · 0 = clusters of smoke/clouds (dense \
                              pockets scatter brighter, with clear gaps between)",
                         );
-                    ui.end_row();
-                    if prop_label(ui, "Cluster contrast", !approx(env.cluster_contrast, D_CLUSTER)) {
-                        env.cluster_contrast = D_CLUSTER;
+                    }) {
+                        env.uniformity = D_UNIFORM;
                     }
-                    ui.add(egui::Slider::new(&mut env.cluster_contrast, 0.0..=1.0))
-                        .on_hover_text(
+                    if row(ui, fs, "Cluster contrast", !approx(env.cluster_contrast, D_CLUSTER), |ui| {
+                        ui.add(egui::Slider::new(&mut env.cluster_contrast, 0.0..=1.0)).on_hover_text(
                             "How much brighter/denser the clusters are vs the haze (and how \
                              clear the gaps). Higher = pockets pop harder. Pairs with low density.",
                         );
-                    ui.end_row();
+                    }) {
+                        env.cluster_contrast = D_CLUSTER;
+                    }
                 });
             });
-        });
+        },
+    );
 }
 
 /// Inspector for a selected static-geometry object (an imported stage deck,
 /// truss, or set piece): identity, visibility, and an editable world transform
 /// (position / rotation / uniform scale), decomposed from its 4×4 and recomposed
 /// only when a field changes (so a one-off non-uniform import isn't flattened).
-fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize]) {
+fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state: &mut InspectorState) {
     let primary = ids[0];
     let Some(g) = scene.geometry.get_mut(primary) else {
         ui.label("Selection is no longer valid.");

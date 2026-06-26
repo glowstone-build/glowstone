@@ -458,7 +458,24 @@ pub struct Renderer {
 
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Self {
-        let instance = wgpu::Instance::default();
+        // Backend selection. On Windows the NVIDIA Vulkan driver (581.95) faults the
+        // device the moment we render to / present the swapchain surface — the 3D
+        // offscreen render is fine, but the on-screen surface is unusable, so the
+        // window only ever showed dropped frames. DX12 is the native, stable Windows
+        // backend and sidesteps that driver bug. Elsewhere keep the platform default
+        // (Metal on macOS, Vulkan on Linux). `WGPU_BACKEND` (e.g. =vulkan) overrides.
+        let backends = if cfg!(target_os = "windows") {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::PRIMARY
+        };
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor {
+                backends,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            }
+            .with_env(),
+        );
 
         // `window` is an Arc<Window>, which is 'static, so the surface is too.
         let surface = instance
@@ -516,6 +533,14 @@ impl Renderer {
             })
             .await
             .expect("request device");
+
+        // Diagnostic: log the reason if the device is ever lost (e.g. a GPU hang /
+        // VK_ERROR_DEVICE_LOST). After a loss every resource creation silently
+        // returns an invalid handle — which is what surfaces downstream as
+        // "Texture 'viewport-hdr' is invalid". This tells us the true cause.
+        device.set_device_lost_callback(|reason, msg| {
+            log::error!("WGPU DEVICE LOST ({reason:?}): {msg}");
+        });
 
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
@@ -920,18 +945,59 @@ impl Renderer {
         }
     }
 
+    /// Acquire the next swapchain texture for this frame, or `None` to skip it.
+    ///
+    /// During a window resize the swapchain is transiently out of date — the Vulkan
+    /// backend reports this as `Outdated`, or (on Windows) as `Validation`. We MUST
+    /// NOT try to recover by reconfiguring the surface and re-acquiring within the
+    /// same frame: on NVIDIA Vulkan the first (failed) acquire can leave an acquire
+    /// semaphore pending, and `configure()` then destroys the swapchain while that
+    /// semaphore is in use → "SwapchainAcquireSemaphore still in use" → the driver
+    /// faults the whole device (`VK_ERROR_DEVICE_LOST`). Instead we simply SKIP the
+    /// frame; the next `WindowEvent::Resized` reconfigures the surface to the final
+    /// size (see `resize_surface`) and acquisition self-heals. Skipped frames are
+    /// invisible — the live loop re-arms the next redraw immediately.
+    fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
+        use wgpu::CurrentSurfaceTexture as St;
+        match self.surface.get_current_texture() {
+            St::Success(f) | St::Suboptimal(f) => Some(f),
+            // Reconfigure for a stale swapchain, but DO NOT re-acquire this frame —
+            // re-acquiring after a configure is what faulted the device. Skip; the
+            // next frame (or the next `Resized`) acquires cleanly.
+            St::Outdated | St::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                None
+            }
+            other => {
+                log::debug!("surface not presentable ({other:?}); skipping frame");
+                None
+            }
+        }
+    }
+
     /// Reconfigure the swapchain after a window resize.
     pub fn resize_surface(&mut self, size: (u32, u32)) {
         if size.0 == 0 || size.1 == 0 {
             return;
         }
-        self.config.width = size.0;
-        self.config.height = size.1;
+        let max = self.device.limits().max_texture_dimension_2d;
+        self.config.width = size.0.min(max);
+        self.config.height = size.1.min(max);
         self.surface.configure(&self.device, &self.config);
     }
 
     /// Resize the offscreen 3D target to match the viewport panel.
     pub fn resize_viewport(&mut self, size: (u32, u32)) {
+        // The viewport panel always lives INSIDE the window, so its render target can
+        // never legitimately exceed the surface size. egui can transiently report a
+        // huge (or infinite → saturates to `u32::MAX`) `available_size` during a
+        // layout pass around a resize/maximize; clamping to the surface here is a
+        // no-op in normal use (render_scale ≤ 1) but prevents a multi-gigabyte
+        // allocation that OOMs the GPU and yields an invalid texture (→ abort).
+        let size = (
+            size.0.min(self.config.width).max(1),
+            size.1.min(self.config.height).max(1),
+        );
         self.viewport
             .resize(&self.device, &mut self.egui_renderer, size);
     }
@@ -1056,22 +1122,9 @@ impl Renderer {
             self.egui_renderer.free_texture(id);
         }
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
-                log::debug!("surface not presentable; skipping frame");
-                return false;
-            }
-            // Anything else (Outdated / Lost, and the Vulkan/Windows backend's
-            // `Validation` for an out-of-date swapchain after a resize/maximize/DPI
-            // change) means the swapchain must be rebuilt. Reconfigure and recover
-            // next frame — otherwise the surface stays broken forever and we spam
-            // dropped frames.
-            other => {
-                log::debug!("reconfiguring surface after status {other:?}");
-                self.surface.configure(&self.device, &self.config);
-                return false;
-            }
+        let frame = match self.acquire_frame() {
+            Some(f) => f,
+            None => return false,
         };
         let surface_view = frame
             .texture
@@ -1812,7 +1865,10 @@ impl Renderer {
         // Outliner eye: skip hidden fog boxes so toggling a fog volume's visibility
         // actually removes its haze, not just the wireframe.
         let fog = scene.environments.iter().find(|e| !e.hidden);
-        let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
+        // PREVIZ_NOVOL disables ALL volumetric work (raymarch + froxel) — a bisection
+        // kill-switch for the Windows/Vulkan device-loss hunt.
+        let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false)
+            && std::env::var("PREVIZ_NOVOL").is_err();
         // Haze uniformity (1 smooth … 0 clustered). Drives the density-noise contrast
         // AND the temporal history cap below: at low uniformity the user WANTS to see the
         // moving smoke clusters, so we hold less history (let them live) instead of

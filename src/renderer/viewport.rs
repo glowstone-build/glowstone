@@ -72,8 +72,14 @@ impl Viewport {
         egui_renderer: &mut egui_wgpu::Renderer,
         size: (u32, u32),
     ) -> Self {
-        let size = clamp_size(size);
+        let size = clamp_size(size, device.limits().max_texture_dimension_2d);
+        // Diagnostic: confirm whether the very first target allocation succeeds.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let (hdr, depth, ldr, bloom, vol, vol_ema) = Self::create_targets(device, size);
+        match pollster::block_on(scope.pop()) {
+            Some(err) => log::error!("Viewport::new alloc FAILED at {size:?}: {err}"),
+            None => log::info!("Viewport::new alloc OK at {size:?}"),
+        }
         let texture_id =
             egui_renderer.register_native_texture(device, &ldr.view, wgpu::FilterMode::Linear);
         Self {
@@ -95,11 +101,26 @@ impl Viewport {
         egui_renderer: &mut egui_wgpu::Renderer,
         size: (u32, u32),
     ) {
-        let size = clamp_size(size);
+        let size = clamp_size(size, device.limits().max_texture_dimension_2d);
         if size == self.size {
             return;
         }
-        let (hdr, depth, ldr, bloom, vol, vol_ema) = Self::create_targets(device, size);
+        // Allocate inside an error scope so an allocation/validation failure (e.g.
+        // the device already lost to an NVIDIA TDR reset) is CAPTURED and logged
+        // with the offending size, instead of going to the default fatal handler
+        // and aborting on the subsequent `create_view`. On failure we keep the old
+        // (valid) targets and skip this resize — far better than crashing.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let targets = Self::create_targets(device, size);
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            log::error!(
+                "viewport target alloc failed at {size:?} (keeping {:?}): {err}",
+                self.size
+            );
+            return;
+        }
+        log::debug!("viewport resized to {size:?}");
+        let (hdr, depth, ldr, bloom, vol, vol_ema) = targets;
         self.hdr = hdr;
         self.depth = depth;
         self.ldr = ldr;
@@ -184,6 +205,11 @@ impl Viewport {
     }
 }
 
-fn clamp_size(size: (u32, u32)) -> (u32, u32) {
-    (size.0.max(1), size.1.max(1))
+/// Clamp a requested target size to `[1, max]` per axis. The upper bound matters:
+/// egui can momentarily report an unconstrained (huge or infinite) `available_size`
+/// during a transient layout pass around a resize/maximize, and `INFINITY as u32`
+/// saturates to `u32::MAX` — which would make `create_texture` produce an invalid
+/// texture and abort. `max` is the device's `max_texture_dimension_2d`.
+fn clamp_size(size: (u32, u32), max: u32) -> (u32, u32) {
+    (size.0.clamp(1, max), size.1.clamp(1, max))
 }

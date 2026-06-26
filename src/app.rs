@@ -40,6 +40,11 @@ struct State {
     /// Whether to keep driving redraws (false while the window is occluded), so
     /// the live preview animates continuously instead of only on input.
     awake: bool,
+    /// Whether the window has no drawable area (minimized → `Resized(0, 0)`). The
+    /// surface keeps its last non-zero size while minimized, so acquiring/presenting
+    /// would return out-of-date (`Validation` on Vulkan/Windows) every frame and
+    /// eventually poison the device — so we skip rendering entirely until restored.
+    minimized: bool,
 }
 
 #[derive(Default)]
@@ -94,6 +99,7 @@ impl ApplicationHandler for App {
             last_frame: Instant::now(),
             fps: 0.0,
             awake: true,
+            minimized: false,
         });
 
         // Profiling: PREVIZ_STEPS overrides the volumetric max step budget.
@@ -652,8 +658,14 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                state.renderer.resize_surface((size.width, size.height));
-                state.window.request_redraw();
+                // A 0-area resize means the window was minimized; stop rendering
+                // (the surface keeps its old size — reconfiguring/acquiring against a
+                // minimized window spams out-of-date and poisons the Vulkan device).
+                state.minimized = size.width == 0 || size.height == 0;
+                if !state.minimized {
+                    state.renderer.resize_surface((size.width, size.height));
+                    state.window.request_redraw();
+                }
             }
             WindowEvent::Occluded(occluded) => {
                 // Idle while hidden; resume the continuous loop when visible.
@@ -666,7 +678,9 @@ impl ApplicationHandler for App {
                 // Render the frame; the next redraw is re-armed in `about_to_wait`
                 // (requesting a redraw from inside RedrawRequested is unreliable
                 // on some platforms, which froze the haze/wheel animation).
-                state.render();
+                if !state.minimized {
+                    state.render();
+                }
             }
             _ => {
                 if response.repaint {
@@ -682,6 +696,7 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &self.state
             && state.awake
+            && !state.minimized
         {
             state.window.request_redraw();
         }
