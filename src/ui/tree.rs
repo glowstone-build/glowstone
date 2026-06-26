@@ -79,7 +79,7 @@ const PAD_X: f32 = 4.0; // left gutter before depth 0
 const DISCLOSURE_W: f32 = 15.0; // disclosure-triangle cell width (≈ one indent step)
 const ICON_DX: f32 = 5.0; // gap between disclosure cell and the type icon
 const TEXT_DX: f32 = 21.0; // gap between icon origin and the name text
-const PATCH_COL: f32 = 50.0; // far-left fixture patch-address column (uni.addr / none)
+const HEAD_COL: f32 = 30.0; // fixture head/unit-number column (between icon and name)
 
 /// What a flattened row represents (carries the data-array index for leaves).
 #[derive(Clone, Copy)]
@@ -145,6 +145,10 @@ struct TreeRow {
     vis: VisState,
     /// Fixture patch tag ("U.AAA" / "unpatched"); empty otherwise.
     patch_tag: String,
+    /// Persistent fixture HEAD number (the MVR <FixtureID>, else <UnitNumber>),
+    /// shown as a stable "#" column. Empty for app-created fixtures and non-fixture
+    /// rows. NOT the session-volatile EntityId, and NOT the sort index.
+    head: String,
     conflict: bool,
     /// Renameable rows (entity leaves) carry their current name for inline edit.
     renameable: bool,
@@ -250,8 +254,13 @@ pub fn scene_tree(
                 if last + 1 < range.start || i > range.end + 1 {
                     continue;
                 }
-                let x = left + PAD_X + (r.depth as f32 + 1.0) * INDENT + DISCLOSURE_W * 0.5;
-                let y0 = row_y(i) + ROW_H * 0.5 + ROW_H * 0.30;
+                // Sit the rail in the indent GUTTER at the PARENT's disclosure-centre
+                // column — that's 7.5px left of the children's content, so it never
+                // cuts through their triangles/icons/text (the previous `+1`*INDENT put
+                // it at the CHILD disclosure centre, straight through the glyphs). Span
+                // from just under the parent row to the last descendant's centre.
+                let x = left + PAD_X + r.depth as f32 * INDENT + DISCLOSURE_W * 0.5;
+                let y0 = row_y(i) + ROW_H;
                 let y1 = row_y(last) + ROW_H * 0.5;
                 ui.painter().line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], egui::Stroke::new(1.0, line_col));
             }
@@ -333,6 +342,7 @@ fn build_rows(
                 .chain(scene.environments.iter().map(|e| e.hidden)),
         ),
         patch_tag: String::new(),
+        head: String::new(),
         conflict: false,
         renameable: false,
     });
@@ -352,6 +362,7 @@ fn build_rows(
         has_children: world_has,
         vis: VisState::fold(scene.environments.iter().map(|e| e.hidden)),
         patch_tag: String::new(),
+        head: String::new(),
         conflict: false,
         renameable: false,
     });
@@ -366,6 +377,7 @@ fn build_rows(
             has_children: !scene.environments.is_empty(),
             vis: VisState::fold(scene.environments.iter().map(|e| e.hidden)),
             patch_tag: String::new(),
+            head: String::new(),
             conflict: false,
             renameable: false,
         });
@@ -382,6 +394,7 @@ fn build_rows(
                     has_children: false,
                     vis: leaf_vis(e.hidden),
                     patch_tag: String::new(),
+                    head: String::new(),
                     conflict: false,
                     renameable: true,
                 });
@@ -405,6 +418,21 @@ fn build_rows(
                 Some(p) => format!("{}.{:03}", p.universe, p.address),
                 None => "none".into(),
             };
+            // Persistent head number: the MVR <FixtureID>, else <UnitNumber>, else
+            // blank (app-created fixtures have no MVR identity). Stable across sort.
+            let head = f
+                .mvr
+                .as_ref()
+                .map(|m| {
+                    if !m.fixture_id.trim().is_empty() {
+                        m.fixture_id.clone()
+                    } else if m.unit_number != 0 {
+                        m.unit_number.to_string()
+                    } else {
+                        String::new()
+                    }
+                })
+                .unwrap_or_default();
             let row_icon = if f.is_laser { icon::COLOR } else { icon::FIXTURE };
             rows.push(TreeRow {
                 key: NodeKey::Entity(f.id),
@@ -416,6 +444,7 @@ fn build_rows(
                 has_children: false,
                 vis: leaf_vis(f.hidden),
                 patch_tag,
+                head,
                 conflict: conflicted.get(i).copied().unwrap_or(false),
                 renameable: true,
             });
@@ -445,6 +474,7 @@ fn build_rows(
                 has_children: false,
                 vis: leaf_vis(g.hidden),
                 patch_tag: String::new(),
+                head: String::new(),
                 conflict: false,
                 renameable: true,
             });
@@ -474,6 +504,7 @@ fn build_rows(
                 has_children: false,
                 vis: leaf_vis(s.hidden),
                 patch_tag: String::new(),
+                head: String::new(),
                 conflict: false,
                 renameable: true,
             });
@@ -496,6 +527,7 @@ fn push_group(rows: &mut Vec<TreeRow>, kind: GroupKind, icon: &'static str, labe
         has_children: count > 0,
         vis,
         patch_tag: String::new(),
+        head: String::new(),
         conflict: false,
         renameable: false,
     });
@@ -590,40 +622,9 @@ fn draw_row(
     }
     let dim = if row.vis.dim() { 0.45 } else { 1.0 };
 
-    // ---- far-left patch column (fixtures): "uni.addr" in the fixture's DMX-pane
-    // colour, or "none" (italic, muted) when unpatched; red when the address
-    // conflicts. Uses the same golden-ratio tint as the DMX universe grid so a
-    // fixture reads the same colour in both places.
-    if !row.patch_tag.is_empty() {
-        let px = rect.left() + 6.0;
-        if row.patch_tag == "none" {
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                "none",
-                0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::proportional(10.0),
-                    color: ink.muted,
-                    italics: true,
-                    ..Default::default()
-                },
-            );
-            let galley = painter.layout_job(job);
-            painter.galley(egui::pos2(px, rect.center().y - galley.size().y * 0.5), galley, ink.muted);
-        } else {
-            let col = if row.conflict {
-                theme::CONFLICT
-            } else if let RowKind::Fixture(i) = row.kind {
-                fixture_tint(i)
-            } else {
-                ink.tertiary
-            };
-            painter.text(egui::pos2(px, rect.center().y), egui::Align2::LEFT_CENTER, &row.patch_tag, egui::FontId::monospace(10.0), col);
-        }
-    }
-
-    // ---- geometry ---- (tree content starts AFTER the far-left patch column)
-    let content_x = rect.left() + PATCH_COL + PAD_X + row.depth as f32 * INDENT;
+    // ---- geometry ---- (the hierarchy starts at the left edge; the patch address
+    // moved to the RIGHT so non-fixture rows aren't shoved in by an empty gutter)
+    let content_x = rect.left() + PAD_X + row.depth as f32 * INDENT;
     let disc_rect = egui::Rect::from_min_size(egui::pos2(content_x, rect.top()), egui::vec2(DISCLOSURE_W, ROW_H));
     let icon_x = content_x + DISCLOSURE_W + ICON_DX;
     let text_x = icon_x + TEXT_DX;
@@ -682,15 +683,36 @@ fn draw_row(
     });
     let right_edge = 30.0;
 
+    // ---- head-number column (fixtures): a stable "#NN" between the icon and the
+    // name so long fixture lists are numbered (bug 6). Blank for app-created
+    // fixtures and non-fixture rows; reserved only for fixtures so other kinds
+    // keep the full name width.
+    let is_fixture = matches!(row.kind, RowKind::Fixture(_));
+    let head_w = if is_fixture { HEAD_COL } else { 0.0 };
+    if is_fixture && !row.head.is_empty() {
+        painter.text(
+            egui::pos2(text_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &row.head,
+            egui::FontId::monospace(10.0),
+            ink.tertiary.gamma_multiply(dim),
+        );
+    }
+    let name_x = text_x + head_w;
+
     // ---- name + secondary (or inline rename editor) ----
     let renaming = rename.as_ref().is_some_and(|(k, _)| *k == row.key);
-    let text_w = (rect.right() - text_x - 56.0 - right_edge).max(40.0);
+    // Only fixtures draw the trailing "NNch" footprint, so only they reserve it —
+    // the old code reserved 56px for EVERY kind, which is why names truncated so
+    // aggressively on Objects/Screens/World rows that have nothing on the right.
+    let right_reserve = if is_fixture { 56.0 } else { 0.0 };
+    let text_w = (rect.right() - name_x - right_reserve - right_edge).max(40.0);
     if renaming {
         // A real allocated TextEdit (painter text can't host a cursor). One live
         // at a time; commit on Enter / focus loss, cancel on Esc.
         if let Some((_, buf)) = rename.as_mut() {
             let edit_rect = egui::Rect::from_min_max(
-                egui::pos2(text_x, rect.top() + 5.0),
+                egui::pos2(name_x, rect.top() + 5.0),
                 egui::pos2(rect.right() - right_edge - 4.0, rect.bottom() - 5.0),
             );
             let mut commit = false;
@@ -722,29 +744,46 @@ fn draw_row(
         // string moves to the row tooltip instead of a cramped second line.
         super::panels::paint_truncated(
             &painter,
-            egui::pos2(text_x, rect.top() + 4.0),
+            egui::pos2(name_x, rect.top() + 4.0),
             &row.label,
             13.0,
             ink.primary.gamma_multiply(dim),
             text_w,
         );
-        if !row.secondary.is_empty() {
-            resp.clone().on_hover_text(&row.secondary);
-        }
+        // Always offer the full name (+ type) on hover so a truncated label stays
+        // reachable — the outliner truncates rather than wraps/scrolls.
+        let tip = if row.secondary.is_empty() {
+            row.label.clone()
+        } else {
+            format!("{}\n{}", row.label, row.secondary)
+        };
+        resp.clone().on_hover_text(tip);
     }
 
-    // ---- right info column (left of the eye): the fixture's CHANNEL COUNT ("47ch").
-    // The patch address moved to the far-left column (an address conflict shows there
-    // in red); the type icon already conveys the kind, so this slot is the footprint.
+    // ---- right info column (left of the eye): the fixture's PATCH address,
+    // colour-coded to match the DMX universe grid (red on a conflict); a muted "—"
+    // when unpatched. Moved here from the old far-left gutter so the hierarchy is
+    // flush-left.
     if let RowKind::Fixture(i) = row.kind {
-        let chans = crate::dmx::patch::footprint_for(&scene.fixtures[i], scene.fixtures[i].mode_index);
-        painter.text(
-            egui::pos2(rect.right() - right_edge - 4.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            format!("{chans}ch"),
-            egui::FontId::monospace(10.0),
-            ink.tertiary.gamma_multiply(dim),
-        );
+        let rx = rect.right() - right_edge - 4.0;
+        if row.patch_tag == "none" {
+            painter.text(
+                egui::pos2(rx, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                "—",
+                egui::FontId::monospace(10.0),
+                ink.muted.gamma_multiply(dim),
+            );
+        } else {
+            let col = if row.conflict { theme::CONFLICT } else { fixture_tint(i) };
+            painter.text(
+                egui::pos2(rx, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                &row.patch_tag,
+                egui::FontId::monospace(10.0),
+                col.gamma_multiply(dim),
+            );
+        }
     }
 
     // ---- interaction ----

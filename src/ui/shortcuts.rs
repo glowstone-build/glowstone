@@ -68,6 +68,11 @@ pub enum Action {
     // Object / transform.
     Delete,
     Duplicate,
+    /// Shift+D — duplicate the selection and IMMEDIATELY enter grab/move mode
+    /// (Blender). The copies follow the cursor and commit on click/Enter; Esc
+    /// deletes them. Typed digits during the grab set the array clone-count.
+    /// Impl in `panels::viewport`.
+    DuplicateGrab,
     Nudge(Dir, f32),
     /// G/R/S — implementation lives in `panels::viewport`; registered here.
     Transform(TransformKind),
@@ -434,7 +439,7 @@ pub static COMMANDS: &[Command] = &[
     command_row("kmi.patch", "Patch selected fixtures", Category::Object, Action::Patch),
     command_row("kmi.unpatch", "Unpatch selected fixtures", Category::Object, Action::Unpatch),
     command_row("kmi.duplicate", "Duplicate / array", Category::Object, Action::Duplicate),
-    command_row("kmi.duplicate_alias", "Duplicate (alias)", Category::Object, Action::Duplicate),
+    command_row("kmi.duplicate_grab", "Duplicate & grab", Category::Object, Action::DuplicateGrab),
     command_row("kmi.delete", "Delete selected", Category::Object, Action::Delete),
     command_row("kmi.delete_alias", "Delete selected (alias)", Category::Object, Action::Delete),
     command_row("edit.undo", "Undo", Category::Object, Action::Undo),
@@ -603,7 +608,7 @@ pub static VIEWPORT: &[Kmi] = &[
     kmi(Trigger::key(Key::S), "transform.scale"),
     kmi(Trigger::key(Key::A).shift(), "kmi.add_menu"),
     kmi(Trigger::key(Key::D), "kmi.duplicate"),
-    kmi(Trigger::key(Key::D).shift(), "kmi.duplicate_alias"),
+    kmi(Trigger::key(Key::D).shift(), "kmi.duplicate_grab"),
     kmi(Trigger::key(Key::N), "view.toggle_n_panel"),
     kmi(Trigger::key(Key::T), "view.toggle_t_panel"),
     // --- Numpad camera navigation (Blender view3d_navigate_axis*.cc). egui maps
@@ -1325,7 +1330,7 @@ mod tests {
         // keymap twin was a dead pick — dispatch_action doesn't own Duplicate; the
         // catalog `fixture.duplicate` dialog is the canonical entry.)
         for id in [
-            "view.camera", "kmi.duplicate", "kmi.duplicate_alias", "kmi.delete",
+            "view.camera", "kmi.duplicate", "kmi.duplicate_grab", "kmi.delete",
             "kmi.patch", "kmi.unpatch", "kmi.add_menu", "edit.redo_alias",
             "view.frame_all_alias",
         ] {

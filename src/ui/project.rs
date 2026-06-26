@@ -32,7 +32,13 @@ const MAGIC: &[u8] = b"ARCHIE\0";
 /// v4: `LedScreen` gained content sources (Image/NDI/CITP/PixelMap) + `pixel_shape`.
 /// v5: `Environment` gained `uniformity` (haze cluster control).
 /// v6: `Environment` gained `cluster_contrast`.
-pub const FORMAT: u32 = 6;
+/// v7: `Fixture` gained `source` (provenance chip). Field is LAST in serde
+///     order with `#[serde(default)]`. NOTE: `read` rejects any version != FORMAT
+///     up front, so pre-v7 files surface a clean "unsupported version" error
+///     rather than mis-decoding — positional bincode never sees the missing
+///     trailing field. The `#[serde(default)]` keeps the in-memory struct sound
+///     and future-proofs any optional/skipped-field shifts above it.
+pub const FORMAT: u32 = 7;
 /// The project file extension (no dot).
 pub const EXT: &str = "archie";
 

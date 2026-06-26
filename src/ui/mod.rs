@@ -31,7 +31,7 @@ use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 use glam::Vec3;
 
 use crate::renderer::camera::{CameraView, OrbitCamera};
-use crate::scene::{Library, RenderSettings, Scene, Selection};
+use crate::scene::{Library, ObjectRef, RenderSettings, Scene, Selection};
 use windows::{Preferences, ProfileEditor};
 
 /// Window within which consecutive arrow-key nudges coalesce into one undo step
@@ -51,6 +51,43 @@ pub struct DuplicateDialog {
     pub y_angle: f32,
     /// Number of copies to make.
     pub count: u32,
+}
+
+/// Remembered Duplicate-dialog values so a fresh Duplicate reuses the LAST ones
+/// instead of a fixed 36°/9 preset (which surprised users with a big fan). Starts
+/// at the identity — zero offset, no fan, a single copy. Held in egui temp memory
+/// so every open site (viewport + menu + catalog) and the confirm share it
+/// without extra plumbing.
+#[derive(Clone, Copy)]
+pub(crate) struct DupDefaults {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub angle: f32,
+    pub count: u32,
+}
+
+impl Default for DupDefaults {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, z: 0.0, angle: 0.0, count: 1 }
+    }
+}
+
+/// The last-used Duplicate values (or all-zero defaults on first use).
+pub(crate) fn dup_defaults(ctx: &egui::Context) -> DupDefaults {
+    ctx.data(|d| d.get_temp::<DupDefaults>(egui::Id::new("previz.dup.defaults")).unwrap_or_default())
+}
+
+/// Remember the Duplicate values just used, so the next Duplicate reuses them.
+pub(crate) fn set_dup_defaults(ctx: &egui::Context, v: DupDefaults) {
+    ctx.data_mut(|m| m.insert_temp(egui::Id::new("previz.dup.defaults"), v));
+}
+
+/// Build a fresh [`DuplicateDialog`] for `fixture`, seeded from the remembered
+/// last-used values (all-zero on first use — never a preset fan).
+pub(crate) fn duplicate_dialog_for(ctx: &egui::Context, fixture: usize) -> DuplicateDialog {
+    let d = dup_defaults(ctx);
+    DuplicateDialog { fixture, x: d.x, y: d.y, z: d.z, y_angle: d.angle, count: d.count }
 }
 
 /// State of the open Replace-fixtures dialog (Shift+R). Swaps the selected
@@ -266,6 +303,16 @@ pub struct TransformOp {
     /// drag), View = the camera basis (`view_basis`, screen-aligned). Shown in the
     /// modal hint.
     pub orientation: TransformOrientation,
+    /// True when this Move op was started by Shift+D (duplicate-then-grab). Two
+    /// effects: the mouse always drives the OFFSET (a typed number is the array
+    /// CLONE-COUNT, not the move amount), and on confirm the extra clones are
+    /// arrayed along the drag vector. The clone itself was already pushed as its
+    /// own undo step before the grab began, so cancel just leaves the copies at
+    /// the source (Blender's Shift+D→Esc).
+    pub from_duplicate: bool,
+    /// The freshly-created copies (this op's targets) — the base set the array
+    /// duplicates from when a clone-count is typed during a duplicate-grab.
+    pub dup_base: Vec<ObjectRef>,
 }
 
 impl TransformOp {
@@ -284,6 +331,12 @@ impl TransformOp {
     /// which keys do what (#23). While the user is typing a value the hint switches
     /// to the Blender-style typed readout and the key cluster is suppressed.
     pub fn hint(&self, keys: &str) -> String {
+        // A duplicate-grab reads a typed number as the array clone-COUNT (the mouse
+        // drives the offset), so its hint shows copies, never metres/degrees.
+        if self.from_duplicate {
+            let n = if self.num.active { (self.num.value().round() as i64).max(1) } else { 1 };
+            return format!("Duplicate · {n} cop{}    drag: offset · type: count · Enter confirm · Esc cancel", if n == 1 { "y" } else { "ies" });
+        }
         if self.num.active {
             // Blender-style typed readout: "Move X: 4.0 m" / "Rotate Z: -45°" /
             // "Scale: 2.0x". Axis label is blank when unconstrained.
@@ -996,14 +1049,7 @@ impl Ui {
                 }
                 "fixture.duplicate" => {
                     if let Some(idx) = self.selection.primary_fixture() {
-                        self.duplicate = Some(DuplicateDialog {
-                            fixture: idx,
-                            x: 0.0,
-                            y: 0.0,
-                            z: 0.0,
-                            y_angle: 36.0,
-                            count: 9,
-                        });
+                        self.duplicate = Some(duplicate_dialog_for(ctx, idx));
                     }
                 }
                 "fixture.patch" => {
@@ -1521,6 +1567,44 @@ impl Ui {
         self.apply_nudge(scene, dmx);
         self.handle_dropped_files(ctx, scene, camera);
 
+        // Shift+D — grab-duplicate (Blender). Clone the selection NOW as its own
+        // undo step (so cancelling the grab leaves the copies at the source, like
+        // Blender's Shift+D→Esc), re-select the copies, then flag the viewport to
+        // start a Move grab on them THIS frame. Done before the dock so the clone
+        // lands before `panels::viewport` reads the flag and snapshots the move's
+        // `before` end. Dispatch_action reports DuplicateGrab unhandled, so this is
+        // its only handler.
+        if self.viewport_focused
+            && self.transform.is_none()
+            && self.selection.has_object()
+            && shortcuts::poll(
+                ctx,
+                shortcuts::ActiveContext { viewport_focused: true, transform_active: false },
+                &shortcuts::active(),
+            )
+            .iter()
+            .any(|a| matches!(a, shortcuts::Action::DuplicateGrab))
+        {
+            let refs = self.selection.object_refs();
+            self.run_op(
+                "object.duplicate_grab",
+                "Duplicate",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    let copies = cx.scene.duplicate_objects(&refs);
+                    if copies.is_empty() {
+                        return op::OpStatus::Cancelled;
+                    }
+                    *cx.selection = Selection::from_object_refs(&copies);
+                    op::OpStatus::Finished
+                },
+            );
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("previz.dupgrab.start"), true));
+        }
+
         // Chrome MUST be reserved before the dock (it fills the CentralPanel).
         self.menu_bar(ctx, scene, camera, dmx);
         self.status_bar(ctx, scene, dmx, fps);
@@ -1681,6 +1765,8 @@ impl Ui {
         // Duplicate mutates the scene; on confirm, run it through the operator
         // pipeline so the (before, after) undo step is pushed uniformly.
         if let Some(d) = duplicate_window(ctx, &mut self.duplicate) {
+            // Remember these values so the NEXT Duplicate reuses them (bug 3).
+            set_dup_defaults(ctx, DupDefaults { x: d.x, y: d.y, z: d.z, angle: d.y_angle, count: d.count });
             self.run_op(
                 "fixture.duplicate",
                 "Duplicate",
@@ -1818,13 +1904,13 @@ impl Ui {
                 self.lib_prefs.push_recent(&k);
             }
         }
+        // Online GDTF-Share catalogue: stocks the project Library ONLY (no longer
+        // instantiates into the scene — bug 9). So it no longer borrows scene/selection.
         share_window::fixture_library_window(
             ctx,
             &mut self.show_share,
             &mut self.share,
             &mut self.library,
-            scene,
-            &mut self.selection,
         );
         // The `~` radial View pie (above the dock, anchored at the cursor). On a
         // pick it applies straight to the camera; cancel / Esc just closes it.
@@ -2289,7 +2375,9 @@ impl Ui {
             // the palette never offers the modal ones as dead picks. (Duplicate IS
             // a palette op, but via its `fixture.duplicate` dialog catalog entry,
             // not this keymap Action.)
-            Action::Transform(_) | Action::AxisLock(_) | Action::Duplicate => return false,
+            Action::Transform(_) | Action::AxisLock(_) | Action::Duplicate | Action::DuplicateGrab => {
+                return false;
+            }
         }
         true
     }
@@ -2486,7 +2574,7 @@ impl Ui {
                     ui.separator();
                     if ui.add_enabled(self.selection.primary_fixture().is_some(), egui::Button::new(format!("{}  Duplicate / Array…", icon::DUPLICATE))).clicked() {
                         if let Some(idx) = self.selection.primary_fixture() {
-                            self.duplicate = Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
+                            self.duplicate = Some(duplicate_dialog_for(ctx, idx));
                         }
                         ui.close();
                     }

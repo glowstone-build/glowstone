@@ -3068,7 +3068,10 @@ fn apply_transform(
     // returns true). Single value → along the active axis (Move falls back to
     // global X, Rotate to Y, Scale to uniform — matching the mouse-path defaults).
     let amount = op.num.value();
-    let typed = op.num.active;
+    // During a duplicate-grab the mouse ALWAYS drives the offset; a typed number is
+    // the array clone-count (applied on confirm), not the move amount — so don't let
+    // it override the drag here.
+    let typed = op.num.active && !op.from_duplicate;
     // Build a picking ray from a screen position through the op's viewport rect
     // (#40 absolute drag + #71 Vertex/Surface snap both need world rays, not just
     // the pixel delta). Aspect derives from the stored rect.
@@ -3331,6 +3334,23 @@ fn geo_world_centre(m: Mat4) -> Vec3 {
     m.w_axis.truncate()
 }
 
+/// The net world translation the primary copy received during a duplicate-grab —
+/// the spacing the array clone-count repeats along. Reads the primary element's
+/// current origin minus its op-start snapshot (the move is a pure translation).
+fn dup_grab_delta(op: &TransformOp, scene: &Scene) -> Vec3 {
+    if let Some((i, p0, _)) = op.start.first() {
+        scene.fixtures.get(*i).map(|f| f.position - *p0).unwrap_or(Vec3::ZERO)
+    } else if let Some((i, m0)) = op.geo_start.first() {
+        scene.geometry.get(*i).map(|g| (g.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
+    } else if let Some((i, m0)) = op.screen_start.first() {
+        scene.screens.get(*i).map(|s| (s.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
+    } else if let Some((i, c0, _)) = op.env_start.first() {
+        scene.environments.get(*i).map(|e| e.center - *c0).unwrap_or(Vec3::ZERO)
+    } else {
+        Vec3::ZERO
+    }
+}
+
 /// Live state for the Measure tool (§2.4) — a read-only two-point ruler that never
 /// mutates the scene (so no op / no undo). `a` is the first point; once `b` is set the
 /// segment + its distance label persist until a third click resets to a fresh `a`.
@@ -3571,6 +3591,61 @@ pub fn viewport(
     // `gizmo_hovered_axis`/`axis` so all three share the live-apply + undo path. The
     // grab is checked BEFORE orbit/select so dragging a handle never orbits the
     // camera; an empty-space press falls through untouched.
+    // Shift+D grab-duplicate hand-off: `Ui::show` already cloned + re-selected the
+    // copies (their own undo step) and set this flag. Pick it up and IMMEDIATELY
+    // start a Move grab on the copies so they follow the cursor and commit on
+    // click / Enter (Esc leaves them at the source, like Blender). A typed number
+    // during the grab becomes the array clone-count (see the confirm path).
+    let dupgrab_start = ui.ctx().data_mut(|d| {
+        let id = egui::Id::new("previz.dupgrab.start");
+        let v = d.get_temp::<bool>(id).unwrap_or(false);
+        if v {
+            d.remove::<bool>(id);
+        }
+        v
+    });
+    if dupgrab_start
+        && transform.is_none()
+        && selection.has_object()
+        && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
+    {
+        let fids: Vec<usize> =
+            selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+        let gids: Vec<usize> =
+            selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
+        let sids: Vec<usize> =
+            selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+        let eids: Vec<usize> =
+            selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+        let objs = obj_refs(&fids, &gids, &sids, &eids);
+        if !objs.is_empty() {
+            let pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
+            let (start, geo_start, screen_start, env_start) =
+                snapshot_starts(scene, &fids, &gids, &sids, &eids);
+            *transform = Some(TransformOp {
+                kind: TransformKind::Move,
+                axis: None,
+                start_screen: cur,
+                viewport: rect,
+                pivot,
+                start,
+                geo_start,
+                screen_start,
+                env_start,
+                gizmo_hovered_axis: None,
+                gizmo_plane_normal: None,
+                from_gizmo: false,
+                num: NumInput::default(),
+                individual: xform.pivot.is_individual(),
+                snap: xform.snap,
+                orientation: xform.orientation,
+                from_duplicate: true,
+                dup_base: objs,
+            });
+            *transform_started = true;
+        }
+    }
+
     let gizmo_targets: bool = active_tool.shows_xform_gizmo()
         && transform.is_none()
         && *viewport_focused
@@ -3645,6 +3720,8 @@ pub fn viewport(
                     individual: xform.pivot.is_individual(),
                     snap: xform.snap,
                     orientation: xform.orientation,
+                    from_duplicate: false,
+                    dup_base: Vec::new(),
                 });
                 *transform_started = true;
             }
@@ -3941,6 +4018,23 @@ pub fn viewport(
                 );
             }
             if confirm {
+                // Duplicate-grab with a typed clone-count: array the extra copies
+                // evenly along the drag vector (the live copy is #1; add N-1 more at
+                // 2·delta … N·delta). They fold into THIS move's undo step.
+                if op.from_duplicate && op.num.active {
+                    let count = (op.num.value().round() as i64).clamp(1, 1000) as u32;
+                    if count > 1 {
+                        let delta = dup_grab_delta(op, scene);
+                        for j in 1..count {
+                            let off = delta * j as f32;
+                            for &base in &op.dup_base {
+                                if let Some(c) = scene.duplicate_object(base) {
+                                    scene.translate_object(c, off);
+                                }
+                            }
+                        }
+                    }
+                }
                 *transform = None;
                 *transform_finished = true;
             }
@@ -3999,6 +4093,8 @@ pub fn viewport(
                     individual: xform.pivot.is_individual(),
                     snap: xform.snap,
                     orientation: xform.orientation,
+                    from_duplicate: false,
+                    dup_base: Vec::new(),
                 });
                 *transform_started = true;
                 consumed = true;
@@ -4361,8 +4457,7 @@ pub fn viewport(
                 }
                 if duplicate.is_none() && ui.button(format!("{}  Duplicate / Array…", theme::icon::DUPLICATE)).clicked() {
                     if let Some(idx) = selection.primary_fixture() {
-                        *duplicate =
-                            Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
+                        *duplicate = Some(super::duplicate_dialog_for(ui.ctx(), idx));
                     }
                     ui.close();
                 }
@@ -4407,14 +4502,7 @@ pub fn viewport(
         && dup_pressed
         && let Some(idx) = selection.primary_fixture()
     {
-        *duplicate = Some(DuplicateDialog {
-            fixture: idx,
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            y_angle: 36.0,
-            count: 9,
-        });
+        *duplicate = Some(super::duplicate_dialog_for(ui.ctx(), idx));
     }
 
     // Focus border.
@@ -5771,7 +5859,7 @@ mod transform_tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), orientation }
     }
 
     #[test]
@@ -5811,6 +5899,8 @@ mod transform_tests {
             individual: false,
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
+            from_duplicate: false,
+            dup_base: Vec::new(),
         };
         // Drag to a clearly different screen point so the in-plane delta is nonzero.
         apply_transform(&o, &mut scene, &cam, egui::pos2(560.0, 180.0), false);
@@ -6003,6 +6093,8 @@ mod transform_tests {
             individual: true,
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
+            from_duplicate: false,
+            dup_base: Vec::new(),
         };
         o.num.active = true;
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
@@ -6043,6 +6135,8 @@ mod transform_tests {
             individual: false,
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
+            from_duplicate: false,
+            dup_base: Vec::new(),
         };
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
         // At least one position moved (they orbited the centroid).

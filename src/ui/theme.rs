@@ -374,6 +374,13 @@ pub fn apply(ctx: &egui::Context, prefs: &Preferences) {
     s.scroll.bar_width = 9.0;
     s.scroll.floating = true;
 
+    // Plain Labels are NOT selectable text in a CAD/console UI: egui defaults
+    // `selectable_labels`/`multi_widget_text_select` to true, which made hovering
+    // or dragging across the UI rubber-band-select every label (the splash bug).
+    // TextEdit / DragValue keep their own selection — this only affects Labels.
+    style.interaction.selectable_labels = false;
+    style.interaction.multi_widget_text_select = false;
+
     ctx.set_style(style);
 
     // Single continuous application scale. Round to whole device pixels so

@@ -333,6 +333,122 @@ pub fn mesh_depth_equal_pipeline(
 }
 
 // ---------------------------------------------------------------------------
+// Selection silhouette: mask geometry pass + edge-detect composite
+// ---------------------------------------------------------------------------
+
+/// Single R8 color target the selection-mask pass writes (1 = selected surface).
+fn sel_mask_target() -> Option<wgpu::ColorTargetState> {
+    Some(wgpu::ColorTargetState {
+        format: Viewport::SEL_MASK_FORMAT,
+        blend: Some(wgpu::BlendState::REPLACE),
+        write_mask: wgpu::ColorWrites::ALL,
+    })
+}
+
+/// Depth state for the mask pass: TEST against the already-written scene depth
+/// (`LessEqual`, so a selected surface at the stored depth passes and an occluded
+/// part fails) but DON'T write — the mask hugs only the visible silhouette and the
+/// scene depth is left intact for later passes.
+fn depth_stencil_mask() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: Viewport::DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Selection-mask pipeline for MeshInstance geometry (fixtures, scene geometry):
+/// reuses `mesh.wgsl`'s vertex layout, discards non-selected fragments, writes 1.0.
+pub fn mesh_mask_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "mask.wgsl", include_str!("../shaders/mask.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sel-mask-mesh-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_mesh"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil_mask()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_mask"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[sel_mask_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Selection-mask pipeline for WallInstance geometry (LED screens): reuses
+/// `wall.wgsl`'s instance layout (selected = look.w) and reproduces its arc bend.
+pub fn wall_mask_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "mask.wgsl", include_str!("../shaders/mask.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sel-mask-wall-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_wall"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), WallInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil_mask()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_mask"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[sel_mask_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Fullscreen edge-detect composite: samples the selection mask and ADDs an amber
+/// silhouette ring into the HDR target (blend One/One) BEFORE bloom so it glows.
+pub fn sel_outline_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "mask.wgsl", include_str!("../shaders/mask.wgsl"));
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent::REPLACE,
+    };
+    fullscreen_pipeline(
+        device, "sel-outline-pipeline", layout, &shader, "fs_outline",
+        Viewport::HDR_FORMAT, Some(blend),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Bind-group layouts for the post passes
 // ---------------------------------------------------------------------------
 

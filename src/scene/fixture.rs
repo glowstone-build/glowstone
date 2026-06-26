@@ -101,6 +101,14 @@ pub struct Fixture {
     /// custom commands) when this fixture came from — or is destined for — an
     /// MVR scene. `None` for purely app-created fixtures.
     pub mvr: Option<Box<MvrFixtureMeta>>,
+
+    /// Where this fixture came from (built-in / disk import / GDTF Share / MVR).
+    /// Drives the colored provenance chip in the Scene panel + inspector. Read
+    /// via `fixture.source`. A REAL serialized field (so chips survive save /
+    /// load), kept LAST in serde order with `#[serde(default)]` so it lands at
+    /// the end of the positional bincode layout (see the `.archie` FORMAT bump).
+    #[serde(default)]
+    pub source: crate::gdtf::FixtureSource,
 }
 
 impl Fixture {
@@ -139,6 +147,7 @@ impl Fixture {
             motion: WheelMotion::default(),
             mvr: None,
             shutter: ShutterKind::None,
+            source: crate::gdtf::FixtureSource::Builtin,
         }
     }
 
@@ -147,6 +156,7 @@ impl Fixture {
         let beam_angle = gdtf.beam_angle.max(1.0);
         let is_laser = gdtf.beam.lamp_type.to_lowercase().contains("laser");
         let shutter = default_shutter(&gdtf);
+        let source = gdtf.source; // read before the Arc moves into the struct
         let mut f = Self {
             name: name.into(),
             profile: gdtf.name.clone(),
@@ -175,6 +185,7 @@ impl Fixture {
             motion: WheelMotion::default(),
             mvr: None,
             shutter,
+            source,
         };
         f.sync_mode();
         f
@@ -233,6 +244,7 @@ impl Fixture {
             motion: WheelMotion::default(),
             mvr: Some(Box::new(imported.meta)),
             shutter,
+            source: crate::gdtf::FixtureSource::Mvr,
         };
         // Imported rigs start blacked out — with no DMX feeding levels, a real
         // rig emits nothing, and importing 100+ fixtures at full would white out

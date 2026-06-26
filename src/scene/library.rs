@@ -199,7 +199,20 @@ impl Library {
 
     /// Import a GDTF file and add it to the library. Returns the new index.
     pub fn import_gdtf(&mut self, path: &std::path::Path) -> Result<usize, String> {
-        let fixture = crate::gdtf::GdtfFixture::load_path(path)?;
+        self.import_gdtf_with_source(path, crate::gdtf::FixtureSource::Import)
+    }
+
+    /// Import a GDTF file, tagging it with its provenance (`Import` for disk
+    /// drops, `GdtfShare` for online downloads) BEFORE it is shared into an
+    /// `Arc`, so every placed fixture inherits the right chip. Returns the new
+    /// index.
+    pub fn import_gdtf_with_source(
+        &mut self,
+        path: &std::path::Path,
+        source: crate::gdtf::FixtureSource,
+    ) -> Result<usize, String> {
+        let mut fixture = crate::gdtf::GdtfFixture::load_path(path)?;
+        fixture.source = source;
         self.gdtf.push(std::sync::Arc::new(fixture));
         Ok(self.gdtf.len() - 1)
     }

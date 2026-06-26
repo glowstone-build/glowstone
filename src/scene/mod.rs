@@ -403,6 +403,22 @@ impl Selection {
         self.object_refs().into_iter().next()
     }
 
+    /// Build a selection from a list of [`ObjectRef`]s — the result of a
+    /// duplicate, which re-selects the new copies. Duplicated refs are all one
+    /// kind (selection is single-kind), so this rebuilds a clean selection.
+    pub fn from_object_refs(refs: &[ObjectRef]) -> Self {
+        let mut s = Self::default();
+        for &r in refs {
+            match r {
+                ObjectRef::Fixture(i) => s.fixtures.push(i),
+                ObjectRef::Geometry(i) => s.geometry.push(i),
+                ObjectRef::Screen(i) => s.screens.push(i),
+                ObjectRef::Environment(i) => s.environment = Some(i),
+            }
+        }
+        s
+    }
+
     /// True when at least one placed (transformable/duplicable) object is
     /// selected — the gate the viewport uses to arm G/R/S and Duplicate.
     pub fn has_object(&self) -> bool {
@@ -862,9 +878,37 @@ impl Scene {
     /// new copies' refs in the same order. Pushing never invalidates the source
     /// indices, so a mixed multi-selection clones safely in one pass — the
     /// grab-duplicate (Shift+D) re-selects the result so the copies follow the
-    /// cursor and commit/cancel as ONE undo step.
+    /// cursor.
     pub fn duplicate_objects(&mut self, objs: &[ObjectRef]) -> Vec<ObjectRef> {
         objs.iter().filter_map(|&o| self.duplicate_object(o)).collect()
+    }
+
+    /// Translate any placed object by a world-space delta — the unified move
+    /// primitive. Used by the duplicate-array (Shift+D, type N) to space the
+    /// extra clones evenly along the drag vector.
+    pub fn translate_object(&mut self, obj: ObjectRef, delta: Vec3) {
+        match obj {
+            ObjectRef::Fixture(i) => {
+                if let Some(f) = self.fixtures.get_mut(i) {
+                    f.position += delta;
+                }
+            }
+            ObjectRef::Geometry(i) => {
+                if let Some(g) = self.geometry.get_mut(i) {
+                    g.transform.w_axis += delta.extend(0.0);
+                }
+            }
+            ObjectRef::Screen(i) => {
+                if let Some(s) = self.screens.get_mut(i) {
+                    s.transform.w_axis += delta.extend(0.0);
+                }
+            }
+            ObjectRef::Environment(i) => {
+                if let Some(e) = self.environments.get_mut(i) {
+                    e.center += delta;
+                }
+            }
+        }
     }
 
     /// Replace the scene's fixtures + static geometry with an imported MVR

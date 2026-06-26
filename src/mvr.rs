@@ -662,6 +662,7 @@ fn load_gdtf_named(name: &str, resources: &HashMap<String, Arc<Vec<u8>>>) -> Opt
         Ok(mut g) => {
             g.spec = name.to_string();
             g.raw = Some(bytes);
+            g.source = crate::gdtf::FixtureSource::Mvr;
             Some(Arc::new(g))
         }
         Err(e) => {
