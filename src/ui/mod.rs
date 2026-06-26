@@ -223,6 +223,16 @@ pub struct TransformOp {
     /// Original (geometry index, world transform) snapshot — the static-geometry
     /// equivalent of `start`. Empty when transforming fixtures.
     pub geo_start: Vec<(usize, glam::Mat4)>,
+    /// Original (LED-screen index, world transform) snapshot. Screens carry the
+    /// SAME `Mat4` transform as static geometry, so they ride the identical
+    /// move/rotate/scale math — this is what makes screens fully grabbable
+    /// (G/R/S) like every other object. Empty unless screens are selected.
+    pub screen_start: Vec<(usize, glam::Mat4)>,
+    /// Original (environment index, center, size) snapshot. Fog volumes are
+    /// axis-aligned (center + size, no orientation): Move slides the centre,
+    /// Rotate orbits it about the pivot (a no-op for a lone box), and Scale grows
+    /// the size in place. Empty unless an environment is selected.
+    pub env_start: Vec<(usize, Vec3, Vec3)>,
     /// The axis the screen-space move gizmo is currently grabbed on. Takes
     /// precedence over `axis` (keyboard X/Y/Z lock) for the live frame, matching
     /// Blender's "click-a-handle overrides the typed constraint" behaviour. Not

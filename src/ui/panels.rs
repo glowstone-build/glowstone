@@ -23,7 +23,7 @@ use crate::optics::{self, OpticField, OpticalControls};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::environment::Environment;
 use crate::scene::screen::{LedScreen, PixelShape, ScreenContent, TestPattern};
-use crate::scene::{apply_fixture_click, apply_select, Fixture, Library, Scene, SelItem, SelectOp, Selection};
+use crate::scene::{apply_fixture_click, apply_select, Fixture, Library, ObjectRef, Scene, SelItem, SelectOp, Selection};
 
 /// Universe is considered live if it updated within this window.
 const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -2840,52 +2840,25 @@ fn frame_selection(scene: &Scene, selection: &Selection, camera: &mut OrbitCamer
 /// position. Reads the snapshot in `op.start`, so it's idempotent — called every
 /// The world origin/centre of one selected fixture (its position) or geometry (its
 /// world-bounds centre, falling back to the transform's translation). The single
-/// per-element anchor both the pivot computation and Individual-Origins read.
-fn fixture_anchor(scene: &Scene, i: usize) -> Option<Vec3> {
-    scene.fixtures.get(i).map(|f| f.position)
-}
-fn geometry_anchor(scene: &Scene, i: usize) -> Option<Vec3> {
-    scene.geometry.get(i).map(|g| {
-        g.world_bounds().map(|(lo, hi)| (lo + hi) * 0.5).unwrap_or_else(|| g.transform.w_axis.truncate())
-    })
-}
-
 /// Compute the single world pivot the rotate/scale spins/grows about, per the
-/// chosen [`PivotMode`] (#5). `fids`/`gids` are the (validated) selected indices in
-/// selection order, so `fids[0]`/`gids[0]` is the active element. Individual-Origins
-/// has no single pivot — the applier uses each element's own anchor — so it returns
-/// the Median like the others (a harmless fallback the applier ignores when
-/// `op.individual`). Empty selection → origin.
-fn compute_pivot(
-    scene: &Scene,
-    fids: &[usize],
-    gids: &[usize],
-    mode: PivotMode,
-    cursor_3d: Vec3,
-) -> Vec3 {
+/// chosen [`PivotMode`] (#5). `objs` are the (validated) selected objects in
+/// selection order, so `objs[0]` is the active element. Reads each object's
+/// origin through the unified [`Scene::object_anchor`] so EVERY kind (fixtures,
+/// geometry, screens, environment) contributes — no kind is excluded from the
+/// centroid. Individual-Origins has no single pivot (the applier uses each
+/// element's own anchor) so it returns the Median like the others. Empty
+/// selection → origin.
+fn compute_pivot(scene: &Scene, objs: &[ObjectRef], mode: PivotMode, cursor_3d: Vec3) -> Vec3 {
     match mode {
         PivotMode::Cursor3d => cursor_3d,
-        PivotMode::Active => {
-            // The primary element = the first selected (fixtures take precedence
-            // over geometry when both kinds are present, matching the gizmo order).
-            fids.first()
-                .and_then(|&i| fixture_anchor(scene, i))
-                .or_else(|| gids.first().and_then(|&i| geometry_anchor(scene, i)))
-                .unwrap_or(Vec3::ZERO)
-        }
+        PivotMode::Active => objs.first().and_then(|&o| scene.object_anchor(o)).unwrap_or(Vec3::ZERO),
         // Median + Individual both seed from the centroid (Individual's per-element
         // pivots are applied in apply_transform via `op.individual`).
         PivotMode::Median | PivotMode::Individual => {
             let mut sum = Vec3::ZERO;
             let mut n = 0.0_f32;
-            for &i in fids {
-                if let Some(a) = fixture_anchor(scene, i) {
-                    sum += a;
-                    n += 1.0;
-                }
-            }
-            for &i in gids {
-                if let Some(a) = geometry_anchor(scene, i) {
+            for &o in objs {
+                if let Some(a) = scene.object_anchor(o) {
                     sum += a;
                     n += 1.0;
                 }
@@ -2893,6 +2866,43 @@ fn compute_pivot(
             if n > 0.0 { sum / n } else { Vec3::ZERO }
         }
     }
+}
+
+/// Flatten validated per-kind index slices into the unified [`ObjectRef`] list
+/// (fixtures, then geometry, screens, environment) — the order the pivot's
+/// "active" element and the gizmo read. The single place selection → object list
+/// happens for the transform path.
+fn obj_refs(fids: &[usize], gids: &[usize], sids: &[usize], eids: &[usize]) -> Vec<ObjectRef> {
+    fids.iter()
+        .map(|&i| ObjectRef::Fixture(i))
+        .chain(gids.iter().map(|&i| ObjectRef::Geometry(i)))
+        .chain(sids.iter().map(|&i| ObjectRef::Screen(i)))
+        .chain(eids.iter().map(|&i| ObjectRef::Environment(i)))
+        .collect()
+}
+
+/// Capture the per-kind op-start snapshots for a transform: fixtures keep
+/// (position, orientation); geometry + screens keep their world `Mat4`;
+/// environments keep (centre, size). ONE source for both the gizmo-drag and the
+/// modal G/R/S op-start so every kind is snapshotted — and thus live-applied and
+/// cancel-restored — identically.
+#[allow(clippy::type_complexity)]
+fn snapshot_starts(
+    scene: &Scene,
+    fids: &[usize],
+    gids: &[usize],
+    sids: &[usize],
+    eids: &[usize],
+) -> (Vec<(usize, Vec3, Quat)>, Vec<(usize, Mat4)>, Vec<(usize, Mat4)>, Vec<(usize, Vec3, Vec3)>) {
+    let start = fids
+        .iter()
+        .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
+        .collect();
+    let geo_start = gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
+    let screen_start = sids.iter().map(|&i| (i, scene.screens[i].transform)).collect();
+    let env_start =
+        eids.iter().map(|&i| (i, scene.environments[i].center, scene.environments[i].size)).collect();
+    (start, geo_start, screen_start, env_start)
 }
 
 /// Resolve the transform-orientation (#37) to a 3×3 whose COLUMNS are the X/Y/Z
@@ -2917,10 +2927,11 @@ fn orientation_basis(op: &TransformOp, camera: &OrbitCamera) -> glam::Mat3 {
         }
         TO::Local => {
             // Prefer the active fixture's orientation (its op-start Quat snapshot);
-            // else the first geometry piece's rotation from its op-start matrix.
+            // else the first geometry/screen piece's rotation from its op-start
+            // matrix (screens share geometry's Mat4 transform).
             if let Some((_, _, q)) = op.start.first() {
                 glam::Mat3::from_quat(*q)
-            } else if let Some((_, m0)) = op.geo_start.first() {
+            } else if let Some((_, m0)) = op.geo_start.first().or_else(|| op.screen_start.first()) {
                 let b = glam::Mat3::from_mat4(*m0);
                 // Normalize the columns so non-uniform scale doesn't skew the axes;
                 // a degenerate column falls back to the world axis.
@@ -3178,6 +3189,18 @@ fn apply_transform(
                     g.transform = Mat4::from_translation(world) * *m0;
                 }
             }
+            // Screens ride the identical Mat4 path as geometry.
+            for (i, m0) in &op.screen_start {
+                if let Some(s) = scene.screens.get_mut(*i) {
+                    s.transform = Mat4::from_translation(world) * *m0;
+                }
+            }
+            // Fog volumes: slide the centre (size unchanged).
+            for (i, c0, _sz) in &op.env_start {
+                if let Some(e) = scene.environments.get_mut(*i) {
+                    e.center = *c0 + world;
+                }
+            }
         }
         TransformKind::Rotate => {
             // Typed degrees override the mouse-derived angle (radians); #4 snaps the
@@ -3208,6 +3231,24 @@ fn apply_transform(
                     * Mat4::from_translation(-pivot);
                 if let Some(g) = scene.geometry.get_mut(*i) {
                     g.transform = about * *m0;
+                }
+            }
+            for (i, m0) in &op.screen_start {
+                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let about = Mat4::from_translation(pivot)
+                    * Mat4::from_quat(rot)
+                    * Mat4::from_translation(-pivot);
+                if let Some(s) = scene.screens.get_mut(*i) {
+                    s.transform = about * *m0;
+                }
+            }
+            for (i, c0, _sz) in &op.env_start {
+                // Axis-aligned fog box: orbit the centre about the pivot (a no-op
+                // for a lone box whose pivot IS its centre); the box stays
+                // axis-aligned, so size is unchanged.
+                let pivot = if op.individual { *c0 } else { op.pivot };
+                if let Some(e) = scene.environments.get_mut(*i) {
+                    e.center = pivot + rot * (*c0 - pivot);
                 }
             }
         }
@@ -3257,6 +3298,24 @@ fn apply_transform(
                     * Mat4::from_translation(-pivot);
                 if let Some(g) = scene.geometry.get_mut(*i) {
                     g.transform = about * *m0;
+                }
+            }
+            for (i, m0) in &op.screen_start {
+                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let about = Mat4::from_translation(pivot)
+                    * about4
+                    * Mat4::from_translation(-pivot);
+                if let Some(s) = scene.screens.get_mut(*i) {
+                    s.transform = about * *m0;
+                }
+            }
+            for (i, c0, sz0) in &op.env_start {
+                // Fog box: scale the centre about the pivot and grow the size by the
+                // same (directional or uniform) factor — a lone box scales in place.
+                let pivot = if op.individual { *c0 } else { op.pivot };
+                if let Some(e) = scene.environments.get_mut(*i) {
+                    e.center = pivot + scale_mat * (*c0 - pivot);
+                    e.size = (scale_mat * *sz0).abs();
                 }
             }
         }
@@ -3516,7 +3575,7 @@ pub fn viewport(
         && transform.is_none()
         && *viewport_focused
         && !selection.world
-        && (!selection.fixtures.is_empty() || !selection.geometry.is_empty());
+        && selection.has_object();
     if gizmo_targets
         && let Some(group) = gizmo::for_tool(active_tool)
     {
@@ -3526,9 +3585,13 @@ pub fn viewport(
             selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
         let gids: Vec<usize> =
             selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-        let n = (fids.len() + gids.len()) as f32;
-        if n > 0.0 {
-            let gizmo_pivot = compute_pivot(scene, &fids, &gids, xform.pivot, *cursor_3d);
+        let sids: Vec<usize> =
+            selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+        let eids: Vec<usize> =
+            selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+        let objs = obj_refs(&fids, &gids, &sids, &eids);
+        if !objs.is_empty() {
+            let gizmo_pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
             let cx = GizmoCtx {
                 pivot: gizmo_pivot,
                 vp: camera.view_proj(aspect),
@@ -3550,14 +3613,11 @@ pub fn viewport(
                 && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
             {
                 let start_spec = group.invoke(handle);
-                // `fids`/`gids` are the validated, selection-order indices computed
-                // above for the pivot — reused here for the per-element snapshots.
-                let start: Vec<(usize, Vec3, Quat)> = fids
-                    .iter()
-                    .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
-                    .collect();
-                let geo_start: Vec<(usize, Mat4)> =
-                    gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
+                // `fids`/`gids`/`sids`/`eids` are the validated, selection-order
+                // indices computed above for the pivot — reused here for the
+                // per-element snapshots (every kind, via `snapshot_starts`).
+                let (start, geo_start, screen_start, env_start) =
+                    snapshot_starts(scene, &fids, &gids, &sids, &eids);
                 *transform = Some(TransformOp {
                     kind: start_spec.kind,
                     // Move locks via `gizmo_hovered_axis` (matching P3a); rotate/scale
@@ -3569,6 +3629,8 @@ pub fn viewport(
                     pivot: cx.pivot,
                     start,
                     geo_start,
+                    screen_start,
+                    env_start,
                     gizmo_hovered_axis: if start_spec.kind == TransformKind::Move {
                         start_spec.axis
                     } else {
@@ -3836,6 +3898,17 @@ pub fn viewport(
                     g.transform = *m0;
                 }
             }
+            for (i, m0) in &op.screen_start {
+                if let Some(s) = scene.screens.get_mut(*i) {
+                    s.transform = *m0;
+                }
+            }
+            for (i, c0, sz0) in &op.env_start {
+                if let Some(e) = scene.environments.get_mut(*i) {
+                    e.center = *c0;
+                    e.size = *sz0;
+                }
+            }
             *transform = None;
         } else {
             if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
@@ -3872,8 +3945,9 @@ pub fn viewport(
                 *transform_finished = true;
             }
         }
-    } else if *viewport_focused && (!selection.fixtures.is_empty() || !selection.geometry.is_empty()) {
-        // Start a transform on G / R / S (over fixtures and/or static geometry).
+    } else if *viewport_focused && selection.has_object() {
+        // Start a transform on G / R / S (over any placed object — fixtures,
+        // static geometry, LED screens or the environment volume).
         // The binds (and their modifier guards — plain R only, since Shift+R is
         // "Replace") live in the central registry under the Viewport context.
         // Viewport context active, no transform in flight (this is the `else`
@@ -3896,17 +3970,18 @@ pub fn viewport(
                 selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
             let gids: Vec<usize> =
                 selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-            if !fids.is_empty() || !gids.is_empty() {
+            let sids: Vec<usize> =
+                selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+            let eids: Vec<usize> =
+                selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+            let objs = obj_refs(&fids, &gids, &sids, &eids);
+            if !objs.is_empty() {
                 // #5: pivot per the chosen mode (Median / Active / 3D-Cursor; the
                 // Individual flag makes apply_transform pivot each element about its
                 // own origin). Per-element snapshots for the live re-apply / cancel.
-                let pivot = compute_pivot(scene, &fids, &gids, xform.pivot, *cursor_3d);
-                let start: Vec<(usize, Vec3, Quat)> = fids
-                    .iter()
-                    .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
-                    .collect();
-                let geo_start: Vec<(usize, Mat4)> =
-                    gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
+                let pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
+                let (start, geo_start, screen_start, env_start) =
+                    snapshot_starts(scene, &fids, &gids, &sids, &eids);
                 *transform = Some(TransformOp {
                     kind,
                     axis: None,
@@ -3915,6 +3990,8 @@ pub fn viewport(
                     pivot,
                     start,
                     geo_start,
+                    screen_start,
+                    env_start,
                     gizmo_hovered_axis: None,
                     gizmo_plane_normal: None,
                     from_gizmo: false,
@@ -5576,10 +5653,10 @@ mod pick_tests {
         scene.fixtures.push(demo.fixtures[0].clone());
         scene.fixtures[0].position = Vec3::new(10.0, 0.0, 10.0);
         let cursor = Vec3::new(-3.0, 1.5, 4.0);
-        let pivot = compute_pivot(&scene, &[0], &[], PivotMode::Cursor3d, cursor);
+        let pivot = compute_pivot(&scene, &[ObjectRef::Fixture(0)], PivotMode::Cursor3d, cursor);
         assert_eq!(pivot, cursor, "Cursor3d pivot ignores selection, uses the cursor");
         // The Median pivot, by contrast, is the fixture's own position.
-        let median = compute_pivot(&scene, &[0], &[], PivotMode::Median, cursor);
+        let median = compute_pivot(&scene, &[ObjectRef::Fixture(0)], PivotMode::Median, cursor);
         assert!((median - Vec3::new(10.0, 0.0, 10.0)).length() < 1.0, "median ≠ cursor");
     }
 
@@ -5694,7 +5771,7 @@ mod transform_tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
     }
 
     #[test]
@@ -5726,7 +5803,7 @@ mod transform_tests {
             viewport: rect,
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
-            geo_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: Some(Axis::Z),
             from_gizmo: true,
@@ -5918,7 +5995,7 @@ mod transform_tests {
             viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
             pivot: median,
             start: vec![(0, p0a, q0a), (1, p0b, scene.fixtures[1].orientation)],
-            geo_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             from_gizmo: false,
@@ -5958,7 +6035,7 @@ mod transform_tests {
                 (0, p0a, scene.fixtures[0].orientation),
                 (1, p0b, scene.fixtures[1].orientation),
             ],
-            geo_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             from_gizmo: false,

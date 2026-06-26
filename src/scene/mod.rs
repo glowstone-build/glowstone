@@ -28,7 +28,7 @@ pub type EntityId = u64;
 /// A static, non-fixture object placed in the scene — a stage deck, truss,
 /// set piece, or screen imported from MVR. Drawn as lit geometry that occludes
 /// beams; not a light source.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SceneGeometry {
     pub name: String,
     /// World-space placement (Y-up, metres) of the object's frame. The renderer
@@ -97,6 +97,13 @@ fn model_local_bounds(models: &[GeometryModel]) -> Option<(Vec3, Vec3)> {
         }
     }
     any.then_some((lo, hi))
+}
+
+/// The name a duplicated object takes: the source name with a "copy" suffix.
+/// (Blender appends a numeric ".001"; a single readable tag is enough here and
+/// avoids parsing/renumbering — repeated duplicates simply stack "copy".)
+fn dup_name(name: &str) -> String {
+    format!("{name} copy")
 }
 
 /// Document-level MVR data retained from an import so the scene can be written
@@ -372,6 +379,38 @@ impl Selection {
         self.screens.clear();
         self.fixtures = (a.min(b)..=a.max(b)).collect();
     }
+
+    /// Every selected placed object as a flat [`ObjectRef`] list — the unified
+    /// currency the transform (G/R/S), duplicate, and framing paths iterate, so
+    /// fixtures, static geometry, LED screens AND environment volumes are all
+    /// driven through ONE code path (no kind is a second-class citizen). The
+    /// three multi-select kinds are mutually exclusive so in practice exactly one
+    /// of them populates; environment is single-only. World is not a placed
+    /// object and is excluded.
+    pub fn object_refs(&self) -> Vec<ObjectRef> {
+        let mut v = Vec::new();
+        v.extend(self.fixtures.iter().map(|&i| ObjectRef::Fixture(i)));
+        v.extend(self.geometry.iter().map(|&i| ObjectRef::Geometry(i)));
+        v.extend(self.screens.iter().map(|&i| ObjectRef::Screen(i)));
+        if let Some(i) = self.environment {
+            v.push(ObjectRef::Environment(i));
+        }
+        v
+    }
+
+    /// The primary (active) object — the first of whichever kind is selected.
+    pub fn primary_object(&self) -> Option<ObjectRef> {
+        self.object_refs().into_iter().next()
+    }
+
+    /// True when at least one placed (transformable/duplicable) object is
+    /// selected — the gate the viewport uses to arm G/R/S and Duplicate.
+    pub fn has_object(&self) -> bool {
+        !self.fixtures.is_empty()
+            || !self.geometry.is_empty()
+            || !self.screens.is_empty()
+            || self.environment.is_some()
+    }
 }
 
 /// One entity the viewport can pick / marquee, addressed by its current kind +
@@ -389,6 +428,22 @@ pub enum SelItem {
     /// `apply_select` already handles it, mirroring `Selection::toggle_world`.
     #[allow(dead_code)]
     World,
+}
+
+/// A handle to ANY placed object in the scene, by kind + index — the unified
+/// "scene object" the user-facing operations (grab/rotate/scale, duplicate,
+/// world-bounds, framing) act through. This is the abstraction that lets
+/// EVERYTHING rendered in the viewport share one interface instead of each
+/// subsystem special-casing the kinds it bothers to support: the [`Scene`]'s
+/// `object_*` methods below resolve a ref against the parallel entity Vecs and
+/// implement translate/rotate/scale/duplicate per kind. Mirrors [`SelItem`]
+/// minus `World` (the World node is not a placed object).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjectRef {
+    Fixture(usize),
+    Geometry(usize),
+    Screen(usize),
+    Environment(usize),
 }
 
 /// How a set of freshly-picked [`SelItem`]s combines with the current
@@ -732,6 +787,84 @@ impl Scene {
             self.fixtures.push(f);
         }
         (count > 0).then_some(first)
+    }
+
+    /// World-space AABB of any placed object — the unified bounds accessor for
+    /// framing + the selection-outline / pivot math. A fixture (a point light)
+    /// gets a small body box around its origin so a lone fixture still frames and
+    /// outlines sensibly.
+    pub fn object_world_bounds(&self, obj: ObjectRef) -> Option<(Vec3, Vec3)> {
+        match obj {
+            ObjectRef::Fixture(i) => self.fixtures.get(i).map(|f| {
+                let h = Vec3::splat(0.2);
+                (f.position - h, f.position + h)
+            }),
+            ObjectRef::Geometry(i) => self.geometry.get(i).and_then(|g| g.world_bounds()),
+            ObjectRef::Screen(i) => self.screens.get(i).map(|s| s.world_bounds()),
+            ObjectRef::Environment(i) => self.environments.get(i).map(|e| (e.min(), e.max())),
+        }
+    }
+
+    /// The object's world-space origin/anchor — what the pivot (Median / Active /
+    /// Individual Origins) reads so every selected kind contributes to the
+    /// centroid, not just fixtures + geometry.
+    pub fn object_anchor(&self, obj: ObjectRef) -> Option<Vec3> {
+        match obj {
+            ObjectRef::Fixture(i) => self.fixtures.get(i).map(|f| f.position),
+            ObjectRef::Geometry(i) => self.geometry.get(i).map(|g| {
+                g.world_bounds().map(|(lo, hi)| (lo + hi) * 0.5).unwrap_or_else(|| g.transform.w_axis.truncate())
+            }),
+            ObjectRef::Screen(i) => self.screens.get(i).map(|s| s.world_center()),
+            ObjectRef::Environment(i) => self.environments.get(i).map(|e| e.center),
+        }
+    }
+
+    /// Duplicate ANY placed object: deep-clone it, give the copy a fresh stable
+    /// id + a "copy" name, push it, and return a ref to the new copy. The single
+    /// any-kind primitive behind cross-kind duplicate (Shift+D) — fixtures keep
+    /// the array fan via [`duplicate_fixture`]; this is the single-copy path that
+    /// also covers geometry, screens and environments.
+    pub fn duplicate_object(&mut self, obj: ObjectRef) -> Option<ObjectRef> {
+        match obj {
+            ObjectRef::Fixture(i) => {
+                let mut f = self.fixtures.get(i)?.clone();
+                f.name = dup_name(&f.name);
+                f.id = self.alloc_id();
+                f.snap_movement();
+                self.fixtures.push(f);
+                Some(ObjectRef::Fixture(self.fixtures.len() - 1))
+            }
+            ObjectRef::Geometry(i) => {
+                let mut g = self.geometry.get(i)?.clone();
+                g.name = dup_name(&g.name);
+                g.id = self.alloc_id();
+                self.geometry.push(g);
+                Some(ObjectRef::Geometry(self.geometry.len() - 1))
+            }
+            ObjectRef::Screen(i) => {
+                let mut s = self.screens.get(i)?.clone();
+                s.name = dup_name(&s.name);
+                s.id = self.alloc_id();
+                self.screens.push(s);
+                Some(ObjectRef::Screen(self.screens.len() - 1))
+            }
+            ObjectRef::Environment(i) => {
+                let mut e = self.environments.get(i)?.clone();
+                e.name = dup_name(&e.name);
+                e.id = self.alloc_id();
+                self.environments.push(e);
+                Some(ObjectRef::Environment(self.environments.len() - 1))
+            }
+        }
+    }
+
+    /// Duplicate every object in `objs` (deep clone + fresh ids), returning the
+    /// new copies' refs in the same order. Pushing never invalidates the source
+    /// indices, so a mixed multi-selection clones safely in one pass — the
+    /// grab-duplicate (Shift+D) re-selects the result so the copies follow the
+    /// cursor and commit/cancel as ONE undo step.
+    pub fn duplicate_objects(&mut self, objs: &[ObjectRef]) -> Vec<ObjectRef> {
+        objs.iter().filter_map(|&o| self.duplicate_object(o)).collect()
     }
 
     /// Replace the scene's fixtures + static geometry with an imported MVR
