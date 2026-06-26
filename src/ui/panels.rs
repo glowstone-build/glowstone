@@ -563,6 +563,21 @@ struct LibRow {
     meta: String,
     category: String,
     accent: bool, // laser/colour entry → tint the icon
+    /// Provenance for the coloured source chip (bug 11). `None` for non-fixture
+    /// rows (environments / screens have no fixture source).
+    source: Option<crate::gdtf::FixtureSource>,
+}
+
+/// Draw a small colour-coded provenance chip ("● GDTF Share" / "MVR" / …) so a
+/// fixture's origin reads at a glance in the library + Replace lists (bug 11). A
+/// coloured dot + label keeps it legible at small sizes without a heavy box.
+pub(crate) fn source_chip(ui: &mut egui::Ui, source: crate::gdtf::FixtureSource) {
+    let [r, g, b] = source.color_rgb();
+    ui.label(
+        egui::RichText::new(format!("● {}", source.label()))
+            .size(9.0)
+            .color(Color32::from_rgb(r, g, b)),
+    );
 }
 
 /// Build the flat row list from the library (Imported GDTF, then built-in
@@ -579,6 +594,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             meta: format!("{} · {} · {} mode{}", g.manufacturer, beam, g.modes.len(), if g.modes.len() == 1 { "" } else { "s" }),
             category: if g.manufacturer.is_empty() { "Imported".into() } else { g.manufacturer.clone() },
             accent: false,
+            source: Some(g.source),
         });
     }
     for (i, p) in library.fixtures.iter().enumerate() {
@@ -589,6 +605,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             meta: if p.laser { "Laser engine".into() } else { format!("{:.0}° beam", p.default_beam_angle) },
             category: p.category.to_string(),
             accent: p.laser,
+            source: Some(crate::gdtf::FixtureSource::Builtin),
         });
     }
     for (i, p) in library.environments.iter().enumerate() {
@@ -600,6 +617,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             meta: format!("{w:.0} × {h:.0} × {d:.0} m"),
             category: if p.category.is_empty() { "Environment" } else { p.category }.to_string(),
             accent: false,
+            source: None,
         });
     }
     for (i, p) in library.screens.iter().enumerate() {
@@ -614,6 +632,7 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             ),
             category: p.category.to_string(),
             accent: p.transparent,
+            source: None,
         });
     }
     rows
@@ -804,7 +823,9 @@ pub fn library_browser(
     ui.horizontal(|ui| {
         let label = if n_sel > 1 { format!("{}  Add {n_sel}", icon::ADD) } else { format!("{}  Add", icon::ADD) };
         if ui.add_enabled(n_sel > 0, egui::Button::new(label)).on_hover_text("Add the selected templates to the scene at the cursor (Enter)").clicked()
-            || (n_sel > 0 && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            || (n_sel > 0
+                && !super::text_focus_active(ui.ctx())
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)))
         {
             let place = placement_point(scene, camera);
             let mut idxs = lib.selected.clone();
@@ -974,6 +995,7 @@ fn clone_lib_row(r: &LibRow) -> LibRow {
         meta: r.meta.clone(),
         category: r.category.clone(),
         accent: r.accent,
+        source: r.source,
     }
 }
 
@@ -1076,7 +1098,19 @@ fn library_row_widget(
     }
     let text_w = (rect.width() - 30.0 - 40.0).max(40.0);
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), &row.name, 13.0, ink.primary, text_w);
-    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, text_w);
+    // Reserve room on the meta line for the colour-coded source chip (bug 11).
+    let meta_w = if row.source.is_some() { (text_w - 72.0).max(30.0) } else { text_w };
+    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, meta_w);
+    if let Some(src) = row.source {
+        let [cr, cg, cb] = src.color_rgb();
+        painter.text(
+            egui::pos2(rect.right() - 36.0, rect.top() + 24.0),
+            egui::Align2::RIGHT_CENTER,
+            format!("● {}", src.label()),
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(cr, cg, cb),
+        );
+    }
     // A "+" affordance on hover (left of the star), right-aligned.
     if resp.hovered() {
         painter.text(
@@ -1466,7 +1500,9 @@ fn inspector_body(
 /// Categories are collapsible and the Optics / Wheels rows are **dynamic** — they
 /// show the union of controls the selected fixtures actually expose, not a fixed
 /// hardcoded list.
-fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, ids: &[usize], state: &mut InspectorState) {
+// `_state` (property filter / collapse) is threaded but not yet applied to the
+// bulk / geometry / screen / GDTF inspectors — a follow-up; they ignore it for now.
+fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, ids: &[usize], _state: &mut InspectorState) {
     let primary = ids[0];
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{}  {} fixtures", theme::icon::FIXTURE, ids.len())).strong());
@@ -1933,7 +1969,7 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut I
 /// truss, or set piece): identity, visibility, and an editable world transform
 /// (position / rotation / uniform scale), decomposed from its 4×4 and recomposed
 /// only when a field changes (so a one-off non-uniform import isn't flattened).
-fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state: &mut InspectorState) {
+fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], _state: &mut InspectorState) {
     let primary = ids[0];
     let Some(g) = scene.geometry.get_mut(primary) else {
         ui.label("Selection is no longer valid.");
@@ -2025,7 +2061,7 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
 /// cabinet grid (with a live derived-resolution readout), surface photometry,
 /// and the content source. Phase 1 covers Test Pattern + Solid Colour content;
 /// the cabinet is editable directly (the panel TYPE is set from the Library).
-fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sources: &ScreenSources, state: &mut InspectorState) {
+fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sources: &ScreenSources, _state: &mut InspectorState) {
     ui.heading(s.name.as_str());
     let [rx, ry] = s.resolution();
     let [mw, mh] = s.size_m();
@@ -2360,7 +2396,7 @@ fn gdtf_inspector(
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
     fixture_id: usize,
     profile: &mut Option<ProfileEditor>,
-    state: &mut InspectorState,
+    _state: &mut InspectorState,
 ) {
     let gdtf = fixture.gdtf.clone().expect("gdtf");
     let key = Arc::as_ptr(&gdtf) as usize;
@@ -5791,7 +5827,7 @@ mod pick_tests {
 
     // --- library content-class chip predicate (S2c) ---------------------------
     fn row(kind: LibKind, accent: bool) -> LibRow {
-        LibRow { kind, icon: "", name: String::new(), meta: String::new(), category: String::new(), accent }
+        LibRow { kind, icon: "", name: String::new(), meta: String::new(), category: String::new(), accent, source: None }
     }
 
     #[test]

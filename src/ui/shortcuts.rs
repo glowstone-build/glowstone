@@ -1437,7 +1437,8 @@ mod tests {
             // Add / Object / history
             (KeymapId::Viewport, Trigger::key(Key::A).shift(), Action::AddMenu),
             (KeymapId::Viewport, Trigger::key(Key::D), Action::Duplicate),
-            (KeymapId::Viewport, Trigger::key(Key::D).shift(), Action::Duplicate),
+            // Shift+D is now Blender-style duplicate-then-grab (was the dialog alias).
+            (KeymapId::Viewport, Trigger::key(Key::D).shift(), Action::DuplicateGrab),
             (KeymapId::Global, Trigger::key(Key::Delete), Action::Delete),
             (KeymapId::Global, Trigger::key(Key::Backspace), Action::Delete),
             (KeymapId::Global, Trigger::key(Key::P), Action::Patch),

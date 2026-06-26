@@ -640,6 +640,7 @@ mod tests {
             merged_into: None,
         };
         GdtfFixture {
+            source: crate::gdtf::FixtureSource::Import,
             name: "Test".into(),
             manufacturer: "Test".into(),
             long_name: "Test".into(),

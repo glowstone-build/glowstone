@@ -73,6 +73,14 @@ impl Default for DupDefaults {
     }
 }
 
+/// Whether a text widget held keyboard focus at the START of this frame (set by
+/// [`Ui::show`]). Global Enter readers (the library batch-add, the patch/unpatch/
+/// add/operator dialogs) check this so committing a value box with Enter can't leak
+/// into them and fire an unintended action (bug 8).
+pub(crate) fn text_focus_active(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("previz.text_focus")).unwrap_or(false))
+}
+
 /// The last-used Duplicate values (or all-zero defaults on first use).
 pub(crate) fn dup_defaults(ctx: &egui::Context) -> DupDefaults {
     ctx.data(|d| d.get_temp::<DupDefaults>(egui::Id::new("previz.dup.defaults")).unwrap_or_default())
@@ -92,11 +100,15 @@ pub(crate) fn duplicate_dialog_for(ctx: &egui::Context, fixture: usize) -> Dupli
 
 /// State of the open Replace-fixtures dialog (Shift+R). Swaps the selected
 /// fixtures' type for a chosen project-library profile, in place (keeping each
-/// fixture's position / aim / level / name). `None` = closed.
+/// fixture's position / aim / level). `None` = closed.
 #[derive(Default)]
 pub struct ReplaceDialog {
     /// Name filter over the project library.
     pub search: String,
+    /// When ON, swap ONLY the visual model/beam and KEEP the fixture's identity —
+    /// name, DMX patch + mode + optical state (bug 12). Default OFF: a full replace
+    /// re-patches AND renames the fixture to the new profile's name.
+    pub mesh_only: bool,
 }
 
 /// What the welcome splash's buttons request (applied after the modal closure,
@@ -623,7 +635,6 @@ pub struct Ui {
 /// contexts) is a later phase.
 #[derive(Clone, Copy, Default)]
 struct ViewportRegions {
-    n_open: bool,
     t_open: bool,
 }
 
@@ -1537,6 +1548,14 @@ impl Ui {
     ) {
         // Theme/accent/DPI live every frame (cheap; egui dedups).
         self.prefs.apply_theme(ctx);
+        // Bug 8 — Enter-leak guard: snapshot whether a text widget holds keyboard
+        // focus at the START of the frame (before any widget runs). When the user
+        // commits a value box with Enter, the field is still focused HERE but
+        // surrenders focus mid-frame, leaving the Enter in the event queue; unguarded
+        // global readers (batch-add, dialog confirms) would otherwise see it as a
+        // fresh keypress. They gate on `text_focus_active()` so the commit can't leak.
+        let text_focus = ctx.memory(|m| m.focused().is_some());
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("previz.text_focus"), text_focus));
         // Age + retire expired toasts (dt from egui — `show()` takes no dt param).
         self.notify.tick(ctx.input(|i| i.stable_dt));
         // DMX connect/disconnect edge: the actual bind happens on the DMX worker,
@@ -2249,9 +2268,9 @@ impl Ui {
             // N / T — toggle the viewport's side regions (§2.2). Viewport-only
             // binds (the keymap stack already gates them to a focused viewport
             // and `poll` is silent while a text field has focus).
-            Action::ToggleNPanel => {
-                self.viewport_regions.n_open = !self.viewport_regions.n_open;
-            }
+            // N now shows/hides the single docked Inspector tab (the inline N-panel
+            // inspector was removed — it duplicated this and stretched the viewport).
+            Action::ToggleNPanel => self.toggle_tab(Tab::Inspector),
             Action::ToggleTPanel => {
                 self.viewport_regions.t_open = !self.viewport_regions.t_open;
             }
@@ -2987,6 +3006,8 @@ fn replace_window(
                     .hint_text(format!("{}  Filter project library…", theme::icon::SEARCH))
                     .desired_width(f32::INFINITY),
             );
+            ui.checkbox(&mut d.mesh_only, "Replace mesh/model only")
+                .on_hover_text("Swap just the visual model + beam; keep the name, DMX patch, mode and levels. Off = full replace (re-patches and renames to the new type).");
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let mut any = false;
@@ -3000,9 +3021,15 @@ fn replace_window(
                     for gi in gdtf {
                         let g = &gdtf_arcs[gi];
                         let label = format!("{}  {} · {}", theme::icon::FIXTURE, g.manufacturer, g.name);
-                        if ui.selectable_label(false, label).clicked() {
-                            picked = Some(Picked::Gdtf(gi));
-                        }
+                        let src = g.source;
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(false, label).clicked() {
+                                picked = Some(Picked::Gdtf(gi));
+                            }
+                            // Colour-coded provenance chip (bug 11) — GDTF Share / MVR /
+                            // Imported read at a glance in the Replace list.
+                            panels::source_chip(ui, src);
+                        });
                     }
                     ui.add_space(6.0);
                 }
@@ -3033,11 +3060,26 @@ fn replace_window(
         });
 
     if let Some(p) = picked {
-        for &i in &targets {
-            // Snapshot the placement + level + name to carry across the swap.
-            let (pos, orient, pan, tilt, name, dimmer) = {
+        // A full replace RENAMES each fixture to the new type (bug 12 — replacing a
+        // fixture should read as its new type, not keep the stale name). Mesh-only
+        // keeps the old name + DMX patch/mode.
+        let new_base = match &p {
+            Picked::Gdtf(gi) => gdtf_arcs[*gi].name.to_string(),
+            Picked::Profile(pi) => library.fixtures[*pi].name.to_string(),
+        };
+        let many = targets.len() > 1;
+        for (j, &i) in targets.iter().enumerate() {
+            // Snapshot the placement + level (+ identity, for mesh-only) to carry across.
+            let (pos, orient, pan, tilt, old_name, dimmer, mode_index, optics) = {
                 let f = &scene.fixtures[i];
-                (f.position, f.orientation, f.pan, f.tilt, f.name.clone(), f.optics.dimmer)
+                (f.position, f.orientation, f.pan, f.tilt, f.name.clone(), f.optics.dimmer, f.mode_index, f.optics.clone())
+            };
+            let name = if d.mesh_only {
+                old_name
+            } else if many {
+                format!("{new_base} {}", j + 1)
+            } else {
+                new_base.clone()
             };
             let mut nf = match &p {
                 Picked::Gdtf(gi) => crate::scene::Fixture::from_gdtf(gdtf_arcs[*gi].clone(), name, pos),
@@ -3046,10 +3088,21 @@ fn replace_window(
             nf.orientation = orient;
             nf.pan = pan;
             nf.tilt = tilt;
-            nf.optics.dimmer = dimmer; // keep it lit at the level it had
+            if d.mesh_only {
+                // Keep the patched fixture's DMX identity: same mode + optical state,
+                // and DON'T re-patch (address/footprint stay). sync_mode clamps the
+                // mode if the new model exposes fewer.
+                nf.mode_index = mode_index;
+                nf.optics = optics;
+                nf.sync_mode();
+            } else {
+                nf.optics.dimmer = dimmer; // keep it lit at the level it had
+            }
             nf.snap_movement();
             scene.fixtures[i] = nf;
-            patch.replace_at(i, &scene.fixtures[i]);
+            if !d.mesh_only {
+                patch.replace_at(i, &scene.fixtures[i]);
+            }
         }
         close = true;
     }
@@ -3206,31 +3259,10 @@ impl TabViewer for PanelViewer<'_> {
                             tool_rail(ui, self.active_tool);
                         });
                 }
-                if self.viewport_regions.n_open {
-                    // N-panel — Item/Transform sidebar; reuses `panels::inspector`
-                    // verbatim ("control belongs where the eyes are", §2.2).
-                    egui::SidePanel::right(id_base.with("n-panel"))
-                        .resizable(true)
-                        .default_width(260.0)
-                        .show_inside(ui, |ui| {
-                            let mut e = panels::InspectorEdit::default();
-                            panels::inspector(
-                                ui,
-                                self.scene,
-                                self.selection,
-                                self.dmx_patch,
-                                self.gdtf_textures,
-                                self.profile,
-                                self.screen_sources,
-                                self.inspector_state,
-                                &mut e,
-                            );
-                            // OR into the shared edge flags (N-panel + Inspector
-                            // tab can both render; only one is dragged at a time).
-                            self.inspector_edit.started |= e.started;
-                            self.inspector_edit.stopped |= e.stopped;
-                        });
-                }
+                // (The inline N-panel inspector was REMOVED: it duplicated the docked
+                // Inspector tab AND, as a layout `SidePanel`, shrank the viewport leaf
+                // so opening/resizing it shifted the camera aspect — bug 5. The docked
+                // Inspector is now the single inspector; `N` toggles that tab.)
                 panels::viewport(
                     ui,
                     self.camera,
@@ -3415,8 +3447,8 @@ mod tests {
         assert!(h && ui.prefs.show_hint != Preferences::default().show_hint);
         let (ui, _, _, h) = run(Action::ViewPie, noop);
         assert!(h && ui.view_pie.open, "ViewPie opens the radial pie");
-        let (ui, _, _, h) = run(Action::ToggleNPanel, noop);
-        assert!(h && ui.viewport_regions.n_open);
+        let (_ui, _, _, h) = run(Action::ToggleNPanel, noop);
+        assert!(h, "ToggleNPanel handled (toggles the docked Inspector tab)");
         let (ui, _, _, h) = run(Action::ToggleTPanel, noop);
         assert!(h && ui.viewport_regions.t_open);
 

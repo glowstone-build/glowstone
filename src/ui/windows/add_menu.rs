@@ -263,11 +263,13 @@ pub fn add_menu_window(
     // hasn't landed on a widget yet) ---
     let mut commit = false;
     let mut next_cat: Option<AddCategory> = None;
-    ctx.input(|i| {
+    ctx.input_mut(|i| {
         if i.key_pressed(egui::Key::Escape) {
             state.open = false;
         }
-        if i.key_pressed(egui::Key::Enter) {
+        // CONSUME the Enter so it both commits the pick AND can't leak downstream
+        // the same frame (bug 8).
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
             commit = true;
         }
         if i.key_pressed(egui::Key::ArrowDown) {
