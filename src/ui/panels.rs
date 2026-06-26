@@ -1155,12 +1155,16 @@ fn common_rgb(values: impl IntoIterator<Item = [f32; 3]>) -> Option<[f32; 3]> {
 /// shows a real widget). Only the touched field is written — siblings keep theirs.
 fn bulk_f32_row(
     ui: &mut egui::Ui,
+    state: &InspectorState,
     label: &str,
     common: Option<f32>,
     seed: f32,
     widget: impl FnOnce(&mut egui::Ui, &mut f32) -> egui::Response,
     mut write: impl FnMut(f32),
 ) {
+    if !state.row_visible(label) {
+        return;
+    }
     ui.label(label);
     match common {
         Some(mut v) => {
@@ -1273,22 +1277,13 @@ fn category(
     true
 }
 
-/// A nested "Advanced ▾" disclosure inside an inspector category (#8): the common
-/// rows are shown by the caller unconditionally; the power-user rows go in `body`,
-/// tucked behind this quiet, default-collapsed caret. `salt` disambiguates the
-/// (per-category) collapse state.
-fn advanced_section(ui: &mut egui::Ui, salt: &str, body: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(2.0);
-    egui::CollapsingHeader::new(RichText::new("Advanced").small().weak())
-        .id_salt(("inspector-advanced", salt))
-        .default_open(false)
-        .show(ui, body);
-}
-
-/// A filter-aware [`advanced_section`] (S1): hides entirely when an active filter
-/// matches none of its `rows`, and force-opens (overriding the default-collapsed
-/// caret) while a filter is active so matched rows aren't buried. Off-filter it
-/// behaves exactly like [`advanced_section`].
+/// A nested, filter-aware "Advanced ▾" disclosure inside an inspector category
+/// (#8 + S1): the common rows are shown by the caller unconditionally; the
+/// power-user rows go in `body`, tucked behind this quiet, default-collapsed
+/// caret. `salt` disambiguates the (per-category) collapse state. Hides entirely
+/// when an active filter matches none of its `rows`, and force-opens (overriding
+/// the default-collapsed caret) while a filter is active so matched rows aren't
+/// buried.
 fn advanced_section_filtered(
     ui: &mut egui::Ui,
     state: &InspectorState,
@@ -1466,7 +1461,7 @@ fn inspector_body(
 /// Categories are collapsible and the Optics / Wheels rows are **dynamic** — they
 /// show the union of controls the selected fixtures actually expose, not a fixed
 /// hardcoded list.
-fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, ids: &[usize]) {
+fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, ids: &[usize], state: &mut InspectorState) {
     let primary = ids[0];
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{}  {} fixtures", theme::icon::FIXTURE, ids.len())).strong());
@@ -1516,13 +1511,19 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
     }
 
     // --- TRANSFORM ---
-    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Transform",
+        format!("{}  Transform", theme::icon::INSPECTOR),
+        true,
+        &["Pan", "Tilt", "Nudge position"],
+        |ui, fs| {
             Grid::new("bulk-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 let pan = common_f32(ids.iter().map(|&i| scene.fixtures[i].pan));
                 bulk_f32_row(
                     ui,
+                    fs,
                     "Pan",
                     pan,
                     scene.fixtures[primary].pan,
@@ -1532,6 +1533,7 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
                 let tilt = common_f32(ids.iter().map(|&i| scene.fixtures[i].tilt));
                 bulk_f32_row(
                     ui,
+                    fs,
                     "Tilt",
                     tilt,
                     scene.fixtures[primary].tilt,
@@ -1539,33 +1541,42 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
                     |v| ids.iter().for_each(|&i| scene.fixtures[i].tilt = v),
                 );
             });
-            ui.add_space(4.0);
-            ui.label(RichText::new("Nudge position (all)").small().strong());
-            ui.horizontal(|ui| {
-                let mut delta = glam::Vec3::ZERO;
-                // Drag from zero applies a delta; the field snaps back each frame.
-                for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
-                    let mut v = 0.0f32;
-                    if ui.add(DragValue::new(&mut v).speed(0.05).prefix(format!("{label} "))).changed() {
-                        delta[axis] += v;
+            if fs.row_visible("Nudge position") {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Nudge position (all)").small().strong());
+                ui.horizontal(|ui| {
+                    let mut delta = glam::Vec3::ZERO;
+                    // Drag from zero applies a delta; the field snaps back each frame.
+                    for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
+                        let mut v = 0.0f32;
+                        if ui.add(DragValue::new(&mut v).speed(0.05).prefix(format!("{label} "))).changed() {
+                            delta[axis] += v;
+                        }
                     }
-                }
-                if delta != glam::Vec3::ZERO {
-                    for &i in ids {
-                        scene.fixtures[i].position += delta;
+                    if delta != glam::Vec3::ZERO {
+                        for &i in ids {
+                            scene.fixtures[i].position += delta;
+                        }
                     }
-                }
-            });
-        });
+                });
+            }
+        },
+    );
 
     // --- FIXTURE ---
-    egui::CollapsingHeader::new(format!("{}  Fixture", theme::icon::COLOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Fixture",
+        format!("{}  Fixture", theme::icon::COLOR),
+        true,
+        &["Dimmer", "Beam", "Color"],
+        |ui, fs| {
             Grid::new("bulk-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 let dimmer = common_f32(ids.iter().map(|&i| scene.fixtures[i].optics.dimmer));
                 bulk_f32_row(
                     ui,
+                    fs,
                     "Dimmer",
                     dimmer,
                     scene.fixtures[primary].optics.dimmer,
@@ -1575,6 +1586,7 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
                 let beam = common_f32(ids.iter().map(|&i| scene.fixtures[i].beam));
                 bulk_f32_row(
                     ui,
+                    fs,
                     "Beam",
                     beam,
                     scene.fixtures[primary].beam,
@@ -1585,31 +1597,34 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
                     |v| ids.iter().for_each(|&i| scene.fixtures[i].beam = v),
                 );
                 // Colour: same mixed/unify pattern, but the widget is a colour well.
-                ui.label("Color");
-                match common_rgb(ids.iter().map(|&i| scene.fixtures[i].color)) {
-                    Some(mut color) => {
-                        if ui.color_edit_button_rgb(&mut color).changed() {
-                            for &i in ids {
-                                scene.fixtures[i].color = color;
+                if fs.row_visible("Color") {
+                    ui.label("Color");
+                    match common_rgb(ids.iter().map(|&i| scene.fixtures[i].color)) {
+                        Some(mut color) => {
+                            if ui.color_edit_button_rgb(&mut color).changed() {
+                                for &i in ids {
+                                    scene.fixtures[i].color = color;
+                                }
+                            }
+                        }
+                        None => {
+                            let seed = scene.fixtures[primary].color;
+                            if ui
+                                .add(egui::Button::new(RichText::new("— Multiple —").small().weak()))
+                                .on_hover_text("Colours differ — click to set all to the active colour")
+                                .clicked()
+                            {
+                                for &i in ids {
+                                    scene.fixtures[i].color = seed;
+                                }
                             }
                         }
                     }
-                    None => {
-                        let seed = scene.fixtures[primary].color;
-                        if ui
-                            .add(egui::Button::new(RichText::new("— Multiple —").small().weak()))
-                            .on_hover_text("Colours differ — click to set all to the active colour")
-                            .clicked()
-                        {
-                            for &i in ids {
-                                scene.fixtures[i].color = seed;
-                            }
-                        }
-                    }
+                    ui.end_row();
                 }
-                ui.end_row();
             });
-        });
+        },
+    );
 
     // --- OPTICS (dynamic): only fields some selected fixture actually exposes ---
     let supports = |f: OpticField| {
@@ -1618,27 +1633,34 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
     let beam: Vec<OpticField> = OpticField::BEAM.into_iter().filter(|&f| supports(f)).collect();
     let color: Vec<OpticField> = OpticField::COLOR.into_iter().filter(|&f| supports(f)).collect();
     if !beam.is_empty() || !color.is_empty() {
-        egui::CollapsingHeader::new(format!("{}  Optics", theme::icon::INSPECTOR))
-            .default_open(true)
-            .show(ui, |ui| {
-                if !beam.is_empty() {
+        let optic_labels: Vec<&str> = beam.iter().chain(&color).map(|f| f.label()).collect();
+        category(
+            ui,
+            state,
+            "Optics",
+            format!("{}  Optics", theme::icon::INSPECTOR),
+            true,
+            &optic_labels,
+            |ui, fs| {
+                if !beam.is_empty() && fs.category_visible(&beam.iter().map(|f| f.label()).collect::<Vec<_>>()) {
                     ui.label(RichText::new("BEAM SHAPING").small().strong());
                     Grid::new("bulk-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                        for f in beam {
-                            bulk_opt_field(ui, scene, ids, f);
+                        for f in &beam {
+                            bulk_opt_field(ui, fs, scene, ids, *f);
                         }
                     });
                 }
-                if !color.is_empty() {
+                if !color.is_empty() && fs.category_visible(&color.iter().map(|f| f.label()).collect::<Vec<_>>()) {
                     ui.add_space(4.0);
                     ui.label(RichText::new("COLOR MIXING").small().strong());
                     Grid::new("bulk-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                        for f in color {
-                            bulk_opt_field(ui, scene, ids, f);
+                        for f in &color {
+                            bulk_opt_field(ui, fs, scene, ids, *f);
                         }
                     });
                 }
-            });
+            },
+        );
     }
 
     // --- WHEELS (dynamic): the union of components across all selected fixtures ---
@@ -1654,15 +1676,22 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
         }
     }
     if !wheels.is_empty() {
-        egui::CollapsingHeader::new(format!("{}  Wheels", theme::icon::COLOR))
-            .default_open(true)
-            .show(ui, |ui| {
+        let wheel_labels: Vec<&str> = wheels.iter().map(|(_, _, l)| l.as_str()).collect();
+        category(
+            ui,
+            state,
+            "Wheels",
+            format!("{}  Wheels", theme::icon::COLOR),
+            true,
+            &wheel_labels,
+            |ui, fs| {
                 Grid::new("bulk-wheels").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
                     for (kind, number, label) in &wheels {
-                        bulk_wheel(ui, scene, ids, *kind, *number, label);
+                        bulk_wheel(ui, fs, scene, ids, *kind, *number, label);
                     }
                 });
-            });
+            },
+        );
     }
 }
 
@@ -1670,6 +1699,7 @@ fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, 
 /// matching component of every selected fixture.
 fn bulk_wheel(
     ui: &mut egui::Ui,
+    state: &InspectorState,
     scene: &mut Scene,
     ids: &[usize],
     kind: WheelKind,
@@ -1688,7 +1718,7 @@ fn bulk_wheel(
     let value = common_f32(
         ids.iter().filter_map(|&i| scene.fixtures[i].wheel_control_mut(kind, number).map(|w| w.value)),
     );
-    bulk_f32_row(ui, label, value, seed_value, |ui, v| ui.add(Slider::new(v, 0.0..=1.0)), |v| {
+    bulk_f32_row(ui, state, label, value, seed_value, |ui, v| ui.add(Slider::new(v, 0.0..=1.0)), |v| {
         for &i in ids {
             if let Some(w) = scene.fixtures[i].wheel_control_mut(kind, number) {
                 w.value = v;
@@ -1700,6 +1730,7 @@ fn bulk_wheel(
     );
     bulk_f32_row(
         ui,
+        state,
         &format!("{label} spin"),
         spin,
         seed_spin,
@@ -1718,7 +1749,7 @@ fn bulk_wheel(
 /// fixture (range-aware: e.g. green tint is bipolar). Seeds from the first
 /// selected fixture that actually exposes the field (the union may include a
 /// control the primary doesn't have), falling back to the primary.
-fn bulk_opt_field(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], f: OpticField) {
+fn bulk_opt_field(ui: &mut egui::Ui, state: &InspectorState, scene: &mut Scene, ids: &[usize], f: OpticField) {
     let seed = ids
         .iter()
         .copied()
@@ -1732,6 +1763,7 @@ fn bulk_opt_field(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], f: OpticF
     );
     bulk_f32_row(
         ui,
+        state,
         f.label(),
         common,
         f.get(&scene.fixtures[seed].optics),
@@ -1970,38 +2002,43 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
     let mut pos_changed = false;
     let mut rs_changed = false;
 
-    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Transform",
+        format!("{}  Transform", theme::icon::INSPECTOR),
+        true,
+        &["Position", "Rotation", "Scale"],
+        |ui, fs| {
             Grid::new("geo-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Position");
-                ui.horizontal(|ui| {
-                    pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
-                    pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
-                    pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                row(ui, fs, "Position", false, |ui| {
+                    ui.horizontal(|ui| {
+                        pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
+                        pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
+                        pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                    });
                 });
-                ui.end_row();
                 // Rotation reverts to identity (0/0/0), scale to unit — the
                 // geometry "default" (struct-Default intent for a placed object).
                 let rot_differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-                if prop_label(ui, "Rotation", rot_differs) {
+                if row(ui, fs, "Rotation", rot_differs, |ui| {
+                    ui.horizontal(|ui| {
+                        rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                        rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                        rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                    });
+                }) {
                     ex = 0.0;
                     ey = 0.0;
                     ez = 0.0;
                     rs_changed = true;
                 }
-                ui.horizontal(|ui| {
-                    rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                    rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                    rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
-                });
-                ui.end_row();
-                if prop_label(ui, "Scale", !approx(uscale, 1.0)) {
+                if row(ui, fs, "Scale", !approx(uscale, 1.0), |ui| {
+                    rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
+                }) {
                     uscale = 1.0;
                     rs_changed = true;
                 }
-                rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
-                ui.end_row();
             });
             if let Some((lo, hi)) = g.world_bounds() {
                 let s = hi - lo;
@@ -2009,7 +2046,8 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
                     RichText::new(format!("size  {:.2} × {:.2} × {:.2} m", s.x, s.y, s.z)).weak().small(),
                 );
             }
-        });
+        },
+    );
 
     if rs_changed {
         let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
@@ -2025,7 +2063,7 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
 /// cabinet grid (with a live derived-resolution readout), surface photometry,
 /// and the content source. Phase 1 covers Test Pattern + Solid Colour content;
 /// the cabinet is editable directly (the panel TYPE is set from the Library).
-fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sources: &ScreenSources) {
+fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sources: &ScreenSources, state: &mut InspectorState) {
     ui.heading(s.name.as_str());
     let [rx, ry] = s.resolution();
     let [mw, mh] = s.size_m();
@@ -2054,29 +2092,35 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
     let (mut ey, mut ex, mut ez) = (ryr.to_degrees(), rxr.to_degrees(), rzr.to_degrees());
     let mut pos_changed = false;
     let mut rs_changed = false;
-    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Transform",
+        format!("{}  Transform", theme::icon::INSPECTOR),
+        true,
+        &["Position", "Rotation", "Scale"],
+        |ui, fs| {
             Grid::new("led-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Position");
-                ui.horizontal(|ui| {
-                    pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
-                    pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
-                    pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                row(ui, fs, "Position", false, |ui| {
+                    ui.horizontal(|ui| {
+                        pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
+                        pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
+                        pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                    });
                 });
-                ui.end_row();
-                ui.label("Rotation");
-                ui.horizontal(|ui| {
-                    rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                    rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                    rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                row(ui, fs, "Rotation", false, |ui| {
+                    ui.horizontal(|ui| {
+                        rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                        rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                        rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                    });
                 });
-                ui.end_row();
-                ui.label("Scale");
-                rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
-                ui.end_row();
+                row(ui, fs, "Scale", false, |ui| {
+                    rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
+                });
             });
-        });
+        },
+    );
     if rs_changed {
         let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
         s.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
@@ -2085,54 +2129,65 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
     }
 
     // --- Panel: one cabinet's size + native pixels (pitch is derived) ---
-    egui::CollapsingHeader::new(format!("{}  Panel", theme::icon::SCREEN))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Panel",
+        format!("{}  Panel", theme::icon::SCREEN),
+        true,
+        &["Cabinet (mm)", "Pixels / cabinet", "Pitch"],
+        |ui, fs| {
             Grid::new("led-panel").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Cabinet (mm)");
-                ui.horizontal(|ui| {
-                    ui.add(DragValue::new(&mut s.cabinet_mm[0]).speed(1.0).range(50.0..=2000.0).prefix("w "));
-                    ui.add(DragValue::new(&mut s.cabinet_mm[1]).speed(1.0).range(50.0..=2000.0).prefix("h "));
+                row(ui, fs, "Cabinet (mm)", false, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(DragValue::new(&mut s.cabinet_mm[0]).speed(1.0).range(50.0..=2000.0).prefix("w "));
+                        ui.add(DragValue::new(&mut s.cabinet_mm[1]).speed(1.0).range(50.0..=2000.0).prefix("h "));
+                    });
                 });
-                ui.end_row();
-                ui.label("Pixels / cabinet");
-                ui.horizontal(|ui| {
-                    let mut px = s.cabinet_px[0] as i32;
-                    let mut py = s.cabinet_px[1] as i32;
-                    if ui.add(DragValue::new(&mut px).speed(1.0).range(8..=1024).prefix("x ")).changed() {
-                        s.cabinet_px[0] = px.max(1) as u32;
-                    }
-                    if ui.add(DragValue::new(&mut py).speed(1.0).range(8..=1024).prefix("y ")).changed() {
-                        s.cabinet_px[1] = py.max(1) as u32;
-                    }
+                row(ui, fs, "Pixels / cabinet", false, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut px = s.cabinet_px[0] as i32;
+                        let mut py = s.cabinet_px[1] as i32;
+                        if ui.add(DragValue::new(&mut px).speed(1.0).range(8..=1024).prefix("x ")).changed() {
+                            s.cabinet_px[0] = px.max(1) as u32;
+                        }
+                        if ui.add(DragValue::new(&mut py).speed(1.0).range(8..=1024).prefix("y ")).changed() {
+                            s.cabinet_px[1] = py.max(1) as u32;
+                        }
+                    });
                 });
-                ui.end_row();
-                ui.label("Pitch");
-                ui.label(RichText::new(format!("{:.2} mm", s.pitch_mm())).weak());
-                ui.end_row();
+                row(ui, fs, "Pitch", false, |ui| {
+                    ui.label(RichText::new(format!("{:.2} mm", s.pitch_mm())).weak());
+                });
             });
-        });
+        },
+    );
 
     // --- Array: panels wide × high → live derived total resolution + size ---
-    egui::CollapsingHeader::new(format!("{}  Array", theme::icon::PATCH))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Array",
+        format!("{}  Array", theme::icon::PATCH),
+        true,
+        &["Panels", "Gap"],
+        |ui, fs| {
             Grid::new("led-array").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Panels");
-                ui.horizontal(|ui| {
-                    let mut w = s.panels_wide as i32;
-                    let mut h = s.panels_high as i32;
-                    if ui.add(DragValue::new(&mut w).speed(0.1).range(1..=64).prefix("w ")).changed() {
-                        s.panels_wide = w.max(1) as u32;
-                    }
-                    if ui.add(DragValue::new(&mut h).speed(0.1).range(1..=64).prefix("h ")).changed() {
-                        s.panels_high = h.max(1) as u32;
-                    }
+                row(ui, fs, "Panels", false, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut w = s.panels_wide as i32;
+                        let mut h = s.panels_high as i32;
+                        if ui.add(DragValue::new(&mut w).speed(0.1).range(1..=64).prefix("w ")).changed() {
+                            s.panels_wide = w.max(1) as u32;
+                        }
+                        if ui.add(DragValue::new(&mut h).speed(0.1).range(1..=64).prefix("h ")).changed() {
+                            s.panels_high = h.max(1) as u32;
+                        }
+                    });
                 });
-                ui.end_row();
-                ui.label("Gap");
-                ui.add(DragValue::new(&mut s.gap_mm).speed(0.1).range(0.0..=50.0).suffix(" mm"));
-                ui.end_row();
+                row(ui, fs, "Gap", false, |ui| {
+                    ui.add(DragValue::new(&mut s.gap_mm).speed(0.1).range(0.0..=50.0).suffix(" mm"));
+                });
             });
             let [rx, ry] = s.resolution();
             let [mw, mh] = s.size_m();
@@ -2142,51 +2197,64 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
                     .strong()
                     .small(),
             );
-        });
+        },
+    );
 
     // --- Surface: photometry + transparency + curvature ---
-    egui::CollapsingHeader::new(format!("{}  Surface", theme::icon::COLOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Surface",
+        format!("{}  Surface", theme::icon::COLOR),
+        true,
+        &["Brightness", "Light emit", "Gamma", "Transparency", "Curvature", "Pixel"],
+        |ui, fs| {
             Grid::new("led-surface").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                ui.label("Brightness");
-                ui.add(DragValue::new(&mut s.nits).speed(10.0).range(50.0..=8000.0).suffix(" nits"));
-                ui.end_row();
-                ui.label("Light emit");
-                ui.add(DragValue::new(&mut s.emit).speed(0.02).range(0.0..=4.0))
-                    .on_hover_text("How much the wall lights the scene + haze (0 = none)");
-                ui.end_row();
-                ui.label("Gamma");
-                ui.add(DragValue::new(&mut s.gamma).speed(0.01).range(1.0..=3.0));
-                ui.end_row();
-                ui.label("Transparency");
-                let mut transp = 1.0 - s.opacity;
-                if ui.add(Slider::new(&mut transp, 0.0..=1.0)).on_hover_text("See-through / mesh LED").changed() {
-                    s.opacity = (1.0 - transp).clamp(0.0, 1.0);
-                }
-                ui.end_row();
-                ui.label("Curvature");
-                ui.add(DragValue::new(&mut s.curvature_deg).speed(0.5).range(-60.0..=60.0).suffix("°"))
-                    .on_hover_text("Horizontal arc subtended across the wall");
-                ui.end_row();
-                ui.label("Pixel");
-                egui::ComboBox::from_id_salt("led-pixel-shape")
-                    .selected_text(s.pixel_shape.label())
-                    .show_ui(ui, |ui| {
-                        for sh in PixelShape::ALL {
-                            ui.selectable_value(&mut s.pixel_shape, sh, sh.label());
-                        }
-                    })
-                    .response
-                    .on_hover_text("LED package shape seen up close (SMD round/square, or discrete RGB sub-pixels)");
-                ui.end_row();
+                row(ui, fs, "Brightness", false, |ui| {
+                    ui.add(DragValue::new(&mut s.nits).speed(10.0).range(50.0..=8000.0).suffix(" nits"));
+                });
+                row(ui, fs, "Light emit", false, |ui| {
+                    ui.add(DragValue::new(&mut s.emit).speed(0.02).range(0.0..=4.0))
+                        .on_hover_text("How much the wall lights the scene + haze (0 = none)");
+                });
+                row(ui, fs, "Gamma", false, |ui| {
+                    ui.add(DragValue::new(&mut s.gamma).speed(0.01).range(1.0..=3.0));
+                });
+                row(ui, fs, "Transparency", false, |ui| {
+                    let mut transp = 1.0 - s.opacity;
+                    if ui.add(Slider::new(&mut transp, 0.0..=1.0)).on_hover_text("See-through / mesh LED").changed() {
+                        s.opacity = (1.0 - transp).clamp(0.0, 1.0);
+                    }
+                });
+                row(ui, fs, "Curvature", false, |ui| {
+                    ui.add(DragValue::new(&mut s.curvature_deg).speed(0.5).range(-60.0..=60.0).suffix("°"))
+                        .on_hover_text("Horizontal arc subtended across the wall");
+                });
+                row(ui, fs, "Pixel", false, |ui| {
+                    egui::ComboBox::from_id_salt("led-pixel-shape")
+                        .selected_text(s.pixel_shape.label())
+                        .show_ui(ui, |ui| {
+                            for sh in PixelShape::ALL {
+                                ui.selectable_value(&mut s.pixel_shape, sh, sh.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text("LED package shape seen up close (SMD round/square, or discrete RGB sub-pixels)");
+                });
             });
-        });
+        },
+    );
 
     // --- Content: the source shown on the surface ---
-    egui::CollapsingHeader::new(format!("{}  Content", theme::icon::IMAGE))
-        .default_open(true)
-        .show(ui, |ui| {
+    // Whole-category filter only (the body is combo/dynamic, not grid rows).
+    category(
+        ui,
+        state,
+        "Content",
+        format!("{}  Content", theme::icon::IMAGE),
+        true,
+        &["Content", "Source", "Pattern", "Colour", "Image", "Grid", "Patch"],
+        |ui, _fs| {
             #[derive(PartialEq, Clone, Copy)]
             enum Kind {
                 Test,
@@ -2349,7 +2417,8 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
                     );
                 }
             }
-        });
+        },
+    );
 }
 
 /// Inspector for an imported GDTF fixture: identity + thumbnail, editable
@@ -2360,6 +2429,7 @@ fn gdtf_inspector(
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
     fixture_id: usize,
     profile: &mut Option<ProfileEditor>,
+    state: &mut InspectorState,
 ) {
     let gdtf = fixture.gdtf.clone().expect("gdtf");
     let key = Arc::as_ptr(&gdtf) as usize;
@@ -2474,80 +2544,103 @@ fn gdtf_inspector(
 
     ui.separator();
     let def = FixtureDefaults::for_fixture(fixture);
-    egui::CollapsingHeader::new(format!("{}  Transform", theme::icon::INSPECTOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Transform",
+        format!("{}  Transform", theme::icon::INSPECTOR),
+        true,
+        &["Pan", "Tilt", "Position", "Move speed"],
+        |ui, fs| {
             Grid::new("gdtf-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 // Common: the live-aim angles (each reverts to 0).
-                if prop_label(ui, "Pan", !approx(fixture.pan, def.pan)) {
+                if row(ui, fs, "Pan", !approx(fixture.pan, def.pan), |ui| {
+                    ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"))
+                        .on_hover_text(format!("commanded · now {:.0}°", fixture.pan_actual));
+                }) {
                     fixture.pan = def.pan;
                 }
-                ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"))
-                    .on_hover_text(format!("commanded · now {:.0}°", fixture.pan_actual));
-                ui.end_row();
-                if prop_label(ui, "Tilt", !approx(fixture.tilt, def.tilt)) {
+                if row(ui, fs, "Tilt", !approx(fixture.tilt, def.tilt), |ui| {
+                    ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-135.0..=135.0).suffix("°"))
+                        .on_hover_text(format!("commanded · now {:.0}°", fixture.tilt_actual));
+                }) {
                     fixture.tilt = def.tilt;
                 }
-                ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-135.0..=135.0).suffix("°"))
-                    .on_hover_text(format!("commanded · now {:.0}°", fixture.tilt_actual));
-                ui.end_row();
             });
             // Advanced: hang position + motor speed (rarely retouched live).
-            advanced_section(ui, "gdtf-transform", |ui| {
+            advanced_section_filtered(ui, fs, "gdtf-transform", &["Position", "Move speed"], |ui| {
                 Grid::new("gdtf-transform-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    ui.label("Position");
-                    ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                        ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                        ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                    row(ui, fs, "Position", false, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
+                            ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
+                            ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                        });
                     });
-                    ui.end_row();
-                    if prop_label(ui, "Move speed", !approx(fixture.move_speed, 0.0)) {
+                    if row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
+                        ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
+                            .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
+                    }) {
                         fixture.move_speed = 0.0;
                     }
-                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
-                        .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
-                    ui.end_row();
                 });
             });
-        });
+        },
+    );
 
-    egui::CollapsingHeader::new(format!("{}  Fixture", theme::icon::COLOR))
-        .default_open(true)
-        .show(ui, |ui| {
+    category(
+        ui,
+        state,
+        "Fixture",
+        format!("{}  Fixture", theme::icon::COLOR),
+        true,
+        &["Dimmer", "Color", "Beam"],
+        |ui, fs| {
             Grid::new("gdtf-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                if prop_label(ui, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer)) {
+                if row(ui, fs, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer), |ui| {
+                    ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
+                }) {
                     fixture.optics.dimmer = def.dimmer;
                 }
-                ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
-                ui.end_row();
                 let color_differs = def.color.is_some_and(|d| !approx_rgb(fixture.color, d));
-                if prop_label(ui, "Color", color_differs) {
+                if row(ui, fs, "Color", color_differs, |ui| {
+                    ui.color_edit_button_rgb(&mut fixture.color);
+                }) {
                     if let Some(d) = def.color {
                         fixture.color = d;
                     }
                 }
-                ui.color_edit_button_rgb(&mut fixture.color);
-                ui.end_row();
             });
-            advanced_section(ui, "gdtf-fixture", |ui| {
+            advanced_section_filtered(ui, fs, "gdtf-fixture", &["Beam"], |ui| {
                 Grid::new("gdtf-fixture-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    if prop_label(ui, "Beam", !approx(fixture.beam, def.beam)) {
+                    if row(ui, fs, "Beam", !approx(fixture.beam, def.beam), |ui| {
+                        ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
+                            .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
+                    }) {
                         fixture.beam = def.beam;
                     }
-                    ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
-                        .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
-                    ui.end_row();
                 });
             });
-        });
+        },
+    );
 
-    optics_section(ui, fixture, &gdtf);
+    optics_section(ui, fixture, &gdtf, state);
 
-    egui::CollapsingHeader::new(format!("Wheels ({})", gdtf.wheels.len()))
-        .default_open(false)
-        .show(ui, |ui| {
+    // Wheel slot gallery — labels are the wheel names; the row filter scopes which
+    // wheels show, the category hides if none match.
+    let wheel_labels: Vec<&str> = gdtf.wheels.iter().map(|w| w.name.as_str()).collect();
+    category(
+        ui,
+        state,
+        "Wheels",
+        format!("Wheels ({})", gdtf.wheels.len()),
+        false,
+        &wheel_labels,
+        |ui, fs| {
             for (wi, wheel) in gdtf.wheels.iter().enumerate() {
+                if !fs.row_visible(&wheel.name) {
+                    continue;
+                }
                 ui.label(RichText::new(&wheel.name).strong().small());
                 ui.horizontal_wrapped(|ui| {
                     for (si, slot) in wheel.slots.iter().enumerate() {
@@ -2578,10 +2671,27 @@ fn gdtf_inspector(
                 });
                 ui.add_space(4.0);
             }
-        });
+        },
+    );
 
-    egui::CollapsingHeader::new(format!("DMX modes ({})", gdtf.modes.len()))
-        .show(ui, |ui| {
+    // DMX modes — a reference table (per-channel attributes). Whole-category
+    // filter: matches on "DMX modes" plus each mode name + every attribute, so a
+    // query like "dmx", a mode name, or a channel attribute keeps it visible.
+    let mut dmx_labels: Vec<&str> = vec!["DMX modes"];
+    for m in &gdtf.modes {
+        dmx_labels.push(m.name.as_str());
+        for ch in &m.channels {
+            dmx_labels.push(ch.attribute.as_str());
+        }
+    }
+    category(
+        ui,
+        state,
+        "DMX modes",
+        format!("DMX modes ({})", gdtf.modes.len()),
+        false,
+        &dmx_labels,
+        |ui, _fs| {
             for mode in &gdtf.modes {
                 egui::CollapsingHeader::new(format!("{} — {} ch", mode.name, mode.footprint))
                     .id_salt(&mode.name)
@@ -2609,7 +2719,8 @@ fn gdtf_inspector(
                             });
                     });
             }
-        });
+        },
+    );
 }
 
 /// The optical-chain control bank for a GDTF fixture: sliders for every stage
@@ -2651,7 +2762,7 @@ fn optic_field_row(
     ui.end_row();
 }
 
-fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) {
+fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, state: &mut InspectorState) {
     let beam_angle = fixture.beam_angle;
     // The dynamic wheel chain of the active mode (any number of color/gobo/
     // prism/animation/frost components).
@@ -2662,15 +2773,37 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
         .unwrap_or_default();
     fixture.optics.ensure_wheels(components.len());
 
-    egui::CollapsingHeader::new("Optics")
-        .default_open(true)
-        .show(ui, |ui| {
+    // The full label universe of this optics bank (used to decide whether the
+    // category survives the filter): every exposed optic field, the wheel
+    // component names, plus the shutter-blade picker.
+    const BEAM_COMMON: [OpticField; 3] = [OpticField::Zoom, OpticField::Focus, OpticField::Iris];
+    const BEAM_ADV: [OpticField; 3] = [OpticField::Ca, OpticField::Shutter, OpticField::Strobe];
+    const COLOR_COMMON: [OpticField; 4] =
+        [OpticField::Cto, OpticField::Cyan, OpticField::Magenta, OpticField::Yellow];
+    const COLOR_ADV: [OpticField; 1] = [OpticField::Green];
+    let mut all_labels: Vec<&str> = vec!["Shutter blades"];
+    for f in BEAM_COMMON.iter().chain(&BEAM_ADV).chain(&COLOR_COMMON).chain(&COLOR_ADV) {
+        all_labels.push(f.label());
+    }
+    for comp in &components {
+        all_labels.push(comp.wheel.as_deref().unwrap_or(comp.attribute.as_str()));
+    }
+
+    category(
+        ui,
+        state,
+        "Optics",
+        "Optics",
+        true,
+        &all_labels,
+        |ui, fs| {
             let zoom_deg = optics::map_attr(gdtf, "Zoom", fixture.optics.zoom, (beam_angle, beam_angle));
             // Shutter blade style — OUR editable model (GDTF lacks blade geometry).
             // Only shown for fixtures that actually have a shutter (or already set
             // one), so a plain PAR/wash isn't offered a blade it can't use.
-            if crate::optics::OpticField::Shutter.supported(gdtf)
-                || fixture.shutter != crate::optics::ShutterKind::None
+            if (crate::optics::OpticField::Shutter.supported(gdtf)
+                || fixture.shutter != crate::optics::ShutterKind::None)
+                && fs.row_visible("Shutter blades")
             {
                 ui.horizontal(|ui| {
                     ui.label("Shutter blades");
@@ -2690,50 +2823,61 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
             // Simple/Advanced split (#8): the everyday controls show up front; the
             // power-user shaping (chromatic ab. / shutter / strobe / ±green tint)
             // tucks behind a per-section "Advanced" caret.
-            const BEAM_COMMON: [OpticField; 3] =
-                [OpticField::Zoom, OpticField::Focus, OpticField::Iris];
-            const BEAM_ADV: [OpticField; 3] =
-                [OpticField::Ca, OpticField::Shutter, OpticField::Strobe];
-            const COLOR_COMMON: [OpticField; 4] =
-                [OpticField::Cto, OpticField::Cyan, OpticField::Magenta, OpticField::Yellow];
-            const COLOR_ADV: [OpticField; 1] = [OpticField::Green];
 
-            ui.label(RichText::new("BEAM SHAPING").small().strong());
-            Grid::new("optics-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                for f in BEAM_COMMON {
-                    optic_field_row(ui, o, &def, f, f.supported(gdtf), (f == OpticField::Zoom).then(|| format!("{zoom_deg:.0}°")));
-                }
-            });
-            advanced_section(ui, "optics-beam", |ui| {
+            if fs.category_visible(&BEAM_COMMON.iter().map(|f| f.label()).collect::<Vec<_>>()) {
+                ui.label(RichText::new("BEAM SHAPING").small().strong());
+                Grid::new("optics-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                    for f in BEAM_COMMON {
+                        if fs.row_visible(f.label()) {
+                            optic_field_row(ui, o, &def, f, f.supported(gdtf), (f == OpticField::Zoom).then(|| format!("{zoom_deg:.0}°")));
+                        }
+                    }
+                });
+            }
+            advanced_section_filtered(ui, fs, "optics-beam", &BEAM_ADV.iter().map(|f| f.label()).collect::<Vec<_>>(), |ui| {
                 Grid::new("optics-beam-adv").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
                     for f in BEAM_ADV {
-                        optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                        if fs.row_visible(f.label()) {
+                            optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                        }
                     }
                 });
             });
 
-            ui.add_space(4.0);
-            ui.label(RichText::new("COLOR MIXING").small().strong());
-            Grid::new("optics-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                for f in COLOR_COMMON {
-                    optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
-                }
-            });
-            advanced_section(ui, "optics-color", |ui| {
+            if fs.category_visible(&COLOR_COMMON.iter().map(|f| f.label()).collect::<Vec<_>>()) {
+                ui.add_space(4.0);
+                ui.label(RichText::new("COLOR MIXING").small().strong());
+                Grid::new("optics-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
+                    for f in COLOR_COMMON {
+                        if fs.row_visible(f.label()) {
+                            optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                        }
+                    }
+                });
+            }
+            advanced_section_filtered(ui, fs, "optics-color", &COLOR_ADV.iter().map(|f| f.label()).collect::<Vec<_>>(), |ui| {
                 Grid::new("optics-color-adv").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
                     for f in COLOR_ADV {
-                        optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                        if fs.row_visible(f.label()) {
+                            optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                        }
                     }
                 });
             });
 
             // One block per wheel component, generated from the GDTF chain.
-            if !components.is_empty() {
+            let wheel_names: Vec<&str> =
+                components.iter().map(|c| c.wheel.as_deref().unwrap_or(c.attribute.as_str())).collect();
+            if !components.is_empty() && fs.category_visible(&wheel_names) {
                 ui.add_space(4.0);
                 ui.label(RichText::new("WHEELS").small().strong());
                 Grid::new("optics-wheels").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
                     for (i, comp) in components.iter().enumerate() {
                         let Some(w) = o.wheels.get_mut(i) else { continue };
+                        let match_name = comp.wheel.as_deref().unwrap_or(comp.attribute.as_str());
+                        if !fs.row_visible(match_name) {
+                            continue;
+                        }
                         let value_label = match comp.kind {
                             WheelKind::Gobo | WheelKind::Color => "select",
                             WheelKind::Prism | WheelKind::Animation | WheelKind::Frost => "insert",
@@ -2767,7 +2911,8 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture) 
                     }
                 });
             }
-        });
+        },
+    );
 }
 
 pub(super) fn load_gdtf_textures(ctx: &egui::Context, gdtf: &GdtfFixture) -> GdtfTextures {
@@ -6184,5 +6329,78 @@ mod property_tests {
         // Reset writes the default back → predicate clears.
         OpticField::Zoom.set(&mut o, OpticField::Zoom.get(&def));
         assert!(!(!approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def))));
+    }
+
+    // --- S1: Inspector filter predicate + collapse persistence -------------
+
+    #[test]
+    fn empty_filter_shows_every_row_and_category() {
+        let st = InspectorState::default();
+        // No query ⇒ everything visible (full layout restored).
+        assert!(st.row_visible("Pan"));
+        assert!(st.row_visible("Anything at all"));
+        assert!(st.category_visible(&["Pan", "Tilt"]));
+        // Even a category with no rows shows when unfiltered.
+        assert!(st.category_visible(&[]));
+    }
+
+    #[test]
+    fn filter_hides_non_matching_rows() {
+        let mut st = InspectorState::default();
+        st.filter = "dim".into();
+        // Fuzzy/substring match on the label (case-insensitive).
+        assert!(st.row_visible("Dimmer"));
+        assert!(!st.row_visible("Pan"));
+        assert!(!st.row_visible("Tilt"));
+        // Whitespace-only filter is treated as no filter.
+        st.filter = "   ".into();
+        assert!(st.row_visible("Pan"));
+    }
+
+    #[test]
+    fn filter_hides_category_with_no_matching_row() {
+        let mut st = InspectorState::default();
+        st.filter = "zoom".into();
+        // Optics has Zoom → visible; Transform has none → hidden.
+        assert!(st.category_visible(&["Zoom", "Focus", "Iris"]));
+        assert!(!st.category_visible(&["Pan", "Tilt", "Position"]));
+        // A category with no rows can never match under a filter.
+        assert!(!st.category_visible(&[]));
+    }
+
+    #[test]
+    fn filter_force_opens_visible_categories() {
+        let mut st = InspectorState::default();
+        // Off-filter a stored-collapsed category stays collapsed.
+        st.collapsed.insert("Transform".into(), false);
+        assert!(!st.open_state("Transform", true));
+        // With a filter active, a visible category force-opens so matches show.
+        st.filter = "pan".into();
+        assert!(st.open_state("Transform", true));
+    }
+
+    #[test]
+    fn collapse_state_round_trips_through_json() {
+        // The remembered open/closed map survives a serialize → deserialize cycle
+        // (the on-disk persistence format), while the live filter does NOT (it's
+        // serde-skipped — a fresh session always starts unfiltered).
+        let mut st = InspectorState::default();
+        st.filter = "transient".into();
+        st.collapsed.insert("Transform".into(), false);
+        st.collapsed.insert("Optics".into(), true);
+
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: InspectorState = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.collapsed.get("Transform").copied(), Some(false));
+        assert_eq!(back.collapsed.get("Optics").copied(), Some(true));
+        assert_eq!(back.collapsed.len(), 2);
+        // The filter is per-session: it round-trips to empty, not "transient".
+        assert!(back.filter.is_empty());
+
+        // And the restored map drives `open_state` exactly as before the round-trip.
+        assert!(!back.open_state("Transform", true)); // stored false wins over default
+        assert!(back.open_state("Optics", false)); // stored true wins over default
+        assert!(back.open_state("Wheels", true)); // unknown → falls back to default
     }
 }

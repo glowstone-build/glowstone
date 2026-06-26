@@ -45,6 +45,11 @@ pub enum Action {
     OrbitStep(f32, f32),
     /// `~` (backtick) — open the radial View pie at the cursor. Wired in S3.
     ViewPie,
+    /// `Z` — open the radial Shading pie at the cursor (Blender's Z pie): pick the
+    /// viewport display Mode (Beauty / Unlit / Wireframe) + quick Grid / Stats
+    /// toggles. Viewport-context only; impl in `Ui::dispatch_action` (opens the pie,
+    /// drawn + resolved after the dock in `show`).
+    ShadingPie,
     /// Save the current camera pose into the next free numbered bookmark slot
     /// (P1 #34). Impl in `Ui::dispatch_action`.
     SaveBookmark,
@@ -374,6 +379,7 @@ pub static COMMANDS: &[Command] = &[
     command_row("view.orbit_left", "Orbit left", Category::View, Action::OrbitStep(-15.0, 0.0)),
     command_row("view.orbit_right", "Orbit right", Category::View, Action::OrbitStep(15.0, 0.0)),
     command_row("view.pie", "View pie (radial)", Category::View, Action::ViewPie),
+    command_row("view.shading_pie", "Shading pie (radial)", Category::View, Action::ShadingPie),
     // --- View bookmarks (P1 #34): save the live pose to the next free slot, recall
     // a numbered slot with an eased jump. One recall command per slot so each gets a
     // stable id the F3 palette lists + the keymap can bind. ---
@@ -623,6 +629,10 @@ pub static VIEWPORT: &[Kmi] = &[
     kmi(Trigger::key(Key::Num6), "view.orbit_right"),
     // `~` opens the radial View pie at the cursor (wired in a later stage).
     kmi(Trigger::key(Key::Backtick), "view.pie"),
+    // `Z` opens the radial Shading pie (display mode + grid/stats toggles). Plain
+    // `Z` is free in Viewport context — undo is Cmd+Z (Global) and the modal `Z`
+    // axis-lock lives in the MODAL map, polled separately during a live transform.
+    kmi(Trigger::key(Key::Z), "view.shading_pie"),
 ];
 
 /// The Modal transform keymap — only active while a G/R/S op owns the viewport.

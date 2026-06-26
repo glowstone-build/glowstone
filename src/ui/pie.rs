@@ -194,6 +194,42 @@ impl<'a> Pie<'a> {
     }
 }
 
+/// One labelled choice for [`choose`]: a Phosphor `icon` (or `""`), a `label`, and
+/// the `value` returned when the sector is picked. The natural shape for an
+/// enum/toggle pie — see the `~` View pie and the `Z` Shading pie.
+pub struct Choice<T> {
+    pub icon: &'static str,
+    pub label: String,
+    pub value: T,
+}
+
+impl<T> Choice<T> {
+    pub fn new(icon: &'static str, label: impl Into<String>, value: T) -> Self {
+        Self { icon, label: label.into(), value }
+    }
+}
+
+/// Build + show a pie over a list of [`Choice<T>`] and return the chosen `value`
+/// (consumed by index) on a pick, `None` while open / on cancel. This is the
+/// ergonomic wrapper over [`Pie::new`] + [`Pie::show`] for the common
+/// "pick one of N values" case: the caller hands over labelled values and gets
+/// the value back, with no parallel-array bookkeeping. `accent` tints the
+/// highlighted wedge. The `choices` `Vec` is consumed so the matched value can be
+/// moved out (no `Clone` bound on `T`).
+pub fn choose<T>(
+    ctx: &egui::Context,
+    state: &mut PieState,
+    accent: egui::Color32,
+    mut choices: Vec<Choice<T>>,
+) -> Option<T> {
+    let items: Vec<PieItem> =
+        choices.iter().map(|c| PieItem::new(c.icon, c.label.clone())).collect();
+    Pie::new(&items)
+        .accent(accent)
+        .show(ctx, state)
+        .map(|i| choices.swap_remove(i).value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

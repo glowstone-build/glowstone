@@ -31,8 +31,34 @@ use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 use glam::Vec3;
 
 use crate::renderer::camera::{CameraView, OrbitCamera};
-use crate::scene::{Library, RenderSettings, Scene, Selection};
+use crate::scene::{Library, RenderSettings, Scene, Selection, ViewportMode};
 use windows::{Preferences, ProfileEditor};
+
+/// One effect the `Z` Shading pie can apply: switch the viewport display
+/// [`ViewportMode`], or flip one of the quick overlay toggles. Returned by
+/// [`shading_pie_choices`] and applied by `Ui::apply_shading_choice`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShadingChoice {
+    Mode(ViewportMode),
+    ToggleGrid,
+    ToggleStats,
+}
+
+/// The `Z` Shading-pie sectors, clockwise from straight up. The three display
+/// modes sit at the cardinal-ish spokes (Beauty up, then Unlit / Wireframe); the
+/// Grid + Stats toggles round out the ring. Returned as labelled [`pie::Choice`]
+/// values so `pie::choose` maps sector→effect with no parallel-array bookkeeping.
+/// A free fn (no `&self`) so the sector→effect layout is unit-testable.
+fn shading_pie_choices() -> Vec<pie::Choice<ShadingChoice>> {
+    use theme::icon;
+    vec![
+        pie::Choice::new(icon::VIEWPORT, "Beauty", ShadingChoice::Mode(ViewportMode::Beauty)),
+        pie::Choice::new(icon::PATCH, "Grid", ShadingChoice::ToggleGrid),
+        pie::Choice::new(icon::FIXTURE, "Unlit", ShadingChoice::Mode(ViewportMode::Unlit)),
+        pie::Choice::new(icon::PERF, "Stats", ShadingChoice::ToggleStats),
+        pie::Choice::new(icon::GEOMETRY, "Wireframe", ShadingChoice::Mode(ViewportMode::Wireframe)),
+    ]
+}
 
 /// Window within which consecutive arrow-key nudges coalesce into one undo step
 /// (a held key repeats well inside this, so the whole drag is one undo).
@@ -454,6 +480,9 @@ pub struct Ui {
     /// Per-frame drag edges the inspector reports (read after the dock) to drive
     /// the `inspector_tx` begin/finalize. Transient — not serialized.
     inspector_edit: panels::InspectorEdit,
+    /// Inspector property-filter box + persisted per-category collapse state (S1).
+    /// Loaded once at startup; the collapse map is saved on each toggle.
+    inspector_state: panels::InspectorState,
     /// Timestamp of the last arrow-key nudge — a fresh nudge within
     /// [`NUDGE_COALESCE`] of it extends the top undo step instead of pushing a new
     /// one, so holding an arrow key collapses into a single undo. `None` = no
@@ -533,6 +562,10 @@ pub struct Ui {
     /// The `~` radial View pie (cursor-anchored axis-view / projection / frame
     /// picker). Opened by the ViewPie action at the pointer; closed on pick/cancel.
     view_pie: pie::PieState,
+    /// The `Z` radial Shading pie (cursor-anchored display-mode picker + Grid /
+    /// Stats toggles, Blender's Z pie). Opened by the ShadingPie action at the
+    /// pointer; closed on pick / cancel.
+    shading_pie: pie::PieState,
     /// Transient toasts + the persistent report log (§2.10). Every user-facing
     /// save / open / import / DMX-connect / undo moment reports here so it surfaces
     /// as a fading toast instead of a silent `log::*`. Ticked + drawn in `show()`.
@@ -616,6 +649,7 @@ impl Ui {
             transform_finished: false,
             inspector_tx: None,
             inspector_edit: panels::InspectorEdit::default(),
+            inspector_state: panels::InspectorState::load(),
             last_nudge: None,
             pending_nudge: Vec3::ZERO,
             groups: Vec::new(),
@@ -641,6 +675,7 @@ impl Ui {
             measure: panels::MeasureState::default(),
             aim: panels::AimState::default(),
             view_pie: pie::PieState::default(),
+            shading_pie: pie::PieState::default(),
             notify: notify::Notifier::default(),
             status_msgs: notify::StatusStack::default(),
             // Debug hook (S3): PREVIZ_UI_LOG opens the report-log window at startup
@@ -1542,6 +1577,7 @@ impl Ui {
             transform_started: &mut self.transform_started,
             transform_finished: &mut self.transform_finished,
             inspector_edit: &mut self.inspector_edit,
+            inspector_state: &mut self.inspector_state,
             groups: &mut self.groups,
             group_name: &mut self.group_name,
             cues: &mut self.cues,
@@ -1814,6 +1850,9 @@ impl Ui {
         // The `~` radial View pie (above the dock, anchored at the cursor). On a
         // pick it applies straight to the camera; cancel / Esc just closes it.
         self.view_pie(ctx, camera, scene);
+        // The `Z` radial Shading pie (above the dock, anchored at the cursor). On a
+        // pick it applies the display mode / overlay toggle immediately.
+        self.shading_pie(ctx);
 
         // Passive status-bar hint (#21 grey slot): advertise an in-flight modal
         // transform; clear it otherwise so the hint never goes stale. (The bar was
@@ -1873,6 +1912,29 @@ impl Ui {
         }
     }
 
+    /// Draw + resolve the `Z` Shading pie (Blender's Z pie). Sectors pick the
+    /// viewport display Mode (Beauty / Unlit / Wireframe) plus two quick overlay
+    /// toggles (Grid, Stats); a pick applies immediately to `settings` / `prefs`.
+    /// Built via the generic [`pie::choose`] helper so the enum/toggle mapping is a
+    /// one-liner over labelled values.
+    fn shading_pie(&mut self, ctx: &egui::Context) {
+        let accent = theme::accent(&self.prefs);
+        if let Some(choice) = pie::choose(ctx, &mut self.shading_pie, accent, shading_pie_choices()) {
+            self.apply_shading_choice(choice);
+        }
+    }
+
+    /// Apply one resolved [`ShadingChoice`] from the Z pie. Split out (and given a
+    /// pure `&mut self`) so the sector→effect mapping is unit-testable without an
+    /// egui context.
+    fn apply_shading_choice(&mut self, choice: ShadingChoice) {
+        match choice {
+            ShadingChoice::Mode(m) => self.settings.mode = m,
+            ShadingChoice::ToggleGrid => self.settings.show_grid = !self.settings.show_grid,
+            ShadingChoice::ToggleStats => self.prefs.show_stats = !self.prefs.show_stats,
+        }
+    }
+
     /// Force the quick-select palette open (headless screenshot hook).
     pub fn debug_open_quick_select(&mut self) {
         self.quick_select = true;
@@ -1886,6 +1948,14 @@ impl Ui {
     /// Open the `~` View pie at the screen centre (headless screenshot hook).
     pub fn debug_open_view_pie(&mut self) {
         self.view_pie.open_at(egui::Pos2::new(750.0, 475.0));
+    }
+
+    /// Open the `Z` Shading pie at the screen centre (headless screenshot hook).
+    /// Wired into the PREVIZ_UI harness by the lead (in the off-limits app.rs);
+    /// dead in the default build until then.
+    #[allow(dead_code)]
+    pub fn debug_open_shading_pie(&mut self) {
+        self.shading_pie.open_at(egui::Pos2::new(750.0, 475.0));
     }
 
     /// Open the online Fixture Library window (headless hook). `demo` injects fake
@@ -2128,6 +2198,14 @@ impl Ui {
                 #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
                 let anchor = ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
                 self.view_pie.open_at(anchor);
+            }
+            // `Z` — open the radial Shading pie at the cursor (display mode + grid /
+            // stats toggles). Same deferred-draw pattern as the View pie: opened
+            // here, drawn + resolved after the dock in `show`.
+            Action::ShadingPie => {
+                #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
+                let anchor = ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
+                self.shading_pie.open_at(anchor);
             }
             // --- View bookmarks (P1 #34) ---------------------------------------
             // Save the live camera pose into the next free numbered slot; recall a
@@ -2990,6 +3068,8 @@ struct PanelViewer<'a> {
     /// Per-frame drag edges the inspector reports for the slider-drag undo
     /// transaction (#13). Read after the dock to begin/finalize `inspector_tx`.
     inspector_edit: &'a mut panels::InspectorEdit,
+    /// Inspector filter + persisted collapse state (S1).
+    inspector_state: &'a mut panels::InspectorState,
     groups: &'a mut Vec<SelectionGroup>,
     group_name: &'a mut String,
     cues: &'a mut cues::CueEngine,
@@ -3116,6 +3196,7 @@ impl TabViewer for PanelViewer<'_> {
                                 self.gdtf_textures,
                                 self.profile,
                                 self.screen_sources,
+                                self.inspector_state,
                                 &mut e,
                             );
                             // OR into the shared edge flags (N-panel + Inspector
@@ -3177,7 +3258,7 @@ impl TabViewer for PanelViewer<'_> {
             ),
             Tab::Inspector => {
                 let mut e = panels::InspectorEdit::default();
-                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, &mut e);
+                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, self.inspector_state, &mut e);
                 self.inspector_edit.started |= e.started;
                 self.inspector_edit.stopped |= e.stopped;
             }
@@ -3308,6 +3389,8 @@ mod tests {
         assert!(h && ui.prefs.show_hint != Preferences::default().show_hint);
         let (ui, _, _, h) = run(Action::ViewPie, noop);
         assert!(h && ui.view_pie.open, "ViewPie opens the radial pie");
+        let (ui, _, _, h) = run(Action::ShadingPie, noop);
+        assert!(h && ui.shading_pie.open, "ShadingPie opens the radial shading pie");
         let (ui, _, _, h) = run(Action::ToggleNPanel, noop);
         assert!(h && ui.viewport_regions.n_open);
         let (ui, _, _, h) = run(Action::ToggleTPanel, noop);
@@ -3391,6 +3474,53 @@ mod tests {
         assert!(!run(Action::Transform(TransformKind::Move), noop).3, "Transform is viewport-owned");
         assert!(!run(Action::AxisLock(Axis::X), noop).3, "AxisLock is viewport-owned");
         assert!(!run(Action::Duplicate, noop).3, "Duplicate is viewport-owned");
+    }
+
+    /// The Z Shading pie lays out exactly the three display modes + the Grid /
+    /// Stats toggles, and each sector's value applies the effect it advertises.
+    #[test]
+    fn shading_pie_sectors_map_to_modes_and_toggles() {
+        let choices = shading_pie_choices();
+        // Every display mode is offered exactly once, in ViewportMode::ALL order.
+        let modes: Vec<ViewportMode> = choices
+            .iter()
+            .filter_map(|c| match c.value {
+                ShadingChoice::Mode(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes, ViewportMode::ALL.to_vec(), "all three modes, once each");
+        // Both quick toggles are present.
+        assert!(choices.iter().any(|c| c.value == ShadingChoice::ToggleGrid), "Grid toggle present");
+        assert!(choices.iter().any(|c| c.value == ShadingChoice::ToggleStats), "Stats toggle present");
+        // No sector is unlabelled.
+        assert!(choices.iter().all(|c| !c.label.is_empty()), "every sector is labelled");
+
+        // Applying a Mode choice sets settings.mode; the toggles flip their flag.
+        let mut ui = Ui::new();
+        ui.settings.mode = ViewportMode::Beauty;
+        ui.apply_shading_choice(ShadingChoice::Mode(ViewportMode::Wireframe));
+        assert_eq!(ui.settings.mode, ViewportMode::Wireframe, "Mode sector switches display mode");
+
+        let grid0 = ui.settings.show_grid;
+        ui.apply_shading_choice(ShadingChoice::ToggleGrid);
+        assert_ne!(ui.settings.show_grid, grid0, "Grid sector flips the grid flag");
+
+        let stats0 = ui.prefs.show_stats;
+        ui.apply_shading_choice(ShadingChoice::ToggleStats);
+        assert_ne!(ui.prefs.show_stats, stats0, "Stats sector flips the stats overlay flag");
+    }
+
+    /// The generic `pie::choose` helper returns the picked sector's VALUE (not its
+    /// index), moved out by index — the seam the Z pie relies on. (Drives the
+    /// mapping logic without an egui frame by checking the choice list is non-empty
+    /// and each value is what the layout fn declared; the angle→index resolution is
+    /// covered by pie.rs's `sector_at` tests.)
+    #[test]
+    fn shading_pie_choices_are_stable_order() {
+        let choices = shading_pie_choices();
+        assert_eq!(choices.len(), 5, "3 modes + Grid + Stats");
+        assert_eq!(choices[0].value, ShadingChoice::Mode(ViewportMode::Beauty));
     }
 
     #[test]
