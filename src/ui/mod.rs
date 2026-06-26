@@ -261,6 +261,12 @@ pub struct TransformOp {
     /// instead of the single-axis projection a `gizmo_hovered_axis` lock drives.
     /// Mutually exclusive with `gizmo_hovered_axis`. Not serialized.
     pub gizmo_plane_normal: Option<Axis>,
+    /// Set when the op was started by grabbing a screen-axis VIEW handle (#72): a
+    /// Move on the screen-parallel plane (plane normal = camera forward) or a Rotate
+    /// about the camera forward (Blender's white trackball ring). `apply_transform`
+    /// resolves the camera basis live, so no world axis is stored. Mutually exclusive
+    /// with the axis / plane locks. Not serialized.
+    pub gizmo_view: bool,
     /// True when the op was started by dragging a screen-space gizmo handle (vs the
     /// modal G/R/S keys). A gizmo drag is driven by `drag_delta` and committed on
     /// pointer release; a modal op is driven by absolute mouse position and

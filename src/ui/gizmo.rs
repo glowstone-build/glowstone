@@ -43,6 +43,12 @@ pub struct GizmoCtx {
     pub rect: egui::Rect,
     /// Handle arm length in world units (camera-distance scaled, clamped).
     pub arm: f32,
+    /// The camera's world-space forward (eye→target) — the VIEW axis. Drives the
+    /// screen-axis rotate ring (#72, rotate about camera forward like Blender's
+    /// white trackball ring) and the view-plane centre move (a screen-parallel
+    /// drag whose plane normal is this forward). `Vec3::Z` is a sane default for
+    /// the few unit tests that don't care about the view handles.
+    pub forward: Vec3,
 }
 
 /// A handle hit — which sub-part of a gizmo group the pointer is over. The blueprint
@@ -60,6 +66,12 @@ pub enum Handle {
     /// The uniform centre handle (scale gizmo only — drag the middle box to scale
     /// every axis together; `axis = None` on the resulting op).
     Uniform,
+    /// The VIEW handle (#72): on the Move gizmo, the small centre square that drags
+    /// on the screen-parallel plane (plane normal = camera forward); on the Rotate
+    /// gizmo, the outer screen-aligned ring that spins about the camera forward
+    /// (Blender's white trackball ring). Carries no axis — `apply_transform` reads
+    /// the camera basis directly.
+    View,
 }
 
 /// What a handle-grab kicks off: the transform kind + the axis it locks (None =
@@ -74,6 +86,11 @@ pub struct GizmoStart {
     /// for every axis/uniform handle. When set the caller drives a two-axis
     /// `ray_plane_point` absolute drag instead of a single-axis projection.
     pub plane_normal: Option<Axis>,
+    /// Set for the VIEW handle (#72): a Move on the screen-parallel plane (normal =
+    /// camera forward) or a Rotate about the camera forward. The caller resolves the
+    /// camera basis at apply time, so no world axis is carried here. Mutually
+    /// exclusive with `axis` / `plane_normal`.
+    pub view: bool,
 }
 
 /// A drawable + interactive transform-gizmo group at the selection pivot. The active
@@ -124,6 +141,11 @@ pub struct MoveGizmo;
 const PLANE_OFFSET: f32 = 0.32;
 const PLANE_HALF_PX: f32 = 6.0;
 
+/// Half-extent (px) of the Move gizmo's centre VIEW square — the screen-parallel
+/// move handle (#72). A touch larger than the axis dot so it's an easy grab, but
+/// small enough to live inside the plane quads without fighting them.
+const VIEW_MOVE_HALF_PX: f32 = 4.0;
+
 impl MoveGizmo {
     /// Screen endpoints (origin, tip) of the axis arm, or `None` if either end is
     /// behind the camera.
@@ -156,11 +178,29 @@ impl MoveGizmo {
     fn plane_rect(c: Pos2) -> egui::Rect {
         egui::Rect::from_center_size(c, egui::vec2(PLANE_HALF_PX * 2.0, PLANE_HALF_PX * 2.0))
     }
+
+    /// The screen rect of the centre VIEW square (the screen-parallel move handle,
+    /// #72), centred on the projected pivot. `None` if the pivot is behind the camera.
+    fn view_rect(cx: &GizmoCtx) -> Option<egui::Rect> {
+        let c = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect)?;
+        Some(egui::Rect::from_center_size(
+            c,
+            egui::vec2(VIEW_MOVE_HALF_PX * 2.0, VIEW_MOVE_HALF_PX * 2.0),
+        ))
+    }
 }
 
 impl GizmoGroup for MoveGizmo {
     fn test_select(&self, p: Pos2, cx: &GizmoCtx) -> Option<Handle> {
-        // Plane quads first: they sit near the pivot where the axis arms also pass,
+        // Centre VIEW square first: it sits dead on the pivot where the arm origins
+        // and plane quads converge, so the most central grab maps to the screen-plane
+        // move (Blender/UE's centre handle is the top-priority pick).
+        if let Some(r) = Self::view_rect(cx)
+            && r.contains(p)
+        {
+            return Some(Handle::View);
+        }
+        // Plane quads next: they sit near the pivot where the axis arms also pass,
         // so a cursor over a quad should grab the PLANE (the larger, more specific
         // target) rather than the arm line it overlaps.
         for normal in [Axis::Z, Axis::X, Axis::Y] {
@@ -200,18 +240,36 @@ impl GizmoGroup for MoveGizmo {
             painter.rect_filled(r, 1.0, fill);
             painter.rect_stroke(r, 1.0, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         }
-        painter.circle_filled(origin, 3.0, egui::Color32::from_gray(220));
+        // Centre VIEW square (#72): a small white screen-parallel move handle on the
+        // pivot, brightening on hover. Drawn last so it sits over the arm origins.
+        if let Some(r) = Self::view_rect(cx) {
+            let vhot = hover == Some(Handle::View);
+            let vcol = if vhot { egui::Color32::WHITE } else { egui::Color32::from_gray(220) };
+            painter.rect_filled(r, 1.0, vcol);
+        } else {
+            painter.circle_filled(origin, 3.0, egui::Color32::from_gray(220));
+        }
     }
 
     fn invoke(&self, h: Handle) -> GizmoStart {
         match h {
-            Handle::Plane(normal) => {
-                GizmoStart { kind: TransformKind::Move, axis: None, plane_normal: Some(normal) }
-            }
+            Handle::Plane(normal) => GizmoStart {
+                kind: TransformKind::Move,
+                axis: None,
+                plane_normal: Some(normal),
+                view: false,
+            },
             Handle::Axis(a) => {
-                GizmoStart { kind: TransformKind::Move, axis: Some(a), plane_normal: None }
+                GizmoStart { kind: TransformKind::Move, axis: Some(a), plane_normal: None, view: false }
             }
-            Handle::Uniform => GizmoStart { kind: TransformKind::Move, axis: None, plane_normal: None },
+            // The centre square moves on the screen-parallel plane (normal = camera
+            // forward), resolved in apply_transform from the live camera basis.
+            Handle::View => {
+                GizmoStart { kind: TransformKind::Move, axis: None, plane_normal: None, view: true }
+            }
+            Handle::Uniform => {
+                GizmoStart { kind: TransformKind::Move, axis: None, plane_normal: None, view: false }
+            }
         }
     }
 }
@@ -223,8 +281,15 @@ impl GizmoGroup for MoveGizmo {
 /// Segment count for a ring polyline — enough to read as a circle at handle size.
 const RING_SEGMENTS: usize = 48;
 
-/// Three RGB rings at the pivot (one per world axis); drag a ring to rotate about
-/// its axis (reuses `apply_transform`'s Rotate math via the axis-locked op).
+/// The screen-axis (VIEW) trackball ring's radius as a fraction of the axis-ring
+/// radius (#72). >1 so it sits OUTSIDE the three world-axis rings, like Blender's
+/// outer white ring, and is easy to grab without colliding with the coloured rings.
+const VIEW_RING_SCALE: f32 = 1.2;
+
+/// Three RGB rings at the pivot (one per world axis) PLUS an outer screen-aligned
+/// VIEW ring (#72: rotate about the camera forward — Blender's white trackball
+/// ring). Drag a ring to rotate about its axis (reuses `apply_transform`'s Rotate
+/// math via the axis-locked op; the view ring resolves the camera forward).
 pub struct RotateGizmo;
 
 impl RotateGizmo {
@@ -255,23 +320,64 @@ impl RotateGizmo {
         }
         pts.windows(2).map(|w| dist_point_segment(p, w[0], w[1])).fold(f32::INFINITY, f32::min)
     }
+
+    /// The projected screen points of the outer VIEW ring (#72): a circle in the
+    /// plane PERPENDICULAR to the camera forward, so it always reads as a flat
+    /// screen-aligned ring. Radius = `arm * VIEW_RING_SCALE`.
+    fn view_ring_screen(cx: &GizmoCtx) -> Vec<Pos2> {
+        // Two unit vectors spanning the screen plane (perpendicular to forward).
+        let n = cx.forward.normalize_or_zero();
+        let u = if n.x.abs() < 0.9 { n.cross(Vec3::X) } else { n.cross(Vec3::Y) }.normalize_or_zero();
+        let v = n.cross(u).normalize_or_zero();
+        let r = cx.arm * VIEW_RING_SCALE;
+        let mut pts = Vec::with_capacity(RING_SEGMENTS + 1);
+        for k in 0..=RING_SEGMENTS {
+            let a = k as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+            let w = cx.pivot + (u * a.cos() + v * a.sin()) * r;
+            if let Some(p) = OrbitCamera::project_to_screen(w, cx.vp, cx.rect) {
+                pts.push(p);
+            }
+        }
+        pts
+    }
+
+    /// Min distance from `p` to the VIEW ring polyline.
+    fn view_ring_dist(p: Pos2, cx: &GizmoCtx) -> f32 {
+        let pts = Self::view_ring_screen(cx);
+        if pts.len() < 2 {
+            return f32::INFINITY;
+        }
+        pts.windows(2).map(|w| dist_point_segment(p, w[0], w[1])).fold(f32::INFINITY, f32::min)
+    }
 }
 
 impl GizmoGroup for RotateGizmo {
     fn test_select(&self, p: Pos2, cx: &GizmoCtx) -> Option<Handle> {
-        // Pick the closest ring within the grab radius (rings overlap near the
-        // pivot, so nearest-wins avoids ambiguity).
-        let mut best: Option<(Axis, f32)> = None;
-        for ax in [Axis::X, Axis::Y, Axis::Z] {
-            let d = Self::ring_dist(p, ax, cx);
+        // Pick the closest ring within the grab radius (rings overlap, so nearest-
+        // wins avoids ambiguity). The VIEW ring competes on equal footing as the
+        // outermost ring; nearest-distance naturally prefers it on its own band.
+        let mut best: Option<(Handle, f32)> = None;
+        let mut consider = |h: Handle, d: f32| {
             if d <= GRAB_PX && best.map(|(_, bd)| d < bd).unwrap_or(true) {
-                best = Some((ax, d));
+                best = Some((h, d));
             }
+        };
+        for ax in [Axis::X, Axis::Y, Axis::Z] {
+            consider(Handle::Axis(ax), Self::ring_dist(p, ax, cx));
         }
-        best.map(|(ax, _)| Handle::Axis(ax))
+        consider(Handle::View, Self::view_ring_dist(p, cx));
+        best.map(|(h, _)| h)
     }
 
     fn draw(&self, painter: &egui::Painter, cx: &GizmoCtx, hover: Option<Handle>) {
+        // Outer screen-aligned VIEW ring first (so the coloured axis rings paint over
+        // it where they cross) — a neutral white trackball ring (#72).
+        let vpts = Self::view_ring_screen(cx);
+        if vpts.len() >= 2 {
+            let vhot = hover == Some(Handle::View);
+            let vcol = if vhot { egui::Color32::WHITE } else { egui::Color32::from_gray(170) };
+            painter.add(egui::Shape::line(vpts, egui::Stroke::new(if vhot { 3.0 } else { 1.5 }, vcol)));
+        }
         for ax in [Axis::X, Axis::Y, Axis::Z] {
             let pts = Self::ring_screen(ax, cx);
             if pts.len() < 2 {
@@ -287,12 +393,19 @@ impl GizmoGroup for RotateGizmo {
     }
 
     fn invoke(&self, h: Handle) -> GizmoStart {
-        // Rotate exposes only axis rings — Plane never originates here.
-        let axis = match h {
-            Handle::Axis(a) => Some(a),
-            Handle::Plane(_) | Handle::Uniform => None,
-        };
-        GizmoStart { kind: TransformKind::Rotate, axis, plane_normal: None }
+        // Rotate exposes the three axis rings + the outer VIEW ring; Plane/Uniform
+        // never originate here.
+        match h {
+            Handle::View => {
+                GizmoStart { kind: TransformKind::Rotate, axis: None, plane_normal: None, view: true }
+            }
+            Handle::Axis(a) => {
+                GizmoStart { kind: TransformKind::Rotate, axis: Some(a), plane_normal: None, view: false }
+            }
+            Handle::Plane(_) | Handle::Uniform => {
+                GizmoStart { kind: TransformKind::Rotate, axis: None, plane_normal: None, view: false }
+            }
+        }
     }
 }
 
@@ -356,12 +469,12 @@ impl GizmoGroup for ScaleGizmo {
     }
 
     fn invoke(&self, h: Handle) -> GizmoStart {
-        // Scale exposes axis boxes + the uniform centre — Plane never originates here.
+        // Scale exposes axis boxes + the uniform centre — Plane/View never originate here.
         let axis = match h {
             Handle::Axis(a) => Some(a),
-            Handle::Plane(_) | Handle::Uniform => None,
+            Handle::Plane(_) | Handle::Uniform | Handle::View => None,
         };
-        GizmoStart { kind: TransformKind::Scale, axis, plane_normal: None }
+        GizmoStart { kind: TransformKind::Scale, axis, plane_normal: None, view: false }
     }
 }
 
@@ -375,7 +488,8 @@ mod tests {
         let cam = OrbitCamera::default();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let aspect = rect.width() / rect.height();
-        GizmoCtx { pivot: cam.target, vp: cam.view_proj(aspect), rect, arm: 2.0 }
+        let (_, _, fwd) = cam.view_basis();
+        GizmoCtx { pivot: cam.target, vp: cam.view_proj(aspect), rect, arm: 2.0, forward: fwd }
     }
 
     /// The plane→in-plane-axes map is the two axes that are NOT the normal.
@@ -424,5 +538,58 @@ mod tests {
         let cx = ctx();
         let g = MoveGizmo;
         assert!(g.test_select(egui::pos2(5.0, 5.0), &cx).is_none());
+    }
+
+    /// #72: a cursor dead on the projected pivot grabs the centre VIEW square (the
+    /// screen-parallel move handle), which has top pick priority over the arms/planes.
+    #[test]
+    fn pick_center_grabs_view_move() {
+        let cx = ctx();
+        let g = MoveGizmo;
+        let c = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect).expect("pivot on screen");
+        assert!(g.test_select(c, &cx) == Some(Handle::View));
+    }
+
+    /// #72: the centre VIEW move handle starts a Move with the `view` flag set and no
+    /// axis/plane lock (apply_transform resolves the screen plane from the camera).
+    #[test]
+    fn invoke_view_move_sets_view_flag() {
+        let s = MoveGizmo.invoke(Handle::View);
+        assert!(s.kind == TransformKind::Move);
+        assert!(s.view);
+        assert!(s.axis.is_none() && s.plane_normal.is_none());
+    }
+
+    /// #72: the outer screen-aligned ring is grabbable, and grabbing it invokes a
+    /// view-axis Rotate (the `view` flag, no world-axis lock).
+    #[test]
+    fn rotate_view_ring_picks_and_invokes() {
+        let cx = ctx();
+        let g = RotateGizmo;
+        // A point exactly on the view ring polyline must be within the grab radius.
+        let pts = RotateGizmo::view_ring_screen(&cx);
+        assert!(pts.len() >= 2, "view ring should project on screen");
+        let on_ring = pts[pts.len() / 4]; // a quarter of the way around
+        assert!(g.test_select(on_ring, &cx) == Some(Handle::View));
+
+        let s = g.invoke(Handle::View);
+        assert!(s.kind == TransformKind::Rotate);
+        assert!(s.view);
+        assert!(s.axis.is_none());
+    }
+
+    /// The VIEW ring sits OUTSIDE the coloured axis rings (radius scaled > 1), so a
+    /// point on the view ring is farther from the pivot than the axis rings reach.
+    #[test]
+    fn view_ring_is_outermost() {
+        let cx = ctx();
+        let origin = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect).unwrap();
+        let view_pts = RotateGizmo::view_ring_screen(&cx);
+        let view_r = view_pts.iter().map(|p| p.distance(origin)).fold(0.0_f32, f32::max);
+        for ax in [Axis::X, Axis::Y, Axis::Z] {
+            let axis_pts = RotateGizmo::ring_screen(ax, &cx);
+            let axis_r = axis_pts.iter().map(|p| p.distance(origin)).fold(0.0_f32, f32::max);
+            assert!(view_r >= axis_r, "view ring should reach at least as far as {}", ax.label());
+        }
     }
 }

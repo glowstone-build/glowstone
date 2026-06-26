@@ -62,6 +62,20 @@ pub struct InspectorState {
     /// (e.g. "Transform", "Optics"). Absent ⇒ fall back to the call-site default.
     #[serde(default)]
     pub collapsed: std::collections::BTreeMap<String, bool>,
+    /// "Show only modified" header toggle (P2 #64): when on, every row that
+    /// equals its default (the reset gutter is empty) is hidden, leaving just the
+    /// properties the user has actually changed. Composes with [`filter`] (a row
+    /// must pass BOTH). Per-session — a fresh session starts off.
+    ///
+    /// [`filter`]: Self::filter
+    #[serde(skip)]
+    pub show_modified: bool,
+    /// PIN target (P2 #65): when `Some(id)`, the inspector stays locked to that
+    /// fixture's [`EntityId`] even as the viewport/outliner selection changes, so
+    /// you can park on one fixture and select others (e.g. to copy values). `None`
+    /// follows the live selection. Per-session — never persisted.
+    #[serde(skip)]
+    pub pinned: Option<crate::scene::EntityId>,
 }
 
 impl InspectorState {
@@ -93,6 +107,17 @@ impl InspectorState {
             None => true,
             Some(q) => super::lib_prefs::fuzzy_score(&q, &label.to_lowercase()).is_some(),
         }
+    }
+
+    /// Whether a single property ROW should render given BOTH gates (S1 + P2 #64):
+    /// the live filter ([`row_visible`]) AND the "show only modified" toggle. With
+    /// `show_modified` on, a row that equals its default (`!differs`) is hidden.
+    /// Rows whose value HAS no default concept pass `differs = true` from the
+    /// caller so they're never swallowed by the modified-only filter.
+    ///
+    /// [`row_visible`]: Self::row_visible
+    pub fn row_shown(&self, label: &str, differs: bool) -> bool {
+        self.row_visible(label) && (!self.show_modified || differs)
     }
 
     /// Whether a CATEGORY (with the given row labels) should be shown: always when
@@ -1268,7 +1293,7 @@ fn row(
     differs: bool,
     value: impl FnOnce(&mut egui::Ui),
 ) -> bool {
-    if !state.row_visible(label) {
+    if !state.row_shown(label, differs) {
         return false;
     }
     let clicked = prop_label(ui, label, differs);
@@ -1378,6 +1403,27 @@ impl FixtureDefaults {
     }
 }
 
+/// The fixture [`EntityId`] the PIN button (P2 #65) would lock onto: the
+/// already-pinned id if held, else the single selected fixture (no world / env /
+/// geometry / screen / multi-selection in play). `None` when there's nothing a
+/// single-fixture pin could target — the button is then disabled.
+fn current_pin_target(scene: &Scene, selection: &Selection, state: &InspectorState) -> Option<crate::scene::EntityId> {
+    if let Some(id) = state.pinned {
+        return Some(id);
+    }
+    if selection.world || selection.environment.is_some() {
+        return None;
+    }
+    if !selection.geometry.is_empty() || !selection.screens.is_empty() {
+        return None;
+    }
+    let ids: Vec<usize> = selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+    match ids.as_slice() {
+        [i] => Some(scene.fixtures[*i].id),
+        _ => None,
+    }
+}
+
 /// Right tab: editable parameters for the current selection. Edits flow
 /// straight into the scene, so the viewport updates on the next frame.
 #[allow(clippy::too_many_arguments)]
@@ -1402,12 +1448,40 @@ pub fn inspector(
                 .desired_width(f32::INFINITY),
         );
     });
-    if !state.filter.trim().is_empty() {
-        ui.horizontal(|ui| {
-            if ui.small_button(format!("{}  clear", theme::icon::CLOSE)).clicked() {
-                state.filter.clear();
+    // Header toggles (P2 #64 + #65): "show only modified" and the inspector PIN.
+    ui.horizontal(|ui| {
+        if !state.filter.trim().is_empty() && ui.small_button(format!("{}  clear", theme::icon::CLOSE)).clicked() {
+            state.filter.clear();
+        }
+        ui.toggle_value(&mut state.show_modified, "Modified only")
+            .on_hover_text("Hide every property still at its default value");
+        // The pin targets the single fixture currently shown (live selection or
+        // the already-pinned one). Disabled when no single fixture is in play.
+        let pin_target = current_pin_target(scene, selection, state);
+        let pinned = state.pinned.is_some();
+        let resp = ui.add_enabled(
+            pinned || pin_target.is_some(),
+            egui::SelectableLabel::new(pinned, format!("{}  Pin", theme::icon::PROFILE)),
+        );
+        if resp.on_hover_text("Lock the inspector to this fixture across selection changes").clicked() {
+            state.pinned = if pinned { None } else { pin_target };
+        }
+    });
+    // The pin banner: "pinned: <name> [x]" — visible while the lock is held.
+    if let Some(id) = state.pinned {
+        match scene.fixture_index_of(id) {
+            Some(idx) => {
+                let name = scene.fixtures[idx].name.clone();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}  pinned: {name}", theme::icon::PROFILE)).small().strong());
+                    if ui.small_button(theme::icon::CLOSE).on_hover_text("Unpin — follow selection").clicked() {
+                        state.pinned = None;
+                    }
+                });
             }
-        });
+            // The pinned fixture was deleted: drop the stale lock silently.
+            None => state.pinned = None,
+        }
     }
     ui.separator();
 
@@ -1441,6 +1515,22 @@ fn inspector_body(
     sources: &ScreenSources,
     state: &mut InspectorState,
 ) {
+    // PIN (P2 #65): while a fixture is pinned, the inspector ignores the live
+    // selection and stays on that fixture (resolved by stable id, so it survives
+    // reorders). A stale pin (deleted fixture) is cleared by the header banner,
+    // so here it simply falls through to the selection path.
+    if let Some(pin) = state.pinned {
+        if let Some(idx) = scene.fixture_index_of(pin) {
+            let fixture = &mut scene.fixtures[idx];
+            if fixture.is_gdtf() {
+                gdtf_inspector(ui, fixture, gdtf_textures, idx, profile, state);
+            } else {
+                fixture_inspector(ui, fixture, state);
+            }
+            return;
+        }
+    }
+
     // World is the top of the hierarchy: its HDRI sky + ambient controls.
     if selection.world {
         let ink = theme::ink(!ui.visuals().dark_mode);
@@ -2763,6 +2853,30 @@ fn gdtf_inspector(
     );
 }
 
+/// EditCondition-style inertness (P2 #66): whether an optic control, though the
+/// fixture *exposes* it, is doing nothing at the fixture's current settings and so
+/// should be greyed/disabled. The driver is the live fixture state, mirroring how
+/// Blender greys a property whose effect another value has nullified:
+///
+/// * Every beam-shaping / colour control is inert when the lamp emits no light —
+///   the dimmer is at 0 (nothing in the beam to zoom/iris/tint), OR the per-fixture
+///   volumetric beam is killed (`beam == 0`) so there's no shaft to shape.
+/// * The strobe rate is also inert when the shutter gate is fully closed
+///   (`shutter == 0`) — a closed blackout can't strobe.
+///
+/// A pure predicate so it's unit-testable independent of egui.
+fn optic_inert(fixture: &Fixture, f: OpticField) -> bool {
+    // Only the DIMMER (the master level) makes the fixture dark. `fixture.beam`
+    // merely scales the volumetric shaft/floor-pool — the lens still emits + shapes
+    // surfaces with beam=0, so optics stay live (see Fixture.beam docs).
+    let dark = approx(fixture.optics.dimmer, 0.0);
+    if dark {
+        return true;
+    }
+    // Strobe needs an open (or at least non-zero) shutter to pulse.
+    matches!(f, OpticField::Strobe) && approx(fixture.optics.shutter, 0.0)
+}
+
 /// The optical-chain control bank for a GDTF fixture: sliders for every stage
 /// the fixture actually exposes (disabled if the GDTF lacks that attribute).
 /// Drives `fixture.optics`, which the renderer resolves into the beam each frame.
@@ -2770,25 +2884,41 @@ fn gdtf_inspector(
 /// the fixture doesn't expose it), with optional trailing text (e.g. zoom °).
 fn optic_field_row(
     ui: &mut egui::Ui,
+    state: &InspectorState,
     o: &mut OpticalControls,
     def: &OpticalControls,
     f: OpticField,
     enabled: bool,
+    inert: bool,
     text: Option<String>,
 ) {
     // Per-property reset (#6): the arrow shows when this control left its neutral
     // default and is reachable (an unsupported/greyed row never differs anyway).
     let differs = enabled && !approx(f.get(o), f.get(def));
+    // P2 #64: "show only modified" swallows rows still at their default. The
+    // caller already filtered by label visibility, but the modified-only gate
+    // depends on the live value, so it's applied here.
+    if state.show_modified && !differs {
+        return;
+    }
+    // P2 #66 (EditCondition): an inert control (supported but currently doing
+    // nothing — e.g. beam shaping with the dimmer at 0) is greyed AND disabled,
+    // so it reads as present-but-not-acting rather than absent.
+    let enabled = enabled && !inert;
     let resp = ui.horizontal(|ui| {
         let reset = reset_arrow(ui, differs);
-        let lbl = ui.label(f.label());
+        // Grey the label of an inert control so the whole row reads disabled.
+        let text = if inert { RichText::new(f.label()).weak() } else { RichText::new(f.label()) };
+        let lbl = ui.label(text);
         (reset, lbl)
     });
     let (reset, lbl) = resp.inner;
     if reset {
         f.set(o, f.get(def));
     }
-    if f == OpticField::Green {
+    if inert {
+        lbl.on_hover_text("Inactive at the current settings (no light to shape)");
+    } else if f == OpticField::Green {
         lbl.on_hover_text("Plus/minus-green (CC axis): −1 magenta … +1 green");
     }
     let mut v = f.get(o);
@@ -2857,6 +2987,16 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                 });
             }
             let def = OpticalControls::default();
+            // P2 #66: pre-evaluate the EditCondition for every optic field BEFORE
+            // the mutable borrow of `fixture.optics`, so the live-edit loops can
+            // read inertness without re-borrowing the fixture. `optic_inert` is the
+            // single (unit-tested) source of the predicate.
+            let inert_of: std::collections::HashMap<&'static str, bool> = OpticField::BEAM
+                .iter()
+                .chain(&OpticField::COLOR)
+                .map(|&f| (f.label(), optic_inert(fixture, f)))
+                .collect();
+            let inert = |f: OpticField| inert_of.get(f.label()).copied().unwrap_or(false);
             let o = &mut fixture.optics;
             // Data-driven rows (gated by the fixture's GDTF attributes) so single
             // and bulk editing enumerate the SAME control set — see `OpticField`.
@@ -2869,7 +3009,7 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                 Grid::new("optics-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
                     for f in BEAM_COMMON {
                         if fs.row_visible(f.label()) {
-                            optic_field_row(ui, o, &def, f, f.supported(gdtf), (f == OpticField::Zoom).then(|| format!("{zoom_deg:.0}°")));
+                            optic_field_row(ui, fs, o, &def, f, f.supported(gdtf), inert(f), (f == OpticField::Zoom).then(|| format!("{zoom_deg:.0}°")));
                         }
                     }
                 });
@@ -2878,7 +3018,7 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                 Grid::new("optics-beam-adv").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
                     for f in BEAM_ADV {
                         if fs.row_visible(f.label()) {
-                            optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                            optic_field_row(ui, fs, o, &def, f, f.supported(gdtf), inert(f), None);
                         }
                     }
                 });
@@ -2890,7 +3030,7 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                 Grid::new("optics-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
                     for f in COLOR_COMMON {
                         if fs.row_visible(f.label()) {
-                            optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                            optic_field_row(ui, fs, o, &def, f, f.supported(gdtf), inert(f), None);
                         }
                     }
                 });
@@ -2899,7 +3039,7 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                 Grid::new("optics-color-adv").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
                     for f in COLOR_ADV {
                         if fs.row_visible(f.label()) {
-                            optic_field_row(ui, o, &def, f, f.supported(gdtf), None);
+                            optic_field_row(ui, fs, o, &def, f, f.supported(gdtf), inert(f), None);
                         }
                     }
                 });
@@ -3213,6 +3353,46 @@ fn nearest_origin_screen(
     best.map(|(_, w)| w)
 }
 
+/// #70 Snap-target PREVIEW: the WORLD destination the PRIMARY moved element's origin
+/// will land on, for the snap marker drawn DURING a live Move drag (before release).
+/// Returns `None` unless the op is a Move with snap currently engaged — Rotate/Scale
+/// and snap-off drags have no destination marker.
+///
+/// `apply_transform` has already moved the primary element to its snapped destination
+/// this frame, so the live origin (`op.start.first()` → `scene.fixtures[i].position`,
+/// or the first geometry's translation) IS the destination — for Vertex it's the
+/// snapped node, for Surface the cursor surface hit, for Increment the quantized
+/// origin. Reading it back (rather than recomputing the snap) keeps the marker exactly
+/// consistent with where the element actually goes. Pure + cheap → unit-testable.
+/// `snap_on` is the live-resolved snap state (`op.snap.on` XOR a held Ctrl), so a
+/// mid-drag Ctrl tap hides/shows the marker in lockstep with the actual snapping.
+fn snap_preview_point(op: &TransformOp, scene: &Scene, snap_on: bool) -> Option<Vec3> {
+    if op.kind != TransformKind::Move || !snap_on {
+        return None;
+    }
+    if let Some((i, _, _)) = op.start.first() {
+        return scene.fixtures.get(*i).map(|f| f.position);
+    }
+    if let Some((i, _)) = op.geo_start.first() {
+        return scene.geometry.get(*i).map(|g| g.transform.w_axis.truncate());
+    }
+    None
+}
+
+/// Draw the #70 snap-destination marker: a small ring + cross at the projected snap
+/// point, tinted to read as "this is where it lands". Screen-space sized so it stays
+/// legible at any zoom. No-op when the point is behind the camera / off the rect math.
+fn draw_snap_marker(painter: &egui::Painter, world: Vec3, vp: Mat4, rect: egui::Rect) {
+    let Some(c) = OrbitCamera::project_to_screen(world, vp, rect) else { return };
+    let col = egui::Color32::from_rgb(120, 230, 255); // cyan — the "snap" accent
+    let r = 6.0;
+    painter.circle_stroke(c, r, egui::Stroke::new(1.5, col));
+    // A small plus through the centre so the exact point reads even over busy geometry.
+    let x = r + 3.0;
+    painter.line_segment([c - egui::vec2(x, 0.0), c + egui::vec2(x, 0.0)], egui::Stroke::new(1.0, col));
+    painter.line_segment([c - egui::vec2(0.0, x), c + egui::vec2(0.0, x)], egui::Stroke::new(1.0, col));
+}
+
 /// frame the op is live; cancelling restores from the same snapshot.
 fn apply_transform(
     op: &TransformOp,
@@ -3260,6 +3440,21 @@ fn apply_transform(
                 // expressed in the active basis — world X for Global).
                 let a = axis.map(axis_dir).unwrap_or_else(|| basis * Vec3::X);
                 a * amount
+            } else if op.gizmo_view && op.from_gizmo && op.viewport.area() > 0.0 {
+                // VIEW-plane move (#72): the screen-parallel drag. The plane normal is
+                // the camera forward, so the grabbed centre square slides on the plane
+                // facing the viewer and STICKS to the cursor (a ray_plane_point
+                // absolute drag, same machinery as the axis-pair plane handles).
+                let n = camera.view_basis().2;
+                let (ro0, rd0) = ray_at(op.start_screen);
+                let (ro1, rd1) = ray_at(cur);
+                match (
+                    ray_plane_point(ro0, rd0, op.pivot, n),
+                    ray_plane_point(ro1, rd1, op.pivot, n),
+                ) {
+                    (Some(from), Some(to)) => to - from,
+                    _ => Vec3::ZERO,
+                }
             } else if let Some(normal) = op.gizmo_plane_normal.filter(|_| op.from_gizmo && op.viewport.area() > 0.0) {
                 // PLANE handle (#S2): intersect the start + live cursor rays with the
                 // plane through the pivot whose normal is the held axis (in the active
@@ -3370,8 +3565,14 @@ fn apply_transform(
             let angle = op.snap.snap_angle(angle, snap_on);
             // Rotate about the active axis IN THE CHOSEN ORIENTATION: Local spins about
             // the element's own axis (a raked head tilts about its local pitch axis),
-            // View about the camera axis. No lock → the orientation's Y.
-            let raxis = axis.map(axis_dir).unwrap_or_else(|| basis * Vec3::Y);
+            // View about the camera axis. No lock → the orientation's Y. A grabbed
+            // screen-axis VIEW ring (#72) overrides everything and spins about the live
+            // camera forward (Blender's white trackball ring).
+            let raxis = if op.gizmo_view && op.from_gizmo {
+                camera.view_basis().2
+            } else {
+                axis.map(axis_dir).unwrap_or_else(|| basis * Vec3::Y)
+            };
             let rot = Quat::from_axis_angle(raxis, angle);
             for (i, p0, q0) in &op.start {
                 if let Some(f) = scene.fixtures.get_mut(*i) {
@@ -3720,6 +3921,9 @@ pub fn viewport(
                 // Arm/ring size scales with camera distance so handles stay a
                 // readable pixel size regardless of zoom.
                 arm: (camera.distance * 0.18).clamp(0.4, 4.0),
+                // Camera forward = the VIEW axis (#72): screen-axis rotate ring +
+                // view-plane move centre resolve from this.
+                forward: camera.view_basis().2,
             };
             // Highlight the handle under the live pointer; on a press we hit-test the
             // press origin instead (so the grabbed handle is the one the drag began on).
@@ -3762,6 +3966,9 @@ pub fn viewport(
                     // (the normal is the held axis). Move-only; mutually exclusive
                     // with the single-axis `gizmo_hovered_axis` lock above.
                     gizmo_plane_normal: start_spec.plane_normal,
+                    // A grabbed VIEW handle (#72): screen-plane Move / view-axis
+                    // Rotate, resolved from the live camera basis in apply_transform.
+                    gizmo_view: start_spec.view,
                     from_gizmo: true,
                     num: NumInput::default(),
                     individual: xform.pivot.is_individual(),
@@ -4029,6 +4236,12 @@ pub fn viewport(
                 let ctrl = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
                 let snap_on = op.snap.on ^ ctrl;
                 apply_transform(op, scene, camera, cur, snap_on);
+                // #70: mark the snapped DESTINATION while the Move is live (pre-release)
+                // so the user sees where the origin will land. Drawn after the apply, so
+                // the primary element's post-snap origin is the marker point.
+                if let Some(target) = snap_preview_point(op, scene, snap_on) {
+                    draw_snap_marker(&ui.painter_at(rect), target, camera.view_proj(aspect), rect);
+                }
             }
             // The key cluster (X/Y/Z · type number · Enter/Esc) is read LIVE from
             // the keymap so the pill can never drift from the binds (#23). When an
@@ -4101,6 +4314,7 @@ pub fn viewport(
                     geo_start,
                     gizmo_hovered_axis: None,
                     gizmo_plane_normal: None,
+                    gizmo_view: false,
                     from_gizmo: false,
                     num: NumInput::default(),
                     individual: xform.pivot.is_individual(),
@@ -5878,7 +6092,7 @@ mod transform_tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, gizmo_view: false, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), orientation }
     }
 
     #[test]
@@ -5913,6 +6127,7 @@ mod transform_tests {
             geo_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: Some(Axis::Z),
+            gizmo_view: false,
             from_gizmo: true,
             num: NumInput::default(),
             individual: false,
@@ -5925,6 +6140,125 @@ mod transform_tests {
         assert!(d.z.abs() < 1e-4, "off-plane Z leaked: {}", d.z);
         // The drag actually moved the fixture in the plane (not a no-op).
         assert!(d.length() > 1e-3, "plane drag produced no motion: {d:?}");
+    }
+
+    /// #72 VIEW-plane move: a centre-square drag slides the fixture on the screen-
+    /// parallel plane (normal = camera forward), so the moved offset has NO component
+    /// along the camera forward (it stays on the view plane) and the drag is nonzero.
+    #[test]
+    fn view_plane_move_stays_on_screen_plane() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let cam = OrbitCamera::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let o = TransformOp {
+            kind: TransformKind::Move,
+            axis: None,
+            start_screen: egui::pos2(400.0, 300.0),
+            viewport: rect,
+            pivot: p0,
+            start: vec![(0, p0, scene.fixtures[0].orientation)],
+            geo_start: Vec::new(),
+            gizmo_hovered_axis: None,
+            gizmo_plane_normal: None,
+            gizmo_view: true,
+            from_gizmo: true,
+            num: NumInput::default(),
+            individual: false,
+            snap: SnapSettings::default(),
+            orientation: TransformOrientation::Global,
+        };
+        apply_transform(&o, &mut scene, &cam, egui::pos2(560.0, 180.0), false);
+        let d = scene.fixtures[0].position - p0;
+        let fwd = cam.view_basis().2;
+        assert!(d.dot(fwd).abs() < 1e-3, "view-plane move leaked along camera forward: {}", d.dot(fwd));
+        assert!(d.length() > 1e-3, "view-plane drag produced no motion: {d:?}");
+    }
+
+    /// #72 VIEW-axis rotate: a view-ring drag spins the fixture about the CAMERA
+    /// FORWARD. With the pivot offset from the fixture, the position rotates about the
+    /// camera-forward axis through the pivot, so the offset's component ALONG forward
+    /// is preserved (rotation about an axis can't move points along that axis).
+    #[test]
+    fn view_rotate_spins_about_camera_forward() {
+        let mut scene = Scene::demo();
+        let p0 = scene.fixtures[0].position;
+        let cam = OrbitCamera::default();
+        let pivot = p0 + Vec3::new(1.5, 0.5, 0.0);
+        let o = TransformOp {
+            kind: TransformKind::Rotate,
+            axis: None,
+            start_screen: egui::pos2(0.0, 0.0),
+            viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
+            pivot,
+            start: vec![(0, p0, scene.fixtures[0].orientation)],
+            geo_start: Vec::new(),
+            gizmo_hovered_axis: None,
+            gizmo_plane_normal: None,
+            gizmo_view: true,
+            from_gizmo: true,
+            num: NumInput::default(),
+            individual: false,
+            snap: SnapSettings::default(),
+            orientation: TransformOrientation::Global,
+        };
+        apply_transform(&o, &mut scene, &cam, egui::pos2(120.0, 0.0), false);
+        let fwd = cam.view_basis().2;
+        let p1 = scene.fixtures[0].position;
+        // The rotation actually moved the fixture (nonzero drag).
+        assert!((p1 - p0).length() > 1e-3, "view rotate produced no motion");
+        // Offset-from-pivot length is preserved, and its forward-component is unchanged
+        // (rotation about the forward axis through the pivot).
+        let r0 = p0 - pivot;
+        let r1 = p1 - pivot;
+        assert!((r0.length() - r1.length()).abs() < 1e-3, "radius changed under view rotate");
+        assert!((r0.dot(fwd) - r1.dot(fwd)).abs() < 1e-3, "moved along the camera-forward axis");
+    }
+
+    /// #70 snap preview: while a Move is live with Vertex snap engaged, the preview
+    /// marker point equals the snap TARGET (the destination the origin lands on) — and
+    /// is `None` when snap is off or the op isn't a Move.
+    #[test]
+    fn snap_preview_matches_snapped_destination() {
+        let mut scene = Scene::demo();
+        // Need a second fixture as a snap target node.
+        scene.duplicate_fixture(0, Vec3::new(5.0, 0.0, 2.0), 0.0, 1).expect("dup");
+        let cam = OrbitCamera::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let aspect = rect.width() / rect.height();
+        let p0 = scene.fixtures[0].position;
+        let target = scene.fixtures[1].position;
+        // Cursor placed over the target fixture's projected origin so Vertex snaps to it.
+        let cursor = OrbitCamera::project_to_screen(target, cam.view_proj(aspect), rect)
+            .expect("target on screen");
+        let mut snap = SnapSettings::default();
+        snap.on = true;
+        snap.mode = crate::ui::SnapMode::Vertex;
+        let o = TransformOp {
+            kind: TransformKind::Move,
+            axis: None,
+            start_screen: egui::pos2(400.0, 300.0),
+            viewport: rect,
+            pivot: p0,
+            start: vec![(0, p0, scene.fixtures[0].orientation)],
+            geo_start: Vec::new(),
+            gizmo_hovered_axis: None,
+            gizmo_plane_normal: None,
+            gizmo_view: false,
+            from_gizmo: true,
+            num: NumInput::default(),
+            individual: false,
+            snap,
+            orientation: TransformOrientation::Global,
+        };
+        apply_transform(&o, &mut scene, &cam, cursor, true);
+        let marker = snap_preview_point(&o, &scene, true).expect("preview while Move+snap");
+        // The marker is the primary origin's snapped destination = the target node.
+        assert!((marker - target).length() < 1e-3, "preview {marker:?} != target {target:?}");
+        // Snap off → no marker; Rotate → no marker.
+        assert!(snap_preview_point(&o, &scene, false).is_none());
+        let rot = make_op(TransformKind::Rotate, None, p0, 0, p0);
+        assert!(snap_preview_point(&rot, &scene, true).is_none());
     }
 
     #[test]
@@ -6105,6 +6439,7 @@ mod transform_tests {
             geo_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
+            gizmo_view: false,
             from_gizmo: false,
             num: NumInput { str: "90".into(), sign: false, active: true },
             individual: true,
@@ -6145,6 +6480,7 @@ mod transform_tests {
             geo_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
+            gizmo_view: false,
             from_gizmo: false,
             num: NumInput { str: "90".into(), sign: false, active: true },
             individual: false,
@@ -6355,6 +6691,108 @@ mod property_tests {
         assert_eq!(d.beam, 1.0);
         assert_eq!(d.pan, 0.0);
         assert_eq!(d.tilt, 0.0);
+    }
+
+    // --- P2 #64: "show only modified" ---------------------------------------
+
+    #[test]
+    fn show_modified_hides_default_rows_keeps_changed() {
+        let mut st = InspectorState::default();
+        // Off: every row shows regardless of differs.
+        assert!(st.row_shown("Dimmer", false));
+        assert!(st.row_shown("Zoom", true));
+        // On: only rows that differ from their default survive.
+        st.show_modified = true;
+        assert!(!st.row_shown("Dimmer", false)); // at default → hidden
+        assert!(st.row_shown("Zoom", true)); // changed → shown
+    }
+
+    #[test]
+    fn show_modified_composes_with_filter() {
+        let mut st = InspectorState::default();
+        st.show_modified = true;
+        st.filter = "zoom".into();
+        // Must pass BOTH gates: matches the filter AND differs from default.
+        assert!(st.row_shown("Zoom", true)); // matches + modified
+        assert!(!st.row_shown("Zoom", false)); // matches but at default
+        assert!(!st.row_shown("Dimmer", true)); // modified but filtered out
+    }
+
+    // --- P2 #65: inspector PIN ----------------------------------------------
+
+    #[test]
+    fn pin_keeps_target_through_selection_change() {
+        let mut scene = Scene::demo();
+        let mut extra = scene.fixtures[0].clone();
+        extra.id = 0; // zeroed so ensure_ids hands it a fresh, distinct id
+        scene.fixtures.push(extra);
+        scene.ensure_ids();
+        let pinned_id = scene.fixtures[0].id;
+        let other_id = scene.fixtures[1].id;
+        assert_ne!(pinned_id, other_id);
+
+        let mut st = InspectorState::default();
+        // Pin fixture 0 while it's the single selection.
+        st.pinned = current_pin_target(&scene, &Selection::fixture(0), &st);
+        assert_eq!(st.pinned, Some(pinned_id));
+
+        // Selection moves to fixture 1; the pin target still resolves to fixture 0
+        // (current_pin_target returns the held id, ignoring the new selection).
+        let sel2 = Selection::fixture(1);
+        assert_eq!(current_pin_target(&scene, &sel2, &st), Some(pinned_id));
+        // And it resolves to the original index regardless of what's selected.
+        assert_eq!(scene.fixture_index_of(st.pinned.unwrap()), Some(0));
+    }
+
+    #[test]
+    fn pin_target_requires_single_fixture() {
+        let mut scene = Scene::demo();
+        let mut extra = scene.fixtures[0].clone();
+        extra.id = 0;
+        scene.fixtures.push(extra);
+        scene.ensure_ids();
+        let st = InspectorState::default();
+        // Nothing selected → no target.
+        assert_eq!(current_pin_target(&scene, &Selection::default(), &st), None);
+        // World / multi-fixture → no single-fixture target.
+        let mut world = Selection::default();
+        world.world = true;
+        assert_eq!(current_pin_target(&scene, &world, &st), None);
+        let multi = Selection { fixtures: vec![0, 1], ..Default::default() };
+        assert_eq!(current_pin_target(&scene, &multi, &st), None);
+        // A single fixture → its id.
+        assert_eq!(current_pin_target(&scene, &Selection::fixture(0), &st), Some(scene.fixtures[0].id));
+    }
+
+    // --- P2 #66: EditCondition gray-out predicate ---------------------------
+
+    #[test]
+    fn optic_inert_when_dark_or_shutter_closed() {
+        let mut f = Scene::demo().fixtures[0].clone();
+        // Lit, open shutter → every control is live.
+        f.optics.dimmer = 1.0;
+        f.beam = 1.0;
+        f.optics.shutter = 1.0;
+        assert!(!optic_inert(&f, OpticField::Zoom));
+        assert!(!optic_inert(&f, OpticField::Cyan));
+        assert!(!optic_inert(&f, OpticField::Strobe));
+
+        // Dimmer at 0: nothing in the beam → all controls inert.
+        f.optics.dimmer = 0.0;
+        assert!(optic_inert(&f, OpticField::Zoom));
+        assert!(optic_inert(&f, OpticField::Cyan));
+        f.optics.dimmer = 1.0;
+
+        // Per-fixture beam (volumetric shaft) killed → the light still emits + shapes
+        // surfaces, so optics stay LIVE (beam only scales the haze, not the fixture).
+        f.beam = 0.0;
+        assert!(!optic_inert(&f, OpticField::Zoom));
+        f.beam = 1.0;
+
+        // Lit but the shutter is fully closed → strobe (only) is inert.
+        f.optics.shutter = 0.0;
+        assert!(optic_inert(&f, OpticField::Strobe));
+        assert!(!optic_inert(&f, OpticField::Zoom));
     }
 
     #[test]
