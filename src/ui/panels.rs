@@ -910,6 +910,11 @@ pub struct LibState {
     /// Selected rows, as indices into the current filtered+sorted list.
     pub selected: Vec<usize>,
     pub anchor: Option<usize>,
+    /// The "active" (last-clicked) catalog row, as its STABLE lib-prefs key. Read
+    /// from the viewport so pressing Enter there adds the highlighted library item
+    /// even when the Library tab isn't the visible sidebar tab. A stable key (not a
+    /// filtered-list index) so it survives search/sort/chip rebuilds.
+    pub active: Option<String>,
 }
 
 impl Default for LibState {
@@ -920,6 +925,7 @@ impl Default for LibState {
             chip: LibChip::All,
             selected: Vec::new(),
             anchor: None,
+            active: None,
         }
     }
 }
@@ -1050,6 +1056,26 @@ fn add_library_row(row: &LibRow, library: &Library, scene: &mut Scene, place: Ve
         }
         LibKind::Screen(i) => Selection::screen(scene.add_screen_at(&library.screens[i], place)),
     }
+}
+
+/// Resolve the Library tab's `active` row (a stable lib-prefs key) and add it to the
+/// scene — the path the viewport's Enter uses, so "add the highlighted library item"
+/// works even when the Library tab isn't the visible sidebar tab. `cursor` is the 3D
+/// cursor when the user has placed one, else the camera/ground anchor is used.
+/// Returns the new selection, or `None` if the key no longer resolves to a catalog row.
+pub(crate) fn add_active_library_item(
+    library: &Library,
+    scene: &mut Scene,
+    camera: &OrbitCamera,
+    active: &str,
+    cursor: Option<Vec3>,
+) -> Option<Selection> {
+    let rows = library_rows(library);
+    let row = rows
+        .iter()
+        .find(|r| crate::ui::lib_prefs::entry_key(library, r.kind.item()).as_deref() == Some(active))?;
+    let place = cursor.unwrap_or_else(|| placement_point(scene, camera));
+    Some(add_library_row(row, library, scene, place))
 }
 
 /// Left tab: the content library — a searchable, sortable list of fixture and
@@ -1330,6 +1356,9 @@ pub fn library_browser(
         // Apply a select-click (after the loop so we don't borrow rows mid-iter).
         if let Some((ri, mods)) = clicked {
             apply_lib_click(lib, ri, &mods, rows.len());
+            // Remember the highlighted row by its STABLE key so the viewport's Enter
+            // can add it (see `add_active_library_item`).
+            lib.active = rows.get(ri).map(|r| key_of(r));
         }
     });
 
@@ -4401,6 +4430,9 @@ pub fn viewport(
     transform: &mut Option<TransformOp>,
     delete_requested: &mut bool,
     replace_requested: &mut bool,
+    // Set when Enter is pressed with the viewport focused + no live transform: the
+    // caller adds the Library tab's highlighted item (mirrors Enter in the Library).
+    add_requested: &mut bool,
     // Modal-transform undo signals (set this frame): `started` = a G/R/S or gizmo
     // op just began (caller snapshots the `before` end); `finished` = it confirmed
     // (caller pushes the undo step). A cancel sets neither — the op already
@@ -5433,6 +5465,22 @@ pub fn viewport(
         && let Some(idx) = selection.primary_fixture()
     {
         *duplicate = Some(super::duplicate_dialog_for(ui.ctx(), idx));
+    }
+
+    // Enter (viewport focused, no live transform / dialog): add the Library tab's
+    // highlighted item — pressing Enter in the viewport mirrors pressing it in the
+    // Library pane. The modal-transform Enter (G/R/S confirm) is decoded only inside
+    // the `Some(op)` branch above, and `transform.is_none()` here guards it, so this
+    // can never steal a confirm. The actual add (key→row resolve + undo step) runs in
+    // `Ui::show` via `add_requested`.
+    if !consumed
+        && *viewport_focused
+        && transform.is_none()
+        && duplicate.is_none()
+        && !super::text_focus_active(ui.ctx())
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+    {
+        *add_requested = true;
     }
 
     // Focus border.
@@ -7639,5 +7687,38 @@ mod property_tests {
         assert!(!back.open_state("Transform", true)); // stored false wins over default
         assert!(back.open_state("Optics", false)); // stored true wins over default
         assert!(back.open_state("Wheels", true)); // unknown → falls back to default
+    }
+}
+
+#[cfg(test)]
+mod library_add_tests {
+    use super::*;
+    use crate::renderer::camera::OrbitCamera;
+    use crate::scene::{Library, Scene};
+
+    /// The viewport's Enter path: a stable library key resolves to a catalog row and
+    /// adds exactly one entity; an unknown key is a clean no-op.
+    #[test]
+    fn add_active_library_item_adds_the_keyed_row() {
+        let library = Library::default(); // the standard library has builtin rows
+        let rows = library_rows(&library);
+        assert!(!rows.is_empty(), "the standard library should expose rows");
+        let key = crate::ui::lib_prefs::entry_key(&library, rows[0].kind.item())
+            .expect("a catalog row has a stable key");
+
+        let mut scene = Scene::default();
+        let camera = OrbitCamera::default();
+        let count =
+            |s: &Scene| s.fixtures.len() + s.geometry.len() + s.screens.len() + s.environments.len();
+        let before = count(&scene);
+        let sel = add_active_library_item(&library, &mut scene, &camera, &key, Some(glam::Vec3::ZERO));
+        assert!(sel.is_some(), "a resolvable key adds + returns a selection");
+        assert_eq!(count(&scene), before + 1, "exactly one entity is added");
+
+        // An unknown key resolves to nothing → no add, no panic (cursor None is fine,
+        // placement_point is only reached once a row resolves).
+        let mid = count(&scene);
+        assert!(add_active_library_item(&library, &mut scene, &camera, "nope::missing", None).is_none());
+        assert_eq!(count(&scene), mid, "an unknown key adds nothing");
     }
 }

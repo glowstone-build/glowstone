@@ -602,6 +602,10 @@ pub struct Ui {
     /// once after the dock, where the patch is reachable, so the patch / groups /
     /// cues all get remapped in lock-step with the fixture removal.
     pending_delete: bool,
+    /// Enter was pressed in the viewport with a Library item highlighted — add that
+    /// item after the dock (where the library + scene are reachable). Mirrors Enter
+    /// in the Library pane.
+    pending_lib_add: bool,
     /// Path of the currently-open `.archie` project (Save vs Save As). `None` =
     /// untitled / never saved.
     current_path: Option<PathBuf>,
@@ -777,6 +781,7 @@ impl Ui {
             cues: cues::CueEngine::default(),
             undo: op::UndoStack::default(),
             pending_delete: false,
+            pending_lib_add: false,
             share: crate::share::Share::new(),
             show_share: false,
             current_path: None,
@@ -1832,6 +1837,7 @@ impl Ui {
             cues: &mut self.cues,
             delete_requested: &mut self.pending_delete,
             replace_requested: &mut self.pending_replace,
+            add_requested: &mut self.pending_lib_add,
             open_share: &mut self.show_share,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
@@ -1937,6 +1943,20 @@ impl Ui {
             self.pending_replace = false;
             if self.replace.is_none() && !self.selection.fixtures.is_empty() {
                 self.replace = Some(ReplaceDialog::default());
+            }
+        }
+        // Enter in the viewport adds the Library tab's highlighted item — resolved +
+        // added here (after the dock, where the library + scene are reachable), so it
+        // mirrors pressing Enter in the Library pane even when Library isn't the
+        // visible sidebar tab. Placed at the 3D cursor when set, else the camera
+        // anchor. Held during a render (a scene edit would reset its accumulation).
+        if self.pending_lib_add && !self.render_active {
+            self.pending_lib_add = false;
+            if let Some(active) = self.lib.active.clone() {
+                let cursor = self.cursor_3d_set.then_some(self.cursor_3d);
+                if let Some(sel) = panels::add_active_library_item(&self.library, scene, camera, &active, cursor) {
+                    self.selection = sel;
+                }
             }
         }
         replace_window(ctx, &self.library, scene, &mut self.selection, dmx.patch_mut(), &mut self.replace);
@@ -3625,6 +3645,7 @@ struct PanelViewer<'a> {
     cues: &'a mut cues::CueEngine,
     delete_requested: &'a mut bool,
     replace_requested: &'a mut bool,
+    add_requested: &'a mut bool,
     open_share: &'a mut bool,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
@@ -3757,6 +3778,7 @@ impl TabViewer for PanelViewer<'_> {
                     self.transform,
                     self.delete_requested,
                     self.replace_requested,
+                    self.add_requested,
                     self.transform_started,
                     self.transform_finished,
                     *self.active_tool,
