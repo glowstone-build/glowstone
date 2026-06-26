@@ -329,6 +329,16 @@ fn row_action(
     add_clicks: &mut Vec<i64>,
     accent: egui::Color32,
 ) {
+    // Once a fixture has been imported into this project's Library, the row shows a
+    // green, disabled "Added" — no further click (and no duplicate import) possible.
+    if share.added.contains(&rid) {
+        ui.add_enabled(
+            false,
+            Button::new(RichText::new(format!("{}  Added", theme::icon::CHECK)).color(theme::OK)),
+        )
+        .on_hover_text("Already in this project's Library — place it from the Library panel.");
+        return;
+    }
     match status {
         RowStatus::Downloading => {
             ui.add_enabled(false, Button::new("Downloading…"));
@@ -398,10 +408,14 @@ fn import_to_library(share: &mut Share, rid: i64, library: &mut Library) {
     let fname = format!("{rid}.gdtf");
     let already = library.gdtf.iter().any(|g| g.spec == fname);
     if already {
+        share.added.insert(rid); // already in this project → it reads as "Added"
         return;
     }
-    if let Err(e) = library.import_gdtf_with_source(&path, crate::gdtf::FixtureSource::GdtfShare) {
-        share.error = Some(format!("could not load downloaded fixture {rid}: {e}"));
+    match library.import_gdtf_with_source(&path, crate::gdtf::FixtureSource::GdtfShare) {
+        Ok(_) => {
+            share.added.insert(rid);
+        }
+        Err(e) => share.error = Some(format!("could not load downloaded fixture {rid}: {e}")),
     }
 }
 

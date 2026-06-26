@@ -605,8 +605,11 @@ pub struct Ui {
     /// Path of the currently-open `.archie` project (Save vs Save As). `None` =
     /// untitled / never saved.
     current_path: Option<PathBuf>,
-    /// The welcome / recover splash is open (shown once at startup).
+    /// The welcome / recover splash is open (shown at startup, on New, and from
+    /// Window ▸ Welcome / the operator search).
     show_splash: bool,
+    /// The welcome splash's hero image, decoded + uploaded once (lazily) and cached.
+    welcome_tex: Option<egui::TextureHandle>,
     /// Recent project paths (most-recent first) for the File menu + splash.
     recent: Vec<PathBuf>,
     /// Seconds since the last successful autosave (driven from `app`); the splash
@@ -778,6 +781,7 @@ impl Ui {
             show_share: false,
             current_path: None,
             show_splash: true,
+            welcome_tex: None,
             recent: project::load_recent(),
             autosave_timer: 0.0,
             viewport_regions: ViewportRegions::default(),
@@ -1458,6 +1462,32 @@ impl Ui {
         self.show_splash = false;
     }
 
+    /// Open the welcome splash — Window ▸ Welcome, the New command, and the operator
+    /// search all route here.
+    pub fn show_welcome(&mut self) {
+        self.show_splash = true;
+    }
+
+    /// The welcome hero image, decoded from the bundled JPEG and uploaded to the GPU
+    /// once (lazily, then cached). `None` only if the embedded image fails to decode.
+    fn welcome_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.welcome_tex.is_none() {
+            static BYTES: &[u8] = include_bytes!("welcome.jpg");
+            // Cap the longest side well under the GPU/egui max-texture-side (2048) —
+            // the splash shows it ~580 px wide, so this never costs visible quality and
+            // guards against a "texture too large" panic if the asset is ever swapped.
+            // `resize` only ever downscales (it preserves aspect, fitting the box).
+            let img = image::load_from_memory(BYTES)
+                .ok()?
+                .resize(1600, 1600, image::imageops::FilterType::Lanczos3)
+                .to_rgba8();
+            let (w, h) = img.dimensions();
+            let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+            self.welcome_tex = Some(ctx.load_texture("welcome-hero", color, egui::TextureOptions::LINEAR));
+        }
+        self.welcome_tex.clone()
+    }
+
     /// Raise a success toast from outside the Ui (e.g. the app loop reporting a
     /// finished render). Mirrors the in-Ui `notify` calls.
     pub fn notify_success(&mut self, msg: impl Into<String>) {
@@ -1481,57 +1511,96 @@ impl Ui {
             return;
         }
         let mut action: Option<SplashAction> = None;
+        // Pull the hero texture + recent list out before the modal closure so the
+        // closure borrows neither `self` (welcome_texture needs &mut self) nor the
+        // recent Vec mutably.
+        let hero = self.welcome_texture(ctx);
+        let recent: Vec<PathBuf> = self.recent.iter().take(8).cloned().collect();
+        let autosave = project::autosave_path().filter(|p| p.exists());
         let modal = egui::Modal::new(egui::Id::new("welcome-splash")).show(ctx, |ui| {
-            ui.set_width(560.0);
-            // Header: product + version (top-right).
-            ui.horizontal(|ui| {
-                ui.heading("previz");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("v{} alpha", env!("CARGO_PKG_VERSION")))
-                            .weak()
-                            .small(),
-                    );
+            ui.set_width(580.0);
+            // ---- hero image (full width) with the wordmark + version overlaid on a
+            // bottom scrim, like Blender's splash artwork. ----
+            if let Some(tex) = &hero {
+                let w = ui.available_width();
+                let sz = tex.size();
+                let h = w * sz[1] as f32 / sz[0] as f32;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.image(
+                    tex.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                let scrim = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.bottom() - 46.0),
+                    rect.right_bottom(),
+                );
+                painter.rect_filled(scrim, 0.0, egui::Color32::from_black_alpha(150));
+                painter.text(
+                    egui::pos2(rect.left() + 16.0, rect.bottom() - 23.0),
+                    egui::Align2::LEFT_CENTER,
+                    "previz",
+                    egui::FontId::proportional(26.0),
+                    egui::Color32::WHITE,
+                );
+                painter.text(
+                    egui::pos2(rect.right() - 16.0, rect.bottom() - 23.0),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("v{} alpha", env!("CARGO_PKG_VERSION")),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_white_alpha(210),
+                );
+            } else {
+                // Fallback if the bundled image fails to decode: the plain text header.
+                ui.horizontal(|ui| {
+                    ui.heading("previz");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("v{} alpha", env!("CARGO_PKG_VERSION")))
+                                .weak()
+                                .small(),
+                        );
+                    });
                 });
-            });
-            ui.label(egui::RichText::new("Open-source lighting previsualization").weak());
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(10.0);
+            }
 
+            ui.add_space(14.0);
             ui.columns(2, |cols| {
                 // Left — start a session.
-                cols[0].label(egui::RichText::new("Start").strong());
+                cols[0].label(egui::RichText::new("New").strong());
                 cols[0].add_space(6.0);
-                if cols[0].add_sized([220.0, 30.0], egui::Button::new("New Project")).clicked() {
+                if cols[0]
+                    .add_sized([240.0, 30.0], egui::Button::new(format!("{}  New Project", theme::icon::SCENE)))
+                    .clicked()
+                {
                     action = Some(SplashAction::New);
                 }
                 if cols[0]
-                    .add_sized([220.0, 30.0], egui::Button::new(format!("{}  Open…", theme::icon::IMPORT_MVR)))
+                    .add_sized([240.0, 30.0], egui::Button::new(format!("{}  Open…", theme::icon::IMPORT_MVR)))
                     .clicked()
                 {
                     action = Some(SplashAction::Open);
                 }
-                if let Some(ap) = project::autosave_path() {
-                    if ap.exists() {
-                        cols[0].add_space(10.0);
-                        if cols[0]
-                            .add_sized([220.0, 30.0], egui::Button::new(format!("{}  Recover Last Session", theme::icon::FRAME)))
-                            .on_hover_text("Reopen the auto-saved session from the last run")
-                            .clicked()
-                        {
-                            action = Some(SplashAction::Recover(ap));
-                        }
+                if let Some(ap) = &autosave {
+                    cols[0].add_space(10.0);
+                    if cols[0]
+                        .add_sized([240.0, 30.0], egui::Button::new(format!("{}  Recover Last Session", theme::icon::FRAME)))
+                        .on_hover_text("Reopen the auto-saved session from the last run")
+                        .clicked()
+                    {
+                        action = Some(SplashAction::Recover(ap.clone()));
                     }
                 }
 
                 // Right — recent files.
                 cols[1].label(egui::RichText::new("Recent Files").strong());
                 cols[1].add_space(6.0);
-                if self.recent.is_empty() {
+                if recent.is_empty() {
                     cols[1].label(egui::RichText::new("No recent projects").weak().small());
                 } else {
-                    for p in self.recent.iter().take(8) {
+                    for p in &recent {
                         let name = p
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
@@ -1547,7 +1616,7 @@ impl Ui {
                 }
             });
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Continue without a project").clicked() {
@@ -2608,6 +2677,8 @@ impl Ui {
             Action::Preferences => self.show_prefs = true,
             // Toggle (not just open) so the same key/palette pick closes it again.
             Action::ToggleReportLog => self.show_report_log = !self.show_report_log,
+            // Re-open the welcome / recover splash (Window ▸ Welcome + operator search).
+            Action::ShowWelcome => self.show_welcome(),
             // --- Workspaces (S1) — soft "modes" ---------------------------------
             // Activate the saved workspace at `idx` (layout + tool + overlay
             // emphasis; no locking). An out-of-range slot is a clean no-op (fewer
@@ -2621,7 +2692,10 @@ impl Ui {
             Action::Save => self.save_project(scene, camera, dmx),
             Action::SaveAs => self.save_project_as(scene, camera, dmx),
             Action::Open => self.open_project_dialog(scene, camera, dmx),
-            Action::New => self.new_project(scene, camera, dmx),
+            // "New" re-opens the welcome so the user picks how to start (a blank
+            // project, open, or a recent) — the splash's own "New Project" button is
+            // what actually creates the blank scene (`new_project`).
+            Action::New => self.show_welcome(),
             // --- Viewport-owned actions — NOT handled here ----------------------
             // G/R/S grab + X/Y/Z axis lock need the live viewport mouse state, and
             // Duplicate (D / Shift+D) is gated on the viewport's `consumed`/focus
@@ -2795,8 +2869,10 @@ impl Ui {
             egui::MenuBar::new().ui(ui, |ui| {
                 use theme::icon;
                 ui.menu_button("File", |ui| {
+                    // "New" re-opens the welcome chooser (its New Project button is what
+                    // actually creates the blank scene) — see Action::New.
                     if ui.button(format!("{}  New Project", icon::SCENE)).clicked() {
-                        self.new_project(scene, camera, dmx);
+                        self.show_welcome();
                         ui.close();
                     }
                     if ui.button(format!("{}  Open Project…", icon::IMPORT_MVR)).clicked() {
@@ -3093,6 +3169,10 @@ impl Ui {
                     ui.separator();
                     ui.checkbox(&mut self.show_perf, format!("{}  Performance", icon::PERF));
                     ui.checkbox(&mut self.show_report_log, format!("{}  Report Log", icon::LOG));
+                    if ui.button(format!("{}  Welcome", icon::INFO)).clicked() {
+                        self.show_welcome();
+                        ui.close();
+                    }
                     ui.separator();
                     ui.label(egui::RichText::new("Panels").small().weak());
                     for tab in Tab::TOGGLEABLE {

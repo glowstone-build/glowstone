@@ -524,6 +524,10 @@ pub struct Share {
     /// rids the user asked to add — downloaded in the background, then imported +
     /// placed on the main thread once the file lands.
     pub pending_add: HashSet<i64>,
+    /// rids successfully imported into THIS project's Library this session — the
+    /// catalogue row then shows a green, disabled "Added" instead of an add button.
+    /// Project-scoped (not the disk `downloaded` set), so it isn't persisted.
+    pub added: HashSet<i64>,
 
     // derived view, rebuilt only when the inputs change (cheap with 1000s of rows)
     filtered: Vec<usize>,
@@ -578,6 +582,7 @@ impl Share {
             downloaded_only: false,
             updates_only: false,
             pending_add: HashSet::new(),
+            added: HashSet::new(),
             filtered: Vec::new(),
             mfr_list: Vec::new(),
             uuid_max_rid: HashMap::new(),

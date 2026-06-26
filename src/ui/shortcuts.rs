@@ -119,6 +119,9 @@ pub enum Action {
     SaveAs,
     Open,
     New,
+    /// Re-open the welcome / recover splash on demand (Window ▸ Welcome + the
+    /// operator search). Impl in `Ui::dispatch_action` (sets `show_splash = true`).
+    ShowWelcome,
 }
 
 /// Nudge directions (floor plane + height). The `f32` in [`Action::Nudge`] is the
@@ -484,6 +487,7 @@ pub static COMMANDS: &[Command] = &[
     // --- App ---
     command_row("app.preferences", "Preferences", Category::App, Action::Preferences),
     command_row("window.report_log", "Report Log", Category::App, Action::ToggleReportLog),
+    command_row("window.welcome", "Welcome Screen", Category::App, Action::ShowWelcome),
     // --- Workspaces (S1): switch the soft "mode" — apply a saved layout + default
     // tool + overlay emphasis (no locking). One activate command per slot (so each
     // gets a stable id the palette lists + the keymap can bind) + a save command. ---
