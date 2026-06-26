@@ -498,9 +498,13 @@ pub struct Ui {
     /// written by the viewport header + N-panel. Transient (not save-persisted).
     xform: TransformPrefs,
     /// The world 3D-cursor point — the [`PivotMode::Cursor3d`] pivot (§2.4 #5).
-    /// Starts at the origin; movable later (Shift-right-click etc., a follow-up).
-    /// Transient for now (no save-format bump); the viewport draws it.
+    /// Starts at the origin; moved by Shift-right-click in the viewport (S1-3d-cursor)
+    /// or the snap/reset commands. Transient (no save-format bump); the viewport draws it.
     cursor_3d: Vec3,
+    /// Whether the 3D cursor has been positioned this session (via Shift-RMB / "Snap
+    /// to selection"). When `true` the Add menu drops new objects AT the cursor instead
+    /// of the view-centre placement default; "Reset cursor to origin" clears it.
+    cursor_3d_set: bool,
     /// Persistent content-library prefs (§3 #20): the Recent + Favourites lists
     /// shared by the Library browser and the Add menu. Loaded once at startup,
     /// saved (synchronously, tiny payload) on each add/star toggle.
@@ -629,6 +633,7 @@ impl Ui {
             active_tool: ActiveTool::default(),
             xform: TransformPrefs::default(),
             cursor_3d: Vec3::ZERO,
+            cursor_3d_set: false,
             lib_prefs: lib_prefs::LibraryPrefs::load(),
             bookmarks: bookmarks::Bookmarks::load(),
             keymap_overrides: shortcuts::KeymapOverrides::load(),
@@ -1558,6 +1563,7 @@ impl Ui {
             active_tool: &mut self.active_tool,
             xform: &mut self.xform,
             cursor_3d: &mut self.cursor_3d,
+            cursor_3d_set: &mut self.cursor_3d_set,
             lib_prefs: &mut self.lib_prefs,
             measure: &mut self.measure,
             aim: &mut self.aim,
@@ -1730,8 +1736,15 @@ impl Ui {
             windows::add_menu_window(ctx, &self.library, &mut self.add_menu, &mut self.lib_prefs)
         {
             use windows::AddAction;
-            // #19: drop at the viewport cursor/camera anchor, not the origin.
-            let place = panels::placement_point(scene, camera);
+            // #19: drop at the viewport cursor/camera anchor, not the origin. When the
+            // 3D cursor has been positioned this session (Shift-RMB / Snap to selection)
+            // it wins as the placement origin (Blender's "Add at 3D cursor"); otherwise
+            // fall back to the view-centre ground/surface anchor.
+            let place = if self.cursor_3d_set {
+                self.cursor_3d
+            } else {
+                panels::placement_point(scene, camera)
+            };
             // #20: the stable key to record in Recent (resolved against the live
             // library so an index can't drift it to the wrong entry).
             let item = match action {
@@ -1995,6 +2008,34 @@ impl Ui {
         Some((lo - pad, hi + pad))
     }
 
+    /// The median world point of the current selection (fixtures + geometry +
+    /// screens). `None` when nothing addressable is selected — the "Snap cursor to
+    /// selection" command then leaves the cursor where it is. Geometry/screen
+    /// anchors are the translation component of their world transform.
+    fn selection_median(&self, scene: &Scene) -> Option<Vec3> {
+        let mut sum = Vec3::ZERO;
+        let mut n = 0.0_f32;
+        for &i in &self.selection.fixtures {
+            if let Some(f) = scene.fixtures.get(i) {
+                sum += f.position;
+                n += 1.0;
+            }
+        }
+        for &i in &self.selection.geometry {
+            if let Some(g) = scene.geometry.get(i) {
+                sum += g.transform.w_axis.truncate();
+                n += 1.0;
+            }
+        }
+        for &i in &self.selection.screens {
+            if let Some(s) = scene.screens.get(i) {
+                sum += s.transform.w_axis.truncate();
+                n += 1.0;
+            }
+        }
+        (n > 0.0).then(|| sum / n)
+    }
+
     /// Keyboard shortcuts handled globally (camera framing/views, delete, etc.).
     /// Every bind comes from the central [`shortcuts`] registry; this is the
     /// dispatcher for the `Global` context. The viewport-owned transform binds
@@ -2188,6 +2229,24 @@ impl Ui {
                         count: self.selection.fixtures.len(),
                     };
                 }
+            }
+            // --- 3D cursor (S1-3d-cursor) --------------------------------------
+            // Snap the world cursor to the selection median (Blender's Shift+S →
+            // "Cursor to Selected"); mark it set so Add places there. A no-op when
+            // nothing addressable is selected (cursor stays put).
+            Action::SnapCursorToSelection => {
+                if let Some(p) = self.selection_median(scene) {
+                    self.cursor_3d = p;
+                    self.cursor_3d_set = true;
+                    self.notify.info("Cursor → selection");
+                }
+            }
+            // Reset the world cursor to the origin and forget the "set this session"
+            // flag, so Add returns to its view-centre placement default.
+            Action::ResetCursor => {
+                self.cursor_3d = Vec3::ZERO;
+                self.cursor_3d_set = false;
+                self.notify.info("Cursor → origin");
             }
             // --- Edit / history -------------------------------------------------
             Action::Undo => self.do_undo(scene, dmx),
@@ -2947,8 +3006,12 @@ struct PanelViewer<'a> {
     /// Transform-tool options (§2.4 #4/#5): snap + pivot mode. The header writes
     /// them; `viewport()` reads them when building a [`TransformOp`].
     xform: &'a mut TransformPrefs,
-    /// The world 3D-cursor point ([`PivotMode::Cursor3d`] pivot, §2.4 #5).
+    /// The world 3D-cursor point ([`PivotMode::Cursor3d`] pivot, §2.4 #5). Moved by
+    /// Shift-right-click in `viewport()` (S1-3d-cursor).
     cursor_3d: &'a mut Vec3,
+    /// Whether the 3D cursor has been set this session — `viewport()` flips it true
+    /// on a Shift-RMB place, so the Add menu can place AT the cursor.
+    cursor_3d_set: &'a mut bool,
     /// Persistent content-library prefs (§3 #20): Recent + Favourites for the
     /// Library browser. `library_browser()` reads them to render the pinned
     /// sections and writes (front-insert on add, star toggle) through them.
@@ -3070,6 +3133,7 @@ impl TabViewer for PanelViewer<'_> {
                     *self.active_tool,
                     *self.xform,
                     self.cursor_3d,
+                    self.cursor_3d_set,
                     self.measure,
                     self.aim,
                 );
@@ -3261,6 +3325,25 @@ mod tests {
         let clear = &|ui: &mut Ui| ui.selection = Selection::default();
         let (ui, _, _, h) = run(Action::Patch, clear);
         assert!(h && !ui.patch_dialog.open, "Patch guarded off with no selection");
+
+        // --- 3D cursor: snap to selection moves + marks set; reset zeroes + clears. ---
+        // The demo `Scene::default()` has fixtures, so fixture 0 resolves → the cursor
+        // snaps to its position and is marked set.
+        let (ui, scene, _, h) = run(Action::SnapCursorToSelection, &|ui: &mut Ui| {
+            ui.selection = Selection::fixture(0);
+        });
+        assert!(h && ui.cursor_3d_set, "SnapCursorToSelection moves the cursor + marks set");
+        assert_eq!(ui.cursor_3d, scene.fixtures[0].position, "cursor snaps to the fixture");
+        // No addressable selection → the median is None, so the cursor stays unset.
+        let (ui, _, _, h) = run(Action::SnapCursorToSelection, &|ui: &mut Ui| {
+            ui.selection = Selection::default();
+        });
+        assert!(h && !ui.cursor_3d_set, "empty selection → cursor stays unset");
+        let (ui, _, _, h) = run(Action::ResetCursor, &|ui: &mut Ui| {
+            ui.cursor_3d = Vec3::new(3.0, 4.0, 5.0);
+            ui.cursor_3d_set = true;
+        });
+        assert!(h && ui.cursor_3d == Vec3::ZERO && !ui.cursor_3d_set, "ResetCursor zeroes + clears");
 
         // --- Edit / history + App / file all reach their effect (handled). ---
         let (ui, _, _, h) = run(Action::OperatorSearch, noop);

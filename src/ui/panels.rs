@@ -3021,8 +3021,11 @@ pub fn viewport(
     // pivot are baked into the op; the header/N-panel write them.
     xform: TransformPrefs,
     // The world 3D-cursor point — the PivotMode::Cursor3d pivot (§2.4 #5). Drawn as a
-    // small target marker; movable later. &mut so a future Shift-RMB can reposition it.
+    // small red/white crosshair-ring; repositioned by Shift-right-click (S1-3d-cursor).
     cursor_3d: &mut Vec3,
+    // Set true when a Shift-RMB places the cursor this frame, so the caller's Add menu
+    // can drop new objects AT the cursor (the "set this session" gate).
+    cursor_3d_set: &mut bool,
     // The Measure tool's two-point ruler state (§2.4). Persists across frames so a
     // completed measurement stays drawn; only the Measure tool reads/writes it.
     measure: &mut MeasureState,
@@ -3717,6 +3720,32 @@ pub fn viewport(
         }
     }
 
+    // --- 3D cursor place (Shift + right-click, S1-3d-cursor) -----------------
+    // Blender's Shift-RMB world cursor: a Shift+right-click drops the 3D cursor onto
+    // the ray's world hit (geometry / ground via `pick_world_point`, falling back to a
+    // point in front of the camera when the ray escapes to the sky). Handled BEFORE
+    // the plain right-click block so it sets the cursor instead of opening the context
+    // menu, and it consumes the click so neither the menu nor select fires this frame.
+    let shift_rclick = !consumed
+        && response.secondary_clicked()
+        && ui.input(|i| i.modifiers.shift)
+        && *viewport_focused;
+    if shift_rclick
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+        let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        let (ro, rd) = camera.ray(ndc, aspect);
+        // Ground/geometry hit, else a sensible point in front of the camera so the
+        // cursor still lands somewhere visible when the ray misses the world.
+        let p = pick_world_point(scene, ro, rd).unwrap_or_else(|| ro + rd * camera.distance.max(1.0));
+        if p.is_finite() {
+            *cursor_3d = p;
+            *cursor_3d_set = true;
+        }
+        consumed = true; // never open the context menu / select on a cursor place
+    }
+
     // Right-click: select the fixture under the cursor (if not already selected),
     // then open a context menu acting on the selection.
     if !consumed {
@@ -3918,7 +3947,7 @@ pub fn viewport(
         } else if active_tool == ActiveTool::Aim {
             "aim: drag to point selected head(s) at the cursor · scroll: zoom · shift+drag: pan"
         } else {
-            "drag: orbit · shift+drag: pan · scroll: zoom · click: select · g/r/s: move/rotate/scale · d: duplicate"
+            "drag: orbit · shift+drag: pan · scroll: zoom · click: select · shift+rmb: 3d cursor · g/r/s: move/rotate/scale · d: duplicate"
         },
         None,
     );
@@ -5017,6 +5046,63 @@ mod pick_tests {
         let p = pick_world_point(&scene, ro, rd).expect("hit");
         // Should hit the top of the fixture sphere (~y=4.5), not the floor (y=0).
         assert!(p.y > 3.0, "expected fixture hit near y=4.5, got {}", p.y);
+    }
+
+    /// S1-3d-cursor: a Shift+RMB place resolves the cursor to the ray's world hit.
+    /// This mirrors the viewport's placement expression (pick_world_point, else a
+    /// point in front of the camera) so the interactive wiring's math is pinned.
+    #[test]
+    fn shift_rclick_sets_cursor_to_ground_hit() {
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        scene.screens.clear();
+        scene.geometry.clear();
+        scene.environments.clear();
+        // Downward ray from above empty space → the y=0 floor under (5, 0, -2).
+        let ro = Vec3::new(5.0, 8.0, -2.0);
+        let rd = Vec3::new(0.0, -1.0, 0.0);
+        let dist = 12.0_f32;
+        let p = pick_world_point(&scene, ro, rd).unwrap_or_else(|| ro + rd * dist.max(1.0));
+        assert!((p.y).abs() < 1e-3, "cursor lands on the floor, got y={}", p.y);
+        assert!((p.x - 5.0).abs() < 1e-3 && (p.z + 2.0).abs() < 1e-3);
+    }
+
+    /// S1-3d-cursor: when the ray escapes to the sky (no hit) the cursor falls back to
+    /// a finite point in front of the camera, never NaN/origin.
+    #[test]
+    fn shift_rclick_cursor_falls_back_in_front() {
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        scene.screens.clear();
+        scene.geometry.clear();
+        scene.environments.clear();
+        // Upward ray that never meets the y=0 plane.
+        let ro = Vec3::new(0.0, 2.0, 0.0);
+        let rd = Vec3::new(0.0, 1.0, 0.0);
+        let dist = 10.0_f32;
+        let p = pick_world_point(&scene, ro, rd).unwrap_or_else(|| ro + rd * dist.max(1.0));
+        assert!(p.is_finite(), "fallback cursor must be finite, got {p:?}");
+        assert!(p.y > 2.0, "fallback is in front of the camera, got {p:?}");
+    }
+
+    /// S1-3d-cursor: the Cursor3d pivot mode reads the supplied cursor point verbatim
+    /// (so a Cursor-pivot rotate/scale spins/grows about it), and is independent of
+    /// the selection's own centroid.
+    #[test]
+    fn pivot_cursor3d_uses_the_cursor_point() {
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        scene.screens.clear();
+        scene.geometry.clear();
+        let demo = Scene::demo();
+        scene.fixtures.push(demo.fixtures[0].clone());
+        scene.fixtures[0].position = Vec3::new(10.0, 0.0, 10.0);
+        let cursor = Vec3::new(-3.0, 1.5, 4.0);
+        let pivot = compute_pivot(&scene, &[0], &[], PivotMode::Cursor3d, cursor);
+        assert_eq!(pivot, cursor, "Cursor3d pivot ignores selection, uses the cursor");
+        // The Median pivot, by contrast, is the fixture's own position.
+        let median = compute_pivot(&scene, &[0], &[], PivotMode::Median, cursor);
+        assert!((median - Vec3::new(10.0, 0.0, 10.0)).length() < 1.0, "median ≠ cursor");
     }
 }
 

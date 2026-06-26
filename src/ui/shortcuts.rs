@@ -68,6 +68,10 @@ pub enum Action {
     AddMenu,
     Patch,
     Unpatch,
+    /// Snap the 3D cursor to the selection's median (impl in `Ui::dispatch_action`).
+    SnapCursorToSelection,
+    /// Reset the 3D cursor to the world origin (impl in `Ui::dispatch_action`).
+    ResetCursor,
     /// N — toggle the viewport N-panel (Item/Transform sidebar). Impl in `show()`.
     ToggleNPanel,
     /// T — toggle the viewport T-panel (tool rail shell). Impl in `show()`.
@@ -402,6 +406,11 @@ pub static COMMANDS: &[Command] = &[
     // --- Add ---
     command_row("kmi.add_menu", "Add menu (at cursor)", Category::Add, Action::AddMenu),
     op_row("object.add", "Add Object…", Category::Add, Action::AddMenu, OpInvoke::Dialog),
+    // --- 3D cursor (S1-3d-cursor): the Blender Shift-RMB world cursor. The set is
+    // wired in `panels::viewport` (Shift+right-click); these two commands snap it to
+    // the selection / reset it to the origin (impl in `Ui::dispatch_action`). ---
+    command_row("cursor.snap_to_selection", "Snap cursor to selection", Category::Transform, Action::SnapCursorToSelection),
+    command_row("cursor.reset", "Reset cursor to origin", Category::Transform, Action::ResetCursor),
     // --- Object / history ---
     op_row("fixture.duplicate", "Duplicate / Array…", Category::Object, Action::Duplicate, OpInvoke::Dialog),
     op_row("fixture.patch", "Patch Fixtures…", Category::Object, Action::Patch, OpInvoke::Dialog),
