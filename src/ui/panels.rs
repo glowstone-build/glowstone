@@ -3448,6 +3448,93 @@ fn dup_grab_delta(op: &TransformOp, scene: &Scene) -> Vec3 {
     }
 }
 
+/// Drop the last `count` objects of `kind`'s Vec — the live Shift+D array clones,
+/// which are always appended at the END (LIFO), so a tail-truncate removes exactly
+/// them (on shrink or cancel) without disturbing the base copies' indices.
+fn truncate_objects(scene: &mut Scene, kind: ObjectRef, count: usize) {
+    match kind {
+        ObjectRef::Fixture(_) => {
+            let l = scene.fixtures.len();
+            scene.fixtures.truncate(l.saturating_sub(count));
+        }
+        ObjectRef::Geometry(_) => {
+            let l = scene.geometry.len();
+            scene.geometry.truncate(l.saturating_sub(count));
+        }
+        ObjectRef::Screen(_) => {
+            let l = scene.screens.len();
+            scene.screens.truncate(l.saturating_sub(count));
+        }
+        ObjectRef::Environment(_) => {
+            let l = scene.environments.len();
+            scene.environments.truncate(l.saturating_sub(count));
+        }
+    }
+}
+
+/// Place live array clone `k` (mirroring base copy `b`) at `base_home[b] + off` —
+/// the base copy's op-start pose translated along the drag vector.
+fn place_array_extra(scene: &mut Scene, op: &TransformOp, k: usize, b: usize, off: Vec3) {
+    match op.dup_extra[k] {
+        ObjectRef::Fixture(e) => {
+            if let (Some((_, p0, q0)), Some(f)) = (op.start.get(b), scene.fixtures.get_mut(e)) {
+                f.position = *p0 + off;
+                f.orientation = *q0;
+                f.snap_movement();
+            }
+        }
+        ObjectRef::Geometry(e) => {
+            if let (Some((_, m0)), Some(g)) = (op.geo_start.get(b), scene.geometry.get_mut(e)) {
+                g.transform = Mat4::from_translation(off) * *m0;
+            }
+        }
+        ObjectRef::Screen(e) => {
+            if let (Some((_, m0)), Some(s)) = (op.screen_start.get(b), scene.screens.get_mut(e)) {
+                s.transform = Mat4::from_translation(off) * *m0;
+            }
+        }
+        ObjectRef::Environment(e) => {
+            if let (Some((_, c0, sz0)), Some(env)) = (op.env_start.get(b), scene.environments.get_mut(e)) {
+                env.center = *c0 + off;
+                env.size = *sz0;
+            }
+        }
+    }
+}
+
+/// Regenerate the LIVE Shift+D array each frame so the WHOLE array follows the
+/// cursor while a clone-count is typed (not just one dragged copy). Grows/shrinks
+/// the clone set to the typed count and repositions every clone along the current
+/// drag vector. Clones live at the END of their kind's Vec (LIFO) so shrink/cancel
+/// tail-truncates them. Skipped on the op's first frame (where the move's `before`
+/// undo snapshot is captured — BEFORE any extras exist — so undo removes them).
+fn update_dup_array(op: &mut TransformOp, scene: &mut Scene) {
+    if !op.from_duplicate || op.dup_base.is_empty() {
+        return;
+    }
+    let base_len = op.dup_base.len();
+    let n = if op.num.active { (op.num.value().round() as i64).clamp(1, 1000) as u32 } else { 1 };
+    let desired = (n.saturating_sub(1) as usize) * base_len; // count of EXTRA clones (#2..N)
+    if op.dup_extra.len() > desired {
+        let remove = op.dup_extra.len() - desired;
+        truncate_objects(scene, op.dup_base[0], remove);
+        op.dup_extra.truncate(desired);
+    }
+    while op.dup_extra.len() < desired {
+        let b = op.dup_extra.len() % base_len;
+        match scene.duplicate_object(op.dup_base[b]) {
+            Some(new) => op.dup_extra.push(new),
+            None => break,
+        }
+    }
+    let delta = dup_grab_delta(op, scene);
+    for k in 0..op.dup_extra.len() {
+        let b = k % base_len;
+        let i = 2 + (k / base_len); // array index (#1 is the base copy)
+        place_array_extra(scene, op, k, b, delta * i as f32);
+    }
+}
+
 /// Live state for the Measure tool (§2.4) — a read-only two-point ruler that never
 /// mutates the scene (so no op / no undo). `a` is the first point; once `b` is set the
 /// segment + its distance label persist until a third click resets to a fresh `a`.
@@ -3738,6 +3825,7 @@ pub fn viewport(
                 orientation: xform.orientation,
                 from_duplicate: true,
                 dup_base: objs,
+                dup_extra: Vec::new(),
             });
             *transform_started = true;
         }
@@ -3818,7 +3906,7 @@ pub fn viewport(
                     snap: xform.snap,
                     orientation: xform.orientation,
                     from_duplicate: false,
-                    dup_base: Vec::new(),
+                    dup_base: Vec::new(), dup_extra: Vec::new(),
                 });
                 *transform_started = true;
             }
@@ -4083,6 +4171,15 @@ pub fn viewport(
                     e.size = *sz0;
                 }
             }
+            // Drop the live duplicate-array clones — cancelling a Shift+D grab leaves
+            // only the base copies at the source (Blender). The base clone was its own
+            // undo step (it stands; one undo removes it).
+            if op.from_duplicate
+                && !op.dup_extra.is_empty()
+                && let Some(&kind) = op.dup_base.first()
+            {
+                truncate_objects(scene, kind, op.dup_extra.len());
+            }
             *transform = None;
         } else {
             if let Some(cur) = ui.input(|i| i.pointer.latest_pos()) {
@@ -4092,6 +4189,13 @@ pub fn viewport(
                 let ctrl = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
                 let snap_on = op.snap.on ^ ctrl;
                 apply_transform(op, scene, camera, cur, snap_on);
+            }
+            // LIVE duplicate-array: after the base copies moved, (re)build the array
+            // clones so the WHOLE array follows the cursor while a count is typed (not
+            // just one dragged copy). Skipped on the op's first frame, where the move's
+            // `before` undo snapshot is taken before any extras exist.
+            if op.from_duplicate && !*transform_started {
+                update_dup_array(op, scene);
             }
             // The key cluster (X/Y/Z · type number · Enter/Esc) is read LIVE from
             // the keymap so the pill can never drift from the binds (#23). When an
@@ -4115,22 +4219,13 @@ pub fn viewport(
                 );
             }
             if confirm {
-                // Duplicate-grab with a typed clone-count: array the extra copies
-                // evenly along the drag vector (the live copy is #1; add N-1 more at
-                // 2·delta … N·delta). They fold into THIS move's undo step.
-                if op.from_duplicate && op.num.active {
-                    let count = (op.num.value().round() as i64).clamp(1, 1000) as u32;
-                    if count > 1 {
-                        let delta = dup_grab_delta(op, scene);
-                        for j in 1..count {
-                            let off = delta * j as f32;
-                            for &base in &op.dup_base {
-                                if let Some(c) = scene.duplicate_object(base) {
-                                    scene.translate_object(c, off);
-                                }
-                            }
-                        }
-                    }
+                // The array is already LIVE (rebuilt each frame above); committing just
+                // selects the whole result (base copies + array clones) so the user can
+                // keep editing them as a unit.
+                if op.from_duplicate {
+                    let mut all = op.dup_base.clone();
+                    all.extend(op.dup_extra.iter().copied());
+                    *selection = Selection::from_object_refs(&all);
                 }
                 *transform = None;
                 *transform_finished = true;
@@ -4191,7 +4286,7 @@ pub fn viewport(
                     snap: xform.snap,
                     orientation: xform.orientation,
                     from_duplicate: false,
-                    dup_base: Vec::new(),
+                    dup_base: Vec::new(), dup_extra: Vec::new(),
                 });
                 *transform_started = true;
                 consumed = true;
@@ -5956,7 +6051,48 @@ mod transform_tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), orientation }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), dup_extra: Vec::new(), orientation }
+    }
+
+    #[test]
+    fn shift_d_array_is_live_and_reversible() {
+        let mut scene = Scene::demo(); // one fixture at index 0
+        // Simulate Shift+D's clone: a base copy of fixture 0.
+        let base = scene.duplicate_object(ObjectRef::Fixture(0)).unwrap();
+        let ObjectRef::Fixture(bi) = base else { panic!("expected a fixture") };
+        let home = scene.fixtures[bi].position;
+        let n_before = scene.fixtures.len();
+        // The grab has moved the base copy by `delta` from its op-start home.
+        let delta = Vec3::new(2.0, 0.0, 0.0);
+        scene.fixtures[bi].position = home + delta;
+
+        let mut op = make_op(TransformKind::Move, None, Vec3::ZERO, bi, home);
+        op.from_duplicate = true;
+        op.dup_base = vec![base];
+        // Type "3" → an array of 3 (the base copy #1 + two LIVE extras #2/#3).
+        op.num = NumInput { str: "3".into(), sign: false, active: true };
+
+        update_dup_array(&mut op, &mut scene);
+        assert_eq!(op.dup_extra.len(), 2, "count 3 → 2 extra clones");
+        assert_eq!(scene.fixtures.len(), n_before + 2, "extras pushed onto the scene");
+        let e0 = match op.dup_extra[0] {
+            ObjectRef::Fixture(i) => i,
+            _ => panic!("fixture"),
+        };
+        let e1 = match op.dup_extra[1] {
+            ObjectRef::Fixture(i) => i,
+            _ => panic!("fixture"),
+        };
+        // #1 stays at home+delta; extras are evenly spaced at home+2·delta, home+3·delta.
+        assert!((scene.fixtures[bi].position - (home + delta)).length() < 1e-3);
+        assert!((scene.fixtures[e0].position - (home + delta * 2.0)).length() < 1e-3);
+        assert!((scene.fixtures[e1].position - (home + delta * 3.0)).length() < 1e-3);
+
+        // Shrinking the count back to 1 tail-truncates the live extras cleanly.
+        op.num = NumInput::default();
+        update_dup_array(&mut op, &mut scene);
+        assert!(op.dup_extra.is_empty(), "count 1 → no extras");
+        assert_eq!(scene.fixtures.len(), n_before, "extras removed from the scene");
     }
 
     #[test]
@@ -5997,7 +6133,7 @@ mod transform_tests {
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
             from_duplicate: false,
-            dup_base: Vec::new(),
+            dup_base: Vec::new(), dup_extra: Vec::new(),
         };
         // Drag to a clearly different screen point so the in-plane delta is nonzero.
         apply_transform(&o, &mut scene, &cam, egui::pos2(560.0, 180.0), false);
@@ -6191,7 +6327,7 @@ mod transform_tests {
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
             from_duplicate: false,
-            dup_base: Vec::new(),
+            dup_base: Vec::new(), dup_extra: Vec::new(),
         };
         o.num.active = true;
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
@@ -6233,7 +6369,7 @@ mod transform_tests {
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
             from_duplicate: false,
-            dup_base: Vec::new(),
+            dup_base: Vec::new(), dup_extra: Vec::new(),
         };
         apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
         // At least one position moved (they orbited the centroid).

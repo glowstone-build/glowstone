@@ -325,6 +325,11 @@ pub struct TransformOp {
     /// The freshly-created copies (this op's targets) — the base set the array
     /// duplicates from when a clone-count is typed during a duplicate-grab.
     pub dup_base: Vec<ObjectRef>,
+    /// The LIVE array clones (#2..N) shown while a count is typed mid-drag. Held
+    /// at the END of their kind's scene Vec (LIFO), regenerated each frame from
+    /// `dup_base` + the current drag delta, and dropped on cancel. Empty until a
+    /// count > 1 is typed.
+    pub dup_extra: Vec<ObjectRef>,
 }
 
 impl TransformOp {
