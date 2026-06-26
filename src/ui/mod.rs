@@ -1532,17 +1532,28 @@ impl Ui {
                 let h = w * sz[1] as f32 / sz[0] as f32;
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
-                painter.image(
-                    tex.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
+                // Round ALL FOUR corners so the artwork reads as a rounded card inside
+                // the modal (the dialog itself rounds at ~7px). The bottom corners must
+                // round too — the semi-transparent scrim can't hide a square image
+                // corner behind it.
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                let radius = egui::CornerRadius::same(6);
+                painter.add(
+                    egui::epaint::RectShape::filled(rect, radius, egui::Color32::WHITE)
+                        .with_texture(tex.id(), uv),
                 );
                 let scrim = egui::Rect::from_min_max(
                     egui::pos2(rect.left(), rect.bottom() - 46.0),
                     rect.right_bottom(),
                 );
-                painter.rect_filled(scrim, 0.0, egui::Color32::from_black_alpha(150));
+                // Match the dark strip to the image's bottom edge: round its BOTTOM
+                // corners by the same radius so the scrim hugs the rounded outline.
+                let bottom = egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 };
+                painter.add(egui::epaint::RectShape::filled(
+                    scrim,
+                    bottom,
+                    egui::Color32::from_black_alpha(150),
+                ));
                 painter.text(
                     egui::pos2(rect.left() + 16.0, rect.bottom() - 23.0),
                     egui::Align2::LEFT_CENTER,
@@ -3287,8 +3298,10 @@ impl Ui {
                     } else {
                         (egui::Color32::from_gray(120), "DMX off")
                     };
-                    ui.colored_label(dot, "•");
-                    ui.label(txt);
+                    // Painter-drawn status dot: a small inline cell + filled circle,
+                    // a breathing gap, then the label — the bundled fonts have no
+                    // round glyph, and a naked "•" sits too tight against the words.
+                    status_dot(ui, dot, txt);
                     ui.separator();
                     ui.label(if self.prefs.units_feet { "ft" } else { "m" });
                 });
@@ -3435,6 +3448,19 @@ fn duplicate_window(
     confirmed
 }
 
+/// Draw a clean inline status dot + label: a small allocated cell with a
+/// painter-drawn filled circle, a breathing gap, then the label in the same
+/// colour. The bundled fonts ship no round glyph (●/○ render as tofu), and a
+/// naked "•" reads tiny and jammed against the words — this keeps it legible.
+/// Used inside `ui.horizontal` rows; mirror the spec in `panels.rs`.
+pub(crate) fn status_dot(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
+    // Small inline cell just wide enough for the circle; vertically centred.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, ui.spacing().interact_size.y), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+    ui.add_space(5.0); // breathing room before the words
+    ui.label(egui::RichText::new(label).size(11.0).color(color));
+}
+
 /// The Replace-fixtures dialog (Shift+R): pick a profile from the **project
 /// library** (imported GDTFs first, then the built-in profiles) and swap every
 /// selected fixture's type for it — in place, keeping each fixture's position,
@@ -3500,7 +3526,13 @@ fn replace_window(
             ui.checkbox(&mut d.mesh_only, "Replace mesh/model only")
                 .on_hover_text("Swap just the visual model + beam; keep the name, DMX patch, mode and levels. Off = full replace (re-patches and renames to the new type).");
             ui.separator();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // Cap the LIST at a sensible height and scroll it — the filter box,
+            // checkbox and header above stay pinned so the dialog stays compact
+            // instead of growing to full screen height on a long library.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .max_height(360.0)
+                .show(ui, |ui| {
                 let mut any = false;
                 // GDTF fixtures in the project (imported + already placed) first.
                 let gdtf: Vec<usize> = (0..gdtf_arcs.len())

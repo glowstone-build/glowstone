@@ -27,8 +27,8 @@ fn sector_at(dx: f32, dy: f32, n: usize) -> usize {
     (norm / tau * n as f32).floor() as usize % n
 }
 
-/// One labelled sector. `icon` is an optional Phosphor glyph drawn above the label
-/// (see [`crate::ui::theme::icon`]); pass `""` for none.
+/// One labelled sector. `icon` is an optional Phosphor glyph drawn inline before
+/// the label (see [`crate::ui::theme::icon`]); pass `""` for none.
 pub struct PieItem {
     pub icon: &'static str,
     pub label: String,
@@ -134,11 +134,14 @@ impl<'a> Pie<'a> {
                 let pos = center + dir * Self::RING;
                 let active = highlight == Some(i);
 
-                // Pill behind the label so it reads over the 3D viewport.
+                // Pill behind the label so it reads over the 3D viewport. Icon and
+                // label sit on ONE line ("⊞ Beauty"), separated by a couple of
+                // spaces — `layout_no_wrap` keeps it single-line, so the pill sizes
+                // itself to that line's width/height (shorter + wider than stacked).
                 let text = if item.icon.is_empty() {
                     item.label.clone()
                 } else {
-                    format!("{}\n{}", item.icon, item.label)
+                    format!("{}  {}", item.icon, item.label)
                 };
                 let galley = painter.layout_no_wrap(
                     text,

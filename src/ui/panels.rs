@@ -977,11 +977,9 @@ struct LibRow {
 /// coloured dot + label keeps it legible at small sizes without a heavy box.
 pub(crate) fn source_chip(ui: &mut egui::Ui, source: crate::gdtf::FixtureSource) {
     let [r, g, b] = source.color_rgb();
-    ui.label(
-        egui::RichText::new(format!("• {}", source.label()))
-            .size(9.0)
-            .color(Color32::from_rgb(r, g, b)),
-    );
+    // A clean painter-drawn dot + label (the "•" glyph reads tiny/jammed, and the
+    // bundled fonts ship no round glyph). Identical spec to `super::status_dot`.
+    super::status_dot(ui, Color32::from_rgb(r, g, b), source.label());
 }
 
 /// Build the flat row list from the library (Imported GDTF, then built-in
@@ -1525,23 +1523,30 @@ fn library_row_widget(
     }
     let text_w = (rect.width() - 30.0 - 40.0).max(40.0);
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), &row.name, 13.0, ink.primary, text_w);
-    // Reserve room on the meta line for the colour-coded source chip (bug 11).
-    let meta_w = if row.source.is_some() { (text_w - 72.0).max(30.0) } else { text_w };
+    // Reserve room on the meta line for the colour-coded source chip + action
+    // gutter (bug 11 + the chip/icon overlap fix): chip ~70px + the 44px gutter.
+    let meta_w = if row.source.is_some() { (text_w - 110.0).max(30.0) } else { text_w };
     paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, meta_w);
+    // Reserve a fixed right-hand gutter for the +/★ action icons so the source
+    // chip (drawn to the LEFT of it) never collides with them (bug: chip + icons
+    // overlapped). The chip sits on the meta line, ending where the gutter begins.
+    const ACTION_GUTTER: f32 = 44.0;
     if let Some(src) = row.source {
         let [cr, cg, cb] = src.color_rgb();
-        painter.text(
-            egui::pos2(rect.right() - 36.0, rect.top() + 24.0),
-            egui::Align2::RIGHT_CENTER,
-            format!("• {}", src.label()),
-            egui::FontId::proportional(9.0),
-            Color32::from_rgb(cr, cg, cb),
-        );
+        let color = Color32::from_rgb(cr, cg, cb);
+        // Painter-drawn dot + label (the "•" glyph reads tiny/jammed, and the
+        // bundled fonts ship no round glyph). Mirrors the `status_dot` spec: a
+        // small dot, a breathing gap, then the label — right-aligned as a unit.
+        let label_pos = egui::pos2(rect.right() - ACTION_GUTTER, rect.top() + 24.0);
+        let galley = painter.layout_no_wrap(src.label().to_owned(), egui::FontId::proportional(10.0), color);
+        let lw = galley.size().x;
+        painter.galley(egui::pos2(label_pos.x - lw, label_pos.y - galley.size().y / 2.0), galley, color);
+        painter.circle_filled(egui::pos2(label_pos.x - lw - 5.0 - 3.5, label_pos.y), 3.5, color);
     }
-    // A "+" affordance on hover (left of the star), right-aligned.
+    // A "+" affordance on hover (left of the star), right-aligned in the gutter.
     if resp.hovered() {
         painter.text(
-            rect.right_center() + egui::vec2(-30.0, 0.0),
+            rect.right_center() + egui::vec2(-28.0, 0.0),
             egui::Align2::RIGHT_CENTER,
             theme::icon::ADD,
             egui::FontId::proportional(15.0),
@@ -1915,6 +1920,21 @@ fn inspector_body(
     render_ui: &mut RenderUiState,
     settings: &mut crate::scene::RenderSettings,
 ) {
+    // Width fit (responsiveness fix): the dock disables horizontal scroll for the
+    // Inspector, so any over-wide widget would clip and leak. Pin the body to the
+    // panel width and shrink egui 0.34's default-wide Slider so its bar fits the
+    // value column at a narrow (~280px) inspector — no horizontal overflow. The
+    // value column is roughly the panel minus the label/arrow gutter; clamp the
+    // slider bar to it (floored so it stays grabbable).
+    ui.set_max_width(ui.available_width());
+    let avail = ui.available_width();
+    ui.spacing_mut().slider_width = (avail - 140.0).clamp(60.0, 220.0);
+    // Tighten the inter-widget gap + the min interactive width so the multi-field
+    // rows (Position/Rotation x/y/z DragValues, the colour well) pack into the
+    // value column at a narrow width instead of pushing past the panel edge.
+    ui.spacing_mut().item_spacing.x = 4.0;
+    ui.spacing_mut().interact_size.x = 24.0;
+
     // PIN (P2 #65): while a fixture is pinned, the inspector ignores the live
     // selection and stays on that fixture (resolved by stable id, so it survives
     // reorders). A stale pin (deleted fixture) is cleared by the header banner,
@@ -2350,18 +2370,80 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
 
     let def = FixtureDefaults::for_fixture(fixture);
 
+    // TRANSFORM = the rig placement: hang Position + Rotation + the pan/tilt motor
+    // speed. Pan/Tilt themselves are head angles → moved to the Fixture category.
     category(
         ui,
         state,
         "Transform",
         format!("{}  Transform", theme::icon::INSPECTOR),
         true,
-        &["Pan", "Tilt", "Position"],
+        &["Position", "Rotation", "Move speed"],
         |ui, fs| {
+            // Size the x/y/z fields to the value column so all THREE fit a narrow
+            // inspector (a default DragValue grows to its content, overflowing + clipping
+            // z; add_sized pins each field so the row never spills past the panel edge).
+            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fh = ui.spacing().interact_size.y;
             Grid::new("fx-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Common: pan/tilt (the live-aim controls); each gets a revert
-                // arrow back to its rest angle (0). Position has no template
-                // default → kept arrow-free, in the Advanced disclosure below.
+                // Position has no template default → kept arrow-free.
+                row(ui, fs, "Position", false, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                    });
+                });
+                // Rotation = the rig HANG (how the fixture is mounted), separate from
+                // the live Pan/Tilt (now in Fixture). Euler for display; recomposed
+                // only on edit (revert arrow → identity). Mirrors bulk_inspector's
+                // YXZ orientation math, but absolute for a single fixture.
+                let (ry, rx, rz) = fixture.orientation.to_euler(glam::EulerRot::YXZ);
+                let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
+                let mut rot_changed = false;
+                let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
+                if row(ui, fs, "Rotation", differs, |ui| {
+                    ui.horizontal(|ui| {
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                    });
+                }) {
+                    ex = 0.0;
+                    ey = 0.0;
+                    ez = 0.0;
+                    rot_changed = true;
+                }
+                if rot_changed {
+                    fixture.orientation = glam::Quat::from_euler(
+                        glam::EulerRot::YXZ,
+                        ey.to_radians(),
+                        ex.to_radians(),
+                        ez.to_radians(),
+                    );
+                }
+                // Move speed = the pan/tilt motor slew (0 = snap, 1 = slowest).
+                if row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
+                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
+                        .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
+                }) {
+                    fixture.move_speed = 0.0;
+                }
+            });
+        },
+    );
+
+    // FIXTURE = the head's own properties: aim (Pan/Tilt), level, colour, beam.
+    category(
+        ui,
+        state,
+        "Fixture",
+        format!("{}  Fixture", theme::icon::COLOR),
+        true,
+        &["Pan", "Tilt", "Dimmer", "Color", "Beam", "Beam angle"],
+        |ui, fs| {
+            Grid::new("fx-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                // Pan/Tilt: the live-aim head angles (each reverts to rest 0).
                 if row(ui, fs, "Pan", !approx(fixture.pan, def.pan), |ui| {
                     ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"));
                 }) {
@@ -2372,58 +2454,6 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
                 }) {
                     fixture.tilt = def.tilt;
                 }
-            });
-            advanced_section_filtered(ui, fs, "fx-transform", &["Position", "Rotation"], |ui| {
-                Grid::new("fx-transform-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    row(ui, fs, "Position", false, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                            ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                            ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
-                        });
-                    });
-                    // Rotation = the rig HANG (how the fixture is mounted), separate from
-                    // the live Pan/Tilt above. Euler for display; recomposed only on edit
-                    // (revert arrow → identity). Previously only reachable via viewport R.
-                    let rot0 = fixture.orientation;
-                    let (ry, rx, rz) = rot0.to_euler(glam::EulerRot::YXZ);
-                    let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
-                    let mut rot_changed = false;
-                    let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-                    if row(ui, fs, "Rotation", differs, |ui| {
-                        ui.horizontal(|ui| {
-                            rot_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                            rot_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                            rot_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
-                        });
-                    }) {
-                        ex = 0.0;
-                        ey = 0.0;
-                        ez = 0.0;
-                        rot_changed = true;
-                    }
-                    if rot_changed {
-                        fixture.orientation = glam::Quat::from_euler(
-                            glam::EulerRot::YXZ,
-                            ey.to_radians(),
-                            ex.to_radians(),
-                            ez.to_radians(),
-                        );
-                    }
-                });
-            });
-        },
-    );
-
-    category(
-        ui,
-        state,
-        "Fixture",
-        format!("{}  Fixture", theme::icon::COLOR),
-        true,
-        &["Dimmer", "Color", "Beam", "Beam angle"],
-        |ui, fs| {
-            Grid::new("fx-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 // Common: the everyday level + colour controls.
                 if row(ui, fs, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer), |ui| {
                     ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
@@ -2479,19 +2509,21 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut I
         true,
         &["Center", "Size"],
         |ui, fs| {
+            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fh = ui.spacing().interact_size.y;
             Grid::new("env-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 row(ui, fs, "Center", false, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut env.center.x).speed(0.1).prefix("x "));
-                        ui.add(DragValue::new(&mut env.center.y).speed(0.1).prefix("y "));
-                        ui.add(DragValue::new(&mut env.center.z).speed(0.1).prefix("z "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut env.center.x).speed(0.1).prefix("x "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut env.center.y).speed(0.1).prefix("y "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut env.center.z).speed(0.1).prefix("z "));
                     });
                 });
                 row(ui, fs, "Size", false, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("w "));
-                        ui.add(DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("h "));
-                        ui.add(DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("d "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("w "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("h "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("d "));
                     });
                 });
             });
@@ -2603,12 +2635,14 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
         true,
         &["Position", "Rotation", "Scale"],
         |ui, fs| {
+            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fh = ui.spacing().interact_size.y;
             Grid::new("geo-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 row(ui, fs, "Position", false, |ui| {
                     ui.horizontal(|ui| {
-                        pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
-                        pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
-                        pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
                     });
                 });
                 // Rotation reverts to identity (0/0/0), scale to unit — the
@@ -2616,9 +2650,9 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
                 let rot_differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
                 if row(ui, fs, "Rotation", rot_differs, |ui| {
                     ui.horizontal(|ui| {
-                        rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                        rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                        rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
                     });
                 }) {
                     ex = 0.0;
@@ -2693,19 +2727,21 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
         true,
         &["Position", "Rotation", "Scale"],
         |ui, fs| {
+            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fh = ui.spacing().interact_size.y;
             Grid::new("led-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 row(ui, fs, "Position", false, |ui| {
                     ui.horizontal(|ui| {
-                        pos_changed |= ui.add(DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
-                        pos_changed |= ui.add(DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
-                        pos_changed |= ui.add(DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
                     });
                 });
                 row(ui, fs, "Rotation", false, |ui| {
                     ui.horizontal(|ui| {
-                        rs_changed |= ui.add(DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                        rs_changed |= ui.add(DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                        rs_changed |= ui.add(DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
                     });
                 });
                 row(ui, fs, "Scale", false, |ui| {
@@ -3145,10 +3181,63 @@ fn gdtf_inspector(
         "Transform",
         format!("{}  Transform", theme::icon::INSPECTOR),
         true,
-        &["Pan", "Tilt", "Position", "Move speed"],
+        &["Position", "Rotation", "Move speed"],
         |ui, fs| {
+            // Size x/y/z fields to the value column so all three fit a narrow inspector.
+            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fh = ui.spacing().interact_size.y;
             Grid::new("gdtf-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Common: the live-aim angles (each reverts to 0).
+                // Position = the rig HANG placement (Pan/Tilt moved to Fixture).
+                row(ui, fs, "Position", false, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
+                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
+                    });
+                });
+                // Rotation = the rig HANG orientation, separate from the live Pan/Tilt.
+                // Euler (YXZ) for display; recomposed on edit; revert arrow → identity.
+                let (ry, rx, rz) = fixture.orientation.to_euler(glam::EulerRot::YXZ);
+                let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
+                let mut rot_changed = false;
+                let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
+                if row(ui, fs, "Rotation", differs, |ui| {
+                    ui.horizontal(|ui| {
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                    });
+                }) {
+                    ex = 0.0;
+                    ey = 0.0;
+                    ez = 0.0;
+                    rot_changed = true;
+                }
+                if rot_changed {
+                    fixture.orientation =
+                        glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
+                }
+                if row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
+                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
+                        .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
+                }) {
+                    fixture.move_speed = 0.0;
+                }
+            });
+        },
+    );
+
+    category(
+        ui,
+        state,
+        "Fixture",
+        format!("{}  Fixture", theme::icon::COLOR),
+        true,
+        &["Pan", "Tilt", "Dimmer", "Color", "Beam"],
+        |ui, fs| {
+            Grid::new("gdtf-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                // Pan/Tilt: the live-aim head angles (moved here from Transform — they're
+                // a fixture property, not the rig placement). Each reverts to rest 0.
                 if row(ui, fs, "Pan", !approx(fixture.pan, def.pan), |ui| {
                     ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"))
                         .on_hover_text(format!("commanded · now {:.0}°", fixture.pan_actual));
@@ -3161,37 +3250,6 @@ fn gdtf_inspector(
                 }) {
                     fixture.tilt = def.tilt;
                 }
-            });
-            // Advanced: hang position + motor speed (rarely retouched live).
-            advanced_section_filtered(ui, fs, "gdtf-transform", &["Position", "Move speed"], |ui| {
-                Grid::new("gdtf-transform-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    row(ui, fs, "Position", false, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add(DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                            ui.add(DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                            ui.add(DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
-                        });
-                    });
-                    if row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
-                        ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0))
-                            .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
-                    }) {
-                        fixture.move_speed = 0.0;
-                    }
-                });
-            });
-        },
-    );
-
-    category(
-        ui,
-        state,
-        "Fixture",
-        format!("{}  Fixture", theme::icon::COLOR),
-        true,
-        &["Dimmer", "Color", "Beam"],
-        |ui, fs| {
-            Grid::new("gdtf-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 if row(ui, fs, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer), |ui| {
                     ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
                 }) {
@@ -5530,14 +5588,28 @@ pub fn viewport(
         None
     };
     if let Some(text) = sel_text {
+        // Drawn AFTER the move gizmo (above) so it sits on top; with a centred
+        // object the gizmo handles can reach this corner, so the pill gets an
+        // OPAQUE rounded background (not the shared translucent overlay) and stays
+        // firmly in the top-right with padding — readable, never visually fighting
+        // the handles. The gizmo's interaction is untouched (paint-only).
         let painter = ui.painter_at(rect);
-        theme::overlay_label(
-            &painter,
-            rect.right_top() + egui::vec2(-10.0, 10.0),
-            egui::Align2::RIGHT_TOP,
-            &text,
-            None,
+        let fg = egui::Color32::from_gray(238);
+        let font = egui::FontId::proportional(12.5);
+        let galley = painter.layout_no_wrap(text.clone(), font, fg);
+        let pad = egui::vec2(9.0, 5.0);
+        let size = galley.size() + pad * 2.0;
+        let anchor = rect.right_top() + egui::vec2(-10.0, 10.0);
+        let bg = egui::Align2::RIGHT_TOP.anchor_size(anchor, size);
+        // Opaque fill + a hairline so it reads as a solid chip over the gizmo.
+        painter.rect_filled(bg, 5.0, egui::Color32::from_rgb(26, 27, 31));
+        painter.rect_stroke(
+            bg,
+            5.0,
+            egui::Stroke::new(1.0, egui::Color32::from_black_alpha(120)),
+            egui::StrokeKind::Inside,
         );
+        painter.galley(bg.min + pad, galley, fg);
     }
 
     // Fixture labels, projected to screen (name / ID / DMX address).
@@ -5723,12 +5795,9 @@ pub fn connectivity(
                 (false, true) => "sACN",
                 (false, false) => "no sockets bound",
             };
-            ui.colored_label(
-                theme::OK,
-                format!("• {bound} · {} source(s)", status.sources.len()),
-            );
+            super::status_dot(ui, theme::OK, &format!("{bound} · {} source(s)", status.sources.len()));
         } else {
-            ui.colored_label(theme::IDLE, "• stopped");
+            super::status_dot(ui, theme::IDLE, "stopped");
         }
     });
     ui.separator();
