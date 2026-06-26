@@ -86,7 +86,7 @@ pub struct InspectorState {
 
 /// Width of the inspector's fixed LABEL column (Blender-style 2-column rows). Every
 /// section uses it so the value column starts at the same x everywhere.
-const INSPECTOR_LABEL_W: f32 = 96.0;
+const INSPECTOR_LABEL_W: f32 = 84.0;
 
 impl InspectorState {
     /// Load the persisted collapse map (config dir); missing/garbled ⇒ default.
@@ -1748,9 +1748,81 @@ fn field_row(
     ui.allocate_ui_with_layout(
         egui::vec2(value_w, h),
         egui::Layout::top_down_justified(egui::Align::Min),
-        value,
+        |ui| {
+            // Size the value widget to the cell so it FILLS but never overflows:
+            //  - a Slider's bar is the cell minus a readout reserve, so the number
+            //    isn't glued to (or cut off at) the right edge;
+            //  - a DragValue / ComboBox grows to the cell's min interact width.
+            // (A vec3 row's add_sized fields override interact_size, so they're unaffected.)
+            ui.spacing_mut().slider_width = (value_w - 50.0).max(24.0);
+            ui.spacing_mut().interact_size.x = value_w;
+            value(ui);
+        },
     );
     ui.end_row();
+}
+
+/// A stacked vector property (Blender-style): the label on the first sub-row, then ONE
+/// FULL-WIDTH draggable field per component (X/Y/Z). Stacking — rather than three
+/// fields across one row — keeps every value readable at ANY panel width (3-across
+/// fields get unreadably narrow and clip). Returns `true` if a value changed (a drag OR
+/// the reset arrow, which zeroes all three) so the caller can recompose (e.g. euler →
+/// quat). Call inside the 2-column inspector `Grid`.
+#[allow(clippy::too_many_arguments)]
+fn vec3_rows(
+    ui: &mut egui::Ui,
+    state: &InspectorState,
+    label: &str,
+    differs: bool,
+    speed: f64,
+    suffix: &str,
+    x: &mut f32,
+    y: &mut f32,
+    z: &mut f32,
+) -> bool {
+    if !state.row_shown(label, differs) {
+        return false;
+    }
+    let mut changed = false;
+    let mut reset = false;
+    // First sub-row carries the property label + reset gutter; the others are blank on
+    // the left so the three fields stack under one heading.
+    field_row(
+        ui,
+        state.panel_w,
+        |ui| {
+            reset = reset_arrow(ui, differs);
+            ui.add(egui::Label::new(label).truncate());
+        },
+        |ui| {
+            let mut dv = DragValue::new(x).speed(speed).prefix("X ");
+            if !suffix.is_empty() {
+                dv = dv.suffix(suffix);
+            }
+            changed |= ui.add(dv).changed();
+        },
+    );
+    field_row(ui, state.panel_w, |_ui| {}, |ui| {
+        let mut dv = DragValue::new(y).speed(speed).prefix("Y ");
+        if !suffix.is_empty() {
+            dv = dv.suffix(suffix);
+        }
+        changed |= ui.add(dv).changed();
+    });
+    field_row(ui, state.panel_w, |_ui| {}, |ui| {
+        let mut dv = DragValue::new(z).speed(speed).prefix("Z ");
+        if !suffix.is_empty() {
+            dv = dv.suffix(suffix);
+        }
+        changed |= ui.add(dv).changed();
+    });
+    if reset {
+        *x = 0.0;
+        *y = 0.0;
+        *z = 0.0;
+        changed = true;
+    }
+    changed
 }
 
 /// Render one Inspector **category** (S1): a `CollapsingHeader` whose open/closed
@@ -2440,41 +2512,19 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
         true,
         &["Position", "Rotation", "Move speed"],
         |ui, fs| {
-            // Size the x/y/z fields to the value column so all THREE fit a narrow
-            // inspector (a default DragValue grows to its content, overflowing + clipping
-            // z; add_sized pins each field so the row never spills past the panel edge).
-            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
-            let fh = ui.spacing().interact_size.y;
             Grid::new("fx-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Position has no template default → kept arrow-free.
-                row(ui, fs, "Position", false, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
-                    });
-                });
-                // Rotation = the rig HANG (how the fixture is mounted), separate from
-                // the live Pan/Tilt (now in Fixture). Euler for display; recomposed
-                // only on edit (revert arrow → identity). Mirrors bulk_inspector's
-                // YXZ orientation math, but absolute for a single fixture.
+                // Position/Rotation STACK X/Y/Z (Blender-style) so each value stays
+                // readable + full-width at any panel width. Position has no default.
+                vec3_rows(
+                    ui, fs, "Position", false, 0.05, "",
+                    &mut fixture.position.x, &mut fixture.position.y, &mut fixture.position.z,
+                );
+                // Rotation = the rig HANG orientation (euler YXZ; recomposed on edit;
+                // revert arrow → identity), separate from the live Pan/Tilt (in Fixture).
                 let (ry, rx, rz) = fixture.orientation.to_euler(glam::EulerRot::YXZ);
                 let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
-                let mut rot_changed = false;
                 let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-                if row(ui, fs, "Rotation", differs, |ui| {
-                    ui.horizontal(|ui| {
-                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
-                    });
-                }) {
-                    ex = 0.0;
-                    ey = 0.0;
-                    ez = 0.0;
-                    rot_changed = true;
-                }
-                if rot_changed {
+                if vec3_rows(ui, fs, "Rotation", differs, 0.5, "°", &mut ex, &mut ey, &mut ez) {
                     fixture.orientation = glam::Quat::from_euler(
                         glam::EulerRot::YXZ,
                         ey.to_radians(),
@@ -2569,23 +2619,24 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut I
         true,
         &["Center", "Size"],
         |ui, fs| {
-            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
-            let fh = ui.spacing().interact_size.y;
             Grid::new("env-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                row(ui, fs, "Center", false, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([fw, fh], DragValue::new(&mut env.center.x).speed(0.1).prefix("x "));
-                        ui.add_sized([fw, fh], DragValue::new(&mut env.center.y).speed(0.1).prefix("y "));
-                        ui.add_sized([fw, fh], DragValue::new(&mut env.center.z).speed(0.1).prefix("z "));
+                // Stacked X/Y/Z (Blender-style) — readable at any panel width.
+                vec3_rows(
+                    ui, fs, "Center", false, 0.1, "",
+                    &mut env.center.x, &mut env.center.y, &mut env.center.z,
+                );
+                // Size keeps its W/H/D prefixes + range, stacked the same way.
+                if fs.row_shown("Size", true) {
+                    field_row(ui, fs.panel_w, |ui| { ui.label("Size"); }, |ui| {
+                        ui.add(DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("W "));
                     });
-                });
-                row(ui, fs, "Size", false, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([fw, fh], DragValue::new(&mut env.size.x).speed(0.1).range(0.1..=500.0).prefix("w "));
-                        ui.add_sized([fw, fh], DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("h "));
-                        ui.add_sized([fw, fh], DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("d "));
+                    field_row(ui, fs.panel_w, |_ui| {}, |ui| {
+                        ui.add(DragValue::new(&mut env.size.y).speed(0.1).range(0.1..=500.0).prefix("H "));
                     });
-                });
+                    field_row(ui, fs.panel_w, |_ui| {}, |ui| {
+                        ui.add(DragValue::new(&mut env.size.z).speed(0.1).range(0.1..=500.0).prefix("D "));
+                    });
+                }
             });
         },
     );
@@ -2695,31 +2746,16 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
         true,
         &["Position", "Rotation", "Scale"],
         |ui, fs| {
-            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
-            let fh = ui.spacing().interact_size.y;
             Grid::new("geo-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                row(ui, fs, "Position", false, |ui| {
-                    ui.horizontal(|ui| {
-                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
-                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
-                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
-                    });
-                });
-                // Rotation reverts to identity (0/0/0), scale to unit — the
-                // geometry "default" (struct-Default intent for a placed object).
+                // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
+                pos_changed |= vec3_rows(
+                    ui, fs, "Position", false, 0.05, "",
+                    &mut pos.x, &mut pos.y, &mut pos.z,
+                );
+                // Rotation reverts to identity (0/0/0), scale to unit — the geometry
+                // "default" (struct-Default intent for a placed object).
                 let rot_differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-                if row(ui, fs, "Rotation", rot_differs, |ui| {
-                    ui.horizontal(|ui| {
-                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
-                    });
-                }) {
-                    ex = 0.0;
-                    ey = 0.0;
-                    ez = 0.0;
-                    rs_changed = true;
-                }
+                rs_changed |= vec3_rows(ui, fs, "Rotation", rot_differs, 0.5, "°", &mut ex, &mut ey, &mut ez);
                 if row(ui, fs, "Scale", !approx(uscale, 1.0), |ui| {
                     rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
                 }) {
@@ -2787,23 +2823,13 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
         true,
         &["Position", "Rotation", "Scale"],
         |ui, fs| {
-            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
-            let fh = ui.spacing().interact_size.y;
             Grid::new("led-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                row(ui, fs, "Position", false, |ui| {
-                    ui.horizontal(|ui| {
-                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
-                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
-                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
-                    });
-                });
-                row(ui, fs, "Rotation", false, |ui| {
-                    ui.horizontal(|ui| {
-                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                        rs_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
-                    });
-                });
+                // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
+                pos_changed |= vec3_rows(
+                    ui, fs, "Position", false, 0.05, "",
+                    &mut pos.x, &mut pos.y, &mut pos.z,
+                );
+                rs_changed |= vec3_rows(ui, fs, "Rotation", false, 0.5, "°", &mut ex, &mut ey, &mut ez);
                 row(ui, fs, "Scale", false, |ui| {
                     rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
                 });
@@ -3243,37 +3269,18 @@ fn gdtf_inspector(
         true,
         &["Position", "Rotation", "Move speed"],
         |ui, fs| {
-            // Size x/y/z fields to the value column so all three fit a narrow inspector.
-            let fw = ((fs.panel_w - INSPECTOR_LABEL_W - 56.0) / 3.0).clamp(28.0, 90.0);
-            let fh = ui.spacing().interact_size.y;
             Grid::new("gdtf-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Position = the rig HANG placement (Pan/Tilt moved to Fixture).
-                row(ui, fs, "Position", false, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.x).speed(0.05).prefix("x "));
-                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.y).speed(0.05).prefix("y "));
-                        ui.add_sized([fw, fh], DragValue::new(&mut fixture.position.z).speed(0.05).prefix("z "));
-                    });
-                });
+                // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
+                vec3_rows(
+                    ui, fs, "Position", false, 0.05, "",
+                    &mut fixture.position.x, &mut fixture.position.y, &mut fixture.position.z,
+                );
                 // Rotation = the rig HANG orientation, separate from the live Pan/Tilt.
                 // Euler (YXZ) for display; recomposed on edit; revert arrow → identity.
                 let (ry, rx, rz) = fixture.orientation.to_euler(glam::EulerRot::YXZ);
                 let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
-                let mut rot_changed = false;
                 let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-                if row(ui, fs, "Rotation", differs, |ui| {
-                    ui.horizontal(|ui| {
-                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
-                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
-                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
-                    });
-                }) {
-                    ex = 0.0;
-                    ey = 0.0;
-                    ez = 0.0;
-                    rot_changed = true;
-                }
-                if rot_changed {
+                if vec3_rows(ui, fs, "Rotation", differs, 0.5, "°", &mut ex, &mut ey, &mut ez) {
                     fixture.orientation =
                         glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
                 }
@@ -3489,9 +3496,11 @@ fn optic_field_row(
     // so it reads as present-but-not-acting rather than absent.
     let enabled = enabled && !inert;
     let mut v = f.get(o);
-    let mut slider = Slider::new(&mut v, f.range());
+    // Keep the readout narrow (was 5+ decimals) so it fits the value cell; when there's
+    // a derived label (e.g. zoom degrees "58°") show ONLY that, not the raw 0-1 value.
+    let mut slider = Slider::new(&mut v, f.range()).max_decimals(2);
     if let Some(t) = text {
-        slider = slider.text(t);
+        slider = slider.text(t).show_value(false);
     }
     let mut reset = false;
     let mut changed = false;
@@ -3663,24 +3672,26 @@ fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, 
                                 ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
                             },
                             |ui| {
-                                ui.add(Slider::new(&mut w.value, 0.0..=1.0).text(value_label));
+                                ui.add(Slider::new(&mut w.value, 0.0..=1.0).max_decimals(2))
+                                    .on_hover_text(value_label);
                             },
                         );
                         // Prism always exposes rotation (index + spin) even when the
                         // profile didn't flag a dedicated Pos/PosRotate function.
                         if comp.has_index || comp.kind == WheelKind::Prism {
                             field_row(ui, fs.panel_w, |ui| { ui.label("index"); }, |ui| {
-                                ui.add(Slider::new(&mut w.index, 0.0..=1.0));
+                                ui.add(Slider::new(&mut w.index, 0.0..=1.0).max_decimals(2));
                             });
                         }
                         if comp.has_spin || matches!(comp.kind, WheelKind::Color | WheelKind::Animation | WheelKind::Prism) {
                             field_row(ui, fs.panel_w, |ui| { ui.label("spin"); }, |ui| {
-                                ui.add(Slider::new(&mut w.spin, 0.0..=1.0).text("0.5=stop"));
+                                ui.add(Slider::new(&mut w.spin, 0.0..=1.0).max_decimals(2))
+                                    .on_hover_text("0.5 = stopped · below CCW · above CW");
                             });
                         }
                         if matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) {
                             field_row(ui, fs.panel_w, |ui| { ui.label("shake"); }, |ui| {
-                                ui.add(Slider::new(&mut w.shake, 0.0..=1.0))
+                                ui.add(Slider::new(&mut w.shake, 0.0..=1.0).max_decimals(2))
                                     .on_hover_text("Oscillate the indexed element");
                             });
                         }
