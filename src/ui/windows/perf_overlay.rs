@@ -163,8 +163,18 @@ pub fn perf_overlay_window(
                     // --- quality / performance levers ---
                     ui.label(RichText::new("QUALITY ↔ PERFORMANCE").small().color(ink.muted));
                     ui.spacing_mut().slider_width = 110.0;
-                    ui.add(
-                        Slider::new(&mut settings.render_scale, 0.5..=1.0)
+                    // Dynamic resolution — auto-adjust the scale to hold a target fps.
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut settings.auto_resolution, "auto fps")
+                            .on_hover_text("Dynamic resolution — auto-adjust render scale to hold the target fps.");
+                        ui.add_enabled(
+                            settings.auto_resolution,
+                            egui::DragValue::new(&mut settings.fps_target).range(20.0..=240.0).speed(1.0).suffix(" fps"),
+                        );
+                    });
+                    ui.add_enabled(
+                        !settings.auto_resolution,
+                        Slider::new(&mut settings.render_scale, 0.25..=1.0)
                             .text("render scale")
                             .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                     )

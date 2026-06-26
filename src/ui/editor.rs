@@ -43,6 +43,17 @@ pub(super) fn header(viewer: &mut PanelViewer, ui: &mut egui::Ui, tab: &mut Tab)
 /// are the controls a designer reaches for constantly, kept where the eyes are.
 /// (Drawn right-to-left, so widgets read in reverse declaration order on screen.)
 fn viewport_controls(ui: &mut egui::Ui, viewer: &mut PanelViewer) {
+    // Fullscreen toggle (far right) — OS window fullscreen, mirrors F11. Declared
+    // first so, right-to-left, it sits at the very right edge of the header.
+    if ui
+        .button(RichText::new(theme::icon::FULLSCREEN).small())
+        .on_hover_text("Toggle fullscreen — F11")
+        .clicked()
+    {
+        *viewer.pending_fullscreen = true;
+    }
+    ui.separator();
+
     // N / T region toggles (right-most) — mirror the N/T keys (§2.2). Drawn first
     // (right_to_left layout) so they sit at the far right edge of the header.
     let regions = &mut *viewer.viewport_regions;

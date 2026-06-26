@@ -11,7 +11,11 @@ mod notify;
 pub(crate) mod op;
 mod panels;
 mod pie;
+mod render_panel;
 pub use panels::ScreenSources;
+pub use render_panel::{
+    default_filename, save_image, RenderPhase, RenderRequest, RenderStatus, RenderUiState,
+};
 pub mod project;
 mod share_window;
 pub mod shortcuts;
@@ -122,6 +126,8 @@ pub enum Tab {
     Patch,
     /// Saved looks + crossfade playback (cue list).
     Cues,
+    /// Live render progress + the finished still image (Save to Disk).
+    Render,
 }
 
 /// A saved, named selection of fixtures (console-style "groups"). Recalled by
@@ -352,7 +358,7 @@ impl Workspace {
 impl Tab {
     /// Every editor type — the SpaceType registry the header's editor-type
     /// switcher offers (`docs/RESEARCH-blender-framework.md` §2.2).
-    pub(crate) const ALL: [Tab; 8] = [
+    pub(crate) const ALL: [Tab; 9] = [
         Tab::Viewport,
         Tab::Scene,
         Tab::Library,
@@ -361,10 +367,11 @@ impl Tab {
         Tab::Connectivity,
         Tab::Patch,
         Tab::Cues,
+        Tab::Render,
     ];
 
     /// Panels shown in the Window menu (Viewport is fixed, so excluded there).
-    const TOGGLEABLE: [Tab; 7] = [
+    const TOGGLEABLE: [Tab; 8] = [
         Tab::Scene,
         Tab::Library,
         Tab::Inspector,
@@ -372,6 +379,7 @@ impl Tab {
         Tab::Patch,
         Tab::Cues,
         Tab::Connectivity,
+        Tab::Render,
     ];
 
     fn title(self) -> &'static str {
@@ -384,6 +392,7 @@ impl Tab {
             Tab::Connectivity => "Connectivity",
             Tab::Patch => "Fixtures",
             Tab::Cues => "Cues",
+            Tab::Render => "Render",
         }
     }
 
@@ -399,6 +408,7 @@ impl Tab {
             Tab::Connectivity => icon::CONNECT,
             Tab::Patch => icon::FIXTURE,
             Tab::Cues => icon::PROFILE,
+            Tab::Render => icon::RENDER,
         }
     }
 }
@@ -415,6 +425,19 @@ pub struct Ui {
     pub settings: RenderSettings,
     pub prefs: Preferences,
     pub requested_viewport_px: (u32, u32),
+    /// Cross-cut render state: the UI↔app mailbox + the finished still image
+    /// (driven by the app's `RenderJob`). The Render dock tab + the World ▸
+    /// Render Properties inspector read/write it.
+    pub render: RenderUiState,
+    /// Set when the user asks to toggle OS window fullscreen (F11 / the viewport
+    /// header button / View menu). The app loop consumes it after the egui pass
+    /// (only it can reach the winit window).
+    pub pending_fullscreen_toggle: bool,
+    /// True while a still render is converging (published by the app each frame).
+    /// The scene must stay frozen for the render's temporal accumulation, so the
+    /// inspector is made read-only and the deferred scene mutations (delete / patch
+    /// / duplicate / outliner edits) are held until the render finishes.
+    pub render_active: bool,
     /// Whether the 3D viewport currently has interaction focus (drives the focus
     /// border and whether the `d` shortcut opens the Duplicate dialog).
     viewport_focused: bool,
@@ -604,6 +627,9 @@ impl Ui {
             settings: RenderSettings::default(),
             prefs: Preferences::default(),
             requested_viewport_px: (1, 1),
+            render: RenderUiState::default(),
+            pending_fullscreen_toggle: false,
+            render_active: false,
             viewport_focused: false,
             duplicate: None,
             replace: None,
@@ -1346,6 +1372,17 @@ impl Ui {
         self.show_splash = false;
     }
 
+    /// Raise a success toast from outside the Ui (e.g. the app loop reporting a
+    /// finished render). Mirrors the in-Ui `notify` calls.
+    pub fn notify_success(&mut self, msg: impl Into<String>) {
+        self.notify.success(msg);
+    }
+
+    /// Raise an error toast from outside the Ui.
+    pub fn notify_error(&mut self, msg: impl Into<String>) {
+        self.notify.error(msg);
+    }
+
     /// The Blender-style welcome / recover splash, shown once at startup.
     fn splash_window(
         &mut self,
@@ -1603,9 +1640,33 @@ impl Ui {
             lib_prefs: &mut self.lib_prefs,
             measure: &mut self.measure,
             aim: &mut self.aim,
+            render: &mut self.render,
+            pending_fullscreen: &mut self.pending_fullscreen_toggle,
+            render_active: self.render_active,
         };
 
         DockArea::new(&mut self.dock).show(ctx, &mut viewer);
+
+        // A render just started (from the inspector Render button or the Render
+        // tab) — pop the Render tab to the front so the result is front-and-centre.
+        // PEEK only: the app loop still consumes `render.request` to start the job.
+        if matches!(self.render.request, Some(RenderRequest::Start)) {
+            self.ensure_render_tab_focused();
+        }
+        // F11 toggles OS window fullscreen; F12 renders. Both respect the text-input
+        // guard (so typing into an inspector field doesn't fire them), matching the
+        // rest of the keymap (`shortcuts::poll`).
+        let typing = ctx.egui_wants_keyboard_input();
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.pending_fullscreen_toggle = true;
+        }
+        if !typing
+            && ctx.input(|i| i.key_pressed(egui::Key::F12))
+            && self.render.status.phase != RenderPhase::Rendering
+        {
+            self.render.request_start();
+            self.ensure_render_tab_focused();
+        }
 
         // Modal-transform undo (viewer borrows released — scene + patch reachable):
         // the viewport drives the live G/R/S op, so its confirm/cancel is routed
@@ -1645,14 +1706,19 @@ impl Ui {
 
         // Commit a requested delete now (viewer borrows released): the patch is
         // reachable here, so fixtures + patch + cues + groups are remapped together.
-        if self.pending_delete {
+        // Held while a still render converges (a scene edit would reset its
+        // accumulation) — the flag persists, so it commits once the render finishes.
+        if self.pending_delete && !self.render_active {
             self.commit_delete(scene, dmx);
         }
         // Apply a deferred outliner action (hide toggle / rename) as ONE undo step,
         // now that the undo stack + patch are reachable (the tree itself can't touch
-        // undo mid-dock, so it returned the intent — mirrors pending_delete).
-        let tree_action = std::mem::replace(&mut self.pending_tree, tree::TreeAction::None);
-        self.apply_tree_action(tree_action, scene, dmx);
+        // undo mid-dock, so it returned the intent — mirrors pending_delete). Also
+        // held during a render (the pending action stays queued until it finishes).
+        if !self.render_active {
+            let tree_action = std::mem::replace(&mut self.pending_tree, tree::TreeAction::None);
+            self.apply_tree_action(tree_action, scene, dmx);
+        }
         // The viewport context menu's "Replace…" opens the dialog here (after the
         // dock), where the library + patch are reachable.
         if self.pending_replace {
@@ -1990,6 +2056,12 @@ impl Ui {
         }
     }
 
+    /// Select the World root so the Inspector shows the Render Properties.
+    /// Headless hook (`PREVIZ_UI_WORLD`) for the render-inspector screenshot.
+    pub fn debug_select_world(&mut self) {
+        self.selection = Selection::world();
+    }
+
     /// Multi-select up to `n` fixtures sharing the profile of the first fixture
     /// that has a wheel chain (so the bulk Wheels section is exercised); falls
     /// back to the first `n` GDTF fixtures. Headless hook for bulk screenshots.
@@ -2031,6 +2103,7 @@ impl Ui {
             Tab::Patch,
             Tab::Cues,
             Tab::Connectivity,
+            Tab::Render,
         ];
         for tab in tabs {
             if tab.title() == title
@@ -2040,6 +2113,23 @@ impl Ui {
                 return;
             }
         }
+    }
+
+    /// Open the Render tab if it isn't already, then focus it. Called when a
+    /// render starts so the result is front-and-centre (Blender pops the Image
+    /// Editor; we focus the dockable Render tab).
+    pub fn ensure_render_tab_focused(&mut self) {
+        if let Some(path) = self.dock.find_tab(&Tab::Render) {
+            let _ = self.dock.set_active_tab(path);
+            return;
+        }
+        // Not open yet — add it beside the Viewport (the large central leaf) so the
+        // render is front-and-centre, not crammed into whatever narrow side panel
+        // happened to hold focus when Render was clicked.
+        if let Some(vp) = self.dock.find_tab(&Tab::Viewport) {
+            self.dock.set_focused_node_and_surface(vp.node_path());
+        }
+        self.dock.push_to_focused_leaf(Tab::Render);
     }
 
     /// Whether a dock tab is currently open.
@@ -2584,6 +2674,11 @@ impl Ui {
                         ui.close();
                     }
                     ui.separator();
+                    if ui.button(format!("{}  Toggle Fullscreen  (F11)", icon::FULLSCREEN)).clicked() {
+                        self.pending_fullscreen_toggle = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     // Blender-style Overlays submenu: a coherent set of quiet,
                     // toggleable viewport HUD bits, each backed by a registered
                     // command so they're also in the F3 palette / keymap. Grid lives
@@ -2609,6 +2704,30 @@ impl Ui {
                         if let Some(i) = self.selection.primary_fixture() {
                             self.profile = Some(ProfileEditor::new(i));
                         }
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Render", |ui| {
+                    let rendering = self.render.status.phase == RenderPhase::Rendering;
+                    if ui
+                        .add_enabled(!rendering, egui::Button::new(format!("{}  Render Image  (F12)", icon::RENDER_GO)))
+                        .clicked()
+                    {
+                        self.render.request_start();
+                        self.ensure_render_tab_focused();
+                        ui.close();
+                    }
+                    ui.add_enabled(false, egui::Button::new(format!("{}  Render Animation", icon::ANIMATION)))
+                        .on_hover_text("Animation rendering — coming soon");
+                    if rendering
+                        && ui.button(format!("{}  Cancel Render", icon::RENDER_STOP)).clicked()
+                    {
+                        self.render.request_cancel();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button(format!("{}  Open Render View", icon::RENDER)).clicked() {
+                        self.ensure_render_tab_focused();
                         ui.close();
                     }
                 });
@@ -3113,6 +3232,13 @@ struct PanelViewer<'a> {
     measure: &'a mut panels::MeasureState,
     /// The Aim tool's in-flight drag (§2.4); `viewport()` sets it while aiming heads.
     aim: &'a mut panels::AimState,
+    /// Cross-cut render mailbox (Render tab + Render Properties read/write it).
+    render: &'a mut RenderUiState,
+    /// Set true by the viewport header's fullscreen button (consumed by the app).
+    pending_fullscreen: &'a mut bool,
+    /// True while a still render is converging — the inspector goes read-only so a
+    /// stray edit can't reset the render's accumulation.
+    render_active: bool,
 }
 
 /// Draw the viewport T-panel tool rail (§2.4): a vertical radio column of icon
@@ -3188,17 +3314,23 @@ impl TabViewer for PanelViewer<'_> {
                         .default_width(260.0)
                         .show_inside(ui, |ui| {
                             let mut e = panels::InspectorEdit::default();
-                            panels::inspector(
-                                ui,
-                                self.scene,
-                                self.selection,
-                                self.dmx_patch,
-                                self.gdtf_textures,
-                                self.profile,
-                                self.screen_sources,
-                                self.inspector_state,
-                                &mut e,
-                            );
+                            // Read-only while a still render converges (a stray edit
+                            // would reset the render's accumulation).
+                            ui.add_enabled_ui(!self.render_active, |ui| {
+                                panels::inspector(
+                                    ui,
+                                    self.scene,
+                                    self.selection,
+                                    self.dmx_patch,
+                                    self.gdtf_textures,
+                                    self.profile,
+                                    self.screen_sources,
+                                    self.inspector_state,
+                                    &mut e,
+                                    self.render,
+                                    self.settings,
+                                );
+                            });
                             // OR into the shared edge flags (N-panel + Inspector
                             // tab can both render; only one is dragged at a time).
                             self.inspector_edit.started |= e.started;
@@ -3258,7 +3390,10 @@ impl TabViewer for PanelViewer<'_> {
             ),
             Tab::Inspector => {
                 let mut e = panels::InspectorEdit::default();
-                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, self.inspector_state, &mut e);
+                let render_active = self.render_active;
+                ui.add_enabled_ui(!render_active, |ui| {
+                    panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, self.inspector_state, &mut e, self.render, self.settings);
+                });
                 self.inspector_edit.started |= e.started;
                 self.inspector_edit.stopped |= e.stopped;
             }
@@ -3288,6 +3423,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.fm,
             ),
             Tab::Cues => cues::cue_panel(ui, self.cues, self.scene),
+            Tab::Render => render_panel::render_tab(ui, &self.scene.render, self.render),
         }
     }
 
@@ -3296,11 +3432,11 @@ impl TabViewer for PanelViewer<'_> {
         false
     }
 
-    /// The viewport draws an opaque image and handles its own scroll-to-zoom,
-    /// so it must not be wrapped in a scroll area.
+    /// The viewport + render preview draw an opaque image and manage their own
+    /// content rect, so they must not be wrapped in a scroll area.
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         match tab {
-            Tab::Viewport => [false, false],
+            Tab::Viewport | Tab::Render => [false, false],
             _ => [true, true],
         }
     }

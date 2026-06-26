@@ -32,7 +32,8 @@ const MAGIC: &[u8] = b"ARCHIE\0";
 /// v4: `LedScreen` gained content sources (Image/NDI/CITP/PixelMap) + `pixel_shape`.
 /// v5: `Environment` gained `uniformity` (haze cluster control).
 /// v6: `Environment` gained `cluster_contrast`.
-pub const FORMAT: u32 = 6;
+/// v7: `Scene` gained `render: RenderConfig` (the persisted render-target setup).
+pub const FORMAT: u32 = 7;
 /// The project file extension (no dot).
 pub const EXT: &str = "archie";
 
@@ -213,6 +214,13 @@ mod tests {
         let mut scene = Scene::default();
         scene.world.brightness = 2.5;
         scene.world.rotation = 0.75;
+        // Render config persists with the show (FORMAT 7) — set non-defaults.
+        scene.render.res_x = 3840;
+        scene.render.res_y = 2160;
+        scene.render.resolution_percentage = 75;
+        scene.render.max_samples = 128;
+        scene.render.format = crate::scene::RenderFormat::Exr;
+        scene.render.out_path = "/tmp/shot.exr".to_string();
         let fixtures = scene.fixtures.len();
         let mut camera = OrbitCamera::default();
         camera.distance = 33.0;
@@ -233,6 +241,13 @@ mod tests {
         assert!((loaded.scene.world.rotation - 0.75).abs() < 1e-6);
         assert!((loaded.camera.distance - 33.0).abs() < 1e-6);
         assert!(matches!(loaded.scene_sort, SceneSort::Name));
+        // Render setup survived the round-trip (no more serde-skip).
+        assert_eq!(loaded.scene.render.res_x, 3840);
+        assert_eq!(loaded.scene.render.res_y, 2160);
+        assert_eq!(loaded.scene.render.resolution_percentage, 75);
+        assert_eq!(loaded.scene.render.max_samples, 128);
+        assert!(matches!(loaded.scene.render.format, crate::scene::RenderFormat::Exr));
+        assert_eq!(loaded.scene.render.out_path, "/tmp/shot.exr");
     }
 
     #[test]

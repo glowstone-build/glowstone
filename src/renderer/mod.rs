@@ -24,7 +24,6 @@ pub use gpu_timer::PassTimings;
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -304,7 +303,12 @@ pub struct Renderer {
     pub device: wgpu::Device,
     queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
-    start_time: Instant,
+    /// The scene animation clock (seconds) used for ALL time-driven animation —
+    /// volumetric fog drift (`eye_time.w`) and beam/wheel resolve. Set by the
+    /// caller each frame (NOT wall-clock), so it advances with the logical scene
+    /// time and can be FROZEN: a still render holds it fixed across every
+    /// accumulation frame, and a headless capture is deterministic.
+    anim_time: f32,
 
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -454,6 +458,63 @@ pub struct Renderer {
 
     egui_renderer: egui_wgpu::Renderer,
     pub viewport: Viewport,
+    /// A SEPARATE offscreen target for a deliberate still render (Blender keeps the
+    /// real-time viewport and the F12 render result wholly separate). Created lazily
+    /// at the chosen output resolution — independent of the live `viewport`, so a
+    /// render never disturbs the interactive preview's size or content. `None` when
+    /// no render has run this session.
+    render_view: Option<Viewport>,
+    /// The GPU backend this renderer is running on (Metal / Vulkan / DX12 / GL).
+    active_backend: wgpu::Backend,
+    /// Every backend that has a usable adapter on this machine — the options the
+    /// Engine ▸ Backend dropdown offers (a single entry on macOS = Metal).
+    available_backends: Vec<wgpu::Backend>,
+}
+
+/// Human label for a GPU backend — the dropdown text + the on-disk pref token.
+pub fn backend_label(b: wgpu::Backend) -> &'static str {
+    match b {
+        wgpu::Backend::Vulkan => "Vulkan",
+        wgpu::Backend::Metal => "Metal",
+        wgpu::Backend::Dx12 => "DX12",
+        wgpu::Backend::Gl => "OpenGL",
+        wgpu::Backend::BrowserWebGpu => "WebGPU",
+        wgpu::Backend::Noop => "None",
+    }
+}
+
+fn backend_from_label(s: &str) -> Option<wgpu::Backend> {
+    Some(match s {
+        "Vulkan" => wgpu::Backend::Vulkan,
+        "Metal" => wgpu::Backend::Metal,
+        "DX12" => wgpu::Backend::Dx12,
+        "OpenGL" => wgpu::Backend::Gl,
+        "WebGPU" => wgpu::Backend::BrowserWebGpu,
+        _ => return None,
+    })
+}
+
+/// `<config>/gpu-backend.txt` — the machine-global GPU backend preference (read at
+/// startup, before any project loads; per-project prefs can't choose the backend).
+fn gpu_pref_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "Embedder", "previz")
+        .map(|d| d.config_dir().join("gpu-backend.txt"))
+}
+
+/// The user's preferred backend, if one was saved (and is parseable).
+pub fn read_gpu_pref() -> Option<wgpu::Backend> {
+    let s = std::fs::read_to_string(gpu_pref_path()?).ok()?;
+    backend_from_label(s.trim())
+}
+
+/// Persist the chosen backend label (takes effect on the next launch).
+pub fn write_gpu_pref(label: &str) {
+    if let Some(p) = gpu_pref_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, label);
+    }
 }
 
 impl Renderer {
@@ -464,7 +525,32 @@ impl Renderer {
         // window only ever showed dropped frames. DX12 is the native, stable Windows
         // backend and sidesteps that driver bug. Elsewhere keep the platform default
         // (Metal on macOS, Vulkan on Linux). `WGPU_BACKEND` (e.g. =vulkan) overrides.
-        let backends = if cfg!(target_os = "windows") {
+        // Enumerate every backend that has a usable adapter on this machine (a
+        // throwaway all-backends instance) — the options for the Backend dropdown.
+        let enum_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let mut available_backends: Vec<wgpu::Backend> = enum_instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .await
+            .iter()
+            .map(|a| a.get_info().backend)
+            .filter(|b| *b != wgpu::Backend::Noop)
+            .collect();
+        available_backends.sort_by_key(|b| *b as u8);
+        available_backends.dedup();
+        drop(enum_instance);
+
+        // Backend selection: a persisted UI preference (if its backend is available)
+        // overrides the platform default; `WGPU_BACKEND` env (.with_env()) still wins.
+        // On Windows the default is DX12 — the NVIDIA Vulkan driver (581.95) faults the
+        // device the moment we present the surface, so the window only showed dropped
+        // frames; DX12 is the native, stable Windows backend.
+        let pref = read_gpu_pref().filter(|b| available_backends.contains(b));
+        let backends = if let Some(b) = pref {
+            wgpu::Backends::from(b)
+        } else if cfg!(target_os = "windows") {
             wgpu::Backends::DX12
         } else {
             wgpu::Backends::PRIMARY
@@ -491,6 +577,7 @@ impl Renderer {
             .await
             .expect("no suitable GPU adapter found");
 
+        let active_backend = adapter.get_info().backend;
         log::info!("using adapter: {:?}", adapter.get_info());
 
         // Wireframe viewport mode needs line polygon mode; request it when the
@@ -862,7 +949,7 @@ impl Renderer {
             device,
             queue,
             config,
-            start_time: Instant::now(),
+            anim_time: 0.0,
             camera_buffer,
             camera_bind_group,
             line_pipeline,
@@ -942,7 +1029,23 @@ impl Renderer {
             post_sampler,
             egui_renderer,
             viewport,
+            render_view: None,
+            active_backend,
+            available_backends,
         }
+    }
+
+    /// The label of the GPU backend currently in use (e.g. "Metal").
+    pub fn active_backend_label(&self) -> &'static str {
+        backend_label(self.active_backend)
+    }
+
+    /// Labels of every available GPU backend (the Backend dropdown options).
+    pub fn available_backend_labels(&self) -> Vec<String> {
+        self.available_backends
+            .iter()
+            .map(|b| backend_label(*b).to_string())
+            .collect()
     }
 
     /// Acquire the next swapchain texture for this frame, or `None` to skip it.
@@ -984,6 +1087,14 @@ impl Renderer {
         self.config.width = size.0.min(max);
         self.config.height = size.1.min(max);
         self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Set the scene animation clock (seconds) used for the next render — fog
+    /// drift + beam/wheel resolve. The caller advances it with the logical scene
+    /// time for the live view, and FREEZES it (a fixed value) for a still render so
+    /// the fog/beams don't drift across the accumulation frames.
+    pub fn set_anim_time(&mut self, t: f32) {
+        self.anim_time = t;
     }
 
     /// Resize the offscreen 3D target to match the viewport panel.
@@ -1294,6 +1405,187 @@ impl Renderer {
         (width, height, pixels)
     }
 
+    // --- Offscreen still render (the dedicated F12 render target) --------------
+    //
+    // The deliberate render runs into `render_view`, a SEPARATE target from the live
+    // `viewport`, so it never changes the interactive preview's size or content
+    // (Blender keeps the 3D view and the render result wholly separate). The render
+    // reuses the real pipeline: each frame the job swaps `render_view` in as the
+    // scene target, records ONE frame (so the temporal volumetric EMA converges over
+    // successive frames), and swaps it back — the live viewport is simply not
+    // re-recorded while a render is in flight, so the EMA state is never thrashed
+    // between two targets.
+
+    /// Create or resize the offscreen render target to `size`, clamped only to the
+    /// GPU's max dimension (NOT the window) so a render can exceed the on-screen
+    /// viewport — e.g. a 4K still from a 1080p window.
+    pub fn ensure_render_view(&mut self, size: (u32, u32)) {
+        let max = self.device.limits().max_texture_dimension_2d;
+        let size = (size.0.clamp(1, max), size.1.clamp(1, max));
+        match self.render_view.as_mut() {
+            Some(v) => v.resize(&self.device, &mut self.egui_renderer, size),
+            None => {
+                self.render_view = Some(Viewport::new(&self.device, &mut self.egui_renderer, size));
+            }
+        }
+    }
+
+    /// The egui texture id of the offscreen render target (for the Render tab),
+    /// or `None` if no render target exists yet.
+    pub fn render_view_texture(&self) -> Option<egui::TextureId> {
+        self.render_view.as_ref().map(|v| v.texture_id)
+    }
+
+    /// Record ONE frame of the scene into the offscreen render target (NOT the live
+    /// viewport). Swaps `render_view` into the scene-target slot, records + submits,
+    /// blocks until the GPU finishes, then swaps back. Returns `false` if no render
+    /// target exists. Each call advances the temporal accumulation by one frame.
+    pub fn record_render_view(
+        &mut self,
+        scene: &Scene,
+        camera: &OrbitCamera,
+        settings: &RenderSettings,
+    ) -> bool {
+        // Take the render target OUT so `record_scene` (which needs `&mut self`) can
+        // run with it installed as `self.viewport`, then restore the live viewport.
+        let Some(mut rv) = self.render_view.take() else {
+            return false;
+        };
+        std::mem::swap(&mut self.viewport, &mut rv); // self.viewport := render target; rv := live
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render-view-encoder") });
+        self.record_scene(&mut encoder, scene, camera, &Selection::default(), settings);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        std::mem::swap(&mut self.viewport, &mut rv); // restore: self.viewport := live; rv := render target
+        self.render_view = Some(rv);
+        true
+    }
+
+    /// Read back the offscreen render target's LDR plate to CPU RGBA8 pixels.
+    pub fn read_render_view_ldr(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.render_view.as_ref().map(|v| self.read_ldr(v))
+    }
+
+    /// Drop the offscreen render target, freeing its GPU memory and unregistering
+    /// its egui texture (after a render finishes/cancels). A subsequent render
+    /// lazily recreates it. Safe to call right after a readback (the GPU is idle).
+    pub fn free_render_view(&mut self) {
+        if let Some(v) = self.render_view.take() {
+            self.egui_renderer.free_texture(&v.texture_id);
+        }
+    }
+
+    /// Present an egui frame to the surface WITHOUT re-recording the live 3D scene —
+    /// used while a render is in flight, so the live viewport keeps its last frame
+    /// (frozen, untouched) while the Render tab shows the converging render target.
+    pub fn present_egui_only(
+        &mut self,
+        paint_jobs: &[egui::ClippedPrimitive],
+        textures_delta: &egui::TexturesDelta,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+    ) -> bool {
+        for (id, delta) in &textures_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+        }
+        for id in &textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+        let frame = match self.acquire_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("egui-only-encoder") });
+        let user_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            paint_jobs,
+            screen_descriptor,
+        );
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui-only-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &surface_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            self.egui_renderer.render(&mut pass, paint_jobs, screen_descriptor);
+        }
+        self.queue
+            .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+        frame.present();
+        true
+    }
+
+    /// Read a viewport's LDR target (the tonemapped `Rgba8Unorm` plate) to CPU
+    /// RGBA8 pixels — shared by the live + offscreen readbacks.
+    fn read_ldr(&self, vp: &Viewport) -> (u32, u32, Vec<u8>) {
+        let (width, height) = vp.size;
+        let unpadded = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ldr-readback"),
+            size: padded as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ldr-readback-encoder") });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: vp.ldr_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().expect("map channel").expect("map readback buffer");
+
+        let data = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity(unpadded as usize * height as usize);
+        for row in 0..height as usize {
+            let start = row * padded as usize;
+            pixels.extend_from_slice(&data[start..start + unpadded as usize]);
+        }
+        drop(data);
+        readback.unmap();
+        (width, height, pixels)
+    }
+
     /// Apply an egui textures delta (font atlas, user images) to the egui
     /// renderer — used by the headless UI capture to settle the atlas across
     /// frames before the final paint.
@@ -1553,7 +1845,7 @@ impl Renderer {
         selection: &Selection,
         settings: &RenderSettings,
     ) {
-        let time = self.start_time.elapsed().as_secs_f32();
+        let time = self.anim_time;
         let aspect = self.viewport.aspect();
 
         // --- world / HDRI environment (reloads the GPU map only when it changes) ---
@@ -3006,8 +3298,9 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.grid_mesh.vertex_buffer.slice(..));
                 pass.draw(0..self.grid_mesh.vertex_count, 0..1);
             }
-            // The fog-box border + gizmos (dynamic_lines) are always drawn.
-            if line_count > 0 {
+            // The fog-box border + gizmos (dynamic_lines) — drawn for the live view,
+            // suppressed for a clean still render (settings.show_gizmos).
+            if line_count > 0 && settings.show_gizmos {
                 pass.set_vertex_buffer(0, self.dynamic_lines.buffer.slice(..));
                 pass.draw(0..line_count, 0..1);
             }

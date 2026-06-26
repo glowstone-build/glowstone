@@ -5,11 +5,13 @@
 pub mod environment;
 pub mod fixture;
 pub mod library;
+pub mod render;
 pub mod screen;
 
 pub use environment::Environment;
 pub use fixture::Fixture;
 pub use library::{EnvironmentProfile, FixtureProfile, Library, ScreenProfile};
+pub use render::{QualityPreset, RenderConfig, RenderDisplay, RenderFormat};
 pub use screen::LedScreen;
 
 use std::collections::HashMap;
@@ -163,21 +165,26 @@ pub struct RenderSettings {
     /// Chroma read-up of saturated beams in haze (Helmholtz–Kohlrausch): lifts
     /// dim-saturated hues (blue/deep-red/magenta) so they read in fog without
     /// flattening to neon; white/pastel and bright-whitened cells are untouched.
-    /// 0 = off (exact pre-feature look). `skip`-ped like [froxel_volumetric] —
-    /// bincode .archie is positional, so a new serialized field corrupts old saves.
-    #[serde(skip, default = "default_chroma_haze")]
+    /// 0 = off (exact pre-feature look). A shared look setting — persisted with the
+    /// show (`.archie` FORMAT 7), shown in Render Properties ▸ Color Management.
     pub chroma_haze: f32,
     /// Floor-pool gobo edge sharpening amount (0 = off). Drives the contour
     /// steepening in mesh.wgsl via `camera.render_mode.y`.
     pub gobo_sharpness: f32,
-    /// Internal render scale (0.5..=1.0): the viewport renders at this fraction of
+    /// Internal render scale (0.25..=1.0): the viewport renders at this fraction of
     /// native and bilinearly upscales — the single biggest fps lever on a Retina
     /// display (everything per-pixel scales with it²). `skip`-ped: it's a machine/
-    /// GPU-specific perf preference, not part of the SHOW, so it must NOT ride in the
-    /// positional bincode .archie (which would also force a FORMAT bump that rejects
-    /// every existing save). Defaults to 1.0 = native (unchanged behaviour).
+    /// GPU-specific perf preference, not part of the SHOW. Defaults to 0.5 (50%).
     #[serde(skip, default = "default_render_scale")]
     pub render_scale: f32,
+    /// Dynamic resolution: when on, the app auto-adjusts `render_scale` every frame
+    /// to hold `fps_target` — dropping it fast when the frame rate sags and raising
+    /// it slowly when there's headroom. `skip`-ped (machine perf preference).
+    #[serde(skip, default = "default_false")]
+    pub auto_resolution: bool,
+    /// Target fps for `auto_resolution` (the rate the dynamic scaler aims to hold).
+    #[serde(skip, default = "default_fps_target")]
+    pub fps_target: f32,
     /// Max hero (per-beam) shadow maps to render, capped to `shadow::MAX`. Lower =
     /// fewer shadow depth passes = faster (each is ~2-3 ms at Retina). `skip`-ped:
     /// machine-specific perf knob (see [render_scale]).
@@ -195,18 +202,32 @@ pub struct RenderSettings {
     /// new serialized field would corrupt older saves, like the fields above).
     #[serde(skip, default)]
     pub axis_hint: Option<(glam::Vec3, [f32; 3], glam::Vec3)>,
+    /// Draw the decorative scene lines — the fog-box border, gizmos, 3D cursor and
+    /// the modal axis-constraint line. ON for the live viewport; a still render
+    /// turns it OFF for a clean plate. `skip`-ped (positional bincode); defaults to
+    /// `true` on load so the live view is unchanged.
+    #[serde(skip, default = "default_true")]
+    pub show_gizmos: bool,
 }
 
 fn default_false() -> bool {
     false
 }
 
-fn default_chroma_haze() -> f32 {
-    1.2
+fn default_true() -> bool {
+    true
 }
 
 fn default_render_scale() -> f32 {
-    1.0
+    // The live VIEWPORT previews at half resolution by default (upscaled) — the
+    // single biggest fps lever on Retina. The final RENDER is full-res (see
+    // RenderConfig::resolution_percentage). Adjustable (down to 25%) in the
+    // Performance overlay and the Render Properties ▸ Sampling ▸ Viewport row.
+    0.5
+}
+
+fn default_fps_target() -> f32 {
+    60.0
 }
 
 fn default_shadow_max() -> u32 {
@@ -228,12 +249,15 @@ impl Default for RenderSettings {
             froxel_volumetric: false,
             chroma_haze: 1.2,
             gobo_sharpness: 0.6,
-            render_scale: 1.0,
+            render_scale: default_render_scale(),
+            auto_resolution: false,
+            fps_target: default_fps_target(),
             shadow_max: 8,
             show_beam_wireframes: false,
             show_grid: true,
             mode: ViewportMode::Beauty,
             axis_hint: None,
+            show_gizmos: true,
         }
     }
 }
@@ -618,6 +642,11 @@ pub struct Scene {
     /// Retained MVR document data, present when the scene came from an MVR
     /// import, so it can be exported back out faithfully.
     pub mvr: Option<MvrSceneData>,
+    /// The deliberate still-render recipe (resolution / sampling / output),
+    /// edited in the World ▸ Render Properties inspector. Persisted with the show
+    /// (`.archie` FORMAT 7) so a saved project keeps its render setup — the look is
+    /// shared with the live viewport, so only render-specific knobs live here.
+    pub render: RenderConfig,
     /// Monotonic [`EntityId`] allocator. serde-skip → reset to 0 on load;
     /// [`ensure_ids`](Self::ensure_ids) reseeds it past the max live id after
     /// every load/import/undo-restore.
@@ -651,6 +680,7 @@ impl Scene {
             geometry: Vec::new(),
             screens: Vec::new(),
             mvr: None,
+            render: RenderConfig::default(),
             next_id: 0,
         };
         scene.ensure_ids(); // hand the demo entities their stable ids
