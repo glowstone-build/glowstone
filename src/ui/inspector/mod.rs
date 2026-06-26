@@ -14,6 +14,10 @@ use std::sync::Arc;
 use egui::{Color32, DragValue, Grid, RichText, Sense, Slider};
 use glam::{Mat4, Vec3};
 
+mod fixture;
+mod props;
+pub use props::{Inspect, Props};
+
 use super::panels::InspectorEdit;
 use super::render_panel::{self, RenderPhase, RenderUiState};
 use super::theme;
@@ -1527,108 +1531,9 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
     ui.label(RichText::new(format!("{} · {}", fixture.category, fixture.profile)).weak().small());
     ui.separator();
 
-    let def = FixtureDefaults::for_fixture(fixture);
-
-    // TRANSFORM = the rig placement: hang Position + Rotation + the pan/tilt motor
-    // speed. Pan/Tilt themselves are head angles → moved to the Fixture category.
-    category(
-        ui,
-        state,
-        "Transform",
-        format!("{}  Transform", theme::icon::INSPECTOR),
-        true,
-        &["Position", "Rotation", "Move speed"],
-        |ui, fs| {
-            Grid::new("fx-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Position/Rotation STACK X/Y/Z (Blender-style) so each value stays
-                // readable + full-width at any panel width. Position has no default.
-                vec3_rows(
-                    ui, fs, "Position", false, 0.05, "",
-                    &mut fixture.position.x, &mut fixture.position.y, &mut fixture.position.z,
-                );
-                // Rotation = the rig HANG orientation (euler YXZ; recomposed on edit;
-                // revert arrow → identity), separate from the live Pan/Tilt (in Fixture).
-                let (ry, rx, rz) = fixture.orientation.to_euler(glam::EulerRot::YXZ);
-                let (mut ey, mut ex, mut ez) = (ry.to_degrees(), rx.to_degrees(), rz.to_degrees());
-                let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-                if vec3_rows(ui, fs, "Rotation", differs, 0.5, "°", &mut ex, &mut ey, &mut ez) {
-                    fixture.orientation = glam::Quat::from_euler(
-                        glam::EulerRot::YXZ,
-                        ey.to_radians(),
-                        ex.to_radians(),
-                        ez.to_radians(),
-                    );
-                }
-                // Move speed = the pan/tilt motor slew (0 = snap, 1 = slowest).
-                if slider_row(ui, fs, "Move speed", !approx(fixture.move_speed, 0.0), |ui| {
-                    ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0).max_decimals(2))
-                        .on_hover_text("Pan/tilt motor speed: 0 = fastest (snap), 1 = slowest");
-                }) {
-                    fixture.move_speed = 0.0;
-                }
-            });
-        },
-    );
-
-    // FIXTURE = the head's own properties: aim (Pan/Tilt), level, colour, beam.
-    category(
-        ui,
-        state,
-        "Fixture",
-        format!("{}  Fixture", theme::icon::COLOR),
-        true,
-        &["Pan", "Tilt", "Dimmer", "Color", "Beam", "Beam angle"],
-        |ui, fs| {
-            Grid::new("fx-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Pan/Tilt: the live-aim head angles (each reverts to rest 0).
-                if row(ui, fs, "Pan", !approx(fixture.pan, def.pan), |ui| {
-                    ui.add(DragValue::new(&mut fixture.pan).speed(0.5).range(-270.0..=270.0).suffix("°"));
-                }) {
-                    fixture.pan = def.pan;
-                }
-                if row(ui, fs, "Tilt", !approx(fixture.tilt, def.tilt), |ui| {
-                    ui.add(DragValue::new(&mut fixture.tilt).speed(0.5).range(-180.0..=180.0).suffix("°"));
-                }) {
-                    fixture.tilt = def.tilt;
-                }
-                // Common: the everyday level + colour controls.
-                if row(ui, fs, "Dimmer", !approx(fixture.optics.dimmer, def.dimmer), |ui| {
-                    ui.add(DragValue::new(&mut fixture.optics.dimmer).speed(0.005).range(0.0..=1.0));
-                }) {
-                    fixture.optics.dimmer = def.dimmer;
-                }
-                // Colour only shows a revert arrow when its template is known
-                // (GDTF white-master); a built-in's library tint isn't stored.
-                let color_differs = def.color.is_some_and(|d| !approx_rgb(fixture.color, d));
-                if row(ui, fs, "Color", color_differs, |ui| {
-                    ui.color_edit_button_rgb(&mut fixture.color);
-                }) {
-                    if let Some(d) = def.color {
-                        fixture.color = d;
-                    }
-                }
-            });
-            // Advanced: the volumetric / cone tuning a designer touches rarely.
-            advanced_section_filtered(ui, fs, "fx-fixture", &["Beam", "Beam angle"], |ui| {
-                Grid::new("fx-fixture-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    if row(ui, fs, "Beam", !approx(fixture.beam, def.beam), |ui| {
-                        ui.add(DragValue::new(&mut fixture.beam).speed(0.01).range(0.0..=4.0))
-                            .on_hover_text("Volumetric beam intensity (0 = off, 1 = normal)");
-                    }) {
-                        fixture.beam = def.beam;
-                    }
-                    let ba_differs = def.beam_angle.is_some_and(|d| !approx(fixture.beam_angle, d));
-                    if row(ui, fs, "Beam angle", ba_differs, |ui| {
-                        ui.add(DragValue::new(&mut fixture.beam_angle).speed(0.2).range(2.0..=90.0).suffix("°"));
-                    }) {
-                        if let Some(d) = def.beam_angle {
-                            fixture.beam_angle = d;
-                        }
-                    }
-                });
-            });
-        },
-    );
+    // The editable property grid (Transform + Fixture) is declared by `impl Inspect
+    // for Fixture` and rendered uniformly by the property builder.
+    props::show(ui, state, fixture);
 }
 
 fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut InspectorState) {
