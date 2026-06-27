@@ -128,6 +128,9 @@ pub enum Action {
     /// Re-open the welcome / recover splash on demand (Window ▸ Welcome + the
     /// operator search). Impl in `Ui::dispatch_action` (sets `show_splash = true`).
     ShowWelcome,
+    /// `H` — hide / reveal the whole selection (every selected entity kind). Toggles:
+    /// hides if anything is visible, else reveals.
+    ToggleHideSelection,
     /// Toggle OS-window fullscreen (also F11 / the viewport header / View menu).
     ToggleFullscreen,
     /// Start a still-image render (also F12 / the Render Image button).
@@ -439,6 +442,7 @@ pub static COMMANDS: &[Command] = &[
     command_row("select.replace", "Replace selected fixtures", Category::Selection, Action::Replace),
     // "None" (Alt+A) reuses the canonical Deselect command (also bound to Escape).
     command_row("select.deselect", "Deselect all (none)", Category::Selection, Action::Deselect),
+    command_row("object.hide_toggle", "Hide / reveal selection", Category::Object, Action::ToggleHideSelection),
     // --- Transform: nudge (plain = 0.1 m, Shift = 1.0 m). Each direction has a
     // plain command + a "(1 m)" command; the keymap binds the matching trigger. ---
     command_row("transform.nudge_x_neg", "Nudge -X (Shift = 1 m)", Category::Transform, Action::Nudge(Dir::XNeg, 0.1)),
@@ -618,6 +622,7 @@ pub static GLOBAL: &[Kmi] = &[
     kmi(Trigger::key(Key::A), "select.all"),
     kmi(Trigger::key(Key::A).alt(), "select.deselect"),
     kmi(Trigger::key(Key::I).cmd(), "select.invert"),
+    kmi(Trigger::key(Key::H), "object.hide_toggle"),
     kmi(Trigger::key(Key::S), "select.quick"),
     kmi(Trigger::key(Key::R).shift(), "select.replace"),
     kmi(Trigger::key(Key::Escape), "select.deselect"),
@@ -1285,10 +1290,12 @@ pub fn key_label(t: &Trigger) -> String {
 /// Display name for a single [`egui::Key`] (the named ones the table uses).
 fn key_name(key: egui::Key) -> String {
     match key {
-        Key::ArrowLeft => super::theme::icon::ARROW_LEFT.into(),
-        Key::ArrowRight => super::theme::icon::ARROW_RIGHT.into(),
-        Key::ArrowUp => super::theme::icon::ARROW_UP.into(),
-        Key::ArrowDown => super::theme::icon::ARROW_DOWN.into(),
+        // Plain words, not arrow GLYPHS — the editor/cheat-sheet font lacks them, so
+        // they rendered as empty "tofu" squares (□).
+        Key::ArrowLeft => "Left".into(),
+        Key::ArrowRight => "Right".into(),
+        Key::ArrowUp => "Up".into(),
+        Key::ArrowDown => "Down".into(),
         Key::PageUp => "PageUp".into(),
         Key::PageDown => "PageDown".into(),
         Key::Home => "Home".into(),

@@ -234,6 +234,43 @@ impl Ui {
                 self.selection = Selection::default();
                 self.scene_anchor = None;
             }
+            // `H` — hide / reveal the WHOLE selection (every kind). Toggles: hides if
+            // anything is still visible, else reveals. One undo step; keeps the
+            // selection so H reveals it again.
+            Action::ToggleHideSelection => {
+                let s = &self.selection;
+                let has_sel = !s.fixtures.is_empty()
+                    || !s.geometry.is_empty()
+                    || !s.screens.is_empty()
+                    || !s.pyro.is_empty()
+                    || s.environment.is_some();
+                if has_sel {
+                    let any_visible = s.fixtures.iter().any(|&i| scene.fixtures.get(i).is_some_and(|f| !f.hidden))
+                        || s.geometry.iter().any(|&i| scene.geometry.get(i).is_some_and(|g| !g.hidden))
+                        || s.screens.iter().any(|&i| scene.screens.get(i).is_some_and(|x| !x.hidden))
+                        || s.pyro.iter().any(|&i| scene.pyro.get(i).is_some_and(|p| !p.hidden))
+                        || s.environment.is_some_and(|i| scene.environments.get(i).is_some_and(|e| !e.hidden));
+                    let hide = any_visible; // hide while anything's visible, else reveal
+                    let before = self.undo_begin(scene, dmx.patch());
+                    for &i in &self.selection.fixtures {
+                        if let Some(f) = scene.fixtures.get_mut(i) { f.hidden = hide; }
+                    }
+                    for &i in &self.selection.geometry {
+                        if let Some(g) = scene.geometry.get_mut(i) { g.hidden = hide; }
+                    }
+                    for &i in &self.selection.screens {
+                        if let Some(x) = scene.screens.get_mut(i) { x.hidden = hide; }
+                    }
+                    for &i in &self.selection.pyro {
+                        if let Some(p) = scene.pyro.get_mut(i) { p.hidden = hide; }
+                    }
+                    if let Some(i) = self.selection.environment {
+                        if let Some(e) = scene.environments.get_mut(i) { e.hidden = hide; }
+                    }
+                    self.undo_push("Hide / Reveal", before, scene, dmx.patch());
+                    self.notify.success(if hide { "Hid selection" } else { "Revealed selection" });
+                }
+            }
             // Invert (#88): flip membership within the active kind. Defaults to
             // fixtures when nothing is selected, so a bare Ctrl+I selects everything.
             Action::SelectInvert => {
