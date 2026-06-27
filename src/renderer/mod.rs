@@ -2,6 +2,9 @@
 //! device/queue/surface, the scene pipelines, the offscreen HDR viewport target,
 //! the volumetric + post passes, and the egui paint pass.
 //!
+//! Credits for the research, talks and standards Spectre's techniques build on:
+//! `docs/SPECTRE-CREDITS.md`.
+//!
 //! Per frame the CPU fills a camera uniform, per-object instance rows, the
 //! dynamic line geometry, and the volumetric uniforms (camera inverse, fog box,
 //! fixtures as spotlights); the GPU renders the forward scene into an HDR
