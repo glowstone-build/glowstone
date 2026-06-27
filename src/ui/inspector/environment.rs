@@ -24,7 +24,7 @@ impl Inspect for Environment {
         p.group("Volume", icon::ENVIRONMENT, true, |p| {
             p.f32("Density", &mut self.density).speed(0.005).range(0.0..=4.0);
             p.color("Tint", &mut self.color, Some(D_COLOR));
-            p.advanced(|p| {
+            p.advanced("volume", |p| {
                 p.f32("Anisotropy", &mut self.anisotropy)
                     .speed(0.005)
                     .range(-0.95..=0.95)

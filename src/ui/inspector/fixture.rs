@@ -51,7 +51,7 @@ impl Inspect for Fixture {
             // master); a built-in's library tint isn't stored (def.color = None).
             p.color("Color", &mut self.color, def.color);
             // Advanced: the volumetric / cone tuning a designer touches rarely.
-            p.advanced(|p| {
+            p.advanced("fixture", |p| {
                 p.f32("Beam", &mut self.beam)
                     .speed(0.01)
                     .range(0.0..=4.0)

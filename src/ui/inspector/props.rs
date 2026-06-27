@@ -57,14 +57,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut InspectorState, obj: &mut impl Inspec
 /// rather than a clean `impl Inspect`. Collapse toggles are applied to `state` +
 /// persisted after the pass (so the builder itself only needs `&state`).
 pub fn with(ui: &mut egui::Ui, state: &mut InspectorState, body: impl FnOnce(&mut Props)) {
-    let mut pending: Vec<(&'static str, bool)> = Vec::new();
+    let mut pending: Vec<(String, bool)> = Vec::new();
     {
-        let mut p = Props { state, pending: &mut pending, salt: "", mode: PropMode::Render(ui) };
+        let mut p = Props { state, pending: &mut pending, salt: String::new(), mode: PropMode::Render(ui) };
         body(&mut p);
     }
     if !pending.is_empty() {
         for (title, open) in pending {
-            state.collapsed.insert(title.to_string(), open);
+            state.collapsed.insert(title, open);
         }
         state.save();
     }
@@ -75,15 +75,15 @@ pub fn with(ui: &mut egui::Ui, state: &mut InspectorState, body: impl FnOnce(&mu
 pub struct Props<'a> {
     state: &'a InspectorState,
     /// Collapse toggles raised this frame, applied to the (mutable) state after the pass.
-    pending: &'a mut Vec<(&'static str, bool)>,
+    pending: &'a mut Vec<(String, bool)>,
     /// id-salt for a nested Advanced disclosure (the enclosing group's title).
-    salt: &'static str,
+    salt: String,
     mode: PropMode<'a>,
 }
 
 enum PropMode<'a> {
     /// Declare-only: push each row's label so the group knows its filter index.
-    Collect(&'a mut Vec<&'static str>),
+    Collect(&'a mut Vec<String>),
     /// Render to egui.
     Render(&'a mut egui::Ui),
 }
@@ -111,6 +111,7 @@ fn field_shell(
     label: &str,
     differs: bool,
     blank_label: bool,
+    enabled: bool,
     value: impl FnOnce(&mut egui::Ui),
 ) -> bool {
     let h = row_height(ui);
@@ -121,6 +122,9 @@ fn field_shell(
             egui::vec2(INSPECTOR_LABEL_W, h),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
+                if !enabled {
+                    ui.disable(); // grey the whole row's label, not just the widget
+                }
                 reset = reset_arrow(ui, differs);
                 if !blank_label {
                     ui.add(egui::Label::new(label).truncate());
@@ -143,6 +147,7 @@ fn slider_shell(
     ui: &mut egui::Ui,
     label: &str,
     differs: bool,
+    enabled: bool,
     value: impl FnOnce(&mut egui::Ui),
 ) -> bool {
     let h = row_height(ui);
@@ -153,6 +158,9 @@ fn slider_shell(
             egui::vec2(INSPECTOR_LABEL_W, h),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
+                if !enabled {
+                    ui.disable();
+                }
                 reset = reset_arrow(ui, differs);
                 ui.add(egui::Label::new(label).truncate());
             },
@@ -174,13 +182,13 @@ fn slider_shell(
 
 impl<'a> Props<'a> {
     /// Collect this body's row labels into a fresh Vec (the declare-only pass).
-    fn collect_labels(&self, body: &mut dyn FnMut(&mut Props)) -> Vec<&'static str> {
-        let mut labels = Vec::new();
+    fn collect_labels(&self, body: &mut dyn FnMut(&mut Props)) -> Vec<String> {
+        let mut labels: Vec<String> = Vec::new();
         let mut throwaway = Vec::new();
         let mut c = Props {
             state: self.state,
             pending: &mut throwaway,
-            salt: self.salt,
+            salt: self.salt.clone(),
             mode: PropMode::Collect(&mut labels),
         };
         body(&mut c);
@@ -191,8 +199,8 @@ impl<'a> Props<'a> {
     /// filter labels and once to render. Collapse state persists by `title`.
     pub fn group(
         &mut self,
-        title: &'static str,
-        icon: &'static str,
+        title: &str,
+        icon: &str,
         default_open: bool,
         mut body: impl FnMut(&mut Props),
     ) {
@@ -201,58 +209,72 @@ impl<'a> Props<'a> {
             // Nested inside a declare-pass: fold this group's labels into the parent's.
             PropMode::Collect(parent) => parent.extend(labels),
             PropMode::Render(ui) => {
-                if !self.state.category_visible(&labels) {
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                if !self.state.category_visible(&refs) {
                     return;
                 }
                 let open = self.state.open_state(title, default_open);
                 let filtering = self.state.query().is_some();
-                let header = format!("{icon}  {title}");
+                let header = if icon.is_empty() { title.to_string() } else { format!("{icon}  {title}") };
                 let state = self.state;
                 let pending = &mut *self.pending;
                 let resp = egui::CollapsingHeader::new(header)
                     .id_salt(("inspector-cat", title))
                     .open(Some(open))
                     .show(ui, |ui| {
-                        let mut inner =
-                            Props { state, pending, salt: title, mode: PropMode::Render(ui) };
+                        let mut inner = Props {
+                            state,
+                            pending,
+                            salt: title.to_string(),
+                            mode: PropMode::Render(ui),
+                        };
                         body(&mut inner);
                     });
                 // Filtering force-opens, so ignore clicks then (they'd fight the override).
                 if resp.header_response.clicked() && !filtering {
-                    self.pending.push((title, !open));
+                    self.pending.push((title.to_string(), !open));
                 }
             }
         }
     }
 
-    /// A nested, default-collapsed "Advanced" disclosure for power-user rows.
-    pub fn advanced(&mut self, mut body: impl FnMut(&mut Props)) {
+    /// A nested, default-collapsed "Advanced" disclosure for power-user rows. `sub`
+    /// disambiguates multiple Advanced sections within ONE group (e.g. "beam"/"color"
+    /// in Optics) so their disclosure ids don't collide.
+    pub fn advanced(&mut self, sub: &str, mut body: impl FnMut(&mut Props)) {
         let labels = self.collect_labels(&mut body);
+        let group_salt = self.salt.clone();
         match &mut self.mode {
             // The parent group's label index must include advanced rows too.
             PropMode::Collect(parent) => parent.extend(labels),
             PropMode::Render(ui) => {
                 let filtering = self.state.query().is_some();
-                if filtering && !self.state.category_visible(&labels) {
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                if filtering && !self.state.category_visible(&refs) {
                     return;
                 }
                 ui.add_space(2.0);
                 let state = self.state;
                 let pending = &mut *self.pending;
-                let salt = self.salt;
                 let mut ch = egui::CollapsingHeader::new(RichText::new("Advanced").small().weak())
-                    .id_salt(("inspector-advanced", salt))
+                    .id_salt(("inspector-advanced", group_salt.as_str(), sub))
                     .default_open(false);
                 if filtering {
                     ch = ch.open(Some(true)); // surface matched advanced rows
                 }
                 ch.show(ui, |ui| {
                     let mut inner =
-                        Props { state, pending, salt, mode: PropMode::Render(ui) };
+                        Props { state, pending, salt: group_salt, mode: PropMode::Render(ui) };
                     body(&mut inner);
                 });
             }
         }
+    }
+
+    /// Whether any of `labels` passes the active filter — for gating a sub-heading so
+    /// it doesn't show above a section whose rows the filter all hid.
+    pub fn any_visible(&self, labels: &[&str]) -> bool {
+        labels.iter().any(|l| self.state.row_visible(l))
     }
 
     /// A small section sub-heading (e.g. "BEAM SHAPING"). Not a filterable row.
@@ -274,10 +296,10 @@ impl<'a> Props<'a> {
 
     /// A draggable scalar (the default) — chain `.slider()` for a bar, `.range()`,
     /// `.speed()`, `.suffix()`, `.default()`, `.enabled()`, `.tip()`.
-    pub fn f32<'p>(&'p mut self, label: &'static str, value: &'p mut f32) -> NumField<'p, 'a> {
+    pub fn f32<'p>(&'p mut self, label: &str, value: &'p mut f32) -> NumField<'p, 'a> {
         NumField {
             p: self,
-            label,
+            label: label.to_string(),
             value,
             range: None,
             speed: 0.1,
@@ -287,16 +309,17 @@ impl<'a> Props<'a> {
             slider: false,
             enabled: true,
             tip: None,
+            text_value: None,
             shown: false,
         }
     }
 
     /// A stacked X/Y/Z vector (Blender-style). Chain `.speed()`/`.suffix()`/`.range()`/
     /// `.prefixes()` (e.g. W/H/D for a size).
-    pub fn vec3<'p>(&'p mut self, label: &'static str, value: &'p mut glam::Vec3) -> Vec3Field<'p, 'a> {
+    pub fn vec3<'p>(&'p mut self, label: &str, value: &'p mut glam::Vec3) -> Vec3Field<'p, 'a> {
         Vec3Field {
             p: self,
-            label,
+            label: label.to_string(),
             value,
             speed: 0.1,
             suffix: "",
@@ -308,7 +331,7 @@ impl<'a> Props<'a> {
 
     /// A rotation, edited as stacked X/Y/Z euler degrees (YXZ) and recomposed to the
     /// quaternion; the revert arrow snaps back to identity. Returns whether it changed.
-    pub fn rotation(&mut self, label: &'static str, value: &mut glam::Quat) -> bool {
+    pub fn rotation(&mut self, label: &str, value: &mut glam::Quat) -> bool {
         let (ry, rx, rz) = value.to_euler(glam::EulerRot::YXZ);
         let (mut ex, mut ey, mut ez) = (rx.to_degrees(), ry.to_degrees(), rz.to_degrees());
         let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
@@ -326,12 +349,12 @@ impl<'a> Props<'a> {
     }
 
     /// An RGB colour swatch. `default = Some` shows a revert arrow (else none).
-    pub fn color(&mut self, label: &'static str, value: &mut [f32; 3], default: Option<[f32; 3]>) -> bool {
+    pub fn color(&mut self, label: &str, value: &mut [f32; 3], default: Option<[f32; 3]>) -> bool {
         let differs = default.is_some_and(|d| !approx_rgb(*value, d));
         let state = self.state;
         match &mut self.mode {
             PropMode::Collect(labels) => {
-                labels.push(label);
+                labels.push(label.to_string());
                 false
             }
             PropMode::Render(ui) => {
@@ -339,7 +362,7 @@ impl<'a> Props<'a> {
                     return false;
                 }
                 let mut changed = false;
-                let reset = field_shell(ui, label, differs, false, |ui| {
+                let reset = field_shell(ui, label, differs, false, true, |ui| {
                     changed = ui.color_edit_button_rgb(value).changed();
                 });
                 if let (true, Some(d)) = (reset, default) {
@@ -352,11 +375,11 @@ impl<'a> Props<'a> {
     }
 
     /// A boolean checkbox. Returns whether it changed this frame.
-    pub fn bool(&mut self, label: &'static str, value: &mut bool) -> bool {
+    pub fn bool(&mut self, label: &str, value: &mut bool) -> bool {
         let state = self.state;
         match &mut self.mode {
             PropMode::Collect(labels) => {
-                labels.push(label);
+                labels.push(label.to_string());
                 false
             }
             PropMode::Render(ui) => {
@@ -364,7 +387,7 @@ impl<'a> Props<'a> {
                     return false;
                 }
                 let mut changed = false;
-                field_shell(ui, label, false, false, |ui| {
+                field_shell(ui, label, false, false, true, |ui| {
                     changed = ui.checkbox(value, "").changed();
                 });
                 changed
@@ -375,14 +398,14 @@ impl<'a> Props<'a> {
     /// A dropdown over `options` (value, display). Returns whether the selection changed.
     pub fn combo<T: PartialEq + Clone>(
         &mut self,
-        label: &'static str,
+        label: &str,
         value: &mut T,
         options: &[(T, &'static str)],
     ) -> bool {
         let state = self.state;
         match &mut self.mode {
             PropMode::Collect(labels) => {
-                labels.push(label);
+                labels.push(label.to_string());
                 false
             }
             PropMode::Render(ui) => {
@@ -395,7 +418,7 @@ impl<'a> Props<'a> {
                     .find(|(v, _)| v == value)
                     .map(|(_, t)| *t)
                     .unwrap_or("");
-                field_shell(ui, label, false, false, |ui| {
+                field_shell(ui, label, false, false, true, |ui| {
                     egui::ComboBox::from_id_salt(("inspector-combo", label))
                         .width(value_width(ui))
                         .selected_text(current)
@@ -414,11 +437,11 @@ impl<'a> Props<'a> {
     }
 
     /// A full-width action button row (e.g. "Profile…"). Returns whether it was clicked.
-    pub fn action(&mut self, label: &'static str) -> bool {
+    pub fn action(&mut self, label: &str) -> bool {
         let state = self.state;
         match &mut self.mode {
             PropMode::Collect(labels) => {
-                labels.push(label);
+                labels.push(label.to_string());
                 false
             }
             PropMode::Render(ui) => {
@@ -435,7 +458,7 @@ impl<'a> Props<'a> {
     #[allow(clippy::too_many_arguments)]
     fn vec3_raw(
         &mut self,
-        label: &'static str,
+        label: &str,
         differs: bool,
         speed: f64,
         suffix: &'static str,
@@ -448,7 +471,7 @@ impl<'a> Props<'a> {
         let state = self.state;
         match &mut self.mode {
             PropMode::Collect(labels) => {
-                labels.push(label);
+                labels.push(label.to_string());
                 false
             }
             PropMode::Render(ui) => {
@@ -459,7 +482,7 @@ impl<'a> Props<'a> {
                 let comps: [(&str, &mut f32); 3] = [(prefixes[0], x), (prefixes[1], y), (prefixes[2], z)];
                 let mut reset = false;
                 for (i, (axis, comp)) in comps.into_iter().enumerate() {
-                    let r = field_shell(ui, label, if i == 0 { differs } else { false }, i != 0, |ui| {
+                    let r = field_shell(ui, label, if i == 0 { differs } else { false }, i != 0, true, |ui| {
                         let mut d = DragValue::new(comp).speed(speed).prefix(format!("{axis} "));
                         if let Some(r) = &range {
                             d = d.range(r.clone());
@@ -493,7 +516,7 @@ impl<'a> Props<'a> {
 /// [`NumField::show`] when the caller needs the change result, e.g. an indirect setter).
 pub struct NumField<'p, 'a> {
     p: &'p mut Props<'a>,
-    label: &'static str,
+    label: String,
     value: &'p mut f32,
     range: Option<RangeInclusive<f32>>,
     speed: f64,
@@ -503,6 +526,8 @@ pub struct NumField<'p, 'a> {
     slider: bool,
     enabled: bool,
     tip: Option<String>,
+    /// Slider readout override (e.g. zoom shown as "58°" instead of the raw 0–1).
+    text_value: Option<String>,
     shown: bool,
 }
 
@@ -542,6 +567,11 @@ impl<'p, 'a> NumField<'p, 'a> {
         self.enabled = e;
         self
     }
+    /// Override a slider's numeric readout with derived text (e.g. zoom "58°").
+    pub fn text_value(mut self, t: impl Into<String>) -> Self {
+        self.text_value = Some(t.into());
+        self
+    }
     /// A hover tooltip. Accepts a static str or an owned `String` (e.g. a live
     /// "commanded · now 45°" read-out).
     pub fn tip(mut self, t: impl Into<String>) -> Self {
@@ -560,12 +590,14 @@ impl<'p, 'a> NumField<'p, 'a> {
             return false;
         }
         self.shown = true;
-        let differs = self.default.is_some_and(|d| !approx(*self.value, d));
+        // A disabled field never shows the revert arrow (matches the optics rows: a
+        // greyed/unsupported control can't "differ" actionably).
+        let differs = self.enabled && self.default.is_some_and(|d| !approx(*self.value, d));
         let state = self.p.state;
-        let label = self.label;
+        let label: &str = &self.label;
         match &mut self.p.mode {
             PropMode::Collect(labels) => {
-                labels.push(label);
+                labels.push(label.to_string());
                 false
             }
             PropMode::Render(ui) => {
@@ -575,6 +607,7 @@ impl<'p, 'a> NumField<'p, 'a> {
                 let value = &mut *self.value;
                 let range = self.range.clone();
                 let tip = self.tip.clone();
+                let text_value = self.text_value.clone();
                 let (speed, suffix, decimals, slider, enabled) =
                     (self.speed, self.suffix, self.decimals, self.slider, self.enabled);
                 let mut changed = false;
@@ -583,6 +616,9 @@ impl<'p, 'a> NumField<'p, 'a> {
                         let mut s = Slider::new(value, range.unwrap_or(0.0..=1.0));
                         if let Some(n) = decimals {
                             s = s.max_decimals(n);
+                        }
+                        if let Some(t) = text_value {
+                            s = s.text(t).show_value(false);
                         }
                         ui.add_enabled(enabled, s)
                     } else {
@@ -604,9 +640,9 @@ impl<'p, 'a> NumField<'p, 'a> {
                     }
                 };
                 let reset = if slider {
-                    slider_shell(ui, label, differs, build)
+                    slider_shell(ui, label, differs, enabled, build)
                 } else {
-                    field_shell(ui, label, differs, false, build)
+                    field_shell(ui, label, differs, false, enabled, build)
                 };
                 if let (true, Some(d)) = (reset, self.default) {
                     *self.value = d;
@@ -631,7 +667,7 @@ impl Drop for NumField<'_, '_> {
 /// A chained stacked-vector declaration; renders on drop.
 pub struct Vec3Field<'p, 'a> {
     p: &'p mut Props<'a>,
-    label: &'static str,
+    label: String,
     value: &'p mut glam::Vec3,
     speed: f64,
     suffix: &'static str,
@@ -669,12 +705,13 @@ impl<'p, 'a> Vec3Field<'p, 'a> {
             return false;
         }
         self.shown = true;
-        let (label, speed, suffix, prefixes) = (self.label, self.speed, self.suffix, self.prefixes);
+        let label = self.label.clone();
+        let (speed, suffix, prefixes) = (self.speed, self.suffix, self.prefixes);
         let range = self.range.clone();
         let (mut x, mut y, mut z) = (self.value.x, self.value.y, self.value.z);
         // A plain vector (Position/Center/Size) has no recoverable default → no revert
         // arrow (`differs = false`); reset-to-identity rotations go through `Props::rotation`.
-        let changed = self.p.vec3_raw(label, false, speed, suffix, prefixes, range, &mut x, &mut y, &mut z);
+        let changed = self.p.vec3_raw(&label, false, speed, suffix, prefixes, range, &mut x, &mut y, &mut z);
         if changed {
             *self.value = glam::vec3(x, y, z);
         }
