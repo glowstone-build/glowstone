@@ -1,7 +1,7 @@
 # RESEARCH — Stage PYRO devices: CO2 cannon/jet + cold-spark machine
 
-Design doc for adding two stage **PYRO** devices to the carthage/previz wgpu
-lighting-previz app:
+Design doc for adding two stage **PYRO** devices to the carthage/glowstone wgpu
+lighting-glowstone app:
 
 1. a **CO2 cannon / cryo jet** — a fast, dramatic white plume that catches
    coloured stage light, and
@@ -326,7 +326,7 @@ vel += c * noise_strength * dt;                       // strength ~ 0.5..3 m/s^2
 A zero-per-frame-cost alternative (Niagara stateless) is to precompute a small
 LUT of integrated curl streamlines and index it by `t` and a hash of the start
 position; the visible effect is a smooth wandering path whose total wander
-scales with `lifetime * noise_strength`. For previz, the live curl term at a low
+scales with `lifetime * noise_strength`. For glowstone, the live curl term at a low
 substep count is fine.
 
 **Velocity-stretched additive sprites** (the streak look). Two coupled pieces:
@@ -417,7 +417,7 @@ alpha *= clamp((scene_z - frag_z) / soft_fade_m, 0.0, 1.0);
 perp = dot(v,n)*n;  tan = v - perp;
 v_out = (1 - friction)*tan - resilience*perp;   // resilience ~0.3, friction ~0.4
 ```
-Decrement a small collision budget (1–3), then kill. For previz this is optional
+Decrement a small collision budget (1–3), then kill. For glowstone this is optional
 — cold sparks mostly burn out before landing; a simple kill-at-floor is enough.
 
 ### 3.2 CO2 — cheap rising white fog column
@@ -689,7 +689,7 @@ documented there for wheel motion applies equally to particles).
   lit by the same fixtures-as-spotlights buffer the volumetric pass uses
   (or sampling the froxel result texture), grow-over-life, soft-depth fade.
 - Optionally a compute shader `src/shaders/pyro_sim.wgsl` for GPU simulation;
-  for previz a **CPU sim** (in `app`/renderer, keyed by `EntityId`) writing an
+  for glowstone a **CPU sim** (in `app`/renderer, keyed by `EntityId`) writing an
   instance buffer is simpler and matches how the app already builds per-frame
   instance vectors.
 

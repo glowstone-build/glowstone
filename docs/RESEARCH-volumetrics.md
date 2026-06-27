@@ -1,7 +1,7 @@
 # Hyper-Realistic Volumetric Beams & Haze — Rendering R&D
 
 > Implementation guide for the volumetric layer of this `wgpu 29 + winit` stage-lighting
-> previz. Audience: the engineer who will write the WGSL/compute passes. This document is
+> glowstone. Audience: the engineer who will write the WGSL/compute passes. This document is
 > the design rationale and the phased plan; it intentionally names texture formats, buffer
 > layouts, workgroup sizes, and the exact integration math you must copy verbatim.
 >
@@ -184,7 +184,7 @@ Per-froxel slice **thickness** `dz = viewZ(s+1) − viewZ(s)` is what feeds Beer
 the scattering integral. **Anchor `near` to the fog box, not the camera near plane** (cf.
 Filament's `zLightNear ≈ 5 m`): the media is bounded, so spend slice resolution inside the
 haze where beams live, not on empty foreground. Stages are small (a few tens of metres), so
-you can afford dense slicing; bias `k` strongly toward the camera since the previz operator
+you can afford dense slicing; bias `k` strongly toward the camera since the glowstone operator
 orbits close to fixtures.
 
 ### 3.3 Pass [2]/[3] — material + light injection (one thread per froxel)
@@ -389,7 +389,7 @@ fn fbm(x: vec3<f32>, H: f32) -> f32 {
 
 **Curl-noise advection** (Bridson 2007) gives the slow rolling/curling motion real fog has,
 incompressibly (no sources/sinks), without a fluid sim: build a 3D vector potential `ψ` from
-three decorrelated FBM fields and take its curl — `v = ∇×ψ`, and `div(∇×ψ) ≡ 0`. For previz,
+three decorrelated FBM fields and take its curl — `v = ∇×ψ`, and `div(∇×ψ) ≡ 0`. For glowstone,
 advect just the *noise-sample offset* by `v·t` (whole-volume coherent, cheap) rather than
 simulating particles. Ramp `ψ` to zero at the fog-box walls so flow stays tangent.
 
@@ -574,7 +574,7 @@ far/minor-fixture tier (§4.5); dual-lobe HG mode; cone cull test replacing sphe
 - **No in-repo ground truth** — validate the analytic airlight + froxel inject against the
   Phase 0 brute-force march to tune `σ_t / σ_s / g` defaults that look like real haze.
 - **Multiple scattering is ignored** by single-scattering — for thick CO2 an ambient/SH term
-  scaled by albedo, or dual-lobe HG, may be needed; decide if "good enough" for previz.
+  scaled by albedo, or dual-lobe HG, may be needed; decide if "good enough" for glowstone.
 
 ---
 

@@ -1046,7 +1046,7 @@ pub fn tonemap_pipeline(
     )
 }
 
-// ---- froxel volumetric (PREVIZ_FROXEL): two compute passes + a composite ----
+// ---- froxel volumetric (GLOWSTONE_FROXEL): two compute passes + a composite ----
 
 /// Bind-group layout shared by the froxel `inject` + `integrate` compute passes.
 /// Mirrors froxel.wgsl bindings, all COMPUTE-visible. 10 = froxel_out (storage

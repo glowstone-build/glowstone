@@ -717,7 +717,7 @@ pub struct EmitterCone {
 /// (the Ayrton Khamsin the renderer's exposure was tuned against).
 const FLUX_REF: f32 = 40_000.0;
 const ANGLE_REF: f32 = 25.0;
-/// Previz ceiling on one fixture's total rated flux. GDTF files in the wild
+/// glowstone ceiling on one fixture's total rated flux. GDTF files in the wild
 /// duplicate group totals onto every pixel (a Roxx S2 sums to >1 Mlm); scaling
 /// the cells back to a plausible fixture total tames those without touching
 /// honest files (Spiider 11.6 klm, Astera 71 klm → mild trim, Khamsin 40 klm).

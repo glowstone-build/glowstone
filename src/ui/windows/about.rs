@@ -7,7 +7,7 @@ use crate::ui::theme;
 /// The About box.
 pub fn about_window(ctx: &egui::Context, open: &mut bool) {
     let mut keep = *open;
-    egui::Window::new("About previz")
+    egui::Window::new("About glowstone")
         .open(&mut keep)
         .resizable(false)
         .collapsible(false)
@@ -20,7 +20,7 @@ pub fn about_window(ctx: &egui::Context, open: &mut bool) {
                 // App mark — a large accent glyph above the wordmark.
                 ui.label(RichText::new(theme::icon::VIEWPORT).size(48.0).color(accent));
                 ui.add_space(2.0);
-                ui.label(RichText::new("previz").heading().size(26.0).strong().color(ink.primary));
+                ui.label(RichText::new("glowstone").heading().size(26.0).strong().color(ink.primary));
                 ui.label(RichText::new("Stage-lighting previsualization").color(ink.secondary));
             });
 

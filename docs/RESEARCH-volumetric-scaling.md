@@ -135,7 +135,7 @@ grid (they're low-angular-frequency — ideal for a coarse grid). Rank heroes by
 narrowness × screen area × proximity; **cross-fade**, never hard-cutoff, or beams pop on
 orbit. Exclude heroes from froxel injection to avoid double-counting. *(This split is a sound
 inference from the literature — froxel grids are confirmed coarse vs a half-res raymarch — but
-no source benchmarks it for DMX previz; the seam/cost trade-off must be prototyped.)*
+no source benchmarks it for DMX glowstone; the seam/cost trade-off must be prototyped.)*
 
 ### Phase D — extreme scale (only if Phase B+C aren't enough)
 - **Aggregate-emitter LOD for dense pixel panels** (the real pixel-mapping endgame): when
@@ -187,7 +187,7 @@ no source benchmarks it for DMX previz; the seam/cost trade-off must be prototyp
    immediately? Instrument the cluster build and log max/avg list length on a real pixel rig.
 2. **Compute vs fragment on TBDR**: the probe proves compute works; whether the froxel compute
    path beats the current tile-based fragment raymarch on Apple Silicon must be **A/B'd**
-   (`PREVIZ_BENCH`). Tile memory may already favor the fragment path for the integrate step.
+   (`GLOWSTONE_BENCH`). Tile memory may already favor the fragment path for the integrate step.
 3. **Hero/froxel composite seams**: where a hero beam crosses froxel fog — bilateral upsample
    + blue-noise jitter to hide the resolution boundary; verify no visible seam on orbit.
 4. **Temporal under strobes**: does extinction-accumulation + variance clamp survive strobes +

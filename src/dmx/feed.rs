@@ -1,8 +1,8 @@
-//! Headless synthetic DMX feed (no socket) for the `PREVIZ_DMX_*` dev harness.
+//! Headless synthetic DMX feed (no socket) for the `GLOWSTONE_DMX_*` dev harness.
 //!
 //! Builds a deterministic [`UniverseSnapshot`] that flows through the SAME
 //! `poll()` → `decode()` path as a live console, so patch + decode + render can be
-//! verified end-to-end with `PREVIZ_SCREENSHOT` and no hardware. Two entry points:
+//! verified end-to-end with `GLOWSTONE_SCREENSHOT` and no hardware. Two entry points:
 //! [`look`] encodes a designed lit look per patched fixture (the inverse of
 //! decode), and [`inject_spec`] sets explicit `universe,channel,value` triples.
 

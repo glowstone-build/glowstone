@@ -1,8 +1,8 @@
-# The Blender Framework, rebuilt as an arch-viz / lighting-previz tool
+# The Blender Framework, rebuilt as an arch-viz / lighting-glowstone tool
 
-This is the architecture blueprint for turning previz into something that *feels*
+This is the architecture blueprint for turning glowstone into something that *feels*
 like Blender — its proven, scalable operating model — while staying a
-purpose-built arch-viz / lighting-previz application. It synthesizes six pillar
+purpose-built arch-viz / lighting-glowstone application. It synthesizes six pillar
 specs (operator+undo, area/region/editor, keymap+events, tools+gizmos,
 datablock/outliner/properties, pie/modes/workspaces) into one coherent plan.
 
@@ -193,7 +193,7 @@ struct KeyMap { id: KeymapId, items: Vec<Kmi>, modal: bool }
 enum   KeymapId { Global, Editor(Tab), Mode(Mode), Modal(ModalMap) }
 
 struct KeyConfig { preset: Preset, user_diffs: Vec<KmiDiff> } // serialize this only
-enum   Preset    { Previz, IndustryCompatible }
+enum   Preset    { glowstone, IndustryCompatible }
 fn resolved(&self) -> Vec<KeyMap>                            // apply diffs over defaults
 
 enum ModalAction { Confirm, Cancel, AxisX, AxisY, AxisZ, PlaneX, Precision, Snap, .. }
@@ -547,7 +547,7 @@ library overrides, full kmi-properties editing — designed-for, shipped-later.
 6. **Inspector duplication.** Once the viewport N-panel renders `inspector`, do we
    keep `Tab::Inspector`/`Tab::Properties` as a dock tab too? Recommendation: keep
    both (N-panel default-on in Focus/Visualise, Properties tab in Design).
-7. **Keymap preset + persistence home.** Confirm shipping `Previz` +
+7. **Keymap preset + persistence home.** Confirm shipping `glowstone` +
    `IndustryCompatible` presets, and that keymap user-diffs + `Ui.mode` + active
    workspace ride on **general preference/project persistence** (Preferences is
    not yet persisted) — or this pillar ships unsavable.

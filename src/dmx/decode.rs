@@ -81,7 +81,7 @@ pub fn apply(
     }
 }
 
-/// Dev hook: when `PREVIZ_DMX_DUMP` is set, log a live GDTF fixture's raw
+/// Dev hook: when `GLOWSTONE_DMX_DUMP` is set, log a live GDTF fixture's raw
 /// footprint bytes (1-based DMX slot → value) whenever they change. Lets a
 /// layered/multi-emitter fixture's real console output be captured and checked
 /// against the decode — the only ground truth for "which channels the desk
@@ -91,7 +91,7 @@ fn dump_footprint(name: &str, universe: u16, address: u16, footprint: u32, buf: 
     use std::collections::HashMap;
     thread_local! {
         static LAST: RefCell<HashMap<(u16, u16), Vec<u8>>> = RefCell::new(HashMap::new());
-        static ON: bool = std::env::var("PREVIZ_DMX_DUMP").is_ok();
+        static ON: bool = std::env::var("GLOWSTONE_DMX_DUMP").is_ok();
     }
     if !ON.with(|on| *on) {
         return;
@@ -685,7 +685,7 @@ pub fn apply_screens(screens: &mut [crate::scene::LedScreen], snap: &UniverseSna
 /// trigger, height + macros. Writes the runtime control fields (`driven`,
 /// `armed`, `fire`, live `height_m`/`pan`/`tilt`/`spin_rpm`) the renderer's sim
 /// reads. A device whose universe is NOT present in the snapshot stays
-/// **un-driven** so it free-runs at its `density` (the previz-preview default).
+/// **un-driven** so it free-runs at its `density` (the glowstone-preview default).
 pub fn apply_pyro(pyro: &mut [crate::scene::PyroDevice], snap: &UniverseSnapshot) {
     use crate::scene::pyro::{PyroKind, PyroMode};
     for d in pyro.iter_mut() {

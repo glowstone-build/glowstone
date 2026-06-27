@@ -1,4 +1,4 @@
-//! previz — an open-source lighting previsualization tool for live events.
+//! glowstone — an open-source lighting previsualization tool for live events.
 //!
 //! Pure wgpu + winit (no game engine, no ECS). This binary wires up the winit
 //! event loop and hands control to [`app::App`].
@@ -19,9 +19,9 @@ mod ui;
 use winit::event_loop::EventLoop;
 
 fn main() {
-    // Quiet by default; `RUST_LOG=previz=debug,wgpu=warn cargo run` to dig in.
+    // Quiet by default; `RUST_LOG=glowstone=debug,wgpu=warn cargo run` to dig in.
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn,previz=info"),
+        env_logger::Env::default().default_filter_or("warn,glowstone=info"),
     )
     .init();
 

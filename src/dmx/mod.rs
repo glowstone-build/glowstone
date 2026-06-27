@@ -133,7 +133,7 @@ pub struct DmxIo {
     bind_ip_text: String,
     universes_text: String,
     pending: PendingNetCmd,
-    /// Headless synthetic feed (no socket), used by `PREVIZ_DMX_FEED/INJECT`.
+    /// Headless synthetic feed (no socket), used by `GLOWSTONE_DMX_FEED/INJECT`.
     injected: Option<Arc<UniverseSnapshot>>,
     stale: Duration,
 }
@@ -317,17 +317,17 @@ pub struct DmxView<'a> {
     pub pending: &'a mut PendingNetCmd,
 }
 
-/// Apply `PREVIZ_DMX_*` dev knobs in `resumed()`, mirroring the other `PREVIZ_*`
+/// Apply `GLOWSTONE_DMX_*` dev knobs in `resumed()`, mirroring the other `GLOWSTONE_*`
 /// harness entry points. Lets the whole pipeline be exercised headlessly:
 ///
-/// - `PREVIZ_DMX=artnet|sacn|both` (+ `PREVIZ_DMX_BIND`, `PREVIZ_DMX_UNIVERSES`)
+/// - `GLOWSTONE_DMX=artnet|sacn|both` (+ `GLOWSTONE_DMX_BIND`, `GLOWSTONE_DMX_UNIVERSES`)
 ///   configures and starts the REAL receiver (point a console at the binary).
-/// - `PREVIZ_DMX_AUTOPATCH=1` auto-assigns addresses to the rig.
-/// - `PREVIZ_DMX_FEED=look|full|ramp` injects a deterministic synthetic universe
+/// - `GLOWSTONE_DMX_AUTOPATCH=1` auto-assigns addresses to the rig.
+/// - `GLOWSTONE_DMX_FEED=look|full|ramp` injects a deterministic synthetic universe
 ///   set (no socket) through the real decode path — composes with
-///   `PREVIZ_SCREENSHOT`/`PREVIZ_SHEET`.
-/// - `PREVIZ_DMX_INJECT="u,ch,val; …"` injects explicit channel values.
-/// - `PREVIZ_DMX_DUMP=1` logs each fixture's decoded state here (a non-graphical
+///   `GLOWSTONE_SCREENSHOT`/`GLOWSTONE_SHEET`.
+/// - `GLOWSTONE_DMX_INJECT="u,ch,val; …"` injects explicit channel values.
+/// - `GLOWSTONE_DMX_DUMP=1` logs each fixture's decoded state here (a non-graphical
 ///   oracle), AND — on the live decode path — the raw footprint bytes each
 ///   console actually drives (see `decode::dump_footprint`), the ground truth
 ///   for layered/multi-emitter fixtures like the Volero Wave.
@@ -336,15 +336,15 @@ pub fn apply_env_knobs(dmx: &mut DmxIo, scene: &mut Scene) {
 
     // Headless receive diagnostic: start the real receiver, dump what arrives for
     // N seconds, then exit. Verifies live Art-Net/sACN without the GUI.
-    if let Ok(secs) = env("PREVIZ_DMX_LISTEN") {
+    if let Ok(secs) = env("GLOWSTONE_DMX_LISTEN") {
         listen_and_exit(dmx, scene, secs.parse().unwrap_or(5));
     }
 
-    if env("PREVIZ_DMX_AUTOPATCH").is_ok() {
+    if env("GLOWSTONE_DMX_AUTOPATCH").is_ok() {
         dmx.auto_patch(scene);
     }
 
-    if let Ok(mode) = env("PREVIZ_DMX") {
+    if let Ok(mode) = env("GLOWSTONE_DMX") {
         match mode.to_lowercase().as_str() {
             "artnet" | "art-net" => {
                 dmx.config.artnet = true;
@@ -359,22 +359,22 @@ pub fn apply_env_knobs(dmx: &mut DmxIo, scene: &mut Scene) {
                 dmx.config.sacn = true;
             }
         }
-        if let Ok(ip) = env("PREVIZ_DMX_BIND")
+        if let Ok(ip) = env("GLOWSTONE_DMX_BIND")
             && let Ok(ip) = ip.parse::<IpAddr>()
         {
             dmx.config.bind_ip = ip;
         }
-        if let Ok(list) = env("PREVIZ_DMX_UNIVERSES") {
+        if let Ok(list) = env("GLOWSTONE_DMX_UNIVERSES") {
             dmx.config.universes = parse_universe_list(&list);
         }
         dmx.start();
     }
 
-    if let Ok(kind) = env("PREVIZ_DMX_FEED") {
+    if let Ok(kind) = env("GLOWSTONE_DMX_FEED") {
         let snap = feed::look(scene, dmx.patch(), &kind);
         dmx.inject(snap);
     }
-    if let Ok(spec) = env("PREVIZ_DMX_INJECT") {
+    if let Ok(spec) = env("GLOWSTONE_DMX_INJECT") {
         dmx.inject(feed::inject_spec(&spec));
     }
 
@@ -385,7 +385,7 @@ pub fn apply_env_knobs(dmx: &mut DmxIo, scene: &mut Scene) {
         dmx.decode(scene);
     }
 
-    if env("PREVIZ_DMX_DUMP").is_ok() {
+    if env("GLOWSTONE_DMX_DUMP").is_ok() {
         dmx.poll();
         dmx.decode(scene);
         for (i, f) in scene.fixtures.iter().enumerate() {
@@ -404,19 +404,19 @@ pub fn apply_env_knobs(dmx: &mut DmxIo, scene: &mut Scene) {
     }
 }
 
-/// `PREVIZ_DMX_LISTEN=secs`: start the real receiver, print every universe that
+/// `GLOWSTONE_DMX_LISTEN=secs`: start the real receiver, print every universe that
 /// arrives (and the sources) for `secs` seconds, then exit. A non-GUI smoke test
-/// for live reception. Honours `PREVIZ_DMX_BIND` / `PREVIZ_DMX_UNIVERSES`.
+/// for live reception. Honours `GLOWSTONE_DMX_BIND` / `GLOWSTONE_DMX_UNIVERSES`.
 fn listen_and_exit(dmx: &mut DmxIo, scene: &mut Scene, secs: u64) -> ! {
-    if let Some(ip) = std::env::var("PREVIZ_DMX_BIND").ok().and_then(|s| s.parse::<IpAddr>().ok()) {
+    if let Some(ip) = std::env::var("GLOWSTONE_DMX_BIND").ok().and_then(|s| s.parse::<IpAddr>().ok()) {
         dmx.config.bind_ip = ip;
     }
-    if let Ok(list) = std::env::var("PREVIZ_DMX_UNIVERSES") {
+    if let Ok(list) = std::env::var("GLOWSTONE_DMX_UNIVERSES") {
         dmx.config.universes = parse_universe_list(&list);
     }
-    // Optional: PREVIZ_DMX_PATCH="universe,address" patches fixture 0 so we can
+    // Optional: GLOWSTONE_DMX_PATCH="universe,address" patches fixture 0 so we can
     // confirm the live feed decodes into a moving fixture.
-    let patch_fixture0 = std::env::var("PREVIZ_DMX_PATCH").ok().and_then(|s| {
+    let patch_fixture0 = std::env::var("GLOWSTONE_DMX_PATCH").ok().and_then(|s| {
         let p: Vec<&str> = s.split(',').map(str::trim).collect();
         match p.as_slice() {
             [u, a] => Some((u.parse::<u16>().ok()?, a.parse::<u16>().ok()?)),

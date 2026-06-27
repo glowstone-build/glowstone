@@ -96,17 +96,17 @@ impl Default for DupDefaults {
 /// add/operator dialogs) check this so committing a value box with Enter can't leak
 /// into them and fire an unintended action (bug 8).
 pub(crate) fn text_focus_active(ctx: &egui::Context) -> bool {
-    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("previz.text_focus")).unwrap_or(false))
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("glowstone.text_focus")).unwrap_or(false))
 }
 
 /// The last-used Duplicate values (or all-zero defaults on first use).
 pub(crate) fn dup_defaults(ctx: &egui::Context) -> DupDefaults {
-    ctx.data(|d| d.get_temp::<DupDefaults>(egui::Id::new("previz.dup.defaults")).unwrap_or_default())
+    ctx.data(|d| d.get_temp::<DupDefaults>(egui::Id::new("glowstone.dup.defaults")).unwrap_or_default())
 }
 
 /// Remember the Duplicate values just used, so the next Duplicate reuses them.
 pub(crate) fn set_dup_defaults(ctx: &egui::Context, v: DupDefaults) {
-    ctx.data_mut(|m| m.insert_temp(egui::Id::new("previz.dup.defaults"), v));
+    ctx.data_mut(|m| m.insert_temp(egui::Id::new("glowstone.dup.defaults"), v));
 }
 
 /// Build a fresh [`DuplicateDialog`] for `fixture`, seeded from the remembered
@@ -721,7 +721,7 @@ impl Ui {
         // global readers (batch-add, dialog confirms) would otherwise see it as a
         // fresh keypress. They gate on `text_focus_active()` so the commit can't leak.
         let text_focus = ctx.memory(|m| m.focused().is_some());
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("previz.text_focus"), text_focus));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("glowstone.text_focus"), text_focus));
         // Age + retire expired toasts (dt from egui — `show()` takes no dt param).
         self.notify.tick(ctx.input(|i| i.stable_dt));
         // DMX connect/disconnect edge: the actual bind happens on the DMX worker,
@@ -787,7 +787,7 @@ impl Ui {
                     op::OpStatus::Finished
                 },
             );
-            ctx.data_mut(|d| d.insert_temp(egui::Id::new("previz.dupgrab.start"), true));
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("glowstone.dupgrab.start"), true));
         }
 
         // Chrome MUST be reserved before the dock (it fills the CentralPanel).

@@ -233,7 +233,7 @@ pub fn builtins() -> Vec<Workspace> {
             overlays: Overlays { labels: true, stats: false, grid: false, gizmos: true },
             builtin: true,
         },
-        // VISUALISE: the previz artist — maximise the viewport, minimal chrome. Select
+        // VISUALISE: the glowstone artist — maximise the viewport, minimal chrome. Select
         // tool; overlays mostly off (clean render look), gizmos off.
         Workspace {
             name: "Visualise".into(),
@@ -319,7 +319,7 @@ mod dock_serde {
 /// `<config>/workspaces.json` — the per-user store, alongside `bookmarks.json` /
 /// `keymap.json`.
 fn workspaces_path() -> Option<PathBuf> {
-    let d = directories::ProjectDirs::from("dev", "Embedder", "previz")?;
+    let d = directories::ProjectDirs::from("dev", "Embedder", "glowstone")?;
     let dir = d.config_dir();
     std::fs::create_dir_all(dir).ok()?;
     Some(dir.join("workspaces.json"))

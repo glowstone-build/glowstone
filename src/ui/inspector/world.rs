@@ -110,9 +110,9 @@ pub(super) fn render_properties(
         // --- Fixed header: engine, backend, actions, display (non-collapsing) ---
         p.custom("Engine", true, |ui| {
             egui::ComboBox::from_id_salt("render-engine")
-                .selected_text("Previz Raymarch")
+                .selected_text("glowstone Raymarch")
                 .show_ui(ui, |ui| {
-                    ui.selectable_label(true, "Previz Raymarch");
+                    ui.selectable_label(true, "glowstone Raymarch");
                 });
         });
 

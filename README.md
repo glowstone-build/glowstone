@@ -1,4 +1,4 @@
-# previz
+# glowstone
 
 An open-source **lighting previsualization** tool for live events
 (concerts, festivals, theatre). It renders a 3D stage with lighting fixtures —
@@ -10,7 +10,7 @@ small and dependency-light so the renderer can grow into the real headline
 feature — volumetric, ray-marched beams in haze.
 
 > Status: scaffold. It runs and is fun to poke at, but it is not yet a usable
-> previz tool. See [Roadmap](#roadmap).
+> glowstone tool. See [Roadmap](#roadmap).
 
 ## What it does today
 
@@ -227,7 +227,7 @@ Controls:
 Logging is off by default. To see init details:
 
 ```sh
-RUST_LOG=previz=debug,wgpu=warn cargo run --release
+RUST_LOG=glowstone=debug,wgpu=warn cargo run --release
 ```
 
 ### Dev tooling
@@ -236,21 +236,21 @@ Two headless modes (no visible window needed) help develop/verify the renderer:
 
 ```sh
 # Render the offscreen 3D view to a PNG and exit (handy for CI / screenshots):
-PREVIZ_SCREENSHOT=shot.png cargo run --release
+GLOWSTONE_SCREENSHOT=shot.png cargo run --release
 
 # Benchmark the render: time N offscreen frames and print ms/frame + fps:
-PREVIZ_BENCH=120 RUST_LOG=previz=info cargo run --release
+GLOWSTONE_BENCH=120 RUST_LOG=glowstone=info cargo run --release
 
 # Optical contact sheet: render one PNG per optical feature (gobo, prism, color,
 # CMY, CTO, frost, zoom, iris, animation, chromatic aberration) for the imported
 # fixture, to verify the whole beam chain without the UI:
-PREVIZ_GDTF=fixture.gdtf PREVIZ_SHEET=out_dir cargo run --release
+GLOWSTONE_GDTF=fixture.gdtf GLOWSTONE_SHEET=out_dir cargo run --release
 
 # Import an MVR scene and render it (the camera frames the rig). An imported rig
-# is blacked out by default, so add PREVIZ_EXPOSURE (boost) and/or PREVIZ_LEVELS
-# (bring all fixtures up) to see it; PREVIZ_MVR_EXPORT writes it back out:
-PREVIZ_MVR=scene.mvr PREVIZ_EXPOSURE=30 PREVIZ_SCREENSHOT=shot.png cargo run --release
-PREVIZ_MVR=scene.mvr PREVIZ_MVR_EXPORT=roundtrip.mvr cargo run --release
+# is blacked out by default, so add GLOWSTONE_EXPOSURE (boost) and/or GLOWSTONE_LEVELS
+# (bring all fixtures up) to see it; GLOWSTONE_MVR_EXPORT writes it back out:
+GLOWSTONE_MVR=scene.mvr GLOWSTONE_EXPOSURE=30 GLOWSTONE_SCREENSHOT=shot.png cargo run --release
+GLOWSTONE_MVR=scene.mvr GLOWSTONE_MVR_EXPORT=roundtrip.mvr cargo run --release
 ```
 
 ### Platform notes

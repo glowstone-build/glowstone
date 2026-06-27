@@ -116,7 +116,7 @@ struct FroxelUniform {
     planes: [f32; 4],
 }
 
-/// Froxel-volumetric resources (PREVIZ_FROXEL). A frustum-aligned 3D grid:
+/// Froxel-volumetric resources (GLOWSTONE_FROXEL). A frustum-aligned 3D grid:
 /// `inject` (compute) writes per-cell scatter+extinction into `inject_tex`,
 /// `integrate` (compute) marches +Z into `result_tex`, and a fragment composite
 /// trilinearly samples `result_tex`. Created only when the adapter supports
@@ -444,7 +444,7 @@ pub struct Renderer {
 
     // Per-beam shadow maps for the hero (sharp moving-head) beams.
     shadow: shadow::ShadowMaps,
-    /// Froxel volumetric (PREVIZ_FROXEL); `None` if the adapter lacks rgba16float
+    /// Froxel volumetric (GLOWSTONE_FROXEL); `None` if the adapter lacks rgba16float
     /// storage textures.
     froxel: Option<FroxelState>,
     /// Per-pass GPU timing for the perf overlay; `None` if the adapter lacks
@@ -564,7 +564,7 @@ fn backend_from_label(s: &str) -> Option<wgpu::Backend> {
 /// `<config>/gpu-backend.txt` — the machine-global GPU backend preference (read at
 /// startup, before any project loads; per-project prefs can't choose the backend).
 fn gpu_pref_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "Embedder", "previz")
+    directories::ProjectDirs::from("dev", "Embedder", "glowstone")
         .map(|d| d.config_dir().join("gpu-backend.txt"))
 }
 
@@ -680,7 +680,7 @@ impl Renderer {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("previz-device"),
+                label: Some("glowstone-device"),
                 required_features,
                 required_limits: wgpu::Limits::default(),
                 ..Default::default()
@@ -1478,14 +1478,14 @@ impl Renderer {
         settings: &RenderSettings,
     ) -> (u32, u32, Vec<u8>) {
         let (width, height) = self.viewport.size;
-        // Headless screenshot = a RENDER → full-quality CO2 (PREVIZ_CO2_PREVIEW forces
+        // Headless screenshot = a RENDER → full-quality CO2 (GLOWSTONE_CO2_PREVIEW forces
         // the cheaper preview path so the split can be A/B'd from the same harness).
-        self.hq_co2 = std::env::var("PREVIZ_CO2_PREVIEW").is_err();
+        self.hq_co2 = std::env::var("GLOWSTONE_CO2_PREVIEW").is_err();
 
         // Warm up the temporal accumulation: a single headless frame would show the raw
         // jittered (dithered) raymarch, so render several static frames first to let the
         // EMA converge to the same smooth result the interactive viewport reaches.
-        let warmup: u32 = std::env::var("PREVIZ_WARMUP")
+        let warmup: u32 = std::env::var("GLOWSTONE_WARMUP")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(28);
@@ -1761,7 +1761,7 @@ impl Renderer {
 
     /// Render the **whole window** — the 3D viewport image + the egui chrome
     /// (panels, menus, dock) — to an offscreen texture and read it back as RGBA8.
-    /// Used by the headless `PREVIZ_UI` path so the interface can be screenshotted
+    /// Used by the headless `GLOWSTONE_UI` path so the interface can be screenshotted
     /// without a visible window (and without Screen-Recording permission). The
     /// caller supplies a tessellated egui frame at size `(w, h)`.
     #[allow(clippy::too_many_arguments)]
@@ -2247,7 +2247,7 @@ impl Renderer {
             scene_geom_instances = inst;
             scene_geom_draws = draws;
         }
-        if std::env::var("PREVIZ_GEOM_STATS").is_ok() {
+        if std::env::var("GLOWSTONE_GEOM_STATS").is_ok() {
             let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
             for (k, _, _, _) in &scene_geom_draws {
                 *keys.entry(*k).or_default() += 1;
@@ -2340,10 +2340,10 @@ impl Renderer {
         // Outliner eye: skip hidden fog boxes so toggling a fog volume's visibility
         // actually removes its haze, not just the wireframe.
         let fog = scene.environments.iter().find(|e| !e.hidden);
-        // PREVIZ_NOVOL disables ALL volumetric work (raymarch + froxel) — a bisection
+        // GLOWSTONE_NOVOL disables ALL volumetric work (raymarch + froxel) — a bisection
         // kill-switch for the Windows/Vulkan device-loss hunt.
         let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false)
-            && std::env::var("PREVIZ_NOVOL").is_err();
+            && std::env::var("GLOWSTONE_NOVOL").is_err();
         // Haze uniformity (1 smooth … 0 clustered). Drives the density-noise contrast
         // AND the temporal history cap below: at low uniformity the user WANTS to see the
         // moving smoke clusters, so we hold less history (let them live) instead of
@@ -2429,11 +2429,11 @@ impl Renderer {
 
         // Hybrid froxel volumetric — opt-in (off by default; the per-pixel raymarch
         // is the default renderer). Enabled only when the adapter supports it and the
-        // user turns it on (settings toggle), or PREVIZ_NOFROXEL is unset.
+        // user turns it on (settings toggle), or GLOWSTONE_NOFROXEL is unset.
         let use_froxel = has_fog
             && self.froxel.is_some()
             && settings.froxel_volumetric
-            && std::env::var("PREVIZ_NOFROXEL").is_err();
+            && std::env::var("GLOWSTONE_NOFROXEL").is_err();
 
         // --- LED-wall surfaces: prepare each wall's content texture (image / live
         // frame), then build ONE emissive quad instance per visible screen (the
@@ -2486,7 +2486,7 @@ impl Renderer {
         // Per-fixture wheel chains, flattened into one buffer; each FixtureGpu
         // indexes its slice via cookie_r.w (offset) + cookie_u.w (count).
         let mut gpu_wheels: Vec<WheelGpu> = Vec::new();
-        let beam_dump = std::env::var("PREVIZ_BEAM_DUMP").is_ok();
+        let beam_dump = std::env::var("GLOWSTONE_BEAM_DUMP").is_ok();
         for (i, f) in scene.fixtures.iter().enumerate() {
             if f.hidden {
                 continue;
@@ -2538,7 +2538,7 @@ impl Renderer {
         });
         // Shadows only matter in the lit Beauty view (unlit/wireframe skip lighting).
         let max_shadows = if settings.mode == ViewportMode::Beauty
-            && std::env::var("PREVIZ_NOSHADOW").is_err()
+            && std::env::var("GLOWSTONE_NOSHADOW").is_err()
         {
             // Capped by the user's `shadow_max` lever (each hero map is a depth pass,
             // ~2-3 ms at Retina) — can only reduce below the atlas-sized `shadow::MAX`.
@@ -2590,7 +2590,7 @@ impl Renderer {
 
         // SHARED occluder: ONE ortho depth pass fit to the union of every lit beam's
         // volume, used as the fallback occluder for every NON-hero beam. DISABLED by
-        // default (opt-in via PREVIZ_SHARED): the single mean-direction projection stamped
+        // default (opt-in via GLOWSTONE_SHARED): the single mean-direction projection stamped
         // a truss/set into the fog of EVERY non-hero beam — including beams whose path
         // never crosses it — producing phantom occluder outlines in the haze (occlusion is
         // per-light-to-sample, which one shared direction can't represent). Dropping it
@@ -2598,7 +2598,7 @@ impl Renderer {
         // per-beam shadows); zero phantoms, and it reclaims the pass (~0.5 ms). A future
         // direction-binned version could restore correct occlusion for all beams.
         let mut shared_layer = -1i32;
-        if max_shadows > 0 && std::env::var("PREVIZ_SHARED").is_ok() {
+        if max_shadows > 0 && std::env::var("GLOWSTONE_SHARED").is_ok() {
             let mut lo = Vec3::splat(f32::INFINITY);
             let mut hi = Vec3::splat(f32::NEG_INFINITY);
             let mut mean_dir = Vec3::ZERO;
@@ -2715,7 +2715,7 @@ impl Renderer {
         // any pixel there, and the per-light gates still run in-shader, so a tiled light
         // is only ever extra work, never a dropped contributor. Wide beams (covering most
         // of the screen) go in a global prefix every tile scans, keeping spot lists tight.
-        // PREVIZ_NOCULL forces the all-lights fallback (the pixel-identity test harness).
+        // GLOWSTONE_NOCULL forces the all-lights fallback (the pixel-identity test harness).
         // `avg_tile_beams` (set in the block) = the beams an average ray actually marches;
         // the volumetric step budget divides by THIS, not the full count, so culling's freed
         // per-ray budget is spent on more march steps (the banding fix) — see the fog block.
@@ -2730,7 +2730,7 @@ impl Renderer {
             // and an edge fragment lands in an unscattered tile (a beam pop).
             const RING_CIRCUM: f32 = 1.082_392_3; // 1/cos(π/8)
             let build_tiles = gpu_fixtures.len() >= TILE_MIN_LIGHTS
-                && std::env::var("PREVIZ_NOCULL").is_err();
+                && std::env::var("GLOWSTONE_NOCULL").is_err();
             let mut wide: Vec<u32> = Vec::new();
             let mut per_tile: Vec<Vec<u32>> = vec![Vec::new(); n_tiles];
             let to_screen = |p: Vec3| -> Option<(f32, f32)> {
@@ -2933,7 +2933,7 @@ impl Renderer {
                     if use_froxel { -2.0 } else { shared_layer as f32 },
                     step_cap,
                     target_dt,
-                    if std::env::var("PREVIZ_JITTER").is_ok() { 1.0 } else { 0.0 },
+                    if std::env::var("GLOWSTONE_JITTER").is_ok() { 1.0 } else { 0.0 },
                 ],
                 // Same chroma read-up strength as the froxel pass (below) so the
                 // hybrid masses/heroes seam lifts saturated colours identically.
@@ -3222,7 +3222,7 @@ impl Renderer {
             let history_valid = self.ema_valid
                 && !resized
                 && self.frame_index != 0
-                && std::env::var("PREVIZ_NOTEMPORAL").is_err();
+                && std::env::var("GLOWSTONE_NOTEMPORAL").is_err();
             let moving = cur_view_proj != self.prev_view_proj || sig != self.prev_beam_sig;
             if moving || !history_valid {
                 self.accum_frames = 0;

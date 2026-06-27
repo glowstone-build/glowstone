@@ -7,7 +7,7 @@
 //! optics (gobo / prism / wheel slot) snap at the start, since wheel slots don't
 //! interpolate. The fade is ticked once per real frame from `app::render`.
 //!
-//! Note: this is the offline-previz look engine. The cue tick runs each frame
+//! Note: this is the offline-glowstone look engine. The cue tick runs each frame
 //! *after* live-DMX decode (see `app::render`), so while a fade is in progress the
 //! cue WINS over a connected console — the recalled look is what you see. Outside
 //! a fade nothing is written, so live DMX drives the rig normally. Cues are meant

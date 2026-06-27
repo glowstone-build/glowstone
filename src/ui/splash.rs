@@ -95,7 +95,7 @@ impl Ui {
                 painter.text(
                     egui::pos2(rect.left() + 16.0, rect.bottom() - 23.0),
                     egui::Align2::LEFT_CENTER,
-                    "previz",
+                    "glowstone",
                     egui::FontId::proportional(26.0),
                     egui::Color32::WHITE,
                 );
@@ -109,7 +109,7 @@ impl Ui {
             } else {
                 // Fallback if the bundled image fails to decode: the plain text header.
                 ui.horizontal(|ui| {
-                    ui.heading("previz");
+                    ui.heading("glowstone");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("v{} alpha", env!("CARGO_PKG_VERSION")))

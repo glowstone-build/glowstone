@@ -150,7 +150,7 @@ fn fs_tonemap(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(col, 1.0);
 }
 
-// --- froxel volumetric composite (PREVIZ_FROXEL path) ---
+// --- froxel volumetric composite (GLOWSTONE_FROXEL path) ---
 // Upsamples the integrated froxel volume (accumulated scatter + transmittance,
 // distributed exponentially along each pixel's ray) with ONE trilinear lookup at
 // the opaque-surface depth, then blends scatter + scene·transmittance (the same

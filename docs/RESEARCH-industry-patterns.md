@@ -1,7 +1,7 @@
-# Industry UX/Feature Patterns for previz — Blender + Unreal, synthesized
+# Industry UX/Feature Patterns for glowstone — Blender + Unreal, synthesized
 
 *Mining two industry-standard 3D editors (Blender = GPL, Unreal = proprietary EULA) for
-UX/feature patterns to port — as our own MIT/Apache Rust — into **previz**, a Rust + wgpu +
+UX/feature patterns to port — as our own MIT/Apache Rust — into **glowstone**, a Rust + wgpu +
 egui(egui_dock) arch-viz / lighting-previsualization tool (stage rigs, DMX/GDTF fixtures,
 beams/haze, MVR scenes).*
 
@@ -9,7 +9,7 @@ beams/haze, MVR scenes).*
 > cited only as *behaviour references* (symbol + line). Never copy GPL/EULA source. Patterns
 > and ideas are fine; code is not.
 
-> **Scope discipline.** previz is NOT a game engine and NOT a general DCC. Every "skip" below
+> **Scope discipline.** glowstone is NOT a game engine and NOT a general DCC. Every "skip" below
 > is a game-only / animation-only / DCC-only pattern we deliberately reject. See §4.
 
 Companion to [`RESEARCH-blender-framework.md`](RESEARCH-blender-framework.md) — see §5 for how
@@ -65,7 +65,7 @@ breadth of features they unblock). Each is detailed in §2 and itemized in §3.
 9. **Pivot-point + transform-orientation selectors.** Generalize the hardcoded centroid pivot
    to Median / 3D-Cursor / Individual-Origins / Active, and add a Global/Local/View orientation
    basis. Individual-origins (fan a row of heads) and Local (head on a raked truss) are the
-   previz must-haves. *(Blender `gizmo_3d_calc_pos` + `applyTransformOrientation`.)* →
+   glowstone must-haves. *(Blender `gizmo_3d_calc_pos` + `applyTransformOrientation`.)* →
    `mod.rs:207` `TransformOp.pivot`, `panels.rs:1941` `apply_transform`.
 
 10. **Grid/increment snap + ray-plane absolute drag.** Header snap toggle + per-axis
@@ -114,7 +114,7 @@ specific features grounded in the source analyses.
 ## 2. Per-domain winning designs
 
 Each domain states the best-of-both design (which engine does it better + why), then the
-concrete previz features. Full priority/effort/seam in the §3 backlog.
+concrete glowstone features. Full priority/effort/seam in the §3 backlog.
 
 ### 2.1 Outliner / scene hierarchy
 
@@ -226,7 +226,7 @@ diff persistence keeps our evolving defaults non-destructive.
 
 Concrete: bind to op `id` (+props) not the closed enum; diff-based user keymap persistence;
 keymap remapping UI (per-row + per-section Reset); live conflict detection with a masking-
-relationship check; two shipped presets (previz-native G/R/S + Industry-Compatible Maya/UE
+relationship check; two shipped presets (glowstone-native G/R/S + Industry-Compatible Maya/UE
 W/E/R, LMB-select, RMB-menu); dual chord slots (fold "(alias)" rows); modal keys in the same
 editable table; project/studio keymap tier; extended trigger vocab (Press/Release/Click/
 DblClick/Drag + repeat-ignore); searchable remap list + show-shortcut-in-menus.
@@ -269,7 +269,7 @@ lifecycle (Pending→Success/Fail in place), and provider-keyed actionable in-vi
 + Blender's *report severity+log duality, structured operator-owned modal hints
 (`WorkspaceStatus`), ETA tooltip, and always-present cancel*.** We have NO toast/report system
 today — this is a clean-slate, high-value addition. The provider-keyed actionable warning
-(distinct from a fading toast) is the right model for previz lint.
+(distinct from a fading toast) is the right model for glowstone lint.
 
 Concrete: handle-based status-bar message stack + grey hint slot; transient toast system with
 severity + action + permanent log history; structured modal-hint HUD pill read from the keymap;
@@ -300,7 +300,7 @@ reconcile + scroll-into-view; select-all action enum (All/None/Invert); lasso/ci
 ## 3. Prioritized backlog (all domains)
 
 Sorted P0→P3, then by leverage. **Effort** S/M/L. **Seam** = target file/symbol in our code.
-Every row is a real `apply_to_previz` item from the analyses.
+Every row is a real `apply_to_glowstone` item from the analyses.
 
 | # | Pri | Eff | Domain | Feature | Seam |
 |---|-----|-----|--------|---------|------|
@@ -352,7 +352,7 @@ Every row is a real `apply_to_previz` item from the analyses.
 | 46 | P1 | M | undo | F3 command palette: poll-filtered fuzzy CATALOG list, each row shows bound shortcut | `op.rs` CATALOG; `shortcuts.rs:62` OpSearch |
 | 47 | P1 | M | input | Keymap remapping UI (contexts→binds, click-to-capture, per-row + per-section Reset) | new Preferences tab; `shortcuts.rs` |
 | 48 | P1 | M | input | Live conflict detection on rebind (masking-relationship classify) | `shortcuts.rs` gather(); reuse no_duplicate_binds test |
-| 49 | P1 | M | input | Two shipped presets: previz-native (G/R/S) + Industry-Compatible (W/E/R, LMB-select, RMB-menu) | `shortcuts.rs` base tables |
+| 49 | P1 | M | input | Two shipped presets: glowstone-native (G/R/S) + Industry-Compatible (W/E/R, LMB-select, RMB-menu) | `shortcuts.rs` base tables |
 | 50 | P1 | M | theming | Serializable dock layout persisted in prefs + `.archie` | egui_dock DockState; `mod.rs` dock; project format |
 | 51 | P1 | M | theming | Tab-spawner registry that auto-builds the Window menu | `mod.rs` Tab::ALL/TOGGLEABLE/title/icon |
 | 52 | P1 | M | theming | Two-axis theming: shared widget palette + per-editor canvas overrides (axis colors match gizmo.rs) | `theme.rs`; per-Tab override |
@@ -417,7 +417,7 @@ Every row is a real `apply_to_previz` item from the analyses.
 ## 4. Skip list — patterns we deliberately won't port
 
 Reasons grounded in the analyses. These are game-only / animation-only / DCC-only or pipeline
-concerns with no previz analogue.
+concerns with no glowstone analogue.
 
 **Outliner / data model**
 - UE Source-Control + Unsaved/external-actors columns; World Partition / `ActorDesc` streaming
@@ -437,7 +437,7 @@ concerns with no previz analogue.
   crossfades, not per-property keyframes.
 - EditInlineNew / instanced-subobject reflective trees; RNA-reflection auto-layout;
   PropertyRowGenerator / async detail-view diffing; DetailsViewStyle config-ini machinery —
-  reflection/diff tooling outside previz scope; our hand-written egui inspectors suffice.
+  reflection/diff tooling outside glowstone scope; our hand-written egui inspectors suffice.
 
 **Camera / nav**
 - Blender FLY 6-DOF + gravity/jump/teleport; NDOF/SpaceMouse; per-axis 4-way view-roll + free
@@ -450,7 +450,7 @@ concerns with no previz analogue.
 
 **Gizmos / transform / snap**
 - All edit-mode transform converters (mesh/curve/lattice/armature/grease-pencil/uv/particle/
-  sculpt/mask) + animation/graph/NLA/sequencer transforms — element-level / timeline; previz
+  sculpt/mask) + animation/graph/NLA/sequencer transforms — element-level / timeline; glowstone
   transforms whole entities.
 - Edge/vertex slide, bend, shrink-fatten, bone-roll, trackball free-rotate; full surface/edge/
   volume snap-object pipeline; UE InteractiveTools GizmoElement* component zoo — modeling/rigging

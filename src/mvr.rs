@@ -139,7 +139,7 @@ impl Default for MvrHeader {
         Self {
             ver_major: 1,
             ver_minor: 5,
-            provider: "previz".into(),
+            provider: "glowstone".into(),
             provider_version: env!("CARGO_PKG_VERSION").into(),
             layers: Vec::new(),
             classes: Vec::new(),
@@ -205,7 +205,7 @@ pub struct MvrImport {
     pub fixtures: Vec<ImportedFixture>,
     pub objects: Vec<ImportedObject>,
     /// LED video walls parsed from `<VideoScreen>` nodes (placement + the
-    /// `previz:` round-trip attributes; falls back to defaults for foreign MVRs).
+    /// `glowstone:` round-trip attributes; falls back to defaults for foreign MVRs).
     pub screens: Vec<crate::scene::LedScreen>,
     /// Every non-XML archive entry, verbatim (gdtf / glb / 3ds / textures).
     pub resources: HashMap<String, Arc<Vec<u8>>>,
@@ -349,7 +349,7 @@ fn walk_children(
                 fixtures.push(parse_fixture(&child, mvr_xform, layer_uuid, resources, gdtf_cache));
             }
             // An LED video wall → a first-class LedScreen (placement + the
-            // previz round-trip attributes; foreign MVRs get sensible defaults).
+            // glowstone round-trip attributes; foreign MVRs get sensible defaults).
             "VideoScreen" => {
                 screens.push(parse_video_screen(&child, mvr_xform));
             }
@@ -504,7 +504,7 @@ fn parse_object(
 
 /// Parse a `<VideoScreen>` into an [`LedScreen`](crate::scene::LedScreen). MVR has
 /// no native cabinet/pitch concept, so the full parametric build is carried in
-/// `previz*` round-trip attributes our export writes; a foreign MVR (no such
+/// `glowstone*` round-trip attributes our export writes; a foreign MVR (no such
 /// attributes) falls back to a sensible default panel and a `<Sources>`-derived
 /// content type.
 fn parse_video_screen(node: &roxmltree::Node, mvr_xform: Mat4) -> crate::scene::LedScreen {
@@ -514,8 +514,8 @@ fn parse_video_screen(node: &roxmltree::Node, mvr_xform: Mat4) -> crate::scene::
 
     // Content: prefer our explicit round-trip attributes; else read a `<Source>`
     // node's type (NDI / File / CITP) if present; else a test pattern.
-    let content = if let Some(kind) = node.attribute("previzContent") {
-        decode_content(kind, node.attribute("previzContentArg").unwrap_or(""))
+    let content = if let Some(kind) = node.attribute("glowstoneContent") {
+        decode_content(kind, node.attribute("glowstoneContentArg").unwrap_or(""))
     } else {
         let src = node
             .descendants()
@@ -535,19 +535,19 @@ fn parse_video_screen(node: &roxmltree::Node, mvr_xform: Mat4) -> crate::scene::
 
     LedScreen {
         name: attr(node, "name"),
-        panel_type: node.attribute("previzPanelType").unwrap_or("Imported").to_string(),
+        panel_type: node.attribute("glowstonePanelType").unwrap_or("Imported").to_string(),
         transform: mvr_to_world() * mvr_xform,
-        cabinet_mm: [a_f32("previzCabinetW", 500.0), a_f32("previzCabinetH", 500.0)],
-        cabinet_px: [a_u32("previzCabPxX", 128), a_u32("previzCabPxY", 128)],
-        panels_wide: a_u32("previzPanelsWide", 4).max(1),
-        panels_high: a_u32("previzPanelsHigh", 2).max(1),
-        gap_mm: a_f32("previzGap", 0.0),
-        curvature_deg: a_f32("previzCurvature", 0.0),
-        nits: a_f32("previzNits", 1200.0),
-        gamma: a_f32("previzGamma", 2.2),
-        opacity: a_f32("previzOpacity", 1.0),
-        emit: a_f32("previzEmit", 1.0),
-        pixel_shape: match a_u32("previzPixel", 0) {
+        cabinet_mm: [a_f32("glowstoneCabinetW", 500.0), a_f32("glowstoneCabinetH", 500.0)],
+        cabinet_px: [a_u32("glowstoneCabPxX", 128), a_u32("glowstoneCabPxY", 128)],
+        panels_wide: a_u32("glowstonePanelsWide", 4).max(1),
+        panels_high: a_u32("glowstonePanelsHigh", 2).max(1),
+        gap_mm: a_f32("glowstoneGap", 0.0),
+        curvature_deg: a_f32("glowstoneCurvature", 0.0),
+        nits: a_f32("glowstoneNits", 1200.0),
+        gamma: a_f32("glowstoneGamma", 2.2),
+        opacity: a_f32("glowstoneOpacity", 1.0),
+        emit: a_f32("glowstoneEmit", 1.0),
+        pixel_shape: match a_u32("glowstonePixel", 0) {
             1 => crate::scene::screen::PixelShape::SmdSquare,
             2 => crate::scene::screen::PixelShape::DiscreteRgb,
             _ => crate::scene::screen::PixelShape::SmdRound,
@@ -896,7 +896,7 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
     let header = scene.mvr.as_ref().map(|m| &m.header);
     let ver_major = header.map(|h| h.ver_major).unwrap_or(1);
     let ver_minor = header.map(|h| h.ver_minor).unwrap_or(5);
-    let provider = "previz";
+    let provider = "glowstone";
     let provider_version = env!("CARGO_PKG_VERSION");
 
     // Group fixtures + objects by layer UUID, preserving the imported layer
@@ -919,7 +919,7 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
         if !order.iter().any(|u| u == uuid) {
             order.push(uuid.to_string());
             names.entry(uuid.to_string()).or_insert_with(|| {
-                if uuid == DEFAULT_LAYER_UUID { "previz".into() } else { "Layer".into() }
+                if uuid == DEFAULT_LAYER_UUID { "glowstone".into() } else { "Layer".into() }
             });
         }
     };
@@ -1153,7 +1153,7 @@ fn write_object(s: &mut String, o: &crate::scene::SceneGeometry, idx: usize) {
 
 /// Write an [`LedScreen`](crate::scene::LedScreen) as a `<VideoScreen>` node. The
 /// full parametric build (cabinet grid / pitch / nits / content) is carried in
-/// `previz*` attributes for a faithful archie round-trip; a `<Sources>` child
+/// `glowstone*` attributes for a faithful archie round-trip; a `<Sources>` child
 /// describes the content type for foreign MVR readers.
 fn write_video_screen(s: &mut String, sc: &crate::scene::LedScreen, idx: usize) {
     use crate::scene::screen::ScreenContent as C;
@@ -1165,7 +1165,7 @@ fn write_video_screen(s: &mut String, sc: &crate::scene::LedScreen, idx: usize) 
         uuid
     ));
     s.push_str(&format!(
-        " previzPanelType=\"{}\" previzCabinetW=\"{}\" previzCabinetH=\"{}\" previzCabPxX=\"{}\" previzCabPxY=\"{}\" previzPanelsWide=\"{}\" previzPanelsHigh=\"{}\" previzGap=\"{}\" previzCurvature=\"{}\" previzNits=\"{}\" previzGamma=\"{}\" previzOpacity=\"{}\" previzEmit=\"{}\" previzPixel=\"{}\" previzContent=\"{}\" previzContentArg=\"{}\">\n",
+        " glowstonePanelType=\"{}\" glowstoneCabinetW=\"{}\" glowstoneCabinetH=\"{}\" glowstoneCabPxX=\"{}\" glowstoneCabPxY=\"{}\" glowstonePanelsWide=\"{}\" glowstonePanelsHigh=\"{}\" glowstoneGap=\"{}\" glowstoneCurvature=\"{}\" glowstoneNits=\"{}\" glowstoneGamma=\"{}\" glowstoneOpacity=\"{}\" glowstoneEmit=\"{}\" glowstonePixel=\"{}\" glowstoneContent=\"{}\" glowstoneContentArg=\"{}\">\n",
         xml_escape(&sc.panel_type), sc.cabinet_mm[0], sc.cabinet_mm[1], sc.cabinet_px[0], sc.cabinet_px[1],
         sc.panels_wide, sc.panels_high, sc.gap_mm, sc.curvature_deg, sc.nits, sc.gamma, sc.opacity, sc.emit,
         sc.pixel_shape.code() as i32, kind, xml_escape(&arg),

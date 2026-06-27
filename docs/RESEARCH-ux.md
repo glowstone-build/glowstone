@@ -1,9 +1,9 @@
 # UX / UI: personas, workflow, and the reasoning behind every panel
 
-This is the design rationale for the previz interface. It draws on Blender's
+This is the design rationale for the glowstone interface. It draws on Blender's
 keyboard-first 3D-DCC conventions (the cloned source's `blender_default` /
 `industry_compatible` keymaps, workspace tabs, the Properties/N-panel/T-panel
-split, the on-viewport shading controls) and on depence R4's lighting-previz model
+split, the on-viewport shading controls) and on depence R4's lighting-glowstone model
 (Project View + 3D Hierarchy + Settings + **Fixture Manager** + Patching +
 Programmer + Show Sequencer + workspace presets; the Patch → Position → Focus →
 Colour → Timeline → Visualise workflow). It explains who the tool is for, what
@@ -13,7 +13,7 @@ each surface is for, and why it lives where it does.
 
 We design for three people. Most users are one of them at a time, and switch hats.
 
-**1. Robin — Lighting Designer / programmer.** At front-of-house or a previz desk,
+**1. Robin — Lighting Designer / programmer.** At front-of-house or a glowstone desk,
 often in the dark, hours before doors. Goal: *make it look right.* Selects rigs
 fast, aims heads, dials colour/intensity/gobo, judges the lit result in 3D.
 Keyboard-first; hates hunting menus; lives in the viewport. Values: instant
@@ -28,7 +28,7 @@ in 3D. Values: a dense table, multi-select + bulk addressing, conflict flags,
 live DMX confirmation. → drives the **Fixtures manager**, **DMX grid**,
 **Connectivity**, the **Patch workspace**.
 
-**3. Alex — Previz artist / lighting architect.** Produces the picture for the
+**3. Alex — glowstone artist / lighting architect.** Produces the picture for the
 client, the director, the sales pitch. Goal: *a convincing render of the space.*
 Sets the environment (world/HDRI, fog), frames the camera, tunes exposure/bloom,
 exports stills. Values: world lighting, a big clean viewport, look controls at
@@ -154,7 +154,7 @@ These were the deferred items; they now exist:
   sorted+deduped; remapped when fixtures are deleted.
 - **Cues (a cue list).** A Cues tab: Record the rig's look, Recall/Go with a
   per-cue crossfade (shortest-path pan/tilt, intensity/colour fade), Prev/Go
-  transport + fade progress. The offline-previz look engine.
+  transport + fade progress. The offline-glowstone look engine.
 
 One **deletion path** (`Ui::commit_delete`) remaps the patch, cues and groups in
 lock-step with the fixture removal, so deleting a fixture never corrupts

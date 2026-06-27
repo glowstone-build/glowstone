@@ -343,7 +343,7 @@ impl Ui {
                         self.show_shortcuts = true;
                         ui.close();
                     }
-                    if ui.button(format!("{}  About previz", icon::INFO)).clicked() {
+                    if ui.button(format!("{}  About glowstone", icon::INFO)).clicked() {
                         self.show_about = true;
                         ui.close();
                     }

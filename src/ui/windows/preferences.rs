@@ -258,9 +258,9 @@ pub fn preferences_window(
                 });
 
             egui::CollapsingHeader::new(format!("{}  {}", theme::icon::KEYBOARD, "Keymap"))
-                // Collapsed by default; the headless PREVIZ_UI_PREFS debug run opens
+                // Collapsed by default; the headless GLOWSTONE_UI_PREFS debug run opens
                 // it so the screenshot captures the editor content.
-                .default_open(std::env::var_os("PREVIZ_UI_PREFS").is_some())
+                .default_open(std::env::var_os("GLOWSTONE_UI_PREFS").is_some())
                 .show(ui, |ui| {
                     keymap_editor(ui, overrides, keymap_state);
                 });

@@ -1,11 +1,11 @@
 [package]
-name = "previz"
+name = "glowstone"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Open-source lighting previsualization for live events — real-time 3D stage and fixture preview"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/your-org/previz"
+repository = "https://github.com/your-org/glowstone"
 readme = "README.md"
 keywords = ["lighting", "previsualization", "dmx", "stage", "wgpu"]
 categories = ["graphics", "rendering", "visualization"]

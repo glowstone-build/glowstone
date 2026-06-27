@@ -24,13 +24,13 @@ impl Ui {
             duplicate: None,
             replace: None,
             pending_replace: false,
-            // Debug hook (S2): PREVIZ_UI_PREFS opens the Preferences window at
-            // startup so the headless PREVIZ_UI screenshot can capture the keymap
+            // Debug hook (S2): GLOWSTONE_UI_PREFS opens the Preferences window at
+            // startup so the headless GLOWSTONE_UI screenshot can capture the keymap
             // editor without app.rs (off-limits) needing a dedicated flag.
-            show_prefs: std::env::var_os("PREVIZ_UI_PREFS").is_some(),
+            show_prefs: std::env::var_os("GLOWSTONE_UI_PREFS").is_some(),
             show_about: false,
             show_shortcuts: false,
-            show_perf: std::env::var("PREVIZ_PERF").is_ok(),
+            show_perf: std::env::var("GLOWSTONE_PERF").is_ok(),
             profile: None,
             lib: library::LibState::default(),
             scene_anchor: None,
@@ -100,10 +100,10 @@ impl Ui {
             shading_pie: pie::PieState::default(),
             notify: notify::Notifier::default(),
             status_msgs: notify::StatusStack::default(),
-            // Debug hook (S3): PREVIZ_UI_LOG opens the report-log window at startup
-            // so the headless PREVIZ_UI screenshot can capture it (mirrors the
-            // PREVIZ_UI_PREFS prefs-window hook) without touching app.rs.
-            show_report_log: std::env::var_os("PREVIZ_UI_LOG").is_some(),
+            // Debug hook (S3): GLOWSTONE_UI_LOG opens the report-log window at startup
+            // so the headless GLOWSTONE_UI screenshot can capture it (mirrors the
+            // GLOWSTONE_UI_PREFS prefs-window hook) without touching app.rs.
+            show_report_log: std::env::var_os("GLOWSTONE_UI_LOG").is_some(),
             dmx_was_running: false,
         }
     }

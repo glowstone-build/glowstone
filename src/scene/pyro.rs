@@ -105,7 +105,7 @@ pub struct PyroDevice {
 
     /// DMX footprint mode (selects the channel layout decoded in `apply_pyro`).
     pub mode: PyroMode,
-    /// Inline DMX patch (`None` = unpatched → free-runs at `density` for previz).
+    /// Inline DMX patch (`None` = unpatched → free-runs at `density` for glowstone).
     pub patch: Option<PyroPatch>,
 
     // --- physical / visual tunables (defaults from the profile; see RESEARCH-pyro §4) ---

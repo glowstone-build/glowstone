@@ -1071,6 +1071,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "glowstone"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "bytemuck",
+ "directories",
+ "egui",
+ "egui-phosphor",
+ "egui-wgpu",
+ "egui-winit",
+ "egui_dock",
+ "env_logger",
+ "glam",
+ "gltf",
+ "grafton-ndi",
+ "half",
+ "image",
+ "log",
+ "pollster",
+ "rfd",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "socket2",
+ "ureq",
+ "wgpu",
+ "winit",
+ "zip",
+]
+
+[[package]]
 name = "gltf"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2276,37 +2307,6 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn",
-]
-
-[[package]]
-name = "previz"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "bytemuck",
- "directories",
- "egui",
- "egui-phosphor",
- "egui-wgpu",
- "egui-winit",
- "egui_dock",
- "env_logger",
- "glam",
- "gltf",
- "grafton-ndi",
- "half",
- "image",
- "log",
- "pollster",
- "rfd",
- "roxmltree",
- "serde",
- "serde_json",
- "socket2",
- "ureq",
- "wgpu",
- "winit",
- "zip",
 ]
 
 [[package]]

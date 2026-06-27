@@ -781,7 +781,7 @@ pub fn viewport(
     // click / Enter (Esc leaves them at the source, like Blender). A typed number
     // during the grab becomes the array clone-count (see the confirm path).
     let dupgrab_start = ui.ctx().data_mut(|d| {
-        let id = egui::Id::new("previz.dupgrab.start");
+        let id = egui::Id::new("glowstone.dupgrab.start");
         let v = d.get_temp::<bool>(id).unwrap_or(false);
         if v {
             d.remove::<bool>(id);

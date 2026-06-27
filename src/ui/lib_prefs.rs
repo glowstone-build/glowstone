@@ -141,7 +141,7 @@ pub fn fuzzy_score(query: &str, hay: &str) -> Option<i32> {
 
 /// `<config>/library.json` — the per-user store, alongside `recent.json`.
 fn prefs_path() -> Option<PathBuf> {
-    let d = directories::ProjectDirs::from("dev", "Embedder", "previz")?;
+    let d = directories::ProjectDirs::from("dev", "Embedder", "glowstone")?;
     let dir = d.config_dir();
     std::fs::create_dir_all(dir).ok()?;
     Some(dir.join("library.json"))

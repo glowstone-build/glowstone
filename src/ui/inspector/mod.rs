@@ -164,7 +164,7 @@ impl InspectorState {
 /// `<config>/inspector.json` — the per-user collapse store, alongside
 /// `library.json` / `recent.json`.
 fn inspector_state_path() -> Option<std::path::PathBuf> {
-    let d = directories::ProjectDirs::from("dev", "Embedder", "previz")?;
+    let d = directories::ProjectDirs::from("dev", "Embedder", "glowstone")?;
     let dir = d.config_dir();
     std::fs::create_dir_all(dir).ok()?;
     Some(dir.join("inspector.json"))

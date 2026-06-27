@@ -181,11 +181,11 @@ pub fn profile_editor_window(
     let _ = selection;
 }
 
-/// Badge marking a value as modeled by previz, not present in the GDTF file.
+/// Badge marking a value as modeled by glowstone, not present in the GDTF file.
 fn modeled(ui: &mut egui::Ui) {
     let ink = theme::ink(!ui.visuals().dark_mode);
     ui.label(RichText::new("modeled").small().italics().color(ink.muted))
-        .on_hover_text("Synthesized by previz — not carried in the GDTF file");
+        .on_hover_text("Synthesized by glowstone — not carried in the GDTF file");
 }
 
 /// A read-only key/value grid row: the key reads as a quiet label (secondary

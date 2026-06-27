@@ -17,7 +17,7 @@ impl Ui {
     }
 
     /// Open the `Z` Shading pie at the screen centre (headless screenshot hook).
-    /// Wired into the PREVIZ_UI harness by the lead (in the off-limits app.rs);
+    /// Wired into the GLOWSTONE_UI harness by the lead (in the off-limits app.rs);
     /// dead in the default build until then.
     #[allow(dead_code)]
     pub fn debug_open_shading_pie(&mut self) {
@@ -57,12 +57,12 @@ impl Ui {
     }
 
     /// Select the World root so the Inspector shows the Render Properties.
-    /// Headless hook (`PREVIZ_UI_WORLD`) for the render-inspector screenshot.
+    /// Headless hook (`GLOWSTONE_UI_WORLD`) for the render-inspector screenshot.
     pub fn debug_select_world(&mut self) {
         self.selection = Selection::world();
     }
 
-    /// Select the first environment (fog volume). Headless hook (`PREVIZ_UI_ENV`).
+    /// Select the first environment (fog volume). Headless hook (`GLOWSTONE_UI_ENV`).
     pub fn debug_select_environment(&mut self, scene: &Scene) {
         if !scene.environments.is_empty() {
             self.selection = Selection::environment(0);

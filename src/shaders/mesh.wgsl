@@ -145,7 +145,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
 
     // Ambient fill: an HDRI world lights the geometry (image-based ambient), else
     // a faint flat key so set geometry stays readable in the dark void where no
-    // beam reaches (previz wants to see the rig, not a pure blackout).
+    // beam reaches (glowstone wants to see the rig, not a pure blackout).
     var ambient: vec3<f32>;
     if (camera.world.w > 0.5) {
         ambient = world_ambient(normal);
