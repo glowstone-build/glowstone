@@ -1,5 +1,7 @@
-//! The online Fixture Library window — browse the GDTF Share catalogue, download
-//! fixtures into a shared cache, and add them straight into the scene.
+//! The online Fixture Library window — browse the GDTF Share catalogue and
+//! download fixtures into the project Library (the stock you then place from the
+//! Library panel). Downloading here NEVER instantiates into the scene/viewport;
+//! it only stocks the Library.
 //!
 //! UX shape borrows from Blender's extensions/plugins browser: a searchable,
 //! filterable catalogue of rows, each with a clear status (cloud / cached /
@@ -9,7 +11,7 @@
 
 use egui::{Align, Button, Layout, RichText};
 
-use crate::scene::{Library, Scene, Selection};
+use crate::scene::Library;
 use crate::share::{ListEntry, RowStatus, Share};
 
 use super::theme;
@@ -22,16 +24,14 @@ pub fn fixture_library_window(
     open: &mut bool,
     share: &mut Share,
     library: &mut Library,
-    scene: &mut Scene,
-    selection: &mut Selection,
 ) {
     if *open {
         share.ensure_started(ctx);
     }
-    // Pull worker state + finish any background "Add" (download → import → place),
-    // even if the window was closed mid-download.
+    // Pull worker state + finish any background download (download → import to
+    // library), even if the window was closed mid-download.
     share.sync();
-    resolve_pending(share, library, scene, selection);
+    resolve_pending(share, library);
 
     if !*open {
         return;
@@ -42,7 +42,10 @@ pub fn fixture_library_window(
     let mut add_clicks: Vec<i64> = Vec::new();
     let title = format!("{}  Fixture Library", theme::icon::ONLINE);
 
+    let max_h = ctx.input(|i| i.content_rect().height()) * 0.8;
     egui::Window::new(title)
+        .vscroll(true)
+        .max_height(max_h)
         .open(&mut keep)
         .resizable(true)
         .default_size([780.0, 560.0])
@@ -84,7 +87,7 @@ pub fn fixture_library_window(
     // Apply row actions outside the catalogue's immutable borrow of `share`.
     for rid in add_clicks {
         if share.downloaded.contains(&rid) {
-            import_and_place(share, rid, library, scene, selection);
+            import_to_library(share, rid, library);
         } else if share.logged_in {
             share.pending_add.insert(rid);
             share.download(rid);
@@ -329,6 +332,16 @@ fn row_action(
     add_clicks: &mut Vec<i64>,
     accent: egui::Color32,
 ) {
+    // Once a fixture has been imported into this project's Library, the row shows a
+    // green, disabled "Added" — no further click (and no duplicate import) possible.
+    if share.added.contains(&rid) {
+        ui.add_enabled(
+            false,
+            Button::new(RichText::new(format!("{}  Added", theme::icon::CHECK)).color(theme::OK)),
+        )
+        .on_hover_text("Already in this project's Library — place it from the Library panel.");
+        return;
+    }
     match status {
         RowStatus::Downloading => {
             ui.add_enabled(false, Button::new("Downloading…"));
@@ -336,8 +349,8 @@ fn row_action(
         }
         RowStatus::Cached => {
             if ui
-                .add(Button::new(RichText::new(format!("{}  Add", theme::icon::ADD)).color(egui::Color32::BLACK)).fill(accent))
-                .on_hover_text("Place this fixture in the scene (already downloaded)")
+                .add(Button::new(RichText::new(format!("{}  Add to project", theme::icon::ADD)).color(egui::Color32::BLACK)).fill(accent))
+                .on_hover_text("Add this fixture to the project library (already downloaded). Place it from the Library panel.")
                 .clicked()
             {
                 add_clicks.push(rid);
@@ -347,7 +360,7 @@ fn row_action(
             let enabled = share.logged_in;
             if ui
                 .add_enabled(enabled, Button::new(RichText::new(format!("{}  Update", theme::icon::CLOUD)).color(theme::WARN)))
-                .on_hover_text(if enabled { "Download the newer revision and place it" } else { "Sign in to download" })
+                .on_hover_text(if enabled { "Download the newer revision into the project Library" } else { "Sign in to download" })
                 .clicked()
             {
                 add_clicks.push(rid);
@@ -356,8 +369,8 @@ fn row_action(
         RowStatus::Cloud => {
             let enabled = share.logged_in;
             if ui
-                .add_enabled(enabled, Button::new(format!("{}  Add", theme::icon::CLOUD)))
-                .on_hover_text(if enabled { "Download and place this fixture" } else { "Sign in to download" })
+                .add_enabled(enabled, Button::new(format!("{}  Download", theme::icon::CLOUD)))
+                .on_hover_text(if enabled { "Download this fixture into the project library, then place it from the Library panel." } else { "Sign in to download" })
                 .clicked()
             {
                 add_clicks.push(rid);
@@ -368,9 +381,9 @@ fn row_action(
 
 // ---------------------------------------------------------------------------
 
-/// Finish any background "Add": once the file is downloaded, import it into the
-/// project library and place it in the scene. Drops entries whose download failed.
-fn resolve_pending(share: &mut Share, library: &mut Library, scene: &mut Scene, selection: &mut Selection) {
+/// Finish any background download: once the file is downloaded, import it into
+/// the project library (NOT the scene). Drops entries whose download failed.
+fn resolve_pending(share: &mut Share, library: &mut Library) {
     if share.pending_add.is_empty() {
         return;
     }
@@ -383,29 +396,29 @@ fn resolve_pending(share: &mut Share, library: &mut Library, scene: &mut Scene, 
         .collect();
     for rid in ready {
         share.pending_add.remove(&rid);
-        import_and_place(share, rid, library, scene, selection);
+        import_to_library(share, rid, library);
     }
     for rid in failed {
         share.pending_add.remove(&rid); // the worker already surfaced the error
     }
 }
 
-/// Import a downloaded `.gdtf` (dedup by filename) and place it in the scene.
-fn import_and_place(share: &mut Share, rid: i64, library: &mut Library, scene: &mut Scene, selection: &mut Selection) {
+/// Import a downloaded `.gdtf` into the project Library (dedup by filename),
+/// tagged with the `GdtfShare` provenance. Does NOT touch the scene/viewport —
+/// the user places it from the Library panel.
+fn import_to_library(share: &mut Share, rid: i64, library: &mut Library) {
     let path = share.gdtf_path(rid);
     let fname = format!("{rid}.gdtf");
-    let idx = library
-        .gdtf
-        .iter()
-        .position(|g| g.spec == fname)
-        .or_else(|| library.import_gdtf(&path).ok());
-    match idx {
-        Some(i) => {
-            let arc = library.gdtf[i].clone();
-            let f = scene.add_gdtf(arc, glam::Vec3::new(0.0, 4.0, 0.0));
-            *selection = Selection::fixture(f);
+    let already = library.gdtf.iter().any(|g| g.spec == fname);
+    if already {
+        share.added.insert(rid); // already in this project → it reads as "Added"
+        return;
+    }
+    match library.import_gdtf_with_source(&path, crate::gdtf::FixtureSource::GdtfShare) {
+        Ok(_) => {
+            share.added.insert(rid);
         }
-        None => share.error = Some(format!("could not load downloaded fixture {rid}")),
+        Err(e) => share.error = Some(format!("could not load downloaded fixture {rid}: {e}")),
     }
 }
 

@@ -124,6 +124,81 @@ impl LensInstance {
     }
 }
 
+/// One LED-wall surface instance (`wall.wgsl`): placement plus the parametric
+/// grid + look the fragment shader needs to synthesize the content and the
+/// distance-aware LED pixel mask. The whole wall is ONE instance of the unit
+/// quad — never per-pixel geometry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct WallInstance {
+    /// Unit quad (local XY `[-0.5, 0.5]²`, +Z normal) → world (physical size baked in).
+    pub model: [[f32; 4]; 4],
+    /// x,y = total resolution (px); z,w = panels wide, high.
+    pub grid: [f32; 4],
+    /// rgb = solid/tint colour (linear); w = nits HDR scale.
+    pub color: [f32; 4],
+    /// x = content kind (0 solid, 1 test pattern), y = test-pattern index,
+    /// z = opacity, w = selected (highlight rim).
+    pub look: [f32; 4],
+    /// x = gamma, y = seam fraction (0 = seamless), z = unused, w = time (s).
+    pub extra: [f32; 4],
+}
+
+impl WallInstance {
+    const ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+        5 => Float32x4,
+        6 => Float32x4,
+        7 => Float32x4,
+        8 => Float32x4,
+        9 => Float32x4,
+        10 => Float32x4,
+        11 => Float32x4,
+        12 => Float32x4,
+    ];
+
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<WallInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
+/// One billboard particle instance (`particles.wgsl`): a camera-facing,
+/// velocity-stretched sprite. The quad is generated in the vertex shader from
+/// `@builtin(vertex_index)` (no mesh vertex buffer) — this is the ONLY vertex
+/// buffer the spark/CO2 pipelines bind. Built each frame by the CPU pyro sim.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct ParticleInstance {
+    /// xyz = world centre (m), w = base half-size radius (m).
+    pub pos_radius: [f32; 4],
+    /// SPARK: rgb = HDR emission (values > 1 bloom), a = coverage alpha.
+    /// CO2:   rgb = the lit base colour (sampled stage light), a = density/alpha.
+    pub color: [f32; 4],
+    /// SPARK: xyz = world velocity (for the velocity-aligned stretch), w = stretch
+    /// multiplier (1 = round). CO2: xyz = dominant world LIGHT DIRECTION (puff→light,
+    /// for the N·L directional shading), w = 1 (no stretch).
+    pub vel_stretch: [f32; 4],
+    /// CO2 aux: x = noise phase/seed, y = self-shadow `0..1` (denser/lower = darker),
+    /// z = ambient floor, w = backlit/translucency term. Unused by sparks.
+    pub aux: [f32; 4],
+}
+
+impl ParticleInstance {
+    const ATTRS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
+
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ParticleInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
 /// A non-indexed vertex buffer plus its vertex count.
 pub struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,
@@ -344,6 +419,34 @@ pub fn disc(segments: u32) -> Vec<MeshVertex> {
         verts.push(MeshVertex { position: [0.0, 0.0, 0.0], normal: n, emissive: 1.0 });
         verts.push(MeshVertex { position: [a0.cos(), a0.sin(), 0.0], normal: n, emissive: 1.0 });
         verts.push(MeshVertex { position: [a1.cos(), a1.sin(), 0.0], normal: n, emissive: 1.0 });
+    }
+    verts
+}
+
+/// A tessellated unit quad in the local XY plane (`[-0.5, 0.5]²`, normal +Z), as
+/// `nx × ny` cells of two triangles each. `position.xy + 0.5` is the `0..1`
+/// surface UV in the wall shader; the tessellation lets the shader bend the
+/// surface into a horizontal arc (curved LED walls) without visible faceting.
+pub fn unit_quad(nx: u32, ny: u32) -> Vec<MeshVertex> {
+    let nx = nx.max(1);
+    let ny = ny.max(1);
+    let n = [0.0, 0.0, 1.0];
+    let p = |x: f32, y: f32| MeshVertex { position: [x, y, 0.0], normal: n, emissive: 1.0 };
+    let at = |i: u32, j: u32| {
+        let x = i as f32 / nx as f32 - 0.5;
+        let y = j as f32 / ny as f32 - 0.5;
+        p(x, y)
+    };
+    let mut verts = Vec::with_capacity((nx * ny * 6) as usize);
+    for j in 0..ny {
+        for i in 0..nx {
+            verts.push(at(i, j));
+            verts.push(at(i + 1, j));
+            verts.push(at(i + 1, j + 1));
+            verts.push(at(i, j));
+            verts.push(at(i + 1, j + 1));
+            verts.push(at(i, j + 1));
+        }
     }
     verts
 }

@@ -13,10 +13,31 @@ use std::hash::{Hash, Hasher};
 
 use crate::scene::{Fixture, Scene};
 
+/// A DMX-patchable scene entity whose patch (universe + 1-based start address)
+/// lives INLINE on the entity — pyro devices today, LED screens (pixel-maps) next.
+/// Fixtures deliberately do NOT implement this: their patch lives in the side
+/// [`PatchTable`] (see the module note) and is packed in batch by
+/// [`PatchTable::assign_indices`]. The trait lets the patch/unpatch keybinds drive
+/// the inline kinds through one code path instead of per-kind special-casing.
+pub trait Patchable {
+    /// DMX channels this entity consumes.
+    fn footprint(&self) -> u16;
+    /// `(universe, 1-based start address)` when patched, else `None`.
+    fn patch_slot(&self) -> Option<(u16, u16)>;
+    /// Patch (and enable) at `universe` / 1-based `address`.
+    fn set_patch(&mut self, universe: u16, address: u16);
+    /// Unpatch — free the channels.
+    fn clear_patch(&mut self);
+    fn is_patched(&self) -> bool {
+        self.patch_slot().is_some()
+    }
+}
+
 /// Where a fixture's patch entry came from (display + auto-assign policy).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum PatchSource {
     /// Imported from an MVR scene's `<Addresses>`.
+    #[default]
     Mvr,
     /// A GDTF fixture, footprint known, address assigned in-app.
     Gdtf,
@@ -39,7 +60,8 @@ impl PatchSource {
 }
 
 /// One fixture's DMX patch entry.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct Patch {
     /// 1-based universe.
     pub universe: u16,
@@ -156,7 +178,8 @@ pub fn channel_map(fixture: &Fixture, mode_index: usize) -> ChannelMap {
 /// Internal: one fixture's patch plus a fingerprint of the fixture it was built
 /// for, so [`PatchTable::sync`] can tell an *append* (keep entries) from a
 /// *wholesale replacement* like an MVR import (rebuild entries).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 struct Entry {
     fp: u64,
     patch: Option<Patch>,
@@ -165,6 +188,7 @@ struct Entry {
 /// The scene's patch: one optional entry per fixture, index-parallel to
 /// `scene.fixtures`.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PatchTable {
     entries: Vec<Entry>,
 }
@@ -287,6 +311,57 @@ impl PatchTable {
             assigned += 1;
         }
         assigned
+    }
+
+    /// Patch a specific set of fixtures (the Scene/viewport `P` dialog), packing
+    /// them sequentially from `start_universe`.`start_addr` and skipping channels
+    /// already claimed by OTHER enabled entries (so we don't clobber an existing
+    /// rig). Each fixture is (re)enabled as it lands, so the next one packs after
+    /// it. Indices that don't exist are ignored. Returns the number patched.
+    pub fn assign_indices(
+        &mut self,
+        scene: &Scene,
+        indices: &[usize],
+        start_universe: u16,
+        start_addr: u16,
+    ) -> usize {
+        self.sync(scene);
+        let mut u = start_universe.max(1);
+        let mut a = start_addr.max(1);
+        let mut assigned = 0;
+        for &i in indices {
+            let footprint = match self.entries.get(i).and_then(|e| e.patch.as_ref()) {
+                Some(p) => p.footprint.max(1),
+                None => continue,
+            };
+            let (fu, fa) = self.next_free(u, a, footprint, i);
+            if let Some(p) = self.entries[i].patch.as_mut() {
+                p.universe = fu;
+                p.address = fa;
+                p.enabled = true;
+            }
+            u = fu;
+            a = fa + footprint;
+            if a > 512 {
+                u += 1;
+                a = 1;
+            }
+            assigned += 1;
+        }
+        assigned
+    }
+
+    /// Disable a fixture's patch entry (the `U` unpatch dialog) — it stops
+    /// decoding + frees its grid channels while keeping the entry aligned to
+    /// `scene.fixtures`. Returns true if an entry was disabled.
+    pub fn unpatch(&mut self, i: usize) -> bool {
+        match self.get_mut(i) {
+            Some(p) if p.enabled => {
+                p.enabled = false;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// First `(universe, address)` at or after `(u, a)` where `footprint` channels
@@ -578,6 +653,48 @@ mod tests {
         assert!(table.get(2).is_none(), "table synced to 2 fixtures");
         assert_eq!(table.get(0).unwrap().address, 100, "edit preserved across append");
         assert!(!table.get(1).unwrap().enabled, "new fixture starts unpatched");
+    }
+
+    #[test]
+    fn assign_indices_patches_only_selection_sequentially() {
+        let scene = plain_scene(4);
+        let mut table = PatchTable::new();
+        table.sync(&scene);
+        // Patch only fixtures 1 and 3 from universe 1, address 1 (footprint 8).
+        let n = table.assign_indices(&scene, &[1, 3], 1, 1);
+        assert_eq!(n, 2);
+        let p1 = table.get(1).unwrap();
+        assert_eq!((p1.universe, p1.address, p1.enabled), (1, 1, true));
+        let p3 = table.get(3).unwrap();
+        assert_eq!((p3.universe, p3.address, p3.enabled), (1, 9, true));
+        // The unselected fixtures stay unpatched.
+        assert!(!table.get(0).unwrap().enabled);
+        assert!(!table.get(2).unwrap().enabled);
+    }
+
+    #[test]
+    fn assign_indices_skips_existing_enabled_entries() {
+        let scene = plain_scene(2);
+        let mut table = PatchTable::new();
+        table.sync(&scene);
+        // Fixture 0 already patched at 1.1 (footprint 8 -> claims 1..8).
+        table.assign_indices(&scene, &[0], 1, 1);
+        // Patching fixture 1 from 1.1 must skip past fixture 0 -> 1.9.
+        table.assign_indices(&scene, &[1], 1, 1);
+        let p1 = table.get(1).unwrap();
+        assert_eq!((p1.universe, p1.address), (1, 9));
+    }
+
+    #[test]
+    fn unpatch_disables_entry() {
+        let scene = plain_scene(1);
+        let mut table = PatchTable::new();
+        table.auto_assign(&scene, 1, 1);
+        assert!(table.get(0).unwrap().enabled);
+        assert!(table.unpatch(0));
+        assert!(!table.get(0).unwrap().enabled);
+        // Idempotent: a second unpatch is a no-op.
+        assert!(!table.unpatch(0));
     }
 
     #[test]

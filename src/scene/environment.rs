@@ -9,7 +9,8 @@ use glam::Vec3;
 
 use super::library::{EnvironmentKind, EnvironmentProfile};
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct Environment {
     pub name: String,
     pub kind: EnvironmentKind,
@@ -25,6 +26,25 @@ pub struct Environment {
     pub color: [f32; 3],
     /// Henyey-Greenstein anisotropy `g` in `-1..=1` (forward scattering > 0).
     pub anisotropy: f32,
+    /// Haze uniformity in `0..=1`: 1 = smooth even fog; 0 = strong clusters of
+    /// smoke/clouds (dense pockets scatter more → brighter wisps with clear gaps
+    /// between). Drives the density-noise contrast in volumetric.wgsl. (Serialized
+    /// with the show.)
+    pub uniformity: f32,
+    /// Cluster contrast in `0..=1`: how much DENSER (brighter) the smoke clusters are
+    /// vs the surrounding haze, and how clear the gaps. Higher = pockets pop harder.
+    /// Only matters as `uniformity` drops below 1. (Serialized with the show.)
+    pub cluster_contrast: f32,
+
+    /// Hidden in the viewport (the Scene outliner's eye toggle). serde-skip →
+    /// session-only, not persisted (matches the other entities' eye,
+    /// which reuse a persisted `hidden`; environments gain it session-only here).
+    // Wired to the outliner eye column (the tree's visibility toggle).
+    #[serde(skip)]
+    pub hidden: bool,
+    /// Session-stable identity (serde-skip → reassigned by `Scene::ensure_ids`).
+    #[serde(skip)]
+    pub id: super::EntityId,
 }
 
 impl Environment {
@@ -40,7 +60,11 @@ impl Environment {
             size: Vec3::from_array(profile.default_size),
             density: profile.default_density,
             color: [0.7, 0.72, 0.78],
-            anisotropy: 0.25,
+            anisotropy: 0.56,
+            uniformity: 0.03,
+            cluster_contrast: 1.0,
+            hidden: false,
+            id: 0, // assigned by Scene::add_environment / ensure_ids
         }
     }
 

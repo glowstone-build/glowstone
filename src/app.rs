@@ -10,6 +10,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
+use crate::render_job::RenderJob;
 use crate::renderer::Renderer;
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::Scene;
@@ -29,11 +30,43 @@ struct State {
     /// Live Art-Net / sACN DMX input: owns the patch + receive thread and decodes
     /// incoming universes into the fixtures each frame.
     dmx: crate::dmx::DmxIo,
+    /// CITP/MSEX media-server client (lazily started when a CITP screen exists),
+    /// feeding live video frames onto LED walls.
+    citp: Option<crate::citp::CitpClient>,
+    /// NDI receive client (lazily started; a no-op stub unless built with the
+    /// `ndi` feature + an installed runtime).
+    ndi: Option<crate::ndi::NdiClient>,
     last_frame: Instant,
     fps: f32,
     /// Whether to keep driving redraws (false while the window is occluded), so
     /// the live preview animates continuously instead of only on input.
     awake: bool,
+    /// Whether the window has no drawable area (minimized → `Resized(0, 0)`). The
+    /// surface keeps its last non-zero size while minimized, so acquiring/presenting
+    /// would return out-of-date (`Validation` on Vulkan/Windows) every frame and
+    /// eventually poison the device — so we skip rendering entirely until restored.
+    minimized: bool,
+    /// The scene animation clock (seconds) — the single logical time that drives
+    /// fog drift + beam/wheel motion in the renderer. Advanced by `dt` each live
+    /// frame; FROZEN while a still render converges so the render is a clean
+    /// snapshot (the renderer no longer reads wall-clock time).
+    anim_time: f32,
+    /// Frames to wait before the next dynamic-resolution adjustment, so the
+    /// smoothed fps settles after each scale change instead of hunting.
+    auto_res_cooldown: u32,
+    /// The in-progress still render, if any. While `Some`, the offscreen render
+    /// runs into a separate target + all scene motion + the anim clock are frozen
+    /// so the temporal accumulation converges; cleared on completion/cancel.
+    render_job: Option<RenderJob>,
+    /// Whether the OS window is currently fullscreen (toggled by F11 / the
+    /// viewport header button / View menu).
+    fullscreen: bool,
+    /// The GPU backend selection last persisted to the global pref (so a dropdown
+    /// change writes + toasts once, not every frame). Seeded to the active backend.
+    gpu_pref_written: String,
+    /// The last window title pushed to the OS (so we only `set_title` when the project
+    /// name / dirty marker actually changes, not every frame).
+    last_title: String,
 }
 
 #[derive(Default)]
@@ -49,7 +82,7 @@ impl ApplicationHandler for App {
         }
 
         let attributes = Window::default_attributes()
-            .with_title("previz — lighting previsualization")
+            .with_title("glowstone — lighting previsualization")
             .with_inner_size(LogicalSize::new(1280.0, 800.0));
         let window = Arc::new(
             event_loop
@@ -83,19 +116,43 @@ impl ApplicationHandler for App {
             camera: OrbitCamera::default(),
             ui: Ui::new(),
             dmx: crate::dmx::DmxIo::new(),
+            citp: None,
+            ndi: None,
             last_frame: Instant::now(),
             fps: 0.0,
             awake: true,
+            minimized: false,
+            anim_time: 0.0,
+            auto_res_cooldown: 0,
+            render_job: None,
+            fullscreen: false,
+            gpu_pref_written: String::new(),
+            last_title: String::new(),
         });
 
-        // Profiling: PREVIZ_STEPS overrides the volumetric max step budget.
-        if let Some(s) = std::env::var("PREVIZ_STEPS").ok().and_then(|s| s.parse().ok()) {
-            self.state.as_mut().unwrap().ui.settings.steps = s;
+        // Publish the GPU backend + available backends to the UI (the Engine ▸
+        // Backend dropdown), and seed the pref tracker so a later change writes once.
+        {
+            let s = self.state.as_mut().unwrap();
+            let active = s.renderer.active_backend_label().to_string();
+            s.ui.render.gpu_available = s.renderer.available_backend_labels();
+            s.ui.render.gpu_active = active.clone();
+            s.ui.render.gpu_selected = active.clone();
+            s.gpu_pref_written = active;
         }
 
-        // Optional .archie project load for profiling: PREVIZ_OPEN=show.archie
+        // Profiling: GLOWSTONE_STEPS overrides the volumetric max step budget.
+        if let Some(s) = std::env::var("GLOWSTONE_STEPS").ok().and_then(|s| s.parse().ok()) {
+            self.state.as_mut().unwrap().ui.settings.steps = s;
+        }
+        // GLOWSTONE_CHROMA overrides the haze chroma read-up strength (0 = off) for A/B.
+        if let Some(c) = std::env::var("GLOWSTONE_CHROMA").ok().and_then(|s| s.parse().ok()) {
+            self.state.as_mut().unwrap().ui.settings.chroma_haze = c;
+        }
+
+        // Optional .glow project load for profiling: GLOWSTONE_OPEN=show.glow
         // loads a saved show (fixtures + geometry + bundled assets) and frames it.
-        if let Ok(path) = std::env::var("PREVIZ_OPEN") {
+        if let Ok(path) = std::env::var("GLOWSTONE_OPEN") {
             let state = self.state.as_mut().unwrap();
             state.ui.open_project(
                 std::path::Path::new(&path),
@@ -103,9 +160,9 @@ impl ApplicationHandler for App {
                 &mut state.camera,
                 &mut state.dmx,
             );
-            if let Some((c, r)) = state.scene.scene_frame() {
-                state.camera.frame(c, r * 1.1);
-            }
+            // Keep the project's *saved* camera (open_project restores it) — that's
+            // the whole point of reopening a show. GLOWSTONE_CAM_* still overrides in
+            // the screenshot path if a specific framing is wanted for profiling.
             log::info!(
                 "opened project: {} fixtures, {} geometry",
                 state.scene.fixtures.len(),
@@ -113,9 +170,9 @@ impl ApplicationHandler for App {
             );
         }
 
-        // Optional GDTF auto-import for testing: PREVIZ_GDTF=path.gdtf loads a
+        // Optional GDTF auto-import for testing: GLOWSTONE_GDTF=path.gdtf loads a
         // fixture, clears the demo scene, and selects it.
-        if let Ok(path) = std::env::var("PREVIZ_GDTF") {
+        if let Ok(path) = std::env::var("GLOWSTONE_GDTF") {
             match crate::gdtf::GdtfFixture::load_path(std::path::Path::new(&path)) {
                 Ok(fixture) => {
                     let state = self.state.as_mut().unwrap();
@@ -124,9 +181,14 @@ impl ApplicationHandler for App {
                         .scene
                         .add_gdtf(std::sync::Arc::new(fixture), glam::Vec3::new(0.0, 4.0, 0.0));
                     state.scene.fixtures[idx].tilt = 20.0;
-                    // PREVIZ_GDTF_MODE=<index or name substring> selects the DMX
+                    // GLOWSTONE_OPTZOOM=<0..1> forces the optics zoom (narrow→wide) for
+                    // testing narrow-beam haze rendering headlessly.
+                    if let Some(z) = std::env::var("GLOWSTONE_OPTZOOM").ok().and_then(|s| s.parse().ok()) {
+                        state.scene.fixtures[idx].optics.zoom = z;
+                    }
+                    // GLOWSTONE_GDTF_MODE=<index or name substring> selects the DMX
                     // mode (emitter layout + channel map) for the test fixture.
-                    if let Ok(sel) = std::env::var("PREVIZ_GDTF_MODE") {
+                    if let Ok(sel) = std::env::var("GLOWSTONE_GDTF_MODE") {
                         let f = &mut state.scene.fixtures[idx];
                         let gdtf = f.gdtf.clone().unwrap();
                         let mi = sel
@@ -142,33 +204,53 @@ impl ApplicationHandler for App {
                             f.sync_mode();
                             log::info!("GDTF mode: [{}] {}", mi, gdtf.modes[mi].name);
                         } else {
-                            log::warn!("PREVIZ_GDTF_MODE '{sel}' matched no mode");
+                            log::warn!("GLOWSTONE_GDTF_MODE '{sel}' matched no mode");
                         }
                     }
-                    // PREVIZ_PIXMAP=N drives a pixel-mapped pattern (alternating
+                    // GLOWSTONE_PIXMAP=N drives a pixel-mapped pattern (alternating
                     // yellow + blue cells) and replicates the bar into a row of N,
                     // so the per-cell shaft look + the many-bar perf can be checked
                     // headlessly. Unpatched fixtures are skipped by the decode, so
                     // these cells persist to render.
-                    if let Ok(v) = std::env::var("PREVIZ_PIXMAP") {
+                    if let Ok(v) = std::env::var("GLOWSTONE_PIXMAP") {
                         let nbars: usize = v.parse().unwrap_or(1).max(1);
                         let arc = state.scene.fixtures[idx].gdtf.clone().unwrap();
                         let mi = state.scene.fixtures[idx].mode_index;
                         let ncells = state.scene.fixtures[idx].emitters().len();
-                        let setup = |f: &mut crate::scene::Fixture| {
+                        // GLOWSTONE_PALETTE: each bar a distinct SOLID saturated colour
+                        // (blue/red/green/magenta/cyan/amber) so the chroma read-up can
+                        // be judged per-hue, side by side. Else the yellow/blue pixel map.
+                        let palette = std::env::var("GLOWSTONE_PALETTE").is_ok();
+                        let pal: [[f32; 3]; 6] = [
+                            [0.0, 0.1, 1.0],
+                            [1.0, 0.0, 0.05],
+                            [0.0, 1.0, 0.1],
+                            [1.0, 0.0, 0.9],
+                            [0.0, 0.9, 1.0],
+                            [1.0, 0.55, 0.0],
+                        ];
+                        let setup = |f: &mut crate::scene::Fixture, k: usize| {
                             f.cells = (0..ncells)
-                                .map(|i| if i % 2 == 0 { [1.0, 0.8, 0.0] } else { [0.0, 0.1, 1.0] })
+                                .map(|i| {
+                                    if palette {
+                                        pal[k % pal.len()]
+                                    } else if i % 2 == 0 {
+                                        [1.0, 0.8, 0.0]
+                                    } else {
+                                        [0.0, 0.1, 1.0]
+                                    }
+                                })
                                 .collect();
                             f.tilt = -90.0;
                             f.snap_movement();
                         };
-                        setup(&mut state.scene.fixtures[idx]);
+                        setup(&mut state.scene.fixtures[idx], 0);
                         for k in 1..nbars {
-                            let pos = glam::Vec3::new(k as f32 * 1.4, 5.0, 0.0);
+                            let pos = glam::Vec3::new(k as f32 * 1.6, 5.0, 0.0);
                             let j = state.scene.add_gdtf(arc.clone(), pos);
                             state.scene.fixtures[j].mode_index = mi;
                             state.scene.fixtures[j].sync_mode();
-                            setup(&mut state.scene.fixtures[j]);
+                            setup(&mut state.scene.fixtures[j], k);
                         }
                     }
                     state.ui.selection = crate::scene::Selection::fixture(idx);
@@ -178,9 +260,9 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Optional laser-engine demo: PREVIZ_LASER replaces the scene with a fan
+        // Optional laser-engine demo: GLOWSTONE_LASER replaces the scene with a fan
         // of R/G/B lasers aimed across the haze (verifies the laser render path).
-        if std::env::var("PREVIZ_LASER").is_ok() {
+        if std::env::var("GLOWSTONE_LASER").is_ok() {
             let state = self.state.as_mut().unwrap();
             let lib = crate::scene::Library::standard();
             state.scene.fixtures.clear();
@@ -200,10 +282,158 @@ impl ApplicationHandler for App {
             state.ui.selection = crate::scene::Selection::default();
         }
 
-        // Optional MVR scene import for testing: PREVIZ_MVR=scene.mvr loads a full
+        // Optional LED-wall demo: GLOWSTONE_LED adds an LED video wall to the scene
+        // (verifies the wall surface + the distance-aware LED dot mask + the cheap
+        // blurred light/haze contribution). GLOWSTONE_LED=<component substring> picks
+        // the library type; GLOWSTONE_LED_CONTENT=grid|bars|gradient|solid sets it.
+        if std::env::var("GLOWSTONE_LED").is_ok() {
+            let state = self.state.as_mut().unwrap();
+            let lib = crate::scene::Library::standard();
+            let want = std::env::var("GLOWSTONE_LED").unwrap_or_default().to_lowercase();
+            let prof = lib
+                .screens
+                .iter()
+                .find(|p| !want.is_empty() && p.name.to_lowercase().contains(&want))
+                .unwrap_or(&lib.screens[0])
+                .clone();
+            let idx = state.scene.add_screen(&prof);
+            {
+                use crate::scene::screen::{ScreenContent, TestPattern};
+                let s = &mut state.scene.screens[idx];
+                s.panels_wide = 8;
+                s.panels_high = 5;
+                let h = s.size_m()[1];
+                s.transform = glam::Mat4::from_translation(glam::Vec3::new(0.0, h * 0.5 + 0.2, -4.0));
+                if let Ok(c) = std::env::var("GLOWSTONE_LED_CONTENT") {
+                    s.content = match c.to_lowercase().as_str() {
+                        "bars" => ScreenContent::TestPattern(TestPattern::Bars),
+                        "gradient" => ScreenContent::TestPattern(TestPattern::Gradient),
+                        "solid" => ScreenContent::SolidColor([0.10, 0.45, 0.95]),
+                        "dmx" => ScreenContent::PixelMapDmx(crate::scene::screen::PixelMap {
+                            cols: 8,
+                            rows: 5,
+                            universe: 1,
+                            start_address: 1,
+                        }),
+                        _ => ScreenContent::TestPattern(TestPattern::Grid),
+                    };
+                }
+                // GLOWSTONE_LED_IMAGE=path puts a still image on the wall (Phase 2).
+                if let Ok(p) = std::env::var("GLOWSTONE_LED_IMAGE") {
+                    match std::fs::read(&p) {
+                        Ok(b) => {
+                            s.content = ScreenContent::Image {
+                                name: p.clone(),
+                                bytes: std::sync::Arc::new(b),
+                            };
+                        }
+                        Err(e) => log::error!("GLOWSTONE_LED_IMAGE read {p}: {e}"),
+                    }
+                }
+                // GLOWSTONE_LED_CURVE=deg bends the wall into a horizontal arc.
+                if let Some(d) = std::env::var("GLOWSTONE_LED_CURVE").ok().and_then(|s| s.parse::<f32>().ok()) {
+                    s.curvature_deg = d;
+                }
+                // GLOWSTONE_LED_PIXEL=round|square|rgb selects the LED package shape.
+                if let Ok(p) = std::env::var("GLOWSTONE_LED_PIXEL") {
+                    use crate::scene::screen::PixelShape;
+                    s.pixel_shape = match p.to_lowercase().as_str() {
+                        "square" => PixelShape::SmdSquare,
+                        "rgb" => PixelShape::DiscreteRgb,
+                        _ => PixelShape::SmdRound,
+                    };
+                }
+            }
+            // For the pixel-map case, inject a synthetic Art-Net feed (a rainbow
+            // grid) and decode it so the wall shows live DMX content headlessly.
+            if std::env::var("GLOWSTONE_LED_CONTENT").map(|c| c.eq_ignore_ascii_case("dmx")).unwrap_or(false) {
+                let (cols, rows) = (8u32, 5u32);
+                let mut spec = String::new();
+                for j in 0..rows {
+                    for i in 0..cols {
+                        let k = j * cols + i;
+                        let ch = 1 + k * 3;
+                        let r = (i as f32 / (cols - 1) as f32 * 255.0) as u8;
+                        let g = (j as f32 / (rows - 1) as f32 * 255.0) as u8;
+                        let b = 255 - r;
+                        spec.push_str(&format!("1,{ch},{r}; 1,{},{g}; 1,{},{b}; ", ch + 1, ch + 2));
+                    }
+                }
+                state.dmx.inject(crate::dmx::feed::inject_spec(&spec));
+                state.dmx.poll();
+                state.dmx.decode(&mut state.scene);
+            }
+            // GLOWSTONE_LED_SOLO removes the demo PAR so only the wall lights the scene.
+            if std::env::var("GLOWSTONE_LED_SOLO").is_ok() {
+                state.scene.fixtures.clear();
+            }
+            if let Some((c, r)) = state.scene.scene_frame() {
+                state.camera.frame(c, r * 1.2);
+            }
+            state.ui.selection = crate::scene::Selection::screen(idx);
+        }
+
+        // Optional stage-pyro demo: GLOWSTONE_PYRO=spark|co2|both builds a stage of
+        // cold-spark fountains and/or CO2 jets (with a coloured back-wash so the
+        // white plumes catch stage colour) to verify the billboard particle pass
+        // headlessly. The sim is primed in the GLOWSTONE_SCREENSHOT path before capture.
+        if std::env::var("GLOWSTONE_PYRO").is_ok() {
+            use crate::scene::pyro::PyroKind;
+            let state = self.state.as_mut().unwrap();
+            let lib = crate::scene::Library::standard();
+            let mode = std::env::var("GLOWSTONE_PYRO").unwrap_or_default().to_lowercase();
+            let sparks = mode != "co2";
+            let co2 = mode != "spark";
+            // Rebuild the stage: drop the single demo PAR.
+            state.scene.fixtures.clear();
+            if sparks {
+                let prof = lib.pyro.iter().find(|p| p.kind == PyroKind::ColdSpark).unwrap();
+                for k in 0..6 {
+                    let x = -5.0 + k as f32 * 2.0;
+                    state.scene.add_pyro_at(prof, glam::Vec3::new(x, 0.0, 1.5));
+                }
+            }
+            if co2 {
+                let prof = lib.pyro.iter().find(|p| p.kind == PyroKind::Co2Jet).unwrap();
+                for &x in &[-3.5f32, 0.0, 3.5] {
+                    let i = state.scene.add_pyro_at(prof, glam::Vec3::new(x, 0.0, -3.0));
+                    state.scene.pyro[i].density = 1.0; // free-run blast for the still
+                }
+                // Coloured back-wash so the white CO2 plumes read in stage colour.
+                if let Some(par) = lib.fixtures.first() {
+                    let mut add = |pos: glam::Vec3, color: [f32; 3], tilt: f32| {
+                        let idx = state.scene.add_fixture_at(par, pos);
+                        let f = &mut state.scene.fixtures[idx];
+                        f.color = color;
+                        f.intensity = 1.0;
+                        f.tilt = tilt;
+                        f.snap_movement();
+                    };
+                    add(glam::Vec3::new(-4.0, 5.0, -7.0), [0.12, 0.85, 1.0], 60.0); // cyan
+                    add(glam::Vec3::new(4.0, 5.0, -7.0), [1.0, 0.12, 0.55], 60.0); // magenta
+                    add(glam::Vec3::new(0.0, 6.0, -8.0), [0.25, 0.55, 1.0], 72.0); // blue
+                }
+                // GLOWSTONE_PYRO_NOHAZE removes the fog box so there are NO volumetric
+                // beams — only the CO2 smoke is visible (isolate the smoke look).
+                if std::env::var("GLOWSTONE_PYRO_NOHAZE").is_ok() {
+                    state.scene.environments.clear();
+                }
+            }
+            // A front, slightly-low stage camera looking into the rig.
+            state.camera.target = glam::Vec3::new(0.0, 2.2, -1.0);
+            state.camera.distance = 17.0;
+            state.camera.yaw = 0.0;
+            state.camera.pitch = -0.12;
+            // Select the first device so a GLOWSTONE_UI shot shows the pyro inspector.
+            if !state.scene.pyro.is_empty() && std::env::var("GLOWSTONE_PYRO_SELECT").is_ok() {
+                state.ui.selection = crate::scene::Selection::pyro(0);
+            }
+        }
+
+        // Optional MVR scene import for testing: GLOWSTONE_MVR=scene.mvr loads a full
         // scene (fixtures + static stage/truss geometry), replacing the demo
         // fixtures, and frames the camera on the rig.
-        if let Ok(path) = std::env::var("PREVIZ_MVR") {
+        if let Ok(path) = std::env::var("GLOWSTONE_MVR") {
             match crate::mvr::MvrImport::load_path(std::path::Path::new(&path)) {
                 Ok(import) => {
                     let state = self.state.as_mut().unwrap();
@@ -235,24 +465,24 @@ impl ApplicationHandler for App {
             }
         }
 
-        // PREVIZ_LOOK builds a designed multi-colour stage look on the imported
+        // GLOWSTONE_LOOK builds a designed multi-colour stage look on the imported
         // rig (using each fixture's CMY / zoom / gobo / prism / frost functions),
-        // plus haze + camera. The PREVIZ_FOG / EXPOSURE / CAM_* knobs override it.
-        if std::env::var("PREVIZ_LOOK").is_ok() {
+        // plus haze + camera. The GLOWSTONE_FOG / EXPOSURE / CAM_* knobs override it.
+        if std::env::var("GLOWSTONE_LOOK").is_ok() {
             apply_stage_look(self.state.as_mut().unwrap());
         }
 
         // Dev knobs for the headless capture paths below: override exposure and
         // bring every fixture up to a level (so an imported, blacked-out rig is
         // visible in a verification screenshot without wiring DMX).
-        if let Ok(v) = std::env::var("PREVIZ_EXPOSURE")
+        if let Ok(v) = std::env::var("GLOWSTONE_EXPOSURE")
             && let Ok(v) = v.parse::<f32>()
         {
             self.state.as_mut().unwrap().ui.settings.exposure = v;
         }
-        // PREVIZ_HDRI=path loads an equirectangular environment map into the world
-        // (sky background + image-based ambient). PREVIZ_HDRI_BRIGHT scales it.
-        if let Ok(path) = std::env::var("PREVIZ_HDRI") {
+        // GLOWSTONE_HDRI=path loads an equirectangular environment map into the world
+        // (sky background + image-based ambient). GLOWSTONE_HDRI_BRIGHT scales it.
+        if let Ok(path) = std::env::var("GLOWSTONE_HDRI") {
             match std::fs::read(&path) {
                 Ok(bytes) => {
                     let w = &mut self.state.as_mut().unwrap().scene.world;
@@ -261,29 +491,29 @@ impl ApplicationHandler for App {
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or(path);
-                    if let Ok(b) = std::env::var("PREVIZ_HDRI_BRIGHT").unwrap_or_default().parse::<f32>() {
+                    if let Ok(b) = std::env::var("GLOWSTONE_HDRI_BRIGHT").unwrap_or_default().parse::<f32>() {
                         w.brightness = b;
                     }
                 }
-                Err(e) => log::error!("PREVIZ_HDRI read {path}: {e}"),
+                Err(e) => log::error!("GLOWSTONE_HDRI read {path}: {e}"),
             }
         }
-        if let Ok(v) = std::env::var("PREVIZ_LEVELS")
+        if let Ok(v) = std::env::var("GLOWSTONE_LEVELS")
             && let Ok(v) = v.parse::<f32>()
         {
             let state = self.state.as_mut().unwrap();
-            // PREVIZ_LEVELS_N=N lights only ~N fixtures, spread evenly across the
+            // GLOWSTONE_LEVELS_N=N lights only ~N fixtures, spread evenly across the
             // rig (the rest stay blacked out) — a cleaner look than all-on.
             let total = state.scene.fixtures.len().max(1);
-            let step = std::env::var("PREVIZ_LEVELS_N")
+            let step = std::env::var("GLOWSTONE_LEVELS_N")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| n > 0 && n < total)
                 .map(|n| (total / n).max(1))
                 .unwrap_or(1);
-            // PREVIZ_TILT / PREVIZ_PAN aim the lit fixtures (degrees).
-            let tilt = std::env::var("PREVIZ_TILT").ok().and_then(|s| s.parse::<f32>().ok());
-            let pan = std::env::var("PREVIZ_PAN").ok().and_then(|s| s.parse::<f32>().ok());
+            // GLOWSTONE_TILT / GLOWSTONE_PAN aim the lit fixtures (degrees).
+            let tilt = std::env::var("GLOWSTONE_TILT").ok().and_then(|s| s.parse::<f32>().ok());
+            let pan = std::env::var("GLOWSTONE_PAN").ok().and_then(|s| s.parse::<f32>().ok());
             for (i, f) in state.scene.fixtures.iter_mut().enumerate() {
                 if i % step == 0 {
                     // The level lives in the dimmer (intensity is the master, =1);
@@ -301,18 +531,32 @@ impl ApplicationHandler for App {
             }
         }
 
-        // PREVIZ_FOG=density overrides the haze density of the first environment
+        // GLOWSTONE_FOG=density overrides the haze density of the first environment
         // (thinner haze → distinct beams instead of a uniform wash).
-        if let Ok(d) = std::env::var("PREVIZ_FOG")
+        if let Ok(d) = std::env::var("GLOWSTONE_FOG")
             && let Ok(d) = d.parse::<f32>()
             && let Some(env) = self.state.as_mut().unwrap().scene.environments.first_mut()
         {
             env.density = d;
         }
+        // GLOWSTONE_UNIFORMITY=0..1 overrides the first fog box's haze uniformity for A/B.
+        if let Ok(v) = std::env::var("GLOWSTONE_UNIFORMITY")
+            && let Ok(v) = v.parse::<f32>()
+            && let Some(env) = self.state.as_mut().unwrap().scene.environments.first_mut()
+        {
+            env.uniformity = v;
+        }
+        // GLOWSTONE_CONTRAST=0..1 overrides the first fog box's cluster contrast for A/B.
+        if let Ok(v) = std::env::var("GLOWSTONE_CONTRAST")
+            && let Ok(v) = v.parse::<f32>()
+            && let Some(env) = self.state.as_mut().unwrap().scene.environments.first_mut()
+        {
+            env.cluster_contrast = v;
+        }
 
-        // PREVIZ_MODE=beauty|unlit|wireframe selects the viewport display mode
+        // GLOWSTONE_MODE=beauty|unlit|wireframe selects the viewport display mode
         // (so the headless capture paths can verify each, like the other knobs).
-        if let Ok(m) = std::env::var("PREVIZ_MODE") {
+        if let Ok(m) = std::env::var("GLOWSTONE_MODE") {
             use crate::scene::ViewportMode;
             self.state.as_mut().unwrap().ui.settings.mode = match m.to_lowercase().as_str() {
                 "wireframe" | "wire" => ViewportMode::Wireframe,
@@ -321,18 +565,18 @@ impl ApplicationHandler for App {
             };
         }
 
-        // Live DMX dev knobs: PREVIZ_DMX starts the real receiver; PREVIZ_DMX_FEED
+        // Live DMX dev knobs: GLOWSTONE_DMX starts the real receiver; GLOWSTONE_DMX_FEED
         // / _INJECT push a synthetic universe set through the real decode path so
-        // the rig can be driven headlessly (composes with PREVIZ_SCREENSHOT below).
+        // the rig can be driven headlessly (composes with GLOWSTONE_SCREENSHOT below).
         {
             let state = self.state.as_mut().unwrap();
             crate::dmx::apply_env_knobs(&mut state.dmx, &mut state.scene);
         }
 
-        // Headless MVR export: PREVIZ_MVR_EXPORT=out.mvr writes the current scene
-        // (typically after a PREVIZ_MVR import) back out and exits — for
+        // Headless MVR export: GLOWSTONE_MVR_EXPORT=out.mvr writes the current scene
+        // (typically after a GLOWSTONE_MVR import) back out and exits — for
         // round-trip verification.
-        if let Ok(out) = std::env::var("PREVIZ_MVR_EXPORT") {
+        if let Ok(out) = std::env::var("GLOWSTONE_MVR_EXPORT") {
             match crate::mvr::export_path(&self.state.as_ref().unwrap().scene, std::path::Path::new(&out)) {
                 Ok(()) => log::info!("exported MVR: {out}"),
                 Err(e) => log::error!("MVR export failed: {e}"),
@@ -341,30 +585,30 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Headless optical contact sheet: PREVIZ_SHEET=dir (with PREVIZ_GDTF)
+        // Headless optical contact sheet: GLOWSTONE_SHEET=dir (with GLOWSTONE_GDTF)
         // renders one screenshot per optical feature so the whole chain can be
-        // verified without the UI. Dev harness, like PREVIZ_BENCH.
-        if let Ok(dir) = std::env::var("PREVIZ_SHEET") {
+        // verified without the UI. Dev harness, like GLOWSTONE_BENCH.
+        if let Ok(dir) = std::env::var("GLOWSTONE_SHEET") {
             render_optics_sheet(self.state.as_mut().unwrap(), &dir);
             event_loop.exit();
             return;
         }
 
-        // Headless animation check: PREVIZ_ANIM=dir (with PREVIZ_GDTF) sets a
+        // Headless animation check: GLOWSTONE_ANIM=dir (with GLOWSTONE_GDTF) sets a
         // spinning gobo / animation / colour / prism and renders a frame
         // sequence, advancing the scene between frames — to verify wheel motion.
-        if let Ok(dir) = std::env::var("PREVIZ_ANIM") {
+        if let Ok(dir) = std::env::var("GLOWSTONE_ANIM") {
             render_anim_sequence(self.state.as_mut().unwrap(), &dir);
             event_loop.exit();
             return;
         }
 
-        // Headless FULL-UI screenshot: PREVIZ_UI=path.png renders the whole
+        // Headless FULL-UI screenshot: GLOWSTONE_UI=path.png renders the whole
         // window (3D viewport + egui panels/menus/dock) offscreen to a PNG and
         // exits — so the interface can be verified without a visible window /
-        // Screen-Recording permission. PREVIZ_UI_RES=WxH sets the size.
-        if let Ok(path) = std::env::var("PREVIZ_UI") {
-            let (w, h) = std::env::var("PREVIZ_UI_RES")
+        // Screen-Recording permission. GLOWSTONE_UI_RES=WxH sets the size.
+        if let Ok(path) = std::env::var("GLOWSTONE_UI") {
+            let (w, h) = std::env::var("GLOWSTONE_UI_RES")
                 .ok()
                 .and_then(|r| {
                     let (w, h) = r.split_once('x')?;
@@ -376,58 +620,67 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Headless wheel-transition check: PREVIZ_WHEEL=dir (with PREVIZ_GDTF)
+        // Headless wheel-transition check: GLOWSTONE_WHEEL=dir (with GLOWSTONE_GDTF)
         // steps a gobo/colour wheel between slots and scrolls CMY in, advancing
         // the scene between frames — to verify the physical split + gap + flag
         // slide (not a crossfade).
-        if let Ok(dir) = std::env::var("PREVIZ_WHEEL") {
+        if let Ok(dir) = std::env::var("GLOWSTONE_WHEEL") {
             render_wheel_sequence(self.state.as_mut().unwrap(), &dir);
             event_loop.exit();
             return;
         }
 
-        // Headless screenshot path: PREVIZ_SCREENSHOT=path.png renders the
+        // Headless screenshot path: GLOWSTONE_SCREENSHOT=path.png renders the
         // offscreen 3D view to a PNG and exits (no window needed). Handy for
         // verifying the renderer without a visible window / CI.
-        if let Ok(path) = std::env::var("PREVIZ_SCREENSHOT") {
+        if let Ok(path) = std::env::var("GLOWSTONE_SCREENSHOT") {
             let state = self.state.as_mut().unwrap();
-            // Optional PREVIZ_RES=WIDTHxHEIGHT to render the screenshot at an
+            // Optional GLOWSTONE_RES=WIDTHxHEIGHT to render the screenshot at an
             // explicit resolution instead of the window size.
-            if let Some((w, h)) = std::env::var("PREVIZ_RES").ok().and_then(|r| {
+            if let Some((w, h)) = std::env::var("GLOWSTONE_RES").ok().and_then(|r| {
                 let (w, h) = r.split_once('x')?;
                 Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
             }) {
                 state.renderer.resize_viewport((w.max(1), h.max(1)));
             }
-            // PREVIZ_ZOOM scales the camera dolly distance (<1 = closer);
-            // PREVIZ_CAM_Y nudges the look-at height (metres).
-            if let Some(z) = std::env::var("PREVIZ_ZOOM").ok().and_then(|s| s.parse::<f32>().ok()) {
+            // GLOWSTONE_ZOOM scales the camera dolly distance (<1 = closer);
+            // GLOWSTONE_CAM_Y nudges the look-at height (metres).
+            if let Some(z) = std::env::var("GLOWSTONE_ZOOM").ok().and_then(|s| s.parse::<f32>().ok()) {
                 state.camera.distance *= z;
             }
-            if let Some(dy) = std::env::var("PREVIZ_CAM_Y").ok().and_then(|s| s.parse::<f32>().ok()) {
+            if let Some(dy) = std::env::var("GLOWSTONE_CAM_Y").ok().and_then(|s| s.parse::<f32>().ok()) {
                 state.camera.target.y += dy;
             }
-            // Full camera override: PREVIZ_CAM_TARGET=x,y,z and PREVIZ_CAM_YAW /
+            // Full camera override: GLOWSTONE_CAM_TARGET=x,y,z and GLOWSTONE_CAM_YAW /
             // _PITCH (radians) / _DIST (metres) for an explicit eye-level shot.
             let envf = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
-            if let Some(t) = std::env::var("PREVIZ_CAM_TARGET").ok().and_then(|s| {
+            if let Some(t) = std::env::var("GLOWSTONE_CAM_TARGET").ok().and_then(|s| {
                 let p: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                 (p.len() == 3).then(|| glam::Vec3::new(p[0], p[1], p[2]))
             }) {
                 state.camera.target = t;
             }
-            if let Some(y) = envf("PREVIZ_CAM_YAW") {
+            if let Some(y) = envf("GLOWSTONE_CAM_YAW") {
                 state.camera.yaw = y;
             }
-            if let Some(p) = envf("PREVIZ_CAM_PITCH") {
+            if let Some(p) = envf("GLOWSTONE_CAM_PITCH") {
                 state.camera.pitch = p;
             }
-            if let Some(d) = envf("PREVIZ_CAM_DIST") {
+            if let Some(d) = envf("GLOWSTONE_CAM_DIST") {
                 state.camera.distance = d;
             }
             // Headless render skips the per-frame motion integrator; settle the
             // posed heads so the screenshot shows the commanded pan/tilt.
             state.scene.snap_movement();
+            // Prime the stage-pyro particle sim: capture() doesn't advance it (that's
+            // the live update tick), so step it to a steady state with the FINAL
+            // camera so the fountains/plumes are fully developed in the still.
+            if !state.scene.pyro.is_empty() {
+                let eye = state.camera.eye();
+                for _ in 0..150 {
+                    state.renderer.advance_pyro(&state.scene, eye, 1.0 / 60.0);
+                }
+            }
             let (w, h, pixels) =
                 state
                     .renderer
@@ -443,13 +696,50 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Headless benchmark: PREVIZ_BENCH=N times N offscreen frames.
-        if let Ok(n) = std::env::var("PREVIZ_BENCH") {
+        // Headless still-render: GLOWSTONE_RENDER=path.png drives the REAL render-job
+        // path (the dedicated offscreen target + multi-frame temporal accumulation +
+        // readback) end-to-end and writes the result — verifying the F12 render
+        // pipeline without the interactive loop. Honours GLOWSTONE_RES / GLOWSTONE_CAM_*.
+        if let Ok(path) = std::env::var("GLOWSTONE_RENDER") {
+            let state = self.state.as_mut().unwrap();
+            apply_cam_env(&mut state.camera);
+            if let Some((w, h)) = std::env::var("GLOWSTONE_RES").ok().and_then(|r| {
+                let (w, h) = r.split_once('x')?;
+                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+            }) {
+                state.scene.render.res_x = w.max(16);
+                state.scene.render.res_y = h.max(16);
+                state.scene.render.resolution_percentage = 100;
+            }
+            state.scene.snap_movement();
+            state.camera.skip_anim();
+            let res = state.scene.render.output_size();
+            let settings = state.scene.render.render_settings(&state.ui.settings);
+            let total = state.scene.render.max_samples.max(1);
+            state.renderer.ensure_render_view(res);
+            for _ in 0..total {
+                state.renderer.record_render_view(&state.scene, &state.camera, &settings);
+            }
+            match state.renderer.read_render_view_ldr().and_then(|(w, h, px)| {
+                image::RgbaImage::from_raw(w, h, px).map(|img| (w, h, img))
+            }) {
+                Some((w, h, img)) => match img.save(&path) {
+                    Ok(()) => log::info!("wrote render {path} ({w}x{h}, {total} samples)"),
+                    Err(e) => log::error!("failed to write {path}: {e}"),
+                },
+                None => log::error!("render readback failed"),
+            }
+            event_loop.exit();
+            return;
+        }
+
+        // Headless benchmark: GLOWSTONE_BENCH=N times N offscreen frames.
+        if let Ok(n) = std::env::var("GLOWSTONE_BENCH") {
             let n: u32 = n.parse().unwrap_or(120);
             let state = self.state.as_mut().unwrap();
-            // Bench at an explicit resolution + camera (PREVIZ_RES / PREVIZ_CAM_*)
+            // Bench at an explicit resolution + camera (GLOWSTONE_RES / GLOWSTONE_CAM_*)
             // so we can measure a realistic FOH shot, not just the auto far frame.
-            if let Some((w, h)) = std::env::var("PREVIZ_RES").ok().and_then(|r| {
+            if let Some((w, h)) = std::env::var("GLOWSTONE_RES").ok().and_then(|r| {
                 let (w, h) = r.split_once('x')?;
                 Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
             }) {
@@ -457,9 +747,9 @@ impl ApplicationHandler for App {
             }
             apply_cam_env(&mut state.camera);
             state.scene.snap_movement();
-            // PREVIZ_BENCH_READBACK=1 keeps the full capture (incl. GPU→CPU copy);
+            // GLOWSTONE_BENCH_READBACK=1 keeps the full capture (incl. GPU→CPU copy);
             // default times render-only (what the live presenting app actually pays).
-            let readback = std::env::var("PREVIZ_BENCH_READBACK").is_ok();
+            let readback = std::env::var("GLOWSTONE_BENCH_READBACK").is_ok();
             for _ in 0..10 {
                 if readback {
                     let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
@@ -510,8 +800,14 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                state.renderer.resize_surface((size.width, size.height));
-                state.window.request_redraw();
+                // A 0-area resize means the window was minimized; stop rendering
+                // (the surface keeps its old size — reconfiguring/acquiring against a
+                // minimized window spams out-of-date and poisons the Vulkan device).
+                state.minimized = size.width == 0 || size.height == 0;
+                if !state.minimized {
+                    state.renderer.resize_surface((size.width, size.height));
+                    state.window.request_redraw();
+                }
             }
             WindowEvent::Occluded(occluded) => {
                 // Idle while hidden; resume the continuous loop when visible.
@@ -524,7 +820,9 @@ impl ApplicationHandler for App {
                 // Render the frame; the next redraw is re-armed in `about_to_wait`
                 // (requesting a redraw from inside RedrawRequested is unreliable
                 // on some platforms, which froze the haze/wheel animation).
-                state.render();
+                if !state.minimized {
+                    state.render();
+                }
             }
             _ => {
                 if response.repaint {
@@ -540,6 +838,7 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &self.state
             && state.awake
+            && !state.minimized
         {
             state.window.request_redraw();
         }
@@ -549,7 +848,7 @@ impl ApplicationHandler for App {
 /// Build a designed multi-colour stage look on the imported rig, exercising each
 /// fixture's optical functions (CMY colour, zoom, gobo, prism, frost) plus a
 /// fanned pan/tilt, and tune haze + camera for it. Lights a spread subset (~24)
-/// so the beams read as a fan rather than a wash. Triggered by `PREVIZ_LOOK`.
+/// so the beams read as a fan rather than a wash. Triggered by `GLOWSTONE_LOOK`.
 fn apply_stage_look(state: &mut State) {
     use crate::optics::OpticalControls;
 
@@ -562,7 +861,7 @@ fn apply_stage_look(state: &mut State) {
         env.anisotropy = 0.35;
     }
     state.ui.settings.exposure = 0.3;
-    state.ui.settings.bloom = 0.8;
+    state.ui.settings.bloom = 0.0;
     state.ui.settings.beam_intensity = 430.0;
 
     // A cool concert palette (blues/teal/lavender) with a single warm amber
@@ -650,7 +949,7 @@ fn apply_stage_look(state: &mut State) {
         color_lit.len()
     );
 
-    // 3/4 audience-level camera framing the fan (overridable via PREVIZ_CAM_*).
+    // 3/4 audience-level camera framing the fan (overridable via GLOWSTONE_CAM_*).
     state.camera.target = glam::Vec3::new(-2.0, 3.0, -0.5);
     state.camera.yaw = 0.4;
     state.camera.pitch = -0.05;
@@ -658,13 +957,13 @@ fn apply_stage_look(state: &mut State) {
 }
 
 /// Render one screenshot per optical feature into `dir` (dev verification of the
-/// full beam chain). Requires a GDTF fixture in the scene (set `PREVIZ_GDTF`).
+/// full beam chain). Requires a GDTF fixture in the scene (set `GLOWSTONE_GDTF`).
 fn render_optics_sheet(state: &mut State, dir: &str) {
     use crate::optics::WheelMotion;
 
     let _ = std::fs::create_dir_all(dir);
     let Some(idx) = state.scene.fixtures.iter().position(|f| f.is_gdtf()) else {
-        log::error!("PREVIZ_SHEET needs a GDTF fixture (set PREVIZ_GDTF)");
+        log::error!("GLOWSTONE_SHEET needs a GDTF fixture (set GLOWSTONE_GDTF)");
         return;
     };
     // Heavier haze for the contact sheet so the beam-in-fog look is visible.
@@ -827,7 +1126,7 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
 fn render_anim_sequence(state: &mut State, dir: &str) {
     let _ = std::fs::create_dir_all(dir);
     let Some(idx) = state.scene.fixtures.iter().position(|f| f.is_gdtf()) else {
-        log::error!("PREVIZ_ANIM needs a GDTF fixture (set PREVIZ_GDTF)");
+        log::error!("GLOWSTONE_ANIM needs a GDTF fixture (set GLOWSTONE_GDTF)");
         return;
     };
     if let Some(env) = state.scene.environments.first_mut() {
@@ -851,7 +1150,9 @@ fn render_anim_sequence(state: &mut State, dir: &str) {
         }
     }
     state.scene.snap_movement(); // settle tilt before the (wheel-only) sequence
+    let mut t = 0.0_f32;
     for frame in 0..6 {
+        state.renderer.set_anim_time(t); // fog + beams animate with the sequence
         let (w, h, px) = state
             .renderer
             .capture(&state.scene, &state.camera, &state.ui.settings);
@@ -861,6 +1162,7 @@ fn render_anim_sequence(state: &mut State, dir: &str) {
         // Advance ~0.33 s of motion between captured frames.
         for _ in 0..3 {
             state.scene.advance(0.11);
+            t += 0.11;
         }
     }
     log::info!("anim: wrote 6 frames to {dir}");
@@ -873,7 +1175,7 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
     use crate::gdtf::WheelKind as K;
     let _ = std::fs::create_dir_all(dir);
     let Some(idx) = state.scene.fixtures.iter().position(|f| f.is_gdtf()) else {
-        log::error!("PREVIZ_WHEEL needs a GDTF fixture (set PREVIZ_GDTF)");
+        log::error!("GLOWSTONE_WHEEL needs a GDTF fixture (set GLOWSTONE_GDTF)");
         return;
     };
     if let Some(env) = state.scene.environments.first_mut() {
@@ -901,13 +1203,16 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
     cam.pitch = 0.12;
     cam.distance = 4.2;
     cam.yaw = 0.7;
+    let mut t = 0.0_f32;
     for frame in 0..10 {
+        state.renderer.set_anim_time(t);
         let (w, h, px) = state.renderer.capture(&state.scene, &cam, &state.ui.settings);
         if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
             let _ = img.save(format!("{dir}/wheel_{frame:02}.png"));
         }
         // ~0.05 s between frames → catch the wheel mid-travel (split + gap sweep).
         state.scene.advance(0.05);
+        t += 0.05;
     }
     log::info!("wheel: wrote 10 frames to {dir}");
 }
@@ -917,64 +1222,108 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
 /// size stabilise, then captures the final frame.
 #[allow(deprecated)] // egui 0.34 Context::run — matches the live render() path
 /// Apply headless camera-override env knobs (shared by the screenshot + bench
-/// paths): PREVIZ_ZOOM, PREVIZ_CAM_Y, PREVIZ_CAM_TARGET=x,y,z, PREVIZ_CAM_YAW /
-/// _PITCH (radians), PREVIZ_CAM_DIST (metres).
+/// paths): GLOWSTONE_ZOOM, GLOWSTONE_CAM_Y, GLOWSTONE_CAM_TARGET=x,y,z, GLOWSTONE_CAM_YAW /
+/// _PITCH (radians), GLOWSTONE_CAM_DIST (metres).
 fn apply_cam_env(camera: &mut OrbitCamera) {
     let envf = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
-    if let Some(z) = envf("PREVIZ_ZOOM") {
+    if let Some(z) = envf("GLOWSTONE_ZOOM") {
         camera.distance *= z;
     }
-    if let Some(dy) = envf("PREVIZ_CAM_Y") {
+    if let Some(dy) = envf("GLOWSTONE_CAM_Y") {
         camera.target.y += dy;
     }
-    if let Some(t) = std::env::var("PREVIZ_CAM_TARGET").ok().and_then(|s| {
+    if let Some(t) = std::env::var("GLOWSTONE_CAM_TARGET").ok().and_then(|s| {
         let p: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         (p.len() == 3).then(|| glam::Vec3::new(p[0], p[1], p[2]))
     }) {
         camera.target = t;
     }
-    if let Some(y) = envf("PREVIZ_CAM_YAW") {
+    if let Some(y) = envf("GLOWSTONE_CAM_YAW") {
         camera.yaw = y;
     }
-    if let Some(p) = envf("PREVIZ_CAM_PITCH") {
+    if let Some(p) = envf("GLOWSTONE_CAM_PITCH") {
         camera.pitch = p;
     }
-    if let Some(d) = envf("PREVIZ_CAM_DIST") {
+    if let Some(d) = envf("GLOWSTONE_CAM_DIST") {
         camera.distance = d;
     }
+    // Headless one-shot: land on the final pose, never mid-transition.
+    camera.skip_anim();
 }
 
 fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     // The welcome splash would otherwise cover every headless UI screenshot;
-    // PREVIZ_UI_SPLASH=1 keeps it up so the splash itself can be captured.
-    if std::env::var("PREVIZ_UI_SPLASH").is_err() {
+    // GLOWSTONE_UI_SPLASH=1 keeps it up so the splash itself can be captured.
+    if std::env::var("GLOWSTONE_UI_SPLASH").is_err() {
         state.ui.dismiss_splash();
     }
-    if let Ok(title) = std::env::var("PREVIZ_UI_TAB") {
+    if let Ok(title) = std::env::var("GLOWSTONE_UI_TAB") {
         state.ui.focus_tab_by_title(&title);
     }
-    if std::env::var("PREVIZ_UI_QS").is_ok() {
+    if std::env::var("GLOWSTONE_UI_QS").is_ok() {
         state.ui.debug_open_quick_select();
     }
-    if std::env::var("PREVIZ_UI_PROFILE").is_ok() {
+    if std::env::var("GLOWSTONE_UI_OPS").is_ok() {
+        state.ui.debug_open_op_search();
+    }
+    if std::env::var("GLOWSTONE_UI_PIE").is_ok() {
+        state.ui.debug_open_view_pie();
+    }
+    if std::env::var("GLOWSTONE_UI_PROFILE").is_ok() {
         state.ui.debug_open_profile(&state.scene);
     }
-    if std::env::var("PREVIZ_UI_REPLACE").is_ok() {
+    if std::env::var("GLOWSTONE_UI_REPLACE").is_ok() {
         state.ui.debug_open_replace(&state.scene);
     }
-    if let Ok(v) = std::env::var("PREVIZ_UI_BULK") {
+    if let Ok(v) = std::env::var("GLOWSTONE_UI_BULK") {
         state.ui.debug_select_n(&state.scene, v.parse().unwrap_or(3));
     }
-    // PREVIZ_UI_SHARE opens the online Fixture Library window; =demo injects rows.
-    if let Ok(v) = std::env::var("PREVIZ_UI_SHARE") {
+    // GLOWSTONE_UI_SHARE opens the online Fixture Library window; =demo injects rows.
+    if let Ok(v) = std::env::var("GLOWSTONE_UI_SHARE") {
         state.ui.debug_open_share(v == "demo");
     }
-    if std::env::var("PREVIZ_UI_SELECT").is_ok() {
+    if std::env::var("GLOWSTONE_UI_SELECT").is_ok() {
         state.ui.debug_select_first_gdtf(&state.scene);
     }
-    if let Ok(n) = std::env::var("PREVIZ_UI_SELECT_N") {
+    if std::env::var("GLOWSTONE_UI_WORLD").is_ok() {
+        state.ui.debug_select_world();
+    }
+    if std::env::var("GLOWSTONE_UI_ENV").is_ok() {
+        state.ui.debug_select_environment(&state.scene);
+    }
+    if std::env::var("GLOWSTONE_UI_RENDERTAB").is_ok() {
+        state.ui.ensure_render_tab_focused();
+    }
+    // GLOWSTONE_UI_RENDERING=<sample> populates a mid-render state on the Render tab so
+    // the Blender-style tile reveal can be screenshotted: render a few frames into
+    // the offscreen target for real content, then publish a Rendering status.
+    if let Ok(s) = std::env::var("GLOWSTONE_UI_RENDERING") {
+        use crate::ui::{RenderPhase, RenderStatus};
+        state.ui.ensure_render_tab_focused();
+        state.scene.snap_movement();
+        let res = state.scene.render.output_size();
+        let settings = state.scene.render.render_settings(&state.ui.settings);
+        state.renderer.ensure_render_view(res);
+        for _ in 0..8 {
+            state.renderer.record_render_view(&state.scene, &state.camera, &settings);
+        }
+        let total = state.scene.render.max_samples.max(1);
+        let sample = s.parse::<u32>().unwrap_or(total / 2).min(total);
+        state.ui.render.preview_tex = state.renderer.render_view_texture();
+        state.ui.render.status = RenderStatus {
+            phase: RenderPhase::Rendering,
+            sample,
+            total,
+            elapsed_s: 14.0,
+            res,
+        };
+    }
+    if let Ok(n) = std::env::var("GLOWSTONE_UI_SELECT_N") {
         state.ui.debug_select_n(&state.scene, n.parse().unwrap_or(4));
     }
+    // Headless one-shot: any startup frame()/set_view() started a transition; land
+    // on its final pose so the screenshot isn't captured mid-animation.
+    state.camera.skip_anim();
     let mut jobs: Vec<egui::ClippedPrimitive> = Vec::new();
     let mut sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
     for i in 0..3 {
@@ -987,6 +1336,8 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         };
         let viewport_texture = state.renderer.viewport.texture_id;
         let egui_ctx = state.egui_ctx.clone();
+        let mut perf_timings = state.renderer.last_timings;
+        perf_timings.frame_ms = 1000.0 / 60.0;
         let out = egui_ctx.run(raw, |ctx| {
             ctx.set_pixels_per_point(1.0);
             state.ui.show(
@@ -996,6 +1347,7 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
                 &mut state.dmx,
                 viewport_texture,
                 60.0,
+                &perf_timings,
             );
         });
         // Settle the atlas + size the 3D viewport to the panel's request.
@@ -1024,8 +1376,8 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         log::error!("UI screenshot: bad buffer");
         return;
     };
-    // PREVIZ_UI_CROP="x,y,w,h" crops to a region (for inspecting one panel).
-    if let Ok(spec) = std::env::var("PREVIZ_UI_CROP") {
+    // GLOWSTONE_UI_CROP="x,y,w,h" crops to a region (for inspecting one panel).
+    if let Ok(spec) = std::env::var("GLOWSTONE_UI_CROP") {
         let nums: Vec<u32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
         if let [x, y, cw, ch] = nums[..] {
             let cw = cw.min(rw.saturating_sub(x));
@@ -1058,22 +1410,127 @@ impl State {
         }
         let fps = self.fps;
 
+        // A still render is converging: freeze ALL scene motion (DMX decode, live
+        // video, cues, camera + wheel/slew advance) so the camera + rig stay static
+        // and the renderer's temporal accumulation keeps converging instead of
+        // resetting every frame. The job is cleared on completion/cancel, after
+        // which the live preview resumes normally.
+        let job_active = self.render_job.is_some();
+
+        // Dynamic resolution: nudge the live render scale toward the fps target
+        // (live preview only — a still render always uses its own native scale).
+        if !job_active {
+            self.auto_resolution_step();
+        }
+
         // Live DMX: apply any deferred connectivity command, pull the latest
         // universes from the receive thread, and decode them into the fixtures —
         // BEFORE advancing motion, so DMX-driven spin values feed this frame's
         // wheel-motion integration.
         self.dmx.apply_pending();
         self.dmx.poll();
-        self.dmx.decode(&mut self.scene);
+        if !job_active {
+            self.dmx.decode(&mut self.scene);
+        }
+
+        // Live CITP/MSEX: pump media-server stream frames onto CITP-sourced LED
+        // walls (lazily starting the discovery/stream client on first use).
+        if !job_active {
+            use crate::scene::screen::ScreenContent;
+            let citp_sources: Vec<String> = self
+                .scene
+                .screens
+                .iter()
+                .filter_map(|s| match &s.content {
+                    ScreenContent::Citp { source } if !source.is_empty() => Some(source.clone()),
+                    _ => None,
+                })
+                .collect();
+            if citp_sources.is_empty() {
+                if let Some(c) = &mut self.citp {
+                    c.retain(&[]); // stop any leftover streams
+                }
+            } else {
+                let client = self.citp.get_or_insert_with(crate::citp::CitpClient::new);
+                client.retain(&citp_sources);
+                for s in &mut self.scene.screens {
+                    let src = match &s.content {
+                        ScreenContent::Citp { source } if !source.is_empty() => Some(source.clone()),
+                        _ => None,
+                    };
+                    if let Some(src) = src {
+                        // Assign unconditionally so switching to a different/empty
+                        // source name clears the previous source's stale frame.
+                        // (frame_for returns the cached latest frame for a live
+                        // source, so a steady stream does not flicker.)
+                        s.frame = client.frame_for(&src);
+                    }
+                }
+            }
+        }
+
+        // Live NDI: pump received frames onto NDI-sourced LED walls (lazily
+        // starting the receive client; a no-op stub without the `ndi` feature).
+        if !job_active {
+            use crate::scene::screen::ScreenContent;
+            let ndi_sources: Vec<String> = self
+                .scene
+                .screens
+                .iter()
+                .filter_map(|s| match &s.content {
+                    ScreenContent::Ndi { source } if !source.is_empty() => Some(source.clone()),
+                    _ => None,
+                })
+                .collect();
+            if ndi_sources.is_empty() {
+                if let Some(c) = &mut self.ndi {
+                    c.retain(&[]);
+                }
+            } else {
+                let client = self.ndi.get_or_insert_with(crate::ndi::NdiClient::new);
+                client.retain(&ndi_sources);
+                for s in &mut self.scene.screens {
+                    let src = match &s.content {
+                        ScreenContent::Ndi { source } if !source.is_empty() => Some(source.clone()),
+                        _ => None,
+                    };
+                    if let Some(src) = src {
+                        // Assign unconditionally so switching to a different/empty
+                        // source name clears the previous source's stale frame.
+                        // (frame_for returns the cached latest frame for a live
+                        // source, so a steady stream does not flicker.)
+                        s.frame = client.frame_for(&src);
+                    }
+                }
+            }
+        }
 
         // Crossfade any in-progress cue AFTER DMX decode (so an offline cue
         // overrides the rest state) and BEFORE motion advance (so its pan/tilt
-        // feeds this frame's slew).
-        self.ui.tick_cues(&mut self.scene, dt);
+        // feeds this frame's slew). Frozen while a still render converges.
+        if !job_active {
+            self.ui.tick_cues(&mut self.scene, dt);
 
-        // Advance time-based wheel motion once per real frame (not in the
-        // renderer, which also runs for headless capture).
-        self.scene.advance(dt);
+            // Advance any in-flight eased camera transition (canned-view / frame /
+            // pie jump). The app already drives continuous redraws, so a running
+            // transition simply settles over the next handful of frames.
+            self.camera.advance(dt);
+
+            // Advance time-based wheel motion once per real frame (not in the
+            // renderer, which also runs for headless capture).
+            self.scene.advance(dt);
+
+            // Advance the stage-pyro particle simulation once per real frame too
+            // (same rule — never in the renderer's record_scene). Reads the
+            // per-device trigger state DMX decode wrote above; the camera position
+            // drives the distance LOD.
+            self.renderer.advance_pyro(&self.scene, self.camera.eye(), dt);
+
+            // Advance the renderer's animation clock by the SAME dt, so fog drift +
+            // beam animation track the logical scene time (not wall-clock). Frozen
+            // here while a render converges → the render is a static snapshot.
+            self.anim_time += dt;
+        }
 
         // Crash-recovery autosave (debounced inside; writes to the cache dir).
         self.ui.autosave_tick(&self.scene, &self.camera, &self.dmx, dt);
@@ -1081,6 +1538,23 @@ impl State {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let viewport_texture = self.renderer.viewport.texture_id;
         let egui_ctx = self.egui_ctx.clone();
+
+        // Refresh discovered live-video sources for the LED-screen content
+        // pickers (NDI + CITP) before drawing the inspector.
+        self.ui.screen_sources = crate::ui::ScreenSources {
+            ndi: self.ndi.as_ref().map(|c| c.server_names()).unwrap_or_default(),
+            ndi_available: self.ndi.as_ref().map(|c| c.available()).unwrap_or(false),
+            citp: self.citp.as_ref().map(|c| c.server_names()).unwrap_or_default(),
+        };
+
+        // Per-pass GPU timings + scene counts for the perf overlay; the CPU EMA fps
+        // fills frame_ms (GPU passes overlap, so the header uses the CPU timer).
+        let mut perf_timings = self.renderer.last_timings;
+        perf_timings.frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+
+        // Publish render-active state so the UI freezes scene edits while a still
+        // render converges (the inspector goes read-only; deferred mutations wait).
+        self.ui.render_active = self.render_job.is_some();
 
         // Build the UI. The closure borrows the scene/camera/ui fields; egui_ctx
         // is a separate (cloned) handle so there's no borrow conflict.
@@ -1092,16 +1566,52 @@ impl State {
                 &mut self.dmx,
                 viewport_texture,
                 fps,
+                &perf_timings,
             );
         });
+
+        // The viewport may have started/updated a modal transform during the egui
+        // run; push its axis constraint into RenderSettings so the renderer draws the
+        // infinite Blender-style axis line through the pivot this same frame.
+        self.ui.sync_axis_hint();
+
+        // Reflect the open project + unsaved-changes state in the window title (only
+        // when it actually changes, to avoid a per-frame `set_title`).
+        let title = self.ui.window_title();
+        if title != self.last_title {
+            self.window.set_title(&title);
+            self.last_title = title;
+        }
 
         self.egui_state.handle_platform_output(
             &self.window,
             std::mem::take(&mut full_output.platform_output),
         );
 
-        // Match the offscreen 3D target to the size the viewport panel wants.
-        self.renderer.resize_viewport(self.ui.requested_viewport_px);
+        // Window fullscreen toggle (F11 / header button / View menu) — only the app
+        // can reach the winit window.
+        if std::mem::take(&mut self.ui.pending_fullscreen_toggle) {
+            self.fullscreen = !self.fullscreen;
+            let fs = self
+                .fullscreen
+                .then(|| winit::window::Fullscreen::Borderless(None));
+            self.window.set_fullscreen(fs);
+        }
+
+        // GPU backend dropdown changed — persist the global preference (takes effect
+        // on the next launch; switching backends means recreating the device/surface).
+        let sel = self.ui.render.gpu_selected.clone();
+        if !sel.is_empty() && sel != self.gpu_pref_written {
+            crate::renderer::write_gpu_pref(&sel);
+            self.gpu_pref_written = sel.clone();
+            if sel != self.ui.render.gpu_active {
+                self.ui
+                    .notify_success(format!("GPU backend set to {sel} — restart glowstone to apply"));
+            }
+        }
+
+        // Render command raised by the UI this frame (inspector / Render tab / F12).
+        self.handle_render_request();
 
         let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -1109,6 +1619,31 @@ impl State {
             pixels_per_point: full_output.pixels_per_point,
         };
 
+        if let Some(job) = self.render_job.as_ref() {
+            // RENDER PATH: record one frame of the scene into the SEPARATE offscreen
+            // target (the live viewport is untouched — its tab keeps its last frame),
+            // then present egui without re-recording the live scene. Use the camera
+            // SNAPSHOT so live-camera moves can't reset the render's accumulation.
+            let (res, settings, cam, t) = (job.res, job.settings, job.camera.clone(), job.anim_time);
+            // FROZEN animation clock — every accumulation frame renders the fog +
+            // beams at the exact instant the render started (no drift mid-render).
+            self.renderer.set_anim_time(t);
+            self.renderer.ensure_render_view(res);
+            let rendered = self.renderer.record_render_view(&self.scene, &cam, &settings);
+            self.window.pre_present_notify();
+            let presented = self.renderer.present_egui_only(
+                &paint_jobs,
+                &full_output.textures_delta,
+                &screen_descriptor,
+            );
+            self.step_render_job(rendered);
+            return presented;
+        }
+
+        // LIVE PATH: track the viewport panel's requested size + live look, and the
+        // logical animation clock (fog drift + beams advance with the scene time).
+        self.renderer.set_anim_time(self.anim_time);
+        self.renderer.resize_viewport(self.ui.requested_viewport_px);
         self.window.pre_present_notify();
         self.renderer.render(
             &self.scene,
@@ -1119,5 +1654,182 @@ impl State {
             &full_output.textures_delta,
             &screen_descriptor,
         )
+    }
+
+    /// Dynamic resolution: nudge `render_scale` toward the fps target — drop it
+    /// fast when the frame rate sags, recover quality slowly when there's headroom.
+    /// A dead-zone + a short cooldown (so the smoothed fps settles after each change)
+    /// keep it from hunting. Live preview only; clamped to `[0.25, 1.0]`.
+    fn auto_resolution_step(&mut self) {
+        if !self.ui.settings.auto_resolution {
+            return;
+        }
+        if self.auto_res_cooldown > 0 {
+            self.auto_res_cooldown -= 1;
+            return;
+        }
+        let fps = self.fps;
+        if fps <= 1.0 {
+            return; // fps EMA not warmed up yet
+        }
+        let target = self.ui.settings.fps_target.clamp(15.0, 240.0);
+        let scale = self.ui.settings.render_scale;
+        let next = if fps < target * 0.90 {
+            scale - 0.05 // sagging → drop resolution fast
+        } else if fps >= target * 0.98 && scale < 1.0 {
+            scale + 0.05 // comfortable headroom → recover quality
+        } else {
+            scale // inside the dead-zone → hold
+        };
+        let next = (next.clamp(0.25, 1.0) * 20.0).round() / 20.0;
+        if (next - scale).abs() > 1e-4 {
+            self.ui.settings.render_scale = next;
+            self.auto_res_cooldown = 8; // let the fps EMA settle before re-adjusting
+        }
+    }
+
+    /// Act on a render command raised by the UI (Start / Cancel / Save). Start
+    /// snaps the rig to its commanded pose, settles the camera, and spins up a
+    /// fresh [`RenderJob`]; the Render tab is focused by the UI side.
+    fn handle_render_request(&mut self) {
+        use crate::ui::{RenderPhase, RenderRequest, RenderStatus};
+        match self.ui.render.request.take() {
+            Some(RenderRequest::Start) => {
+                self.scene.snap_movement();
+                self.camera.skip_anim();
+                self.ui.render.image = None;
+                self.ui.render.result_tex = None;
+                let job = RenderJob::new(
+                    &self.scene.render,
+                    &self.ui.settings,
+                    &self.camera,
+                    self.anim_time,
+                    Instant::now(),
+                );
+                self.ui.render.status = RenderStatus {
+                    phase: RenderPhase::Rendering,
+                    sample: 0,
+                    total: job.total,
+                    elapsed_s: 0.0,
+                    res: job.res,
+                };
+                self.render_job = Some(job);
+            }
+            Some(RenderRequest::Cancel) => {
+                self.render_job = None;
+                self.renderer.free_render_view();
+                self.ui.render.preview_tex = None;
+                self.ui.render.status = RenderStatus::default();
+            }
+            Some(RenderRequest::Save { copy }) => self.save_render(copy),
+            None => {}
+        }
+    }
+
+    /// Advance the active render job by one rendered frame; on reaching the sample
+    /// target, read the converged plate back, upload it for the preview, optionally
+    /// auto-save it, and freeze a `Complete` status. `rendered` is whether the
+    /// offscreen target actually recorded a frame this tick (it advances the EMA).
+    fn step_render_job(&mut self, rendered: bool) {
+        use crate::ui::{RenderPhase, RenderStatus};
+
+        // Publish the live render-target texture so the Render tab shows the
+        // converging image (with its Blender-style tile reveal driven off the status).
+        self.ui.render.preview_tex = self.renderer.render_view_texture();
+
+        let (sample, total, res, elapsed) = {
+            let job = self.render_job.as_mut().expect("job present");
+            if rendered {
+                job.sample += 1;
+            }
+            (job.sample, job.total, job.res, job.elapsed_s())
+        };
+        // The next frame is re-armed in `about_to_wait` while the window is awake,
+        // so the accumulation keeps converging frame-by-frame without an explicit
+        // (and, per that handler, unreliable) redraw request from in here.
+
+        if sample < total {
+            self.ui.render.status = RenderStatus {
+                phase: RenderPhase::Rendering,
+                sample,
+                total,
+                elapsed_s: elapsed,
+                res,
+            };
+            return;
+        }
+
+        // Done — grab the job's save params, drop it, read back the finished plate
+        // from the OFFSCREEN render target (not the live viewport).
+        let (write_on_done, out_path, format) = {
+            let job = self.render_job.as_ref().expect("job present");
+            (job.write_on_done, job.out_path.clone(), job.format)
+        };
+        self.render_job = None;
+
+        let readback = self.renderer.read_render_view_ldr();
+        self.renderer.free_render_view();
+        self.ui.render.preview_tex = None;
+
+        if let Some((w, h, px)) = readback
+            && let Some(img) = image::RgbaImage::from_raw(w, h, px)
+        {
+            let color =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+            let tex = self
+                .egui_ctx
+                .load_texture("render-result", color, egui::TextureOptions::LINEAR);
+            self.ui.render.result_tex = Some(tex);
+
+            if write_on_done {
+                let path = std::path::PathBuf::from(&out_path);
+                match crate::ui::save_image(&img, &path, format) {
+                    Ok(()) => self.ui.notify_success(format!("Saved render → {}", path.display())),
+                    Err(e) => self.ui.notify_error(format!("Save render failed: {e}")),
+                }
+            }
+            self.ui
+                .notify_success(format!("Render complete — {total} samples · {elapsed:.1}s"));
+            self.ui.render.image = Some(img);
+        } else {
+            self.ui.notify_error("Render readback failed");
+        }
+
+        self.ui.render.status = RenderStatus {
+            phase: RenderPhase::Complete,
+            sample: total,
+            total,
+            elapsed_s: elapsed,
+            res,
+        };
+    }
+
+    /// Save the finished render to a user-chosen file. `copy` = "Save a Copy"
+    /// (don't update the remembered output path). Seeds the dialog from the
+    /// render config's format + remembered path.
+    fn save_render(&mut self, copy: bool) {
+        let Some(img) = self.ui.render.image.clone() else {
+            return;
+        };
+        let fmt = self.scene.render.format;
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter(fmt.label(), &[fmt.ext()])
+            .set_file_name(crate::ui::default_filename(&self.scene.render));
+        if let Some(dir) = std::path::Path::new(&self.scene.render.out_path).parent() {
+            if dir.is_dir() {
+                dialog = dialog.set_directory(dir);
+            }
+        }
+        if let Some(path) = dialog.save_file() {
+            match crate::ui::save_image(&img, &path, fmt) {
+                Ok(()) => {
+                    if !copy {
+                        self.scene.render.out_path = path.to_string_lossy().into_owned();
+                    }
+                    self.ui.notify_success(format!("Saved render → {}", path.display()));
+                }
+                Err(e) => self.ui.notify_error(format!("Save failed: {e}")),
+            }
+        }
     }
 }

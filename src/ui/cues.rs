@@ -7,7 +7,7 @@
 //! optics (gobo / prism / wheel slot) snap at the start, since wheel slots don't
 //! interpolate. The fade is ticked once per real frame from `app::render`.
 //!
-//! Note: this is the offline-previz look engine. The cue tick runs each frame
+//! Note: this is the offline-glowstone look engine. The cue tick runs each frame
 //! *after* live-DMX decode (see `app::render`), so while a fade is in progress the
 //! cue WINS over a connected console — the recalled look is what you see. Outside
 //! a fade nothing is written, so live DMX drives the rig normally. Cues are meant
@@ -39,7 +39,8 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// The controllable look of one fixture, captured into / restored from a cue.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct FixtureLook {
     pub pan: f32,
     pub tilt: f32,
@@ -85,7 +86,8 @@ impl FixtureLook {
 
 /// A saved look: one [`FixtureLook`] per fixture (aligned to fixture index at
 /// capture time), plus a fade time.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct Cue {
     pub name: String,
     pub looks: Vec<FixtureLook>,
@@ -101,6 +103,7 @@ struct Fade {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CueEngine {
     pub cues: Vec<Cue>,
     /// The last cue fully reached (for Go / highlight).
@@ -253,7 +256,6 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
     let accent = ui.visuals().selection.stroke.color;
 
     ui.horizontal(|ui| {
-        ui.heading("Cues");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(format!("{}", engine.cues.len())).small().weak());
         });
@@ -297,13 +299,13 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
             engine.go(scene);
         }
         match engine.current.and_then(|c| engine.cues.get(c)) {
-            Some(cue) => ui.label(RichText::new(format!("▶ {}", cue.name)).small().color(accent)),
+            Some(cue) => ui.label(RichText::new(format!("{}  {}", theme::icon::PLAY, cue.name)).small().color(accent)),
             None => ui.label(RichText::new("—").small().weak()),
         };
     });
     if let Some((to, p)) = engine.fading_progress() {
         let name = engine.cues.get(to).map(|c| c.name.as_str()).unwrap_or("");
-        ui.add(egui::ProgressBar::new(p).desired_height(6.0).text(RichText::new(format!("→ {name}")).small()));
+        ui.add(egui::ProgressBar::new(p).desired_height(6.0).text(RichText::new(format!("{}  {name}", theme::icon::ARROW_RIGHT)).small()));
     }
     ui.separator();
 

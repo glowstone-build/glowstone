@@ -4,7 +4,9 @@
 //! **HDR** [`Viewport`] target. The post pipelines (volumetric raymarch, bloom,
 //! tonemap) are fullscreen passes that consume/produce those targets.
 
-use super::mesh::{LensInstance, LineVertex, MeshInstance, MeshVertex};
+use super::mesh::{
+    LensInstance, LineVertex, MeshInstance, MeshVertex, ParticleInstance, WallInstance,
+};
 use super::viewport::Viewport;
 
 fn load(device: &wgpu::Device, label: &str, source: &'static str) -> wgpu::ShaderModule {
@@ -33,6 +35,30 @@ fn depth_stencil() -> wgpu::DepthStencilState {
         depth_compare: Some(wgpu::CompareFunction::Less),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Depth state for the emissive lens discs: still depth-TESTS (so a lens behind a
+/// wall is hidden) but does NOT WRITE depth. Writing it (the old behaviour) put the
+/// small ~lens-radius disc into `depth_tex`, and the half-res volumetric pass then
+/// clipped its march `t_far` to that disc — erasing the beam shaft right behind the
+/// lens, i.e. the dark gap between the lens face and where the beam "starts".
+fn depth_stencil_no_write() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        depth_write_enabled: Some(false),
+        ..depth_stencil()
+    }
+}
+
+/// Main forward pass when a depth PRE-PASS already wrote the scene depth: test
+/// `Equal` (so the heavy per-fragment light loop runs exactly once per visible
+/// pixel, no overdraw) and don't re-write depth. Bit-identical clip-Z is required
+/// vs the pre-pass — guaranteed by sharing `mesh.wgsl`'s `@invariant` `vs_main`.
+fn depth_stencil_equal() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Equal),
+        ..depth_stencil()
     }
 }
 
@@ -95,6 +121,40 @@ pub fn lens_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
             cull_mode: None,
             ..Default::default()
         },
+        // Test (hide behind nearer geometry) but DON'T write depth, so the lens disc
+        // doesn't clip the volumetric beam shaft behind it (the lens-gap bug).
+        depth_stencil: Some(depth_stencil_no_write()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Pipeline for LED-wall surfaces: an instanced unit quad (camera-only bind
+/// group, like the lens pipeline) that writes emissive HDR colour with a
+/// distance-aware LED pixel mask. No backface cull (read from either side).
+pub fn wall_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let shader = load(device, "wall.wgsl", include_str!("../shaders/wall.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wall-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), WallInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
         depth_stencil: Some(depth_stencil()),
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
@@ -102,6 +162,122 @@ pub fn lens_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
             entry_point: Some("fs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Transparent / see-through LED walls: same as [`wall_pipeline`] but with
+/// PREMULTIPLIED-alpha blending (`One` / `OneMinusSrcAlpha`) and **no depth
+/// write** (depth-test still on), drawn after the opaque scene so it shows
+/// through the gaps between lit LEDs.
+pub fn wall_alpha_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let shader = load(device, "wall.wgsl", include_str!("../shaders/wall.wgsl"));
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wall-alpha-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), WallInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: Viewport::DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: Viewport::HDR_FORMAT,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Cold-spark billboard pipeline: **additive** (`One`/`One`) so emissive sparks
+/// accumulate and bloom; depth-TESTS against the scene (occluded by geometry) but
+/// does NOT write depth (so it never clips the volumetric beams behind it, like
+/// the lens discs). Camera-only bind group; the quad is generated in the VS, so
+/// the only vertex buffer is the per-particle [`ParticleInstance`] stream.
+pub fn spark_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    particle_pipeline(device, layout, blend, "fs_spark", "spark-pipeline")
+}
+
+/// CO2 / fog billboard pipeline: **premultiplied alpha** (`One`/`OneMinusSrcAlpha`)
+fn particle_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    blend: wgpu::BlendState,
+    fs_entry: &str,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "particles.wgsl", include_str!("../shaders/particles.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[ParticleInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil_no_write()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some(fs_entry),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: Viewport::HDR_FORMAT,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
         }),
         multiview_mask: None,
         cache: None,
@@ -152,6 +328,187 @@ fn mesh_pipeline_mode(
         multiview_mask: None,
         cache: None,
     })
+}
+
+/// Depth-only PRE-PASS over the opaque meshes: `mesh.wgsl`'s `vs_main` (so the
+/// clip-Z exactly matches the main pass) with NO fragment shader, writing only depth
+/// (`Less` + write). Lets the main pass run with `depth_stencil_equal()` → the heavy
+/// per-fragment light loop executes once per visible pixel instead of per overdrawn layer.
+pub fn mesh_depth_prepass_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load_with_optics(device, "mesh.wgsl", include_str!("../shaders/mesh.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mesh-depth-prepass"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: None,
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// The lit mesh pipeline for the main pass WHEN a depth pre-pass ran: `Equal` depth
+/// test, no depth write (see [`depth_stencil_equal`]).
+pub fn mesh_depth_equal_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load_with_optics(device, "mesh.wgsl", include_str!("../shaders/mesh.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mesh-pipeline-equal"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil_equal()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[hdr_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Selection silhouette: mask geometry pass + edge-detect composite
+// ---------------------------------------------------------------------------
+
+/// Single R8 color target the selection-mask pass writes (1 = selected surface).
+fn sel_mask_target() -> Option<wgpu::ColorTargetState> {
+    Some(wgpu::ColorTargetState {
+        format: Viewport::SEL_MASK_FORMAT,
+        blend: Some(wgpu::BlendState::REPLACE),
+        write_mask: wgpu::ColorWrites::ALL,
+    })
+}
+
+/// Depth state for the mask pass: TEST against the already-written scene depth
+/// (`LessEqual`, so a selected surface at the stored depth passes and an occluded
+/// part fails) but DON'T write — the mask hugs only the visible silhouette and the
+/// scene depth is left intact for later passes.
+fn depth_stencil_mask() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: Viewport::DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Selection-mask pipeline for MeshInstance geometry (fixtures, scene geometry):
+/// reuses `mesh.wgsl`'s vertex layout, discards non-selected fragments, writes 1.0.
+pub fn mesh_mask_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "mask.wgsl", include_str!("../shaders/mask.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sel-mask-mesh-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_mesh"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), MeshInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil_mask()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_mask"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[sel_mask_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Selection-mask pipeline for WallInstance geometry (LED screens): reuses
+/// `wall.wgsl`'s instance layout (selected = look.w) and reproduces its arc bend.
+pub fn wall_mask_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "mask.wgsl", include_str!("../shaders/mask.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sel-mask-wall-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_wall"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[MeshVertex::layout(), WallInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil_mask()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_mask"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[sel_mask_target()],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Fullscreen edge-detect composite: samples the selection mask and ADDs an amber
+/// silhouette ring into the HDR target (blend One/One) BEFORE bloom so it glows.
+pub fn sel_outline_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "mask.wgsl", include_str!("../shaders/mask.wgsl"));
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent::REPLACE,
+    };
+    fullscreen_pipeline(
+        device, "sel-outline-pipeline", layout, &shader, "fs_outline",
+        Viewport::HDR_FORMAT, Some(blend),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +588,29 @@ pub fn volumetric_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
             shadow_matrices_entry(9),
             // 10: per-fixture wheel chain (dynamic count).
             storage_entry(10),
+            // 11: per-screen-tile light-list CSR offsets, 12: flat light indices
+            // (tiled light culling — the ray's tile bounds which beams it marches).
+            storage_entry(11),
+            storage_entry(12),
+            // 13: CO2 volume descriptors (AABB + Z-slab layer) the raymarch loops.
+            storage_entry(13),
+            // 14: the splatted CO2 smoke density grid (3D), 15: its filtering sampler.
+            wgpu::BindGroupLayoutEntry {
+                binding: 14,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 15,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
@@ -287,6 +667,10 @@ pub fn light_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             shadow_matrices_entry(5),
             // 6: per-fixture wheel chain (dynamic count).
             storage_entry(6),
+            // 7: per-screen-tile light-list CSR offsets, 8: flat light indices
+            // (tiled light culling — the fragment's tile bounds which lights it loops).
+            storage_entry(7),
+            storage_entry(8),
         ],
     })
 }
@@ -467,6 +851,42 @@ pub fn single_tex_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
     })
 }
 
+/// Volumetric composite upsample: the half-res vol texture (0) + filtering sampler (1)
+/// + the full-res scene depth (2) for the depth-aware (joint-bilateral) blend.
+pub fn composite_upsample_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite-upsample-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
 /// Two sampled textures + sampler + a small uniform (tonemap/resolve).
 pub fn tonemap_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let tex = |binding| wgpu::BindGroupLayoutEntry {
@@ -623,5 +1043,251 @@ pub fn tonemap_pipeline(
     let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
     fullscreen_pipeline(
         device, "tonemap-pipeline", layout, &shader, "fs_tonemap", Viewport::LDR_FORMAT, None,
+    )
+}
+
+// ---- froxel volumetric (GLOWSTONE_FROXEL): two compute passes + a composite ----
+
+/// Bind-group layout shared by the froxel `inject` + `integrate` compute passes.
+/// Mirrors froxel.wgsl bindings, all COMPUTE-visible. 10 = froxel_out (storage
+/// write), 11 = froxel_in (read texture).
+pub fn froxel_compute_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let c = wgpu::ShaderStages::COMPUTE;
+    let buf = |binding, read_only| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: c,
+        ty: wgpu::BindingType::Buffer {
+            ty: if read_only {
+                wgpu::BufferBindingType::Storage { read_only: true }
+            } else {
+                wgpu::BufferBindingType::Uniform
+            },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let tex3 = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: c,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let tex_arr = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: c,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let samp = |binding, ty| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: c,
+        ty: wgpu::BindingType::Sampler(ty),
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("froxel-compute-bgl"),
+        entries: &[
+            buf(0, false),                                   // Froxel uniform
+            buf(1, true),                                    // fixtures
+            tex3(2),                                         // noise 3d
+            samp(3, wgpu::SamplerBindingType::Filtering),    // noise samp
+            tex_arr(4),                                      // gobo atlas
+            samp(5, wgpu::SamplerBindingType::Filtering),    // gobo samp
+            wgpu::BindGroupLayoutEntry {                     // shadow atlas
+                binding: 6,
+                visibility: c,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            samp(7, wgpu::SamplerBindingType::Comparison),   // shadow comparison samp
+            buf(8, true),                                    // shadow matrices
+            buf(9, true),                                    // wheels
+            wgpu::BindGroupLayoutEntry {                     // froxel_out (write storage)
+                binding: 10,
+                visibility: c,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                },
+                count: None,
+            },
+            tex3(11), // froxel_in (read)
+        ],
+    })
+}
+
+pub fn froxel_compute_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> (wgpu::ComputePipeline, wgpu::ComputePipeline) {
+    let shader = load_with_optics(device, "froxel.wgsl", include_str!("../shaders/froxel.wgsl"));
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("froxel-compute-pl"),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    let make = |entry: &str, label: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl),
+            module: &shader,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        })
+    };
+    (make("inject", "froxel-inject"), make("integrate", "froxel-integrate"))
+}
+
+/// Bind-group layout for the froxel composite (fragment): Froxel uniform, the
+/// integrated result 3D texture, a linear sampler, and the scene depth.
+pub fn froxel_composite_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let f = wgpu::ShaderStages::FRAGMENT;
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("froxel-composite-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: f,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: f,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: f,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: f,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+pub fn froxel_composite_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
+    // Same additive blend as the raymarch composite: out = scatter + scene*transmittance.
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::SrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    fullscreen_pipeline(
+        device,
+        "froxel-composite",
+        layout,
+        &shader,
+        "fs_froxel_composite",
+        Viewport::HDR_FORMAT,
+        Some(blend),
+    )
+}
+
+// ---- temporal volumetric accumulation (EMA reproject resolve) ----
+
+/// Bind-group layout for the temporal volumetric resolve: TemporalU uniform,
+/// the raw raymarch (current), the previous accumulated EMA, a linear sampler,
+/// and the scene depth (for reprojection).
+pub fn vol_temporal_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let f = wgpu::ShaderStages::FRAGMENT;
+    let tex = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: f,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("vol-temporal-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: f,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            tex(1),
+            tex(2),
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: f,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: f,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+pub fn vol_temporal_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "vol_temporal.wgsl", include_str!("../shaders/vol_temporal.wgsl"));
+    // No blend: writes the accumulated result directly into the EMA target.
+    fullscreen_pipeline(
+        device, "vol-temporal", layout, &shader, "fs_main", Viewport::VOL_FORMAT, None,
     )
 }

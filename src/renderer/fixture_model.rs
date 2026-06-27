@@ -240,17 +240,73 @@ pub struct Assembly {
     pub beams: Vec<BeamFrame>,
 }
 
+/// How an articulated axis geometry takes its angle: the fixture-wide pan/tilt
+/// scalar (the common single-yoke head), or a specific emitter cell's own angle
+/// (a fixture whose individual heads articulate — the Volero Wave).
+#[derive(Clone, Copy)]
+enum AngleSrc {
+    Fixture,
+    Cell(usize),
+}
+
+/// Per-axis-geometry articulation: which source drives this axis's pan / tilt.
+#[derive(Clone, Copy, Default)]
+struct AxisDrive {
+    pan: Option<AngleSrc>,
+    tilt: Option<AngleSrc>,
+}
+
+/// Resolve an axis angle (degrees): the fixture-wide scalar, or the emitter
+/// cell's own angle, falling back to the head's rest (0) if the cell is absent.
+fn axis_angle(src: AngleSrc, scalar: f32, cells: &[f32]) -> f32 {
+    match src {
+        AngleSrc::Fixture => scalar,
+        AngleSrc::Cell(c) => cells.get(c).copied().unwrap_or(0.0),
+    }
+}
+
 /// Walk the mode's expanded geometry tree with pan/tilt applied, in world space
 /// (`root` already maps GDTF -> world and places the fixture).
+///
+/// `cell_pan`/`cell_tilt` carry per-emitter angles for fixtures whose individual
+/// heads articulate (aligned with the mode's emitters); they're empty/ignored
+/// for the common single-yoke head, which uses the `pan_deg`/`tilt_deg` scalars.
 pub fn assemble(
     fixture: &GdtfFixture,
     mode_index: usize,
     root: Mat4,
     pan_deg: f32,
     tilt_deg: f32,
+    cell_pan: &[f32],
+    cell_tilt: &[f32],
 ) -> Assembly {
-    let pan_geom = fixture.geometry_for_attribute("Pan").map(str::to_string);
-    let tilt_geom = fixture.geometry_for_attribute("Tilt").map(str::to_string);
+    // Map each articulated axis geometry → how its pan/tilt is driven. A Pan/Tilt
+    // channel covering a STRICT SUBSET of the mode's cells is a per-head axis (its
+    // angle comes from cell_pan/cell_tilt[cell]); one covering every cell — or a
+    // single-emitter fixture — is the fixture-wide yoke/head (the scalar).
+    let n_cells = fixture.modes.get(mode_index).map(|m| m.emitters.len()).unwrap_or(0);
+    let mut axes: std::collections::HashMap<&str, AxisDrive> = std::collections::HashMap::new();
+    if let Some(mode) = fixture.modes.get(mode_index) {
+        for rc in &mode.resolved {
+            let ch = &mode.channels[rc.channel];
+            let pan = match ch.attribute.as_str() {
+                "Pan" => true,
+                "Tilt" => false,
+                _ => continue,
+            };
+            let src = if n_cells > 1 && !rc.cells.is_empty() && rc.cells.len() < n_cells {
+                AngleSrc::Cell(rc.cells[0] as usize)
+            } else {
+                AngleSrc::Fixture
+            };
+            let e = axes.entry(ch.geometry.as_str()).or_default();
+            if pan {
+                e.pan = Some(src);
+            } else {
+                e.tilt = Some(src);
+            }
+        }
+    }
 
     // A static fixture (LED wash / cluster / bar / blinder) has NO articulated
     // pan/tilt geometry, so `walk` would drop the user's pan/tilt entirely and the
@@ -260,8 +316,10 @@ pub fn assemble(
     // parts + every emitter beam) rotates. Pan is about the fixture's up (GDTF +Z),
     // tilt about its +X — same axes/order `walk` uses, so an articulated moving head
     // is byte-for-byte unchanged (its base angles are 0).
-    let base_pan = if pan_geom.is_none() { pan_deg } else { 0.0 };
-    let base_tilt = if tilt_geom.is_none() { tilt_deg } else { 0.0 };
+    let pan_articulated = axes.values().any(|a| a.pan.is_some());
+    let tilt_articulated = axes.values().any(|a| a.tilt.is_some());
+    let base_pan = if pan_articulated { 0.0 } else { pan_deg };
+    let base_tilt = if tilt_articulated { 0.0 } else { tilt_deg };
     let root = root
         * Mat4::from_rotation_z(base_pan.to_radians())
         * Mat4::from_rotation_x(base_tilt.to_radians());
@@ -273,8 +331,9 @@ pub fn assemble(
         root,
         pan_deg,
         tilt_deg,
-        pan_geom.as_deref(),
-        tilt_geom.as_deref(),
+        cell_pan,
+        cell_tilt,
+        &axes,
         &mut parts,
         &mut beams,
     );
@@ -287,18 +346,22 @@ fn walk(
     parent: Mat4,
     pan: f32,
     tilt: f32,
-    pan_geom: Option<&str>,
-    tilt_geom: Option<&str>,
+    cell_pan: &[f32],
+    cell_tilt: &[f32],
+    axes: &std::collections::HashMap<&str, AxisDrive>,
     parts: &mut Vec<PartDraw>,
     beams: &mut Vec<BeamFrame>,
 ) {
     let mut local = node.matrix;
     // GDTF axes rotate about their local axis: pan about +Z (up), tilt about +X.
-    if Some(node.name.as_str()) == pan_geom {
-        local *= Mat4::from_rotation_z(pan.to_radians());
-    }
-    if Some(node.name.as_str()) == tilt_geom {
-        local *= Mat4::from_rotation_x(tilt.to_radians());
+    // Each axis takes the fixture-wide angle or its own head's per-cell angle.
+    if let Some(a) = axes.get(node.name.as_str()) {
+        if let Some(src) = a.pan {
+            local *= Mat4::from_rotation_z(axis_angle(src, pan, cell_pan).to_radians());
+        }
+        if let Some(src) = a.tilt {
+            local *= Mat4::from_rotation_x(axis_angle(src, tilt, cell_tilt).to_radians());
+        }
     }
     let world = parent * local;
 
@@ -322,7 +385,7 @@ fn walk(
     }
 
     for child in &node.children {
-        walk(child, world, pan, tilt, pan_geom, tilt_geom, parts, beams);
+        walk(child, world, pan, tilt, cell_pan, cell_tilt, axes, parts, beams);
     }
 }
 

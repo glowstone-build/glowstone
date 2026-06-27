@@ -1,25 +1,63 @@
 //! egui + egui_dock setup: the dock layout and the [`TabViewer`] that routes
 //! each dock panel to its drawing function in [`panels`].
 
+mod actions;
+mod bookmarks;
+mod chrome;
 mod cues;
+mod debug_hooks;
+mod dock;
+mod editor;
+mod file_ops;
+mod gizmo;
+mod inspector;
+mod lib_prefs;
+mod library;
+mod ops;
+mod pies;
+mod setup;
+mod splash;
+pub mod nav_gizmo;
+mod notify;
+pub(crate) mod op;
+mod outliner;
 mod panels;
+mod pie;
+mod render_panel;
+pub use panels::ScreenSources;
+pub use render_panel::{
+    default_filename, save_image, RenderPhase, RenderRequest, RenderStatus, RenderUiState,
+};
 pub mod project;
 mod share_window;
+pub mod shortcuts;
 pub mod theme;
+mod tools;
+mod tree;
+mod viewport_math;
+mod workspaces;
+pub use tools::ActiveTool;
 mod windows;
+mod xform;
+pub use xform::{PivotMode, SnapMode, SnapSettings, TransformOrientation, TransformPrefs};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
+use egui_dock::{DockArea, DockState, TabViewer};
 use glam::Vec3;
 
 use crate::renderer::camera::{CameraView, OrbitCamera};
-use crate::scene::{Library, RenderSettings, Scene, Selection};
+use crate::scene::{Library, ObjectRef, RenderSettings, Scene, SelKind, Selection, ViewportMode};
 use windows::{Preferences, ProfileEditor};
 
+/// Window within which consecutive arrow-key nudges coalesce into one undo step
+/// (a held key repeats well inside this, so the whole drag is one undo).
+const NUDGE_COALESCE: std::time::Duration = std::time::Duration::from_millis(600);
+
 /// State of the open Duplicate dialog (the `d`-key array tool). `None` = closed.
+#[derive(Clone)]
 pub struct DuplicateDialog {
     /// Fixture being duplicated.
     pub fixture: usize,
@@ -33,23 +71,62 @@ pub struct DuplicateDialog {
     pub count: u32,
 }
 
+/// Remembered Duplicate-dialog values so a fresh Duplicate reuses the LAST ones
+/// instead of a fixed 36°/9 preset (which surprised users with a big fan). Starts
+/// at the identity — zero offset, no fan, a single copy. Held in egui temp memory
+/// so every open site (viewport + menu + catalog) and the confirm share it
+/// without extra plumbing.
+#[derive(Clone, Copy)]
+pub(crate) struct DupDefaults {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub angle: f32,
+    pub count: u32,
+}
+
+impl Default for DupDefaults {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, z: 0.0, angle: 0.0, count: 1 }
+    }
+}
+
+/// Whether a text widget held keyboard focus at the START of this frame (set by
+/// [`Ui::show`]). Global Enter readers (the library batch-add, the patch/unpatch/
+/// add/operator dialogs) check this so committing a value box with Enter can't leak
+/// into them and fire an unintended action (bug 8).
+pub(crate) fn text_focus_active(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("glowstone.text_focus")).unwrap_or(false))
+}
+
+/// The last-used Duplicate values (or all-zero defaults on first use).
+pub(crate) fn dup_defaults(ctx: &egui::Context) -> DupDefaults {
+    ctx.data(|d| d.get_temp::<DupDefaults>(egui::Id::new("glowstone.dup.defaults")).unwrap_or_default())
+}
+
+/// Remember the Duplicate values just used, so the next Duplicate reuses them.
+pub(crate) fn set_dup_defaults(ctx: &egui::Context, v: DupDefaults) {
+    ctx.data_mut(|m| m.insert_temp(egui::Id::new("glowstone.dup.defaults"), v));
+}
+
+/// Build a fresh [`DuplicateDialog`] for `fixture`, seeded from the remembered
+/// last-used values (all-zero on first use — never a preset fan).
+pub(crate) fn duplicate_dialog_for(ctx: &egui::Context, fixture: usize) -> DuplicateDialog {
+    let d = dup_defaults(ctx);
+    DuplicateDialog { fixture, x: d.x, y: d.y, z: d.z, y_angle: d.angle, count: d.count }
+}
+
 /// State of the open Replace-fixtures dialog (Shift+R). Swaps the selected
 /// fixtures' type for a chosen project-library profile, in place (keeping each
-/// fixture's position / aim / level / name). `None` = closed.
+/// fixture's position / aim / level). `None` = closed.
 #[derive(Default)]
 pub struct ReplaceDialog {
     /// Name filter over the project library.
     pub search: String,
-}
-
-/// What the welcome splash's buttons request (applied after the modal closure,
-/// where `scene` / `dmx` are mutably reachable again).
-enum SplashAction {
-    New,
-    Open,
-    OpenPath(PathBuf),
-    Recover(PathBuf),
-    Dismiss,
+    /// When ON, swap ONLY the visual model/beam and KEEP the fixture's identity —
+    /// name, DMX patch + mode + optical state (bug 12). Default OFF: a full replace
+    /// re-patches AND renames the fixture to the new profile's name.
+    pub mesh_only: bool,
 }
 
 /// egui textures decoded from a GDTF fixture's images (thumbnail + wheel slot
@@ -76,26 +153,18 @@ pub enum Tab {
     Patch,
     /// Saved looks + crossfade playback (cue list).
     Cues,
+    /// Live render progress + the finished still image (Save to Disk).
+    Render,
 }
 
 /// A saved, named selection of fixtures (console-style "groups"). Recalled by
 /// click in the Scene › Groups folder. Indices are filtered to valid range on
 /// recall, so editing the rig afterwards can't crash a recall.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct SelectionGroup {
     pub name: String,
     pub fixtures: Vec<usize>,
-}
-
-/// Map a fixture index through a removal of `removed` (a sorted, deduped set of
-/// deleted indices): `None` if `idx` was itself removed, else `idx` shifted down
-/// by the number of removed indices below it.
-fn remap_index(idx: usize, removed: &[usize]) -> Option<usize> {
-    if removed.binary_search(&idx).is_ok() {
-        return None;
-    }
-    let below = removed.partition_point(|&r| r < idx);
-    Some(idx - below)
 }
 
 /// An in-progress modal transform of the selected fixtures (Blender's G/R/S):
@@ -133,12 +202,55 @@ impl Axis {
             Self::Z => Vec3::Z,
         }
     }
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::X => "X",
             Self::Y => "Y",
             Self::Z => "Z",
         }
+    }
+    /// The Blender-convention axis colour (X red, Y green, Z blue). Single
+    /// source of truth: the screen-space move gizmo, the modal axis-lock line,
+    /// and the renderer's infinite constraint line all read this.
+    pub fn color(self) -> [f32; 3] {
+        match self {
+            Self::X => [1.0, 0.25, 0.25],
+            Self::Y => [0.35, 0.9, 0.35],
+            Self::Z => [0.3, 0.6, 1.0],
+        }
+    }
+}
+
+/// Blender-style modal numeric entry for a transform op. A SINGLE typed value
+/// (arch-viz simplification of Blender's up-to-3 components, editors/util/
+/// numinput.cc) that maps onto the op's active axis: Move = metres, Rotate =
+/// degrees, Scale = factor. `active` is the `hasNumInput()` gate — while true the
+/// typed amount OVERRIDES the mouse; clearing the buffer (backspace past empty)
+/// reverts `active` to false and hands control back to the mouse. `sign` mirrors
+/// Blender's NUM_NEGATE: '-' toggles it rather than inserting a literal char.
+#[derive(Default)]
+pub struct NumInput {
+    /// The literal typed digits/'.' (no sign char — see `sign`). Capped at 16.
+    pub str: String,
+    /// NUM_NEGATE: '-' toggles this; applied to the parsed value.
+    pub sign: bool,
+    /// == Blender hasNumInput(): typed value overrides the mouse while true.
+    pub active: bool,
+}
+
+impl NumInput {
+    /// Parse the buffer to a finite amount. Empty / lone '.' / parse-fail → 0.0;
+    /// `sign` negates. Used by the explicit-amount apply path.
+    pub fn value(&self) -> f32 {
+        let v = self.str.parse::<f32>().unwrap_or(0.0);
+        let v = if v.is_finite() { v } else { 0.0 };
+        if self.sign { -v } else { v }
+    }
+    /// The typed readout for the header pill, e.g. `-4.0`. Shows a lone `-` when
+    /// only the sign is set, so the user sees their keystroke land.
+    pub fn display(&self) -> String {
+        let s = if self.str.is_empty() { "0" } else { self.str.as_str() };
+        if self.sign { format!("-{s}") } else { s.to_string() }
     }
 }
 
@@ -147,6 +259,11 @@ pub struct TransformOp {
     pub axis: Option<Axis>,
     /// Mouse position (screen) when the op started.
     pub start_screen: egui::Pos2,
+    /// The viewport rect (screen px) the op runs in. Lets `apply_transform`
+    /// reconstruct picking rays from `start_screen` / the live cursor for the
+    /// #40 ray-plane ABSOLUTE gizmo drag and the #71 Vertex/Surface snap modes
+    /// (which need a ray + screen-space threshold, not just a pixel delta).
+    pub viewport: egui::Rect,
     /// Selection centroid (pivot for rotate/scale).
     pub pivot: Vec3,
     /// Original (fixture index, position, orientation) snapshot, for live re-apply
@@ -155,42 +272,148 @@ pub struct TransformOp {
     /// Original (geometry index, world transform) snapshot — the static-geometry
     /// equivalent of `start`. Empty when transforming fixtures.
     pub geo_start: Vec<(usize, glam::Mat4)>,
+    /// Original (LED-screen index, world transform) snapshot. Screens carry the
+    /// SAME `Mat4` transform as static geometry, so they ride the identical
+    /// move/rotate/scale math — this is what makes screens fully grabbable
+    /// (G/R/S) like every other object. Empty unless screens are selected.
+    pub screen_start: Vec<(usize, glam::Mat4)>,
+    /// Original (pyro-device index, world transform) snapshot. Pyro devices carry
+    /// the SAME `Mat4` transform as screens/geometry, so they ride the identical
+    /// move/rotate/scale math. Empty unless pyro devices are selected.
+    pub pyro_start: Vec<(usize, glam::Mat4)>,
+    /// Original (environment index, center, size) snapshot. Fog volumes are
+    /// axis-aligned (center + size, no orientation): Move slides the centre,
+    /// Rotate orbits it about the pivot (a no-op for a lone box), and Scale grows
+    /// the size in place. Empty unless an environment is selected.
+    pub env_start: Vec<(usize, Vec3, Vec3)>,
+    /// The axis the screen-space move gizmo is currently grabbed on. Takes
+    /// precedence over `axis` (keyboard X/Y/Z lock) for the live frame, matching
+    /// Blender's "click-a-handle overrides the typed constraint" behaviour. Not
+    /// serialized (TransformOp is never persisted).
+    pub gizmo_hovered_axis: Option<Axis>,
+    /// Set when a Move op was started by grabbing a screen-space PLANE handle: the
+    /// plane *normal* (the axis held FIXED). The drag then slides on the other two
+    /// axes via a `ray_plane_point` absolute drag (the handle sticks to the cursor),
+    /// instead of the single-axis projection a `gizmo_hovered_axis` lock drives.
+    /// Mutually exclusive with `gizmo_hovered_axis`. Not serialized.
+    pub gizmo_plane_normal: Option<Axis>,
+    /// Set when the op was started by grabbing a screen-axis VIEW handle (#72): a
+    /// Move on the screen-parallel plane (plane normal = camera forward) or a Rotate
+    /// about the camera forward (Blender's white trackball ring). `apply_transform`
+    /// resolves the camera basis live, so no world axis is stored. Mutually exclusive
+    /// with the axis / plane locks. Not serialized.
+    pub gizmo_view: bool,
+    /// True when the op was started by dragging a screen-space gizmo handle (vs the
+    /// modal G/R/S keys). A gizmo drag is driven by `drag_delta` and committed on
+    /// pointer release; a modal op is driven by absolute mouse position and
+    /// committed by a click/Enter.
+    pub from_gizmo: bool,
+    /// Modal numeric entry. Default = empty/inactive (mouse drives). Never
+    /// serialized (TransformOp is never persisted).
+    pub num: NumInput,
+    /// Pivot policy (#5). When `false` (Median/Active/3D-Cursor) rotate/scale pivot
+    /// about the single world `pivot`; when `true` (Individual Origins) each element
+    /// pivots about ITS OWN origin/centre, captured per-element in `start`/`geo_start`.
+    pub individual: bool,
+    /// Grid/increment snap settings (#4) captured at op start — `apply_transform`
+    /// quantizes the committed amount when `snap.on` (XOR the live Ctrl invert).
+    pub snap: SnapSettings,
+    /// Transform-orientation (#37): which basis the axis-lock + numeric-default axis
+    /// map through. `apply_transform` resolves it to a 3×3 whose COLUMNS are the
+    /// X/Y/Z directions — Global = identity (world axes, today's behaviour), Local =
+    /// the active element's orientation (its `start` Quat snapshot, stable across the
+    /// drag), View = the camera basis (`view_basis`, screen-aligned). Shown in the
+    /// modal hint.
+    pub orientation: TransformOrientation,
+    /// True when this Move op was started by Shift+D (duplicate-then-grab). Two
+    /// effects: the mouse always drives the OFFSET (a typed number is the array
+    /// CLONE-COUNT, not the move amount), and on confirm the extra clones are
+    /// arrayed along the drag vector. The clone itself was already pushed as its
+    /// own undo step before the grab began, so cancel just leaves the copies at
+    /// the source (Blender's Shift+D→Esc).
+    pub from_duplicate: bool,
+    /// The freshly-created copies (this op's targets) — the base set the array
+    /// duplicates from when a clone-count is typed during a duplicate-grab.
+    pub dup_base: Vec<ObjectRef>,
+    /// The LIVE array clones (#2..N) shown while a count is typed mid-drag. Held
+    /// at the END of their kind's scene Vec (LIFO), regenerated each frame from
+    /// `dup_base` + the current drag delta, and dropped on cancel. Empty until a
+    /// count > 1 is typed.
+    pub dup_extra: Vec<ObjectRef>,
 }
 
 impl TransformOp {
-    /// The on-viewport status line shown while the op is in progress.
-    pub fn hint(&self) -> String {
-        let ax = match self.axis {
-            Some(a) => format!(" · axis {}", a.label()),
-            None => String::new(),
-        };
-        format!(
-            "{}{}   X/Y/Z lock · click/Enter confirm · Esc cancel",
-            self.kind.label(),
-            ax
-        )
+    /// The axis actually constraining this op: the grabbed gizmo handle wins,
+    /// else the keyboard lock. Read by apply_transform + the constraint-line viz
+    /// so behaviour and visuals stay in sync.
+    pub fn active_axis(&self) -> Option<Axis> {
+        self.gizmo_hovered_axis.or(self.axis)
     }
 }
 
-/// A workspace layout preset, switchable from the Window menu.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Workspace {
-    Design,
-    Patch,
-    Visualize,
-}
-
-impl Workspace {
-    const ALL: [(Workspace, &'static str); 3] = [
-        (Workspace::Design, "Design"),
-        (Workspace::Patch, "Patch"),
-        (Workspace::Visualize, "Visualise"),
-    ];
+impl TransformOp {
+    /// The on-viewport status line shown while the op is in progress. `keys` is the
+    /// live structured key hint from the keymap (`shortcuts::modal_hint_keys`) —
+    /// passed in (not built here) so the registry stays the one source of truth for
+    /// which keys do what (#23). While the user is typing a value the hint switches
+    /// to the Blender-style typed readout and the key cluster is suppressed.
+    pub fn hint(&self, keys: &str) -> String {
+        // A duplicate-grab reads a typed number as the array clone-COUNT (the mouse
+        // drives the offset), so its hint shows copies, never metres/degrees.
+        if self.from_duplicate {
+            let n = if self.num.active { (self.num.value().round() as i64).max(1) } else { 1 };
+            return format!("Duplicate · {n} cop{}    drag: offset · type: count · Enter confirm · Esc cancel", if n == 1 { "y" } else { "ies" });
+        }
+        if self.num.active {
+            // Blender-style typed readout: "Move X: 4.0 m" / "Rotate Z: -45°" /
+            // "Scale: 2.0x". Axis label is blank when unconstrained.
+            let axl = self
+                .active_axis()
+                .map(|a| format!(" {}", a.label()))
+                .unwrap_or_default();
+            let (val, unit) = match self.kind {
+                TransformKind::Move => (self.num.display(), " m"),
+                TransformKind::Rotate => (self.num.display(), "°"),
+                TransformKind::Scale => (self.num.display(), "x"),
+            };
+            let orient = match self.orientation {
+                TransformOrientation::Global => String::new(),
+                o => format!(" ({})", o.label()),
+            };
+            return format!("{}{}{}: {}{}", self.kind.label(), axl, orient, val, unit);
+        }
+        let ax = match self.active_axis() {
+            Some(a) => format!(" · axis {}", a.label()),
+            None => String::new(),
+        };
+        // The orientation tag is suppressed for Global (the default world axes) so the
+        // common case stays uncluttered; Local/View are surfaced.
+        let orient = match self.orientation {
+            TransformOrientation::Global => String::new(),
+            o => format!(" · {}", o.label()),
+        };
+        // "Move · axis X · Local    X/Y/Z lock · type number · Enter confirm · Esc cancel"
+        format!("{}{}{}    {keys}", self.kind.label(), ax, orient)
+    }
 }
 
 impl Tab {
+    /// Every editor type — the SpaceType registry the header's editor-type
+    /// switcher offers (`docs/RESEARCH-blender-framework.md` §2.2).
+    pub(crate) const ALL: [Tab; 9] = [
+        Tab::Viewport,
+        Tab::Scene,
+        Tab::Library,
+        Tab::Inspector,
+        Tab::DmxMonitor,
+        Tab::Connectivity,
+        Tab::Patch,
+        Tab::Cues,
+        Tab::Render,
+    ];
+
     /// Panels shown in the Window menu (Viewport is fixed, so excluded there).
-    const TOGGLEABLE: [Tab; 7] = [
+    const TOGGLEABLE: [Tab; 8] = [
         Tab::Scene,
         Tab::Library,
         Tab::Inspector,
@@ -198,6 +421,7 @@ impl Tab {
         Tab::Patch,
         Tab::Cues,
         Tab::Connectivity,
+        Tab::Render,
     ];
 
     fn title(self) -> &'static str {
@@ -210,6 +434,7 @@ impl Tab {
             Tab::Connectivity => "Connectivity",
             Tab::Patch => "Fixtures",
             Tab::Cues => "Cues",
+            Tab::Render => "Render",
         }
     }
 
@@ -225,6 +450,7 @@ impl Tab {
             Tab::Connectivity => icon::CONNECT,
             Tab::Patch => icon::FIXTURE,
             Tab::Cues => icon::PROFILE,
+            Tab::Render => icon::RENDER,
         }
     }
 }
@@ -241,6 +467,19 @@ pub struct Ui {
     pub settings: RenderSettings,
     pub prefs: Preferences,
     pub requested_viewport_px: (u32, u32),
+    /// Cross-cut render state: the UI↔app mailbox + the finished still image
+    /// (driven by the app's `RenderJob`). The Render dock tab + the World ▸
+    /// Render Properties inspector read/write it.
+    pub render: RenderUiState,
+    /// Set when the user asks to toggle OS window fullscreen (F11 / the viewport
+    /// header button / View menu). The app loop consumes it after the egui pass
+    /// (only it can reach the winit window).
+    pub pending_fullscreen_toggle: bool,
+    /// True while a still render is converging (published by the app each frame).
+    /// The scene must stay frozen for the render's temporal accumulation, so the
+    /// inspector is made read-only and the deferred scene mutations (delete / patch
+    /// / duplicate / outliner edits) are held until the render finishes.
+    pub render_active: bool,
     /// Whether the 3D viewport currently has interaction focus (drives the focus
     /// border and whether the `d` shortcut opens the Duplicate dialog).
     viewport_focused: bool,
@@ -255,26 +494,77 @@ pub struct Ui {
     show_prefs: bool,
     show_about: bool,
     show_shortcuts: bool,
+    show_perf: bool,
     profile: Option<ProfileEditor>,
     /// Library panel state (search / sort / multi-select).
-    lib: panels::LibState,
+    lib: library::LibState,
     /// Anchor index for shift-range selection of scene fixtures (list + 3D).
     scene_anchor: Option<usize>,
     /// Sort order for the Scene panel's Fixtures folder.
-    scene_sort: panels::SceneSort,
+    scene_sort: outliner::SceneSort,
     /// Scene-outliner name filter (fixtures + objects).
     scene_search: String,
+    /// Scene-outliner type/state filter chips (catalog #62) — composes with the
+    /// name filter to narrow the tree by entity kind + fixture state.
+    scene_filter: tree::OutlinerFilter,
+    /// Expanded outliner-tree nodes (absent = collapsed). Group/Root keys are
+    /// constant; entity keys are stable EntityIds, so expand-state survives
+    /// reorder. Held across frames on `Ui` (the tree is rebuilt each frame).
+    scene_expanded: std::collections::HashSet<tree::NodeKey>,
+    /// In-flight inline rename: the target node key + its edit buffer (one live).
+    scene_rename: Option<(tree::NodeKey, String)>,
+    /// Deferred outliner action (hide/rename) returned by the tree mid-dock and
+    /// applied after the dock where the undo stack is reachable.
+    pending_tree: tree::TreeAction,
+    /// Discovered live video sources (NDI + CITP) for the LED-screen content
+    /// pickers; the app refreshes this each frame.
+    pub screen_sources: panels::ScreenSources,
     /// Fixture-manager (Fixtures tab) state: filter / sort / bulk values.
     fm: panels::FmState,
     /// The `s` quick-select palette is open.
     quick_select: bool,
+    /// The Shift+A viewport Add menu (cursor-anchored entity picker).
+    add_menu: windows::AddMenuState,
+    /// The F3 operator-search palette (run any registered op by name).
+    op_search: windows::OperatorSearchState,
+    /// The `P` Patch dialog (assign sequential addresses to the selection).
+    patch_dialog: windows::PatchDialog,
+    /// The `U` Unpatch confirm dialog (disable the selection's patch entries).
+    unpatch_dialog: windows::UnpatchDialog,
     /// In-progress modal transform (G/R/S), if any.
     transform: Option<TransformOp>,
-    /// Saved fixture selection groups + the new-group name buffer.
+    /// The document snapshot taken when a modal transform STARTED — its `before`
+    /// end. Pushed (with the post-transform `after`) when the transform confirms;
+    /// dropped without pushing when it cancels (Esc restores in-place). `None`
+    /// whenever no transform is live.
+    transform_before: Option<op::DocSnapshot>,
+    /// Per-frame signals the viewport sets (read after the dock): a transform just
+    /// began / just confirmed this frame. Transient — not serialized.
+    transform_started: bool,
+    transform_finished: bool,
+    /// In-flight inspector slider/DragValue drag transaction (#13): captured at
+    /// drag-start, pushed as ONE undo step on release. `None` between gestures.
+    inspector_tx: Option<op::DragTx>,
+    /// Per-frame drag edges the inspector reports (read after the dock) to drive
+    /// the `inspector_tx` begin/finalize. Transient — not serialized.
+    inspector_edit: panels::InspectorEdit,
+    /// Persistent Inspector UI state (property filter + per-category collapse).
+    /// Loaded from the config dir on launch; categories self-save on toggle.
+    inspector_state: inspector::InspectorState,
+    /// Timestamp of the last arrow-key nudge — a fresh nudge within
+    /// [`NUDGE_COALESCE`] of it extends the top undo step instead of pushing a new
+    /// one, so holding an arrow key collapses into a single undo. `None` = no
+    /// nudge burst in progress.
+    last_nudge: Option<std::time::Instant>,
+    /// Arrow-key nudge accumulated this frame in `handle_shortcuts`; applied in
+    /// `show()` where the patch is reachable (so it rides the undo stack).
+    pending_nudge: Vec3,
+    /// Saved fixture selection groups (persisted with the show; remapped on delete).
     groups: Vec<SelectionGroup>,
-    group_name: String,
     /// The cue list + crossfade engine.
     cues: cues::CueEngine,
+    /// Full-document undo / redo history (snapshots; not serialized into .glow).
+    undo: op::UndoStack,
     /// The online GDTF Share fixture library + its window toggle.
     share: crate::share::Share,
     show_share: bool,
@@ -282,426 +572,155 @@ pub struct Ui {
     /// once after the dock, where the patch is reachable, so the patch / groups /
     /// cues all get remapped in lock-step with the fixture removal.
     pending_delete: bool,
-    /// Path of the currently-open `.archie` project (Save vs Save As). `None` =
+    /// Enter was pressed in the viewport with a Library item highlighted — add that
+    /// item after the dock (where the library + scene are reachable). Mirrors Enter
+    /// in the Library pane.
+    pending_lib_add: bool,
+    /// `B` (box-select) was pressed — set by `dispatch_action`, consumed by the
+    /// viewport, which then latches into marquee mode for the next drag. A flag (not a
+    /// viewport-local key poll) so it rides the single keymap→dispatch path.
+    box_select_armed: bool,
+    /// Path of the currently-open `.glow` project (Save vs Save As). `None` =
     /// untitled / never saved.
     current_path: Option<PathBuf>,
-    /// The welcome / recover splash is open (shown once at startup).
+    /// The undo [`state_id`](op::UndoStack::state_id) at the last save / open / new —
+    /// the "clean" anchor. The document is dirty (window-title `*`) when the live
+    /// state id differs from this.
+    saved_state_id: u64,
+    /// The welcome / recover splash is open (shown at startup, on New, and from
+    /// Window ▸ Welcome / the operator search).
     show_splash: bool,
+    /// The welcome splash's hero image, decoded + uploaded once (lazily) and cached.
+    welcome_tex: Option<egui::TextureHandle>,
     /// Recent project paths (most-recent first) for the File menu + splash.
     recent: Vec<PathBuf>,
     /// Seconds since the last successful autosave (driven from `app`); the splash
     /// uses the autosave file's presence to offer crash recovery.
     autosave_timer: f32,
+    /// Viewport N-panel / T-panel open state (Blender's RGN_TYPE_UI / RGN_TYPE_TOOLS;
+    /// blueprint §2.2). Toggled by the N / T keys + the viewport-header buttons.
+    viewport_regions: ViewportRegions,
+    /// The viewport's active tool (§2.4) — decides which gizmo draws (Move shows the
+    /// screen-space xform gizmo; Select is plain click-select). Set from the T-panel
+    /// tool rail. Default [`ActiveTool::Select`].
+    active_tool: ActiveTool,
+    /// Transform-tool options (§2.4 #4/#5): grid/increment snap + pivot-point mode.
+    /// Read by the gizmo + modal G/R/S blocks when building a [`TransformOp`];
+    /// written by the viewport header + N-panel. Transient (not save-persisted).
+    xform: TransformPrefs,
+    /// The world 3D-cursor point — the [`PivotMode::Cursor3d`] pivot (§2.4 #5).
+    /// Starts at the origin; moved by Shift-right-click in the viewport (S1-3d-cursor)
+    /// or the snap/reset commands. Transient (not persisted); the viewport draws it.
+    cursor_3d: Vec3,
+    /// Whether the 3D cursor has been positioned this session (via Shift-RMB / "Snap
+    /// to selection"). When `true` the Add menu drops new objects AT the cursor instead
+    /// of the view-centre placement default; "Reset cursor to origin" clears it.
+    cursor_3d_set: bool,
+    /// Persistent content-library prefs (§3 #20): the Recent + Favourites lists
+    /// shared by the Library browser and the Add menu. Loaded once at startup,
+    /// saved (synchronously, tiny payload) on each add/star toggle.
+    lib_prefs: lib_prefs::LibraryPrefs,
+    /// Numbered view/camera bookmarks (P1 #34): saved camera poses recalled with an
+    /// eased jump. Persisted to `bookmarks.json` in the config dir (loaded once at
+    /// startup, saved on each save/delete). Reachable from the Window menu strip +
+    /// the registered `view.bookmark_*` commands (F3 palette / keymap).
+    bookmarks: bookmarks::Bookmarks,
+    /// User-savable workspaces (S1): the soft "modes" — saved records of
+    /// {dock layout, default tool, overlay flags}. The four built-ins
+    /// (Design/Patch/Focus/Visualise) regenerate when `workspaces.json` is absent.
+    /// Switched from the tab strip / Window menu / `workspace.activate_*` commands;
+    /// activating applies the layout + presets the tool + emphasises overlays — it
+    /// does NOT lock anything (everything stays editable).
+    workspaces: workspaces::Workspaces,
+    /// The open "Save current as workspace…" dialog name buffer, if any. `None` =
+    /// closed.
+    save_workspace: Option<String>,
+    /// Runtime keymap overrides (S1): a rebind/disable/add layer over the static
+    /// [`shortcuts::KEYMAPS`] defaults, persisted to `keymap.json` in the config
+    /// dir. EMPTY by default ⇒ the app dispatches exactly the shipped binds. Loaded
+    /// once at startup; published to the process-wide active snapshot each frame so
+    /// the fixed-signature viewport poll sites resolve against the same set.
+    keymap_overrides: shortcuts::KeymapOverrides,
+    /// Transient UI state for the Preferences › Keymap editor (S2): the in-flight
+    /// "press a key to rebind" capture target + the command search filter. Held by
+    /// the `Ui` so it persists across frames while the editor waits for a chord.
+    keymap_editor: windows::KeymapEditorState,
+    /// The Measure tool's two-point ruler (§2.4) — a read-only viewport measurement
+    /// that persists across frames; cleared when the Measure tool isn't active.
+    measure: panels::MeasureState,
+    /// The Aim tool's in-flight drag (§2.4) — `active()` while a head-aim drag is
+    /// underway, so the pending undo snapshot is kept alive across the drag frames.
+    aim: panels::AimState,
+    /// The `~` radial View pie (cursor-anchored axis-view / projection / frame
+    /// picker). Opened by the ViewPie action at the pointer; closed on pick/cancel.
+    view_pie: pie::PieState,
+    /// The `Z` radial Shading pie (cursor-anchored display-mode picker + Grid /
+    /// Stats toggles, Blender's Z pie). Opened by the ShadingPie action at the
+    /// pointer; closed on pick / cancel.
+    shading_pie: pie::PieState,
+    /// Transient toasts + the persistent report log (§2.10). Every user-facing
+    /// save / open / import / DMX-connect / undo moment reports here so it surfaces
+    /// as a fading toast instead of a silent `log::*`. Ticked + drawn in `show()`.
+    notify: notify::Notifier,
+    /// Handle-based status-bar message stack (#21): a transient slot pushed/popped
+    /// by handle, layered over the selection/units/fps content. Last push wins.
+    status_msgs: notify::StatusStack,
+    /// The report-log window (§2.10 #22): a persistent newest-first view of the
+    /// `notify` history. Opened from the status-bar message area, the Window menu,
+    /// or the `window.report_log` command (so it surfaces in the F3 palette).
+    show_report_log: bool,
+    /// Was the DMX I/O running last frame? Used to detect the connect/disconnect
+    /// edge in `show()` (the actual start/stop happens on the DMX worker) and emit
+    /// one toast per transition rather than every frame.
+    dmx_was_running: bool,
+}
+
+/// Open state for the viewport's side regions — the N-panel (Item/Transform
+/// sidebar, reuses `inspector::inspector` verbatim) and the T-panel (tool-rail shell,
+/// Phase 3 fills it with the ActiveTool buttons). Blueprint §2.2 / RGN_TYPE_UI +
+/// RGN_TYPE_TOOLS. Default both off; the lead's note (auto-on in Focus/Visualise
+/// contexts) is a later phase.
+#[derive(Clone, Copy, Default)]
+struct ViewportRegions {
+    t_open: bool,
 }
 
 impl Ui {
-    pub fn new() -> Self {
-        Self {
-            dock: Self::default_dock(),
-            library: Library::standard(),
-            gdtf_textures: HashMap::new(),
-            selection: Selection::fixture(0),
-            settings: RenderSettings::default(),
-            prefs: Preferences::default(),
-            requested_viewport_px: (1, 1),
-            viewport_focused: false,
-            duplicate: None,
-            replace: None,
-            pending_replace: false,
-            show_prefs: false,
-            show_about: false,
-            show_shortcuts: false,
-            profile: None,
-            lib: panels::LibState::default(),
-            scene_anchor: None,
-            scene_sort: panels::SceneSort::Patch,
-            scene_search: String::new(),
-            fm: panels::FmState::default(),
-            quick_select: false,
-            transform: None,
-            groups: Vec::new(),
-            group_name: String::new(),
-            cues: cues::CueEngine::default(),
-            pending_delete: false,
-            share: crate::share::Share::new(),
-            show_share: false,
-            current_path: None,
-            show_splash: true,
-            recent: project::load_recent(),
-            autosave_timer: 0.0,
-        }
-    }
-
     /// Advance any in-progress cue crossfade. Called once per real frame from
     /// `app::render`, after live DMX decode and before motion advance.
     pub fn tick_cues(&mut self, scene: &mut Scene, dt: f32) {
         self.cues.tick(scene, dt);
     }
 
-    // --- `.archie` project save / load ----------------------------------
-
-    /// Gather + serialise the whole project to `path` (bundling GDTF archive
-    /// bytes; model + HDRI bytes ride along inside the serialised `Scene`).
-    fn write_project(
-        &self,
-        path: &std::path::Path,
-        scene: &Scene,
-        camera: &OrbitCamera,
-        dmx: &crate::dmx::DmxIo,
-    ) -> Result<(), String> {
-        let fixture_specs: Vec<Option<String>> = scene
-            .fixtures
-            .iter()
-            .map(|f| f.gdtf.as_ref().map(|g| g.spec.clone()).filter(|s| !s.is_empty()))
-            .collect();
-        let mut gdtf_assets: HashMap<String, Vec<u8>> = HashMap::new();
-        for f in &scene.fixtures {
-            if let Some(g) = &f.gdtf {
-                if !g.spec.is_empty() {
-                    if let Some(raw) = &g.raw {
-                        gdtf_assets.entry(g.spec.clone()).or_insert_with(|| raw.as_ref().clone());
-                    }
-                }
-            }
-        }
-        let pr = project::ProjectRef {
-            format: project::FORMAT,
-            scene,
-            fixture_specs,
-            gdtf_assets,
-            camera,
-            settings: &self.settings,
-            prefs: &self.prefs,
-            groups: &self.groups,
-            cues: &self.cues,
-            scene_sort: self.scene_sort,
-            patch: dmx.patch(),
-            dmx_config: dmx.config(),
-        };
-        project::write(path, &pr)
+    /// True when the document has unsaved edits (the live undo state differs from the
+    /// last save / open / new anchor).
+    pub fn is_dirty(&self) -> bool {
+        self.undo.state_id() != self.saved_state_id
     }
 
-    /// Save to the current path, or fall back to Save As if untitled.
-    fn save_project(&mut self, scene: &Scene, camera: &OrbitCamera, dmx: &crate::dmx::DmxIo) {
-        match self.current_path.clone() {
-            Some(path) => self.save_to(&path, scene, camera, dmx),
-            None => self.save_project_as(scene, camera, dmx),
-        }
-    }
-
-    /// Prompt for a destination, then save (forcing the `.archie` extension).
-    fn save_project_as(&mut self, scene: &Scene, camera: &OrbitCamera, dmx: &crate::dmx::DmxIo) {
+    /// The window title: `glowstone - <name>`, with a `*` marking unsaved changes and
+    /// `untitled` for a never-saved document. E.g. `glowstone - show.glow` (clean),
+    /// `glowstone -*show.glow` (unsaved), `glowstone - untitled` (new).
+    pub fn window_title(&self) -> String {
         let name = self
             .current_path
             .as_ref()
             .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("show.{}", project::EXT));
-        if let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("Archie project", &[project::EXT])
-            .set_file_name(&name)
-            .save_file()
-        {
-            if path.extension().and_then(|e| e.to_str()) != Some(project::EXT) {
-                path.set_extension(project::EXT);
-            }
-            self.save_to(&path, scene, camera, dmx);
-        }
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".to_string());
+        let sep = if self.is_dirty() { "*" } else { " " };
+        format!("glowstone -{sep}{name}")
     }
 
-    fn save_to(
-        &mut self,
-        path: &std::path::Path,
-        scene: &Scene,
-        camera: &OrbitCamera,
-        dmx: &crate::dmx::DmxIo,
-    ) {
-        match self.write_project(path, scene, camera, dmx) {
-            Ok(()) => {
-                self.current_path = Some(path.to_path_buf());
-                project::push_recent(path);
-                self.recent = project::load_recent();
-                log::info!("saved project: {}", path.display());
-            }
-            Err(e) => log::error!("save project: {e}"),
-        }
+    /// Raise a success toast from outside the Ui (e.g. the app loop reporting a
+    /// finished render). Mirrors the in-Ui `notify` calls.
+    pub fn notify_success(&mut self, msg: impl Into<String>) {
+        self.notify.success(msg);
     }
 
-    /// Prompt for a `.archie` file, then open it.
-    fn open_project_dialog(
-        &mut self,
-        scene: &mut Scene,
-        camera: &mut OrbitCamera,
-        dmx: &mut crate::dmx::DmxIo,
-    ) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Archie project", &[project::EXT])
-            .pick_file()
-        {
-            self.open_project(&path, scene, camera, dmx);
-        }
-    }
-
-    /// Open a project file, replacing the current scene + UI/DMX state.
-    pub fn open_project(
-        &mut self,
-        path: &std::path::Path,
-        scene: &mut Scene,
-        camera: &mut OrbitCamera,
-        dmx: &mut crate::dmx::DmxIo,
-    ) {
-        match project::read(path) {
-            Ok(p) => {
-                self.apply_project(p, scene, camera, dmx);
-                self.current_path = Some(path.to_path_buf());
-                project::push_recent(path);
-                self.recent = project::load_recent();
-                self.show_splash = false;
-                log::info!("opened project: {}", path.display());
-            }
-            Err(e) => log::error!("open project {}: {e}", path.display()),
-        }
-    }
-
-    fn apply_project(
-        &mut self,
-        p: project::Project,
-        scene: &mut Scene,
-        camera: &mut OrbitCamera,
-        dmx: &mut crate::dmx::DmxIo,
-    ) {
-        *scene = p.scene;
-        // Re-link each fixture's GDTF by re-parsing the bundled archive (one parse
-        // per unique spec, Arc-shared so the renderer's per-type model cache and
-        // the GPU wheel atlas stay deduped).
-        let mut cache: HashMap<String, Arc<crate::gdtf::GdtfFixture>> = HashMap::new();
-        for (i, f) in scene.fixtures.iter_mut().enumerate() {
-            let Some(spec) = p.fixture_specs.get(i).cloned().flatten() else { continue };
-            let arc = if let Some(a) = cache.get(&spec) {
-                a.clone()
-            } else if let Some(bytes) = p.gdtf_assets.get(&spec) {
-                match crate::gdtf::GdtfFixture::load_bytes(bytes) {
-                    Ok(mut g) => {
-                        g.spec = spec.clone();
-                        g.raw = Some(Arc::new(bytes.clone()));
-                        let a = Arc::new(g);
-                        cache.insert(spec.clone(), a.clone());
-                        a
-                    }
-                    Err(e) => {
-                        log::error!("re-parse GDTF {spec}: {e}");
-                        continue;
-                    }
-                }
-            } else {
-                continue;
-            };
-            f.gdtf = Some(arc);
-            f.sync_mode();
-        }
-        // Register the project's fixture types in the library (Replace / add picker).
-        for a in cache.values() {
-            if !self.library.gdtf.iter().any(|g| g.spec == a.spec) {
-                self.library.gdtf.push(a.clone());
-            }
-        }
-        *camera = p.camera;
-        self.settings = p.settings;
-        self.prefs = p.prefs;
-        self.groups = p.groups;
-        self.cues = p.cues;
-        self.scene_sort = p.scene_sort;
-        *dmx.patch_mut() = p.patch;
-        *dmx.config_mut() = p.dmx_config;
-        self.selection = Selection::default();
-    }
-
-    /// Start a fresh, empty project.
-    fn new_project(&mut self, scene: &mut Scene, camera: &mut OrbitCamera, dmx: &mut crate::dmx::DmxIo) {
-        *scene = Scene::default();
-        *dmx.patch_mut() = crate::dmx::PatchTable::default();
-        self.groups.clear();
-        self.cues = cues::CueEngine::default();
-        self.selection = Selection::default();
-        self.current_path = None;
-        camera.frame(Vec3::ZERO, 12.0);
-        self.show_splash = false;
-    }
-
-    /// Periodic crash-recovery autosave — writes the whole project to the cache
-    /// dir every ~20 s when there's content. Driven from `app::render` with `dt`.
-    pub fn autosave_tick(
-        &mut self,
-        scene: &Scene,
-        camera: &OrbitCamera,
-        dmx: &crate::dmx::DmxIo,
-        dt: f32,
-    ) {
-        self.autosave_timer += dt;
-        if self.autosave_timer < 20.0 {
-            return;
-        }
-        self.autosave_timer = 0.0;
-        if scene.fixtures.is_empty() && scene.geometry.is_empty() {
-            return;
-        }
-        if let Some(path) = project::autosave_path() {
-            if let Err(e) = self.write_project(&path, scene, camera, dmx) {
-                log::warn!("autosave: {e}");
-            }
-        }
-    }
-
-    /// Dismiss the welcome splash (headless screenshot hook).
-    pub fn dismiss_splash(&mut self) {
-        self.show_splash = false;
-    }
-
-    /// The Blender-style welcome / recover splash, shown once at startup.
-    fn splash_window(
-        &mut self,
-        ctx: &egui::Context,
-        scene: &mut Scene,
-        camera: &mut OrbitCamera,
-        dmx: &mut crate::dmx::DmxIo,
-    ) {
-        if !self.show_splash {
-            return;
-        }
-        let mut action: Option<SplashAction> = None;
-        let modal = egui::Modal::new(egui::Id::new("welcome-splash")).show(ctx, |ui| {
-            ui.set_width(560.0);
-            // Header: product + version (top-right).
-            ui.horizontal(|ui| {
-                ui.heading("previz");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("v{} alpha", env!("CARGO_PKG_VERSION")))
-                            .weak()
-                            .small(),
-                    );
-                });
-            });
-            ui.label(egui::RichText::new("Open-source lighting previsualization").weak());
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            ui.columns(2, |cols| {
-                // Left — start a session.
-                cols[0].label(egui::RichText::new("Start").strong());
-                cols[0].add_space(6.0);
-                if cols[0].add_sized([220.0, 30.0], egui::Button::new("New Project")).clicked() {
-                    action = Some(SplashAction::New);
-                }
-                if cols[0]
-                    .add_sized([220.0, 30.0], egui::Button::new(format!("{}  Open…", theme::icon::IMPORT_MVR)))
-                    .clicked()
-                {
-                    action = Some(SplashAction::Open);
-                }
-                if let Some(ap) = project::autosave_path() {
-                    if ap.exists() {
-                        cols[0].add_space(10.0);
-                        if cols[0]
-                            .add_sized([220.0, 30.0], egui::Button::new(format!("{}  Recover Last Session", theme::icon::FRAME)))
-                            .on_hover_text("Reopen the auto-saved session from the last run")
-                            .clicked()
-                        {
-                            action = Some(SplashAction::Recover(ap));
-                        }
-                    }
-                }
-
-                // Right — recent files.
-                cols[1].label(egui::RichText::new("Recent Files").strong());
-                cols[1].add_space(6.0);
-                if self.recent.is_empty() {
-                    cols[1].label(egui::RichText::new("No recent projects").weak().small());
-                } else {
-                    for p in self.recent.iter().take(8) {
-                        let name = p
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        if cols[1]
-                            .add(egui::Button::new(format!("{}  {}", theme::icon::PROFILE, name)).frame(false))
-                            .on_hover_text(p.display().to_string())
-                            .clicked()
-                        {
-                            action = Some(SplashAction::OpenPath(p.clone()));
-                        }
-                    }
-                }
-            });
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Continue without a project").clicked() {
-                    action = Some(SplashAction::Dismiss);
-                }
-            });
-        });
-
-        if modal.should_close() {
-            self.show_splash = false;
-        }
-        match action {
-            Some(SplashAction::New) => self.new_project(scene, camera, dmx),
-            Some(SplashAction::Open) => self.open_project_dialog(scene, camera, dmx),
-            Some(SplashAction::OpenPath(p)) => self.open_project(&p, scene, camera, dmx),
-            Some(SplashAction::Recover(p)) => {
-                self.open_project(&p, scene, camera, dmx);
-                // A recovered session is untitled — don't let Save clobber the
-                // autosave file; force Save As on the next save.
-                self.current_path = None;
-            }
-            Some(SplashAction::Dismiss) => self.show_splash = false,
-            None => {}
-        }
-    }
-
-    /// The default dock layout (also used by Window ▸ Reset Panel Layout).
-    ///
-    /// egui_dock's `fraction` is the share given to the side being split toward:
-    /// `split_left(n, f)` makes the NEW left panel `f` of the width, `split_right`
-    /// makes the new right panel `1 - f`, `split_below` the new bottom `1 - f`.
-    /// (The old code passed 0.80 to `split_left` expecting the central to keep
-    /// 80% — that made the Scene sidebar 80% wide, the startup-layout bug.)
-    fn default_dock() -> DockState<Tab> {
-        Self::workspace_dock(Workspace::Design)
-    }
-
-    /// A workspace layout preset (à la Blender's workspace tabs / depence's
-    /// Construction·ShowControl·Animation presets): each pre-arranges the panels
-    /// for one stage of the lighting workflow.
-    fn workspace_dock(ws: Workspace) -> DockState<Tab> {
-        let mut dock = DockState::new(vec![Tab::Viewport]);
-        let surface = dock.main_surface_mut();
-        match ws {
-            // DESIGN: balanced — outliner + library left, inspector right, the
-            // Fixtures/DMX data as a bottom strip. The everyday layout.
-            Workspace::Design => {
-                let [c, _l] = surface.split_left(NodeIndex::root(), 0.17, vec![Tab::Scene, Tab::Library]);
-                let [c, _i] = surface.split_right(c, 0.79, vec![Tab::Inspector]);
-                surface.split_below(c, 0.70, vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity]);
-            }
-            // PATCH: the systems tech — the Fixtures sheet + DMX dominate (a tall
-            // bottom data area), the viewport just for orientation.
-            Workspace::Patch => {
-                let [c, _l] = surface.split_left(NodeIndex::root(), 0.16, vec![Tab::Scene]);
-                let [c, _i] = surface.split_right(c, 0.80, vec![Tab::Inspector]);
-                surface.split_below(c, 0.42, vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity]);
-            }
-            // VISUALISE: the previz artist — maximise the viewport; thin Scene
-            // (World + outliner) left, Inspector right, no data strip.
-            Workspace::Visualize => {
-                let [c, _l] = surface.split_left(NodeIndex::root(), 0.15, vec![Tab::Scene]);
-                surface.split_right(c, 0.82, vec![Tab::Inspector]);
-            }
-        }
-        dock
+    /// Raise an error toast from outside the Ui.
+    pub fn notify_error(&mut self, msg: impl Into<String>) {
+        self.notify.error(msg);
     }
 
     /// Build the whole docked UI for one egui frame.
@@ -719,39 +738,96 @@ impl Ui {
         dmx: &mut crate::dmx::DmxIo,
         viewport_texture: egui::TextureId,
         fps: f32,
+        timings: &crate::renderer::PassTimings,
     ) {
         // Theme/accent/DPI live every frame (cheap; egui dedups).
         self.prefs.apply_theme(ctx);
-        // Global shortcuts + drag-dropped .gdtf/.mvr files.
-        self.handle_shortcuts(ctx, scene, camera);
+        // Bug 8 — Enter-leak guard: snapshot whether a text widget holds keyboard
+        // focus at the START of the frame (before any widget runs). When the user
+        // commits a value box with Enter, the field is still focused HERE but
+        // surrenders focus mid-frame, leaving the Enter in the event queue; unguarded
+        // global readers (batch-add, dialog confirms) would otherwise see it as a
+        // fresh keypress. They gate on `text_focus_active()` so the commit can't leak.
+        let text_focus = ctx.memory(|m| m.focused().is_some());
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("glowstone.text_focus"), text_focus));
+        // Age + retire expired toasts (dt from egui — `show()` takes no dt param).
+        self.notify.tick(ctx.input(|i| i.stable_dt));
+        // DMX connect/disconnect edge: the actual bind happens on the DMX worker,
+        // so we detect the running-state transition here and toast it ONCE per edge
+        // (not every frame). `is_running()` reflects the worker's current state.
+        let dmx_running = dmx.is_running();
+        if dmx_running != self.dmx_was_running {
+            if dmx_running {
+                self.notify.success("DMX input connected");
+            } else {
+                self.notify.info("DMX input stopped");
+            }
+            self.dmx_was_running = dmx_running;
+        }
+        // Publish the active keymap overrides for this frame so the fixed-signature
+        // viewport poll sites (`panels::viewport`, whose app.rs caller is off-limits)
+        // resolve against the SAME overrides this Ui polls with. EMPTY by default ⇒
+        // those sites see the static defaults, unchanged.
+        shortcuts::publish_active(&self.keymap_overrides);
+        // Global shortcuts — ONE poll, ONE dispatch path (S1). `handle_shortcuts`
+        // routes every non-modal Action through `dispatch_action` (the single source
+        // of truth), which handles File/Patch/Unpatch/Undo/Redo/OperatorSearch/
+        // AdjustLast directly here (scene + camera + dmx reachable) and defers the
+        // Delete / Patch-commit / nudge writes through `self` flags as before.
+        self.handle_shortcuts(ctx, scene, camera, dmx);
+        // Apply any arrow-key nudge collected above (here the patch is reachable, so
+        // it rides the undo stack — a held-key burst coalesces into one step).
+        self.apply_nudge(scene, dmx);
         self.handle_dropped_files(ctx, scene, camera);
 
-        // Project shortcuts (Ctrl/Cmd + S / Shift+S / O / N) — handled here where
-        // scene + camera + dmx are all reachable in one place.
-        let (do_save, do_save_as, do_open, do_new) = ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            (
-                cmd && !i.modifiers.shift && i.key_pressed(egui::Key::S),
-                cmd && i.modifiers.shift && i.key_pressed(egui::Key::S),
-                cmd && i.key_pressed(egui::Key::O),
-                cmd && i.key_pressed(egui::Key::N),
+        // Shift+D — grab-duplicate (Blender). Clone the selection NOW as its own
+        // undo step (so cancelling the grab leaves the copies at the source, like
+        // Blender's Shift+D→Esc), re-select the copies, then flag the viewport to
+        // start a Move grab on them THIS frame. Done before the dock so the clone
+        // lands before `panels::viewport` reads the flag and snapshots the move's
+        // `before` end. Dispatch_action reports DuplicateGrab unhandled, so this is
+        // its only handler.
+        if self.viewport_focused
+            && self.transform.is_none()
+            && self.selection.has_object()
+            && shortcuts::poll(
+                ctx,
+                shortcuts::ActiveContext { viewport_focused: true, transform_active: false, box_select_active: false },
+                &shortcuts::active(),
             )
-        });
-        if do_save_as {
-            self.save_project_as(scene, camera, dmx);
-        } else if do_save {
-            self.save_project(scene, camera, dmx);
-        }
-        if do_open {
-            self.open_project_dialog(scene, camera, dmx);
-        }
-        if do_new {
-            self.new_project(scene, camera, dmx);
+            .iter()
+            .any(|a| matches!(a, shortcuts::Action::DuplicateGrab))
+        {
+            let refs = self.selection.object_refs();
+            self.run_op(
+                "object.duplicate_grab",
+                "Duplicate",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    let copies = cx.scene.duplicate_objects(&refs);
+                    if copies.is_empty() {
+                        return op::OpStatus::Cancelled;
+                    }
+                    *cx.selection = Selection::from_object_refs(&copies);
+                    op::OpStatus::Finished
+                },
+            );
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("glowstone.dupgrab.start"), true));
         }
 
         // Chrome MUST be reserved before the dock (it fills the CentralPanel).
         self.menu_bar(ctx, scene, camera, dmx);
+        // The workspace tab strip (Blender's workspace tabs) — switch the soft "mode"
+        // with one click. Reserved below the menu bar, above the dock.
+        self.workspace_strip(ctx);
         self.status_bar(ctx, scene, dmx, fps);
+
+        // Reset the per-frame inspector drag edges before the dock OR-accumulates
+        // this frame's signals into them (#13).
+        self.inspector_edit = panels::InspectorEdit::default();
 
         // One call hands back all the disjoint DMX borrows the panels need.
         let dmxv = dmx.view();
@@ -766,19 +842,27 @@ impl Ui {
             viewport_texture,
             requested_viewport_px: &mut self.requested_viewport_px,
             viewport_focused: &mut self.viewport_focused,
+            box_select_armed: &mut self.box_select_armed,
             duplicate: &mut self.duplicate,
             profile: &mut self.profile,
             lib: &mut self.lib,
             scene_anchor: &mut self.scene_anchor,
             scene_sort: &mut self.scene_sort,
             scene_search: &mut self.scene_search,
+            scene_filter: &mut self.scene_filter,
+            scene_expanded: &mut self.scene_expanded,
+            scene_rename: &mut self.scene_rename,
+            pending_tree: &mut self.pending_tree,
             fm: &mut self.fm,
             transform: &mut self.transform,
-            groups: &mut self.groups,
-            group_name: &mut self.group_name,
+            transform_started: &mut self.transform_started,
+            transform_finished: &mut self.transform_finished,
+            inspector_edit: &mut self.inspector_edit,
+            inspector_state: &mut self.inspector_state,
             cues: &mut self.cues,
             delete_requested: &mut self.pending_delete,
             replace_requested: &mut self.pending_replace,
+            add_requested: &mut self.pending_lib_add,
             open_share: &mut self.show_share,
             dmx_patch: dmxv.patch,
             dmx_snapshot: dmxv.snapshot,
@@ -790,14 +874,93 @@ impl Ui {
             dmx_pending: dmxv.pending,
             dmx_running: dmxv.running,
             fps,
+            screen_sources: &self.screen_sources,
+            viewport_regions: &mut self.viewport_regions,
+            active_tool: &mut self.active_tool,
+            xform: &mut self.xform,
+            cursor_3d: &mut self.cursor_3d,
+            cursor_3d_set: &mut self.cursor_3d_set,
+            lib_prefs: &mut self.lib_prefs,
+            measure: &mut self.measure,
+            aim: &mut self.aim,
+            render: &mut self.render,
+            pending_fullscreen: &mut self.pending_fullscreen_toggle,
+            render_active: self.render_active,
         };
 
         DockArea::new(&mut self.dock).show(ctx, &mut viewer);
 
+        // A render just started (from the inspector Render button or the Render
+        // tab) — pop the Render tab to the front so the result is front-and-centre.
+        // PEEK only: the app loop still consumes `render.request` to start the job.
+        if matches!(self.render.request, Some(RenderRequest::Start)) {
+            self.ensure_render_tab_focused();
+        }
+        // F11 toggles OS window fullscreen; F12 renders. Both respect the text-input
+        // guard (so typing into an inspector field doesn't fire them), matching the
+        // rest of the keymap (`shortcuts::poll`).
+        let typing = ctx.egui_wants_keyboard_input();
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.pending_fullscreen_toggle = true;
+        }
+        if !typing
+            && ctx.input(|i| i.key_pressed(egui::Key::F12))
+            && self.render.status.phase != RenderPhase::Rendering
+        {
+            self.render.request_start();
+            self.ensure_render_tab_focused();
+        }
+
+        // Modal-transform undo (viewer borrows released — scene + patch reachable):
+        // the viewport drives the live G/R/S op, so its confirm/cancel is routed
+        // through the undo stack HERE. A start snapshots the `before` end; a confirm
+        // pushes (before, after); a cancel (the op already restored in-place — the
+        // transform field went back to None without a confirm) drops `before`.
+        if self.transform_started {
+            self.transform_before = Some(self.undo_begin(scene, dmx.patch()));
+        }
+        if self.transform_finished {
+            if let Some(before) = self.transform_before.take() {
+                self.undo_push("Transform", before, scene, dmx.patch());
+                self.undo.set_last_op("transform.apply", "Transform");
+            }
+        } else if self.transform.is_none() && !self.aim.active() {
+            // Op ended without confirming (cancelled / focus lost) — discard. An Aim
+            // drag has no `TransformOp` in flight, so guard on `aim.active()` too or its
+            // mid-drag frames would drop the pending snapshot before the release commit.
+            self.transform_before = None;
+        }
+
+        // Inspector slider/DragValue undo transaction (#13): the inspector edits the
+        // scene live each frame (no push) — the same begin→preview→finalize shape as
+        // the gizmo. On drag-START snapshot `before` into `inspector_tx`; on RELEASE
+        // push ONE step for the whole gesture. A drag both starting AND stopping in
+        // one frame (a tiny nudge) still gets begin-then-finalize in order.
+        if self.inspector_edit.started {
+            let before = self.undo_begin(scene, dmx.patch());
+            self.inspector_tx = Some(op::DragTx::begin(before, "inspector.edit", "Edit Value"));
+        }
+        if self.inspector_edit.stopped
+            && let Some(tx) = self.inspector_tx.take()
+        {
+            let after = self.undo_begin(scene, dmx.patch());
+            self.undo.finalize_drag(tx, after);
+        }
+
         // Commit a requested delete now (viewer borrows released): the patch is
         // reachable here, so fixtures + patch + cues + groups are remapped together.
-        if self.pending_delete {
-            self.commit_delete(scene, dmx.patch_mut());
+        // Held while a still render converges (a scene edit would reset its
+        // accumulation) — the flag persists, so it commits once the render finishes.
+        if self.pending_delete && !self.render_active {
+            self.commit_delete(scene, dmx);
+        }
+        // Apply a deferred outliner action (hide toggle / rename) as ONE undo step,
+        // now that the undo stack + patch are reachable (the tree itself can't touch
+        // undo mid-dock, so it returned the intent — mirrors pending_delete). Also
+        // held during a render (the pending action stays queued until it finishes).
+        if !self.render_active {
+            let tree_action = std::mem::replace(&mut self.pending_tree, tree::TreeAction::None);
+            self.apply_tree_action(tree_action, scene, dmx);
         }
         // The viewport context menu's "Replace…" opens the dialog here (after the
         // dock), where the library + patch are reachable.
@@ -807,10 +970,94 @@ impl Ui {
                 self.replace = Some(ReplaceDialog::default());
             }
         }
+        // Enter in the viewport adds the Library tab's highlighted item — resolved +
+        // added here (after the dock, where the library + scene are reachable), so it
+        // mirrors pressing Enter in the Library pane even when Library isn't the
+        // visible sidebar tab. Placed at the 3D cursor when set, else the camera
+        // anchor. Held during a render (a scene edit would reset its accumulation).
+        if self.pending_lib_add && !self.render_active {
+            self.pending_lib_add = false;
+            if let Some(active) = self.lib.active.clone() {
+                let cursor = self.cursor_3d_set.then_some(self.cursor_3d);
+                if let Some(sel) = library::add_active_library_item(&self.library, scene, camera, &active, cursor) {
+                    self.selection = sel;
+                }
+            }
+        }
         replace_window(ctx, &self.library, scene, &mut self.selection, dmx.patch_mut(), &mut self.replace);
 
+        // Patch / Unpatch dialogs (committed here, where the patch is reachable).
+        // On confirm, P assigns sequential addresses to the selected fixtures from
+        // the chosen start slot; U disables the selected fixtures' patch entries.
+        if windows::patch_dialog_window(ctx, &mut self.patch_dialog) {
+            let (u, a) = (self.patch_dialog.start_universe, self.patch_dialog.start_address);
+            let kind = self.patch_dialog.kind;
+            self.run_op(
+                "fixture.patch",
+                "Patch",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    // Fixtures pack through the side PatchTable; pyro (inline patch)
+                    // packs through the Patchable trait. The captured scene snapshot
+                    // covers scene.pyro, so undo works for both.
+                    match kind {
+                        SelKind::Pyro => ops::patch_pyro_inline(cx.scene, &cx.selection.pyro, u, a),
+                        _ => {
+                            cx.patch.assign_indices(cx.scene, &cx.selection.fixtures, u, a);
+                        }
+                    }
+                    op::OpStatus::Finished
+                },
+            );
+        }
+        if windows::unpatch_dialog_window(ctx, &mut self.unpatch_dialog) {
+            let kind = self.unpatch_dialog.kind;
+            self.run_op(
+                "fixture.unpatch",
+                "Unpatch",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    ops::unpatch_selection(cx, kind);
+                    op::OpStatus::Finished
+                },
+            );
+        }
+
         // Floating windows (viewer borrows released — scene/selection free again).
-        duplicate_window(ctx, scene, &mut self.selection, &mut self.duplicate);
+        // Duplicate mutates the scene; on confirm, run it through the operator
+        // pipeline so the (before, after) undo step is pushed uniformly.
+        if let Some(d) = duplicate_window(ctx, &mut self.duplicate) {
+            // Remember these values so the NEXT Duplicate reuses them (bug 3).
+            set_dup_defaults(ctx, DupDefaults { x: d.x, y: d.y, z: d.z, angle: d.y_angle, count: d.count });
+            self.run_op(
+                "fixture.duplicate",
+                "Duplicate",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    match cx.scene.duplicate_fixture(
+                        d.fixture,
+                        Vec3::new(d.x, d.y, d.z),
+                        d.y_angle,
+                        d.count,
+                    ) {
+                        Some(first) => {
+                            *cx.selection = Selection::fixture(first);
+                            op::OpStatus::Finished
+                        }
+                        None => op::OpStatus::Cancelled,
+                    }
+                },
+            );
+        }
         windows::profile_editor_window(
             ctx,
             scene,
@@ -825,544 +1072,158 @@ impl Ui {
             &mut self.prefs,
             &mut self.settings,
             dmx.config_mut(),
+            &mut self.keymap_overrides,
+            &mut self.keymap_editor,
         );
         windows::about_window(ctx, &mut self.show_about);
         windows::shortcuts_window(ctx, &mut self.show_shortcuts);
+        // The "Save current as workspace…" modal (S1) — captures the live layout +
+        // tool + overlays under a name when confirmed.
+        self.save_workspace_dialog(ctx);
+        // The report-log history window (§2.10 #22) — the persistent companion to
+        // the fading toasts drawn below; lists past notifications newest-first.
+        self.notify.draw_log_window(ctx, &mut self.show_report_log);
+        windows::perf_overlay_window(ctx, &mut self.show_perf, timings, &mut self.settings);
         windows::quick_select_window(ctx, scene, &mut self.selection, &mut self.quick_select);
+        // The F3 operator-search palette (S2: lists + runs the WHOLE registry, not
+        // just the 5 catalog ops). Precompute each command's runnable state (the
+        // window borrows `self.op_search` mutably, so `op_runnable`'s `&self` read
+        // can't be live inside the closure) and dispatch the chosen command after.
+        // A catalog op (`invoke.is_some()`) reports its `poll`; a pure-action command
+        // (view / nav / selection / file) is always enabled.
+        let runnable: Vec<(&'static str, bool)> = shortcuts::palette_commands()
+            .iter()
+            .map(|c| (c.id, c.invoke.is_none() || self.op_runnable(c.id)))
+            .collect();
+        let picked = windows::operator_search_window(ctx, &mut self.op_search, |id| {
+            runnable.iter().find(|(cid, _)| *cid == id).map(|(_, ok)| *ok).unwrap_or(false)
+        });
+        if let Some(id) = picked {
+            self.run_palette_command(ctx, id, scene, camera, dmx);
+        }
+        // The Shift+A Add menu: on a pick, drop the entity into the scene + select
+        // it (the menu itself stays library-only, decoupled from the mutation). The
+        // menu also owns starring (mutates + persists `lib_prefs` directly).
+        if let Some(action) =
+            windows::add_menu_window(ctx, &self.library, &mut self.add_menu, &mut self.lib_prefs, &mut self.gdtf_textures)
+        {
+            use windows::AddAction;
+            // #19: drop at the viewport cursor/camera anchor, not the origin. When the
+            // 3D cursor has been positioned this session (Shift-RMB / Snap to selection)
+            // it wins as the placement origin (Blender's "Add at 3D cursor"); otherwise
+            // fall back to the view-centre ground/surface anchor.
+            let place = if self.cursor_3d_set {
+                self.cursor_3d
+            } else {
+                panels::placement_point(scene, camera)
+            };
+            // #20: the stable key to record in Recent (resolved against the live
+            // library so an index can't drift it to the wrong entry).
+            let item = match action {
+                AddAction::Fixture(i) => lib_prefs::LibItem::Fixture(i),
+                AddAction::Gdtf(i) => lib_prefs::LibItem::Gdtf(i),
+                AddAction::Screen(i) => lib_prefs::LibItem::Screen(i),
+                AddAction::Pyro(i) => lib_prefs::LibItem::Pyro(i),
+                AddAction::Environment(i) => lib_prefs::LibItem::Env(i),
+            };
+            let key = lib_prefs::entry_key(&self.library, item);
+            let status = self.run_op(
+                "object.add",
+                "Add",
+                op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                scene,
+                dmx,
+                true,
+                |cx| {
+                    let new: Option<Selection> = match action {
+                        AddAction::Fixture(i) => cx
+                            .library
+                            .fixtures
+                            .get(i)
+                            .cloned()
+                            .map(|p| Selection::fixture(cx.scene.add_fixture_at(&p, place))),
+                        AddAction::Gdtf(i) => cx
+                            .library
+                            .gdtf
+                            .get(i)
+                            .cloned()
+                            .map(|g| Selection::fixture(cx.scene.add_gdtf(g, place))),
+                        AddAction::Screen(i) => cx
+                            .library
+                            .screens
+                            .get(i)
+                            .cloned()
+                            .map(|p| Selection::screen(cx.scene.add_screen_at(&p, place))),
+                        AddAction::Pyro(i) => cx
+                            .library
+                            .pyro
+                            .get(i)
+                            .cloned()
+                            .map(|p| Selection::pyro(cx.scene.add_pyro_at(&p, place))),
+                        AddAction::Environment(i) => cx
+                            .library
+                            .environments
+                            .get(i)
+                            .cloned()
+                            .map(|p| Selection::environment(cx.scene.add_environment_at(&p, place))),
+                    };
+                    match new {
+                        Some(sel) => {
+                            *cx.selection = sel;
+                            op::OpStatus::Finished
+                        }
+                        None => op::OpStatus::Cancelled,
+                    }
+                },
+            );
+            if status == op::OpStatus::Finished
+                && let Some(k) = key
+            {
+                self.lib_prefs.push_recent(&k);
+            }
+        }
+        // Online GDTF-Share catalogue: stocks the project Library ONLY (no longer
+        // instantiates into the scene — bug 9). So it no longer borrows scene/selection.
         share_window::fixture_library_window(
             ctx,
             &mut self.show_share,
             &mut self.share,
             &mut self.library,
-            scene,
-            &mut self.selection,
         );
+        // The `~` radial View pie (above the dock, anchored at the cursor). On a
+        // pick it applies straight to the camera; cancel / Esc just closes it.
+        self.view_pie(ctx, camera, scene);
+        // The `Z` radial Shading pie (above the dock, anchored at the cursor). On a
+        // pick it applies the display mode / overlay toggle immediately.
+        self.shading_pie(ctx);
+
+        // Passive status-bar hint (#21 grey slot): advertise an in-flight modal
+        // transform; clear it otherwise so the hint never goes stale. (The bar was
+        // already drawn this frame; the slot is read again next frame — a one-frame
+        // lag that's imperceptible for a passive hint.)
+        match &self.transform {
+            Some(op) => self.status_msgs.set_hint(format!("{} in progress", op.kind.label())),
+            None => self.status_msgs.clear_hint(),
+        }
+
+        // Transient toasts overlay the dock (foreground order), below only the
+        // modal splash so a fresh launch isn't cluttered.
+        self.notify.draw(ctx);
+
         // The welcome / recover splash sits above everything (it's the first
         // thing on a fresh launch).
         self.splash_window(ctx, scene, camera, dmx);
     }
-
-    /// Force the quick-select palette open (headless screenshot hook).
-    pub fn debug_open_quick_select(&mut self) {
-        self.quick_select = true;
-    }
-
-    /// Open the online Fixture Library window (headless hook). `demo` injects fake
-    /// catalogue rows so the browse view renders without real credentials.
-    pub fn debug_open_share(&mut self, demo: bool) {
-        self.show_share = true;
-        if demo {
-            self.share.debug_demo();
-        }
-    }
-
-    /// Select the first fixture and open the Replace dialog (headless hook).
-    pub fn debug_open_replace(&mut self, scene: &Scene) {
-        if !scene.fixtures.is_empty() {
-            self.selection = Selection::fixture(0);
-            self.replace = Some(ReplaceDialog::default());
-        }
-    }
-
-    /// Open the profile editor for the first GDTF fixture (headless hook).
-    pub fn debug_open_profile(&mut self, scene: &Scene) {
-        if let Some(i) = scene.fixtures.iter().position(|f| f.is_gdtf()) {
-            self.selection = Selection::fixture(i);
-            self.profile = Some(ProfileEditor::new(i));
-        }
-    }
-
-    /// Select the first GDTF fixture (headless hook for inspector screenshots).
-    pub fn debug_select_first_gdtf(&mut self, scene: &Scene) {
-        if let Some(i) = scene.fixtures.iter().position(|f| f.is_gdtf()) {
-            self.selection = Selection::fixture(i);
-        }
-    }
-
-    /// Multi-select up to `n` fixtures sharing the profile of the first fixture
-    /// that has a wheel chain (so the bulk Wheels section is exercised); falls
-    /// back to the first `n` GDTF fixtures. Headless hook for bulk screenshots.
-    pub fn debug_select_n(&mut self, scene: &Scene, n: usize) {
-        let with_wheels = scene.fixtures.iter().position(|f| {
-            f.gdtf
-                .as_ref()
-                .and_then(|g| g.modes.get(f.mode_index))
-                .is_some_and(|m| !m.components.is_empty())
-        });
-        let pick: Vec<usize> = match with_wheels {
-            Some(seed) => {
-                let prof = scene.fixtures[seed].profile.clone();
-                scene
-                    .fixtures
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, f)| f.profile == prof)
-                    .map(|(i, _)| i)
-                    .take(n)
-                    .collect()
-            }
-            None => scene.fixtures.iter().enumerate().filter(|(_, f)| f.is_gdtf()).map(|(i, _)| i).take(n).collect(),
-        };
-        if !pick.is_empty() {
-            self.selection = Selection { fixtures: pick, geometry: Vec::new(), environment: None };
-        }
-    }
-
-    /// Make the named tab the active one in its leaf (used by the headless UI
-    /// screenshot path to capture a specific panel).
-    pub fn focus_tab_by_title(&mut self, title: &str) {
-        let tabs = [
-            Tab::Viewport,
-            Tab::Scene,
-            Tab::Library,
-            Tab::Inspector,
-            Tab::DmxMonitor,
-            Tab::Patch,
-            Tab::Cues,
-            Tab::Connectivity,
-        ];
-        for tab in tabs {
-            if tab.title() == title
-                && let Some(path) = self.dock.find_tab(&tab)
-            {
-                let _ = self.dock.set_active_tab(path);
-                return;
-            }
-        }
-    }
-
-    /// Whether a dock tab is currently open.
-    fn is_tab_open(&self, tab: Tab) -> bool {
-        self.dock.find_tab(&tab).is_some()
-    }
-
-    /// Show or hide a dock tab.
-    fn toggle_tab(&mut self, tab: Tab) {
-        if let Some(path) = self.dock.find_tab(&tab) {
-            self.dock.remove_tab(path);
-        } else {
-            self.dock.push_to_focused_leaf(tab);
-        }
-    }
-
-    /// AABB of the current selection (or whole scene if nothing selected),
-    /// padded a little, for the Frame commands.
-    fn frame_bounds(&self, scene: &Scene, selection_only: bool) -> Option<(Vec3, Vec3)> {
-        let idx: Vec<usize> = if selection_only && !self.selection.fixtures.is_empty() {
-            self.selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect()
-        } else {
-            (0..scene.fixtures.len()).collect()
-        };
-        let mut pts: Vec<Vec3> = idx.iter().map(|&i| scene.fixtures[i].position).collect();
-        if !selection_only {
-            pts.extend(scene.geometry.iter().map(|g| g.transform.w_axis.truncate()));
-        }
-        let first = *pts.first()?;
-        let (mut lo, mut hi) = (first, first);
-        for p in &pts {
-            lo = lo.min(*p);
-            hi = hi.max(*p);
-        }
-        let pad = Vec3::splat(1.0);
-        Some((lo - pad, hi + pad))
-    }
-
-    /// Keyboard shortcuts handled globally (camera framing/views, delete, etc.).
-    fn handle_shortcuts(&mut self, ctx: &egui::Context, scene: &mut Scene, camera: &mut OrbitCamera) {
-        // Don't steal keys while a text field has focus.
-        if ctx.egui_wants_keyboard_input() {
-            return;
-        }
-        let del = ctx.input(|i| {
-            use egui::Key;
-            if i.key_pressed(Key::F) {
-                let sel = !i.modifiers.shift;
-                if let Some((lo, hi)) = self.frame_bounds(scene, sel) {
-                    camera.frame_aabb(lo, hi);
-                }
-            }
-            if i.modifiers.command && i.key_pressed(Key::Comma) {
-                self.show_prefs = true;
-            }
-            // `s` opens the quick-select palette — UNLESS the viewport is focused
-            // with a selection, where `s` means Scale (Blender modal transform,
-            // handled in panels::viewport). So: something to scale → scale; nothing
-            // to scale → open the select palette.
-            let s_is_scale = self.viewport_focused
-                && (!self.selection.fixtures.is_empty() || !self.selection.geometry.is_empty());
-            if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl && !s_is_scale {
-                self.quick_select = true;
-            }
-            // `a` = select all fixtures; `l` = toggle fixture labels.
-            if i.key_pressed(Key::A) && !i.modifiers.command && !i.modifiers.ctrl && !scene.fixtures.is_empty() {
-                self.selection = Selection { fixtures: (0..scene.fixtures.len()).collect(), geometry: Vec::new(), environment: None };
-            }
-            if i.key_pressed(Key::L) && !i.modifiers.command {
-                self.prefs.show_labels = !self.prefs.show_labels;
-            }
-            // Shift+R replaces the selected fixtures with another project profile.
-            // (Plain R is the Rotate modal transform, handled in the viewport.)
-            if i.key_pressed(Key::R)
-                && i.modifiers.shift
-                && !i.modifiers.command
-                && !i.modifiers.ctrl
-                && self.replace.is_none()
-                && !self.selection.fixtures.is_empty()
-            {
-                self.replace = Some(ReplaceDialog::default());
-            }
-            for (key, view) in [
-                (Key::Num5, CameraView::Perspective),
-                (Key::Num7, CameraView::Top),
-                (Key::Num1, CameraView::Front),
-                (Key::Num3, CameraView::Right),
-            ] {
-                if i.key_pressed(key) {
-                    camera.set_view(view);
-                }
-            }
-            i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)
-        });
-        if del && (!self.selection.fixtures.is_empty() || !self.selection.geometry.is_empty()) {
-            self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
-        }
-
-        // Arrow keys nudge the selected fixtures on the floor plane (Shift = 1 m,
-        // else 0.1 m), but only when the viewport has focus so they don't fight
-        // panel scrolling. PageUp/Down nudge height.
-        if self.viewport_focused && self.transform.is_none() && !self.selection.fixtures.is_empty() {
-            let (mut dx, mut dz, mut dy) = (0.0f32, 0.0f32, 0.0f32);
-            let step = ctx.input(|i| {
-                use egui::Key;
-                let s = if i.modifiers.shift { 1.0 } else { 0.1 };
-                if i.key_pressed(Key::ArrowLeft) { dx -= s; }
-                if i.key_pressed(Key::ArrowRight) { dx += s; }
-                if i.key_pressed(Key::ArrowUp) { dz -= s; }
-                if i.key_pressed(Key::ArrowDown) { dz += s; }
-                if i.key_pressed(Key::PageUp) { dy += s; }
-                if i.key_pressed(Key::PageDown) { dy -= s; }
-                Vec3::new(dx, dy, dz)
-            });
-            if step != Vec3::ZERO {
-                for &fi in &self.selection.fixtures {
-                    if let Some(f) = scene.fixtures.get_mut(fi) {
-                        f.position += step;
-                        f.snap_movement();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Remove every selected fixture and clear the selection.
-    /// Commit a requested fixture deletion, remapping every index-keyed structure
-    /// in lock-step so nothing is silently corrupted: the patch entries, the cue
-    /// look lists, and the saved selection groups all follow the removal. Called
-    /// once after the dock, where the patch is reachable.
-    fn commit_delete(&mut self, scene: &mut Scene, patch: &mut crate::dmx::PatchTable) {
-        self.pending_delete = false;
-        // --- fixtures: remove + remap every index-keyed structure in lock-step ---
-        let mut removed: Vec<usize> =
-            self.selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
-        removed.sort_unstable();
-        removed.dedup();
-        if !removed.is_empty() {
-            // Descending so earlier indices stay valid as we remove.
-            for &i in removed.iter().rev() {
-                scene.fixtures.remove(i);
-                patch.remove_at(i);
-                self.cues.remove_fixture(i);
-            }
-            // Groups store arbitrary index references: remap each through the
-            // shift, dropping deleted members, then drop any group left empty.
-            for g in &mut self.groups {
-                g.fixtures = g.fixtures.iter().filter_map(|&idx| remap_index(idx, &removed)).collect();
-            }
-            self.groups.retain(|g| !g.fixtures.is_empty());
-        }
-        // --- static geometry: a plain removal (no patch/cue/group keyed by it) ---
-        let mut geo: Vec<usize> =
-            self.selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-        geo.sort_unstable();
-        geo.dedup();
-        for &i in geo.iter().rev() {
-            scene.geometry.remove(i);
-        }
-        if !removed.is_empty() || !geo.is_empty() {
-            self.selection = Selection::default();
-            self.scene_anchor = None;
-        }
-    }
-
-    /// Import any `.gdtf` / `.mvr` files dropped onto the window.
-    fn handle_dropped_files(&mut self, ctx: &egui::Context, scene: &mut Scene, camera: &mut OrbitCamera) {
-        // The common case is nothing dropped — avoid the per-frame allocation.
-        if ctx.input(|i| i.raw.dropped_files.is_empty()) {
-            return;
-        }
-        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
-            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
-        });
-        for path in dropped {
-            match path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) {
-                Some(ext) if ext == "gdtf" => match self.library.import_gdtf(&path) {
-                    Ok(idx) => {
-                        let arc = self.library.gdtf[idx].clone();
-                        let f = scene.add_gdtf(arc, Vec3::new(0.0, 4.0, 0.0));
-                        self.selection = Selection::fixture(f);
-                    }
-                    Err(e) => log::error!("drop GDTF: {e}"),
-                },
-                Some(ext) if ext == "mvr" => match crate::mvr::MvrImport::load_path(&path) {
-                    Ok(import) => {
-                        scene.import_mvr(import);
-                        if let Some((c, r)) = scene.scene_frame() {
-                            camera.frame(c, r * 1.15);
-                        }
-                        self.selection = Selection::default();
-                    }
-                    Err(e) => log::error!("drop MVR: {e}"),
-                },
-                _ => {}
-            }
-        }
-    }
-
-    /// The top menu bar (File / Edit / View / Fixture / Window / Help).
-    // egui 0.34 deprecates `Panel::show(ctx)` mid-migration (the replacement
-    // `show_inside` needs a Ui, not the root Context — DockArea uses the same
-    // path); the ctx-based root panel is still correct here.
-    #[allow(deprecated)]
-    fn menu_bar(
-        &mut self,
-        ctx: &egui::Context,
-        scene: &mut Scene,
-        camera: &mut OrbitCamera,
-        dmx: &mut crate::dmx::DmxIo,
-    ) {
-        egui::TopBottomPanel::top("menu-bar").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                use theme::icon;
-                ui.menu_button("File", |ui| {
-                    if ui.button(format!("{}  New Project", icon::SCENE)).clicked() {
-                        self.new_project(scene, camera, dmx);
-                        ui.close();
-                    }
-                    if ui.button(format!("{}  Open Project…", icon::IMPORT_MVR)).clicked() {
-                        self.open_project_dialog(scene, camera, dmx);
-                        ui.close();
-                    }
-                    if !self.recent.is_empty() {
-                        let recent = self.recent.clone();
-                        ui.menu_button(format!("{}  Open Recent", icon::PROFILE), |ui| {
-                            for p in &recent {
-                                let name = p
-                                    .file_name()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                if ui.button(name).on_hover_text(p.display().to_string()).clicked() {
-                                    self.open_project(p, scene, camera, dmx);
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                    ui.separator();
-                    if ui.button(format!("{}  Save  (Ctrl+S)", icon::EXPORT)).clicked() {
-                        self.save_project(scene, camera, dmx);
-                        ui.close();
-                    }
-                    if ui.button(format!("{}  Save As…", icon::EXPORT)).clicked() {
-                        self.save_project_as(scene, camera, dmx);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(format!("{}  Import GDTF Fixture…", icon::IMPORT_GDTF)).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("GDTF", &["gdtf"]).pick_file() {
-                            if let Ok(idx) = self.library.import_gdtf(&path) {
-                                let arc = self.library.gdtf[idx].clone();
-                                let f = scene.add_gdtf(arc, Vec3::new(0.0, 4.0, 0.0));
-                                self.selection = Selection::fixture(f);
-                            }
-                        }
-                        ui.close();
-                    }
-                    if ui.button(format!("{}  Import MVR Scene…", icon::IMPORT_MVR)).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("MVR", &["mvr"]).pick_file() {
-                            if let Ok(import) = crate::mvr::MvrImport::load_path(&path) {
-                                scene.import_mvr(import);
-                                if let Some((c, r)) = scene.scene_frame() {
-                                    camera.frame(c, r * 1.15);
-                                }
-                                self.selection = Selection::default();
-                            }
-                        }
-                        ui.close();
-                    }
-                    let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
-                    if ui.add_enabled(can_export, egui::Button::new(format!("{}  Export MVR Scene…", icon::EXPORT))).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("MVR", &["mvr"]).set_file_name("scene.mvr").save_file() {
-                            if let Err(e) = crate::mvr::export_path(scene, &path) {
-                                log::error!("export MVR: {e}");
-                            }
-                        }
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button(format!("{}  Preferences…", icon::SETTINGS)).clicked() {
-                        self.show_prefs = true;
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Edit", |ui| {
-                    if ui.add_enabled(self.selection.primary_fixture().is_some(), egui::Button::new(format!("{}  Duplicate / Array…", icon::DUPLICATE))).clicked() {
-                        if let Some(idx) = self.selection.primary_fixture() {
-                            self.duplicate = Some(DuplicateDialog { fixture: idx, x: 0.0, y: 0.0, z: 0.0, y_angle: 36.0, count: 9 });
-                        }
-                        ui.close();
-                    }
-                    if ui.add_enabled(!self.selection.fixtures.is_empty(), egui::Button::new(format!("{}  Delete Selected", icon::TRASH))).clicked() {
-                        self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
-                        ui.close();
-                    }
-                    if ui.button(format!("{}  Deselect All", icon::DESELECT)).clicked() {
-                        self.selection = Selection::default();
-                        ui.close();
-                    }
-                });
-                ui.menu_button("View", |ui| {
-                    ui.menu_button(format!("{}  Camera", icon::CAMERA), |ui| {
-                        for v in CameraView::ALL {
-                            if ui.button(v.label()).clicked() {
-                                camera.set_view(v);
-                                ui.close();
-                            }
-                        }
-                    });
-                    if ui.button(format!("{}  Frame Selection  (F)", icon::FRAME)).clicked() {
-                        if let Some((lo, hi)) = self.frame_bounds(scene, true) {
-                            camera.frame_aabb(lo, hi);
-                        }
-                        ui.close();
-                    }
-                    if ui.button(format!("{}  Frame All  (Shift+F)", icon::FRAME)).clicked() {
-                        if let Some((lo, hi)) = self.frame_bounds(scene, false) {
-                            camera.frame_aabb(lo, hi);
-                        }
-                        ui.close();
-                    }
-                    ui.separator();
-                    ui.label("Display mode");
-                    for m in crate::scene::ViewportMode::ALL {
-                        if ui.selectable_label(self.settings.mode == m, m.label()).clicked() {
-                            self.settings.mode = m;
-                        }
-                    }
-                    ui.separator();
-                    ui.checkbox(&mut self.prefs.show_labels, "Fixture labels");
-                    ui.checkbox(&mut self.settings.show_grid, "Grid");
-                    ui.checkbox(&mut self.prefs.show_fps, "FPS overlay");
-                    ui.checkbox(&mut self.settings.show_beam_wireframes, "Beam gizmos");
-                });
-                ui.menu_button("Fixture", |ui| {
-                    if ui.button(format!("{}  Online Library…", icon::ONLINE)).clicked() {
-                        self.show_share = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    let has = self.selection.primary_fixture().map(|i| i < scene.fixtures.len() && scene.fixtures[i].is_gdtf()).unwrap_or(false);
-                    if ui.add_enabled(has, egui::Button::new(format!("{}  Edit Profile…", icon::PROFILE))).clicked() {
-                        if let Some(i) = self.selection.primary_fixture() {
-                            self.profile = Some(ProfileEditor::new(i));
-                        }
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Window", |ui| {
-                    ui.menu_button(format!("{}  Workspace", icon::LAYOUT), |ui| {
-                        for (ws, name) in Workspace::ALL {
-                            if ui.button(name).clicked() {
-                                self.dock = Self::workspace_dock(ws);
-                                ui.close();
-                            }
-                        }
-                    });
-                    ui.separator();
-                    ui.label(egui::RichText::new("Panels").small().weak());
-                    for tab in Tab::TOGGLEABLE {
-                        let mut open = self.is_tab_open(tab);
-                        if ui.checkbox(&mut open, format!("{}  {}", tab.icon(), tab.title())).changed() {
-                            self.toggle_tab(tab);
-                        }
-                    }
-                    ui.separator();
-                    if ui.button(format!("{}  Reset Layout", icon::LAYOUT)).clicked() {
-                        self.dock = Self::default_dock();
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Help", |ui| {
-                    if ui.button(format!("{}  Keyboard Shortcuts", icon::KEYBOARD)).clicked() {
-                        self.show_shortcuts = true;
-                        ui.close();
-                    }
-                    if ui.button(format!("{}  About previz", icon::INFO)).clicked() {
-                        self.show_about = true;
-                        ui.close();
-                    }
-                });
-            });
-        });
-    }
-
-    /// The bottom status bar (selection · units · DMX · fixtures · FPS).
-    #[allow(deprecated)]
-    fn status_bar(
-        &self,
-        ctx: &egui::Context,
-        scene: &Scene,
-        dmx: &crate::dmx::DmxIo,
-        fps: f32,
-    ) {
-        egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let sel = match self.selection.fixtures.len() {
-                    0 => "nothing selected".to_string(),
-                    1 => scene
-                        .fixtures
-                        .get(self.selection.fixtures[0])
-                        .map(|f| format!("{} · {}", f.name, f.profile))
-                        .unwrap_or_default(),
-                    n => format!("{n} fixtures selected"),
-                };
-                ui.label(sel);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("{fps:.0} fps"));
-                    ui.separator();
-                    ui.label(format!("{} fixtures", scene.fixtures.len()));
-                    ui.separator();
-                    let (dot, txt) = if dmx.is_running() {
-                        (egui::Color32::from_rgb(120, 210, 120), "DMX live")
-                    } else {
-                        (egui::Color32::from_gray(120), "DMX off")
-                    };
-                    ui.colored_label(dot, "●");
-                    ui.label(txt);
-                    ui.separator();
-                    ui.label(if self.prefs.units_feet { "ft" } else { "m" });
-                });
-            });
-        });
-    }
 }
 
-/// The modal Duplicate dialog: array the selected fixture by offset + Y angle.
+/// Draws the Duplicate dialog and returns the confirmed [`DuplicateDialog`]
+/// parameters on "Duplicate" (so the caller applies the mutation through the
+/// operator pipeline / undo); returns `None` while open, on cancel, or on Esc.
+/// This fn no longer touches the scene itself — it only manages dialog state.
 fn duplicate_window(
     ctx: &egui::Context,
-    scene: &mut Scene,
-    selection: &mut Selection,
     dialog: &mut Option<DuplicateDialog>,
-) {
+) -> Option<DuplicateDialog> {
     let mut do_dup = false;
     let mut close = false;
 
@@ -1407,22 +1268,28 @@ fn duplicate_window(
             });
     }
 
+    let mut confirmed: Option<DuplicateDialog> = None;
     if do_dup {
-        if let Some(d) = dialog.as_ref()
-            && let Some(first) = scene.duplicate_fixture(
-                d.fixture,
-                Vec3::new(d.x, d.y, d.z),
-                d.y_angle,
-                d.count,
-            )
-        {
-            *selection = Selection::fixture(first);
-        }
+        confirmed = dialog.clone();
         close = true;
     }
     if close {
         *dialog = None;
     }
+    confirmed
+}
+
+/// Draw a clean inline status dot + label: a small allocated cell with a
+/// painter-drawn filled circle, a breathing gap, then the label in the same
+/// colour. The bundled fonts ship no round glyph (●/○ render as tofu), and a
+/// naked "•" reads tiny and jammed against the words — this keeps it legible.
+/// Used inside `ui.horizontal` rows; mirror the spec in `panels.rs`.
+pub(crate) fn status_dot(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
+    // Small inline cell just wide enough for the circle; vertically centred.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, ui.spacing().interact_size.y), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+    ui.add_space(5.0); // breathing room before the words
+    ui.label(egui::RichText::new(label).size(11.0).color(color));
 }
 
 /// The Replace-fixtures dialog (Shift+R): pick a profile from the **project
@@ -1487,39 +1354,70 @@ fn replace_window(
                     .hint_text(format!("{}  Filter project library…", theme::icon::SEARCH))
                     .desired_width(f32::INFINITY),
             );
+            ui.checkbox(&mut d.mesh_only, "Replace mesh/model only")
+                .on_hover_text("Swap just the visual model + beam; keep the name, DMX patch, mode and levels. Off = full replace (re-patches and renames to the new type).");
             ui.separator();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // Cap the LIST at a sensible height and scroll it — the filter box,
+            // checkbox and header above stay pinned so the dialog stays compact
+            // instead of growing to full screen height on a long library.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .max_height(360.0)
+                .show(ui, |ui| {
                 let mut any = false;
-                // GDTF fixtures in the project (imported + already placed) first.
-                let gdtf: Vec<usize> = (0..gdtf_arcs.len())
+                // Grouped EXACTLY like the Library browser: imported GDTFs by
+                // MANUFACTURER, then built-ins by CATEGORY — same `theme::section`
+                // headers (the old "GDTF FIXTURES" / "BUILT-IN" scheme read as a
+                // different categorisation from the Library, which was jarring).
+                let mut gdtf: Vec<usize> = (0..gdtf_arcs.len())
                     .filter(|&gi| matches(&format!("{} {}", gdtf_arcs[gi].manufacturer, gdtf_arcs[gi].name)))
                     .collect();
-                if !gdtf.is_empty() {
+                gdtf.sort_by(|&a, &b| {
+                    let (ga, gb) = (&gdtf_arcs[a], &gdtf_arcs[b]);
+                    ga.manufacturer
+                        .to_lowercase()
+                        .cmp(&gb.manufacturer.to_lowercase())
+                        .then(ga.name.to_lowercase().cmp(&gb.name.to_lowercase()))
+                });
+                let mut last = String::new();
+                for gi in gdtf {
                     any = true;
-                    theme::section(ui, "GDTF FIXTURES");
-                    for gi in gdtf {
-                        let g = &gdtf_arcs[gi];
-                        let label = format!("{}  {} · {}", theme::icon::FIXTURE, g.manufacturer, g.name);
-                        if ui.selectable_label(false, label).clicked() {
+                    let g = &gdtf_arcs[gi];
+                    let cat = if g.manufacturer.is_empty() { "Imported".to_string() } else { g.manufacturer.clone() };
+                    if cat != last {
+                        last = cat.clone();
+                        theme::section(ui, &cat.to_uppercase());
+                    }
+                    let src = g.source;
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(false, format!("{}  {}", theme::icon::FIXTURE, g.name)).clicked() {
                             picked = Some(Picked::Gdtf(gi));
                         }
-                    }
-                    ui.add_space(6.0);
+                        inspector::source_chip(ui, src);
+                    });
                 }
-                // Then the built-in placeholder profiles.
-                let prof: Vec<usize> = (0..library.fixtures.len())
+                // Then the built-in profiles, grouped by category (Generic / Laser / …).
+                let mut prof: Vec<usize> = (0..library.fixtures.len())
                     .filter(|&pi| matches(&format!("{} {}", library.fixtures[pi].category, library.fixtures[pi].name)))
                     .collect();
-                if !prof.is_empty() {
+                prof.sort_by(|&a, &b| {
+                    let (pa, pb) = (&library.fixtures[a], &library.fixtures[b]);
+                    pa.category
+                        .to_lowercase()
+                        .cmp(&pb.category.to_lowercase())
+                        .then(pa.name.to_lowercase().cmp(&pb.name.to_lowercase()))
+                });
+                let mut last_c = String::new();
+                for pi in prof {
                     any = true;
-                    theme::section(ui, "BUILT-IN");
-                    for pi in prof {
-                        let p = &library.fixtures[pi];
-                        let icon = if p.laser { theme::icon::COLOR } else { theme::icon::FIXTURE };
-                        let label = format!("{icon}  {} · {}", p.category, p.name);
-                        if ui.selectable_label(false, label).clicked() {
-                            picked = Some(Picked::Profile(pi));
-                        }
+                    let p = &library.fixtures[pi];
+                    if p.category != last_c {
+                        last_c = p.category.to_string();
+                        theme::section(ui, &p.category.to_uppercase());
+                    }
+                    let icon = if p.laser { theme::icon::COLOR } else { theme::icon::FIXTURE };
+                    if ui.selectable_label(false, format!("{icon}  {}", p.name)).clicked() {
+                        picked = Some(Picked::Profile(pi));
                     }
                 }
                 if !any {
@@ -1533,34 +1431,52 @@ fn replace_window(
         });
 
     if let Some(p) = picked {
-        for &i in &targets {
-            // Snapshot the placement + level + name to carry across the swap.
-            let (pos, orient, pan, tilt, name, dimmer) = {
-                let f = &scene.fixtures[i];
-                (f.position, f.orientation, f.pan, f.tilt, f.name.clone(), f.optics.dimmer)
+        if d.mesh_only {
+            // "Mesh/model only": borrow JUST the picked GDTF's 3D MODEL and leave
+            // EVERYTHING else on each target untouched — its profile, channels, DMX
+            // patch + address, mode, name and optics all stay. For a fixture that has
+            // all its data but no real 3D mesh, this finally gives it a model. A
+            // built-in pick has no rich GDTF model to lend, so it clears the override.
+            let model: Option<Arc<crate::gdtf::GdtfFixture>> = match &p {
+                Picked::Gdtf(gi) => Some(gdtf_arcs[*gi].clone()),
+                Picked::Profile(_) => None,
             };
-            let mut nf = match &p {
-                Picked::Gdtf(gi) => crate::scene::Fixture::from_gdtf(gdtf_arcs[*gi].clone(), name, pos),
-                Picked::Profile(pi) => crate::scene::Fixture::from_profile(&library.fixtures[*pi], name, pos),
+            for &i in &targets {
+                scene.fixtures[i].model_src = model.clone();
+            }
+        } else {
+            // Full replace RENAMES each fixture to the new type (bug 12 — it should
+            // read as its new type) and re-patches; only placement, aim + level carry
+            // across. The rebuilt fixture's `model_src` defaults None, dropping any
+            // previously-borrowed model.
+            let new_base = match &p {
+                Picked::Gdtf(gi) => gdtf_arcs[*gi].name.to_string(),
+                Picked::Profile(pi) => library.fixtures[*pi].name.to_string(),
             };
-            nf.orientation = orient;
-            nf.pan = pan;
-            nf.tilt = tilt;
-            nf.optics.dimmer = dimmer; // keep it lit at the level it had
-            nf.snap_movement();
-            scene.fixtures[i] = nf;
-            patch.replace_at(i, &scene.fixtures[i]);
+            let many = targets.len() > 1;
+            for (j, &i) in targets.iter().enumerate() {
+                let (pos, orient, pan, tilt, dimmer) = {
+                    let f = &scene.fixtures[i];
+                    (f.position, f.orientation, f.pan, f.tilt, f.optics.dimmer)
+                };
+                let name = if many { format!("{new_base} {}", j + 1) } else { new_base.clone() };
+                let mut nf = match &p {
+                    Picked::Gdtf(gi) => crate::scene::Fixture::from_gdtf(gdtf_arcs[*gi].clone(), name, pos),
+                    Picked::Profile(pi) => crate::scene::Fixture::from_profile(&library.fixtures[*pi], name, pos),
+                };
+                nf.orientation = orient;
+                nf.pan = pan;
+                nf.tilt = tilt;
+                nf.optics.dimmer = dimmer; // keep it lit at the level it had
+                nf.snap_movement();
+                scene.fixtures[i] = nf;
+                patch.replace_at(i, &scene.fixtures[i]);
+            }
         }
         close = true;
     }
     if close {
         *dialog = None;
-    }
-}
-
-impl Default for Ui {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1576,19 +1492,31 @@ struct PanelViewer<'a> {
     viewport_texture: egui::TextureId,
     requested_viewport_px: &'a mut (u32, u32),
     viewport_focused: &'a mut bool,
+    box_select_armed: &'a mut bool,
     duplicate: &'a mut Option<DuplicateDialog>,
     profile: &'a mut Option<ProfileEditor>,
-    lib: &'a mut panels::LibState,
+    lib: &'a mut library::LibState,
     scene_anchor: &'a mut Option<usize>,
-    scene_sort: &'a mut panels::SceneSort,
+    scene_sort: &'a mut outliner::SceneSort,
     scene_search: &'a mut String,
+    scene_filter: &'a mut tree::OutlinerFilter,
+    scene_expanded: &'a mut std::collections::HashSet<tree::NodeKey>,
+    scene_rename: &'a mut Option<(tree::NodeKey, String)>,
+    pending_tree: &'a mut tree::TreeAction,
     fm: &'a mut panels::FmState,
     transform: &'a mut Option<TransformOp>,
-    groups: &'a mut Vec<SelectionGroup>,
-    group_name: &'a mut String,
+    /// Per-frame signals the viewport sets for the modal-transform undo wiring.
+    transform_started: &'a mut bool,
+    transform_finished: &'a mut bool,
+    /// Per-frame drag edges the inspector reports for the slider-drag undo
+    /// transaction (#13). Read after the dock to begin/finalize `inspector_tx`.
+    inspector_edit: &'a mut panels::InspectorEdit,
+    /// Persistent Inspector filter + collapse state (the single docked Inspector tab).
+    inspector_state: &'a mut inspector::InspectorState,
     cues: &'a mut cues::CueEngine,
     delete_requested: &'a mut bool,
     replace_requested: &'a mut bool,
+    add_requested: &'a mut bool,
     open_share: &'a mut bool,
     // Live DMX borrows (from `DmxIo::view`).
     dmx_patch: &'a mut crate::dmx::PatchTable,
@@ -1601,6 +1529,72 @@ struct PanelViewer<'a> {
     dmx_pending: &'a mut crate::dmx::PendingNetCmd,
     dmx_running: bool,
     fps: f32,
+    /// Discovered live video sources for the LED-screen content pickers.
+    screen_sources: &'a panels::ScreenSources,
+    /// Viewport N-panel / T-panel open state (§2.2) — read to decide which side
+    /// regions to carve, and flipped by the header's N/T toggle buttons.
+    viewport_regions: &'a mut ViewportRegions,
+    /// The viewport's active tool (§2.4) — the T-panel rail sets it; `viewport()`
+    /// reads `shows_xform_gizmo()` to gate the screen-space move gizmo.
+    active_tool: &'a mut ActiveTool,
+    /// Transform-tool options (§2.4 #4/#5): snap + pivot mode. The header writes
+    /// them; `viewport()` reads them when building a [`TransformOp`].
+    xform: &'a mut TransformPrefs,
+    /// The world 3D-cursor point ([`PivotMode::Cursor3d`] pivot, §2.4 #5). Moved by
+    /// Shift-right-click in `viewport()` (S1-3d-cursor).
+    cursor_3d: &'a mut Vec3,
+    /// Whether the 3D cursor has been set this session — `viewport()` flips it true
+    /// on a Shift-RMB place, so the Add menu can place AT the cursor.
+    cursor_3d_set: &'a mut bool,
+    /// Persistent content-library prefs (§3 #20): Recent + Favourites for the
+    /// Library browser. `library_browser()` reads them to render the pinned
+    /// sections and writes (front-insert on add, star toggle) through them.
+    lib_prefs: &'a mut lib_prefs::LibraryPrefs,
+    /// The Measure tool's persistent two-point ruler (§2.4); `viewport()` reads/writes
+    /// it when the Measure tool is active and clears it otherwise.
+    measure: &'a mut panels::MeasureState,
+    /// The Aim tool's in-flight drag (§2.4); `viewport()` sets it while aiming heads.
+    aim: &'a mut panels::AimState,
+    /// Cross-cut render mailbox (Render tab + Render Properties read/write it).
+    render: &'a mut RenderUiState,
+    /// Set true by the viewport header's fullscreen button (consumed by the app).
+    pending_fullscreen: &'a mut bool,
+    /// True while a still render is converging — the inspector goes read-only so a
+    /// stray edit can't reset the render's accumulation.
+    render_active: bool,
+}
+
+/// Draw the viewport T-panel tool rail (§2.4): a vertical radio column of icon
+/// toggle-buttons over [`ActiveTool::TOOLBAR`], highlighting the active tool;
+/// clicking sets `*active`. Square-ish buttons in a dense, centred column to match
+/// the console chrome. A faint separator splits the transform trio from the
+/// (still-stubbed) lighting tools so the rail reads in groups.
+fn tool_rail(ui: &mut egui::Ui, active: &mut ActiveTool) {
+    ui.add_space(4.0);
+    ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        for tool in ActiveTool::TOOLBAR {
+            // A thin group separator before the lighting tools (Aim onward).
+            if tool == ActiveTool::Aim {
+                ui.add_space(2.0);
+                ui.separator();
+                ui.add_space(2.0);
+            }
+            let selected = *active == tool;
+            let resp = ui
+                .add_sized(
+                    [30.0, 28.0],
+                    egui::SelectableLabel::new(
+                        selected,
+                        egui::RichText::new(tool.icon()).size(16.0),
+                    ),
+                )
+                .on_hover_text(tool.tooltip());
+            if resp.clicked() {
+                *active = tool;
+            }
+        }
+    });
 }
 
 impl TabViewer for PanelViewer<'_> {
@@ -1611,25 +1605,63 @@ impl TabViewer for PanelViewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
+        // Per-editor header bar carved from the leaf's `ui` BEFORE the main content
+        // (§2.2): editor-type switcher + right-aligned per-editor controls. May
+        // rewrite `*tab` (the type switcher), so re-match `*tab` below.
+        editor::header(self, ui, tab);
         match tab {
-            Tab::Viewport => panels::viewport(
-                ui,
-                self.camera,
-                self.scene,
-                self.selection,
-                self.scene_anchor,
-                self.viewport_focused,
-                self.duplicate,
-                self.viewport_texture,
-                self.requested_viewport_px,
-                self.fps,
-                self.prefs,
-                self.settings,
-                self.transform,
-                self.delete_requested,
-                self.replace_requested,
-            ),
-            Tab::Scene => panels::scene_outliner(
+            Tab::Viewport => {
+                // §2.2: carve the N-panel (right sidebar) + T-panel (left tool rail)
+                // from the leaf's `ui` BEFORE the main viewport content, so the
+                // texture/main region shrinks to the space between them and still
+                // orbits/selects/gizmos correctly. Region Ids are salted with the
+                // tab title so two Viewport leaves never clash.
+                let id_base = ui.id().with(tab.title());
+                if self.viewport_regions.t_open {
+                    // T-panel tool rail (§2.4): a vertical radio column of icon
+                    // toggle-buttons, one per `ActiveTool`, with the active tool
+                    // highlighted. Clicking sets `active_tool` — which `viewport()`
+                    // reads to decide whether the screen-space xform gizmo draws.
+                    egui::SidePanel::left(id_base.with("t-panel"))
+                        .resizable(false)
+                        .exact_width(40.0)
+                        .show_inside(ui, |ui| {
+                            tool_rail(ui, self.active_tool);
+                        });
+                }
+                // (The inline N-panel inspector was REMOVED: it duplicated the docked
+                // Inspector tab AND, as a layout `SidePanel`, shrank the viewport leaf
+                // so opening/resizing it shifted the camera aspect — bug 5. The docked
+                // Inspector is now the single inspector; `N` toggles that tab.)
+                panels::viewport(
+                    ui,
+                    self.camera,
+                    self.scene,
+                    self.selection,
+                    self.scene_anchor,
+                    self.viewport_focused,
+                    self.box_select_armed,
+                    self.duplicate,
+                    self.viewport_texture,
+                    self.requested_viewport_px,
+                    self.fps,
+                    self.prefs,
+                    self.settings.render_scale,
+                    self.transform,
+                    self.delete_requested,
+                    self.replace_requested,
+                    self.add_requested,
+                    self.transform_started,
+                    self.transform_finished,
+                    *self.active_tool,
+                    *self.xform,
+                    self.cursor_3d,
+                    self.cursor_3d_set,
+                    self.measure,
+                    self.aim,
+                );
+            }
+            Tab::Scene => outliner::scene_outliner(
                 ui,
                 self.scene,
                 self.selection,
@@ -1637,20 +1669,30 @@ impl TabViewer for PanelViewer<'_> {
                 self.scene_anchor,
                 self.scene_sort,
                 self.scene_search,
-                self.groups,
-                self.group_name,
+                self.scene_filter,
+                self.scene_expanded,
+                self.scene_rename,
+                self.pending_tree,
             ),
-            Tab::Library => panels::library_browser(
+            Tab::Library => library::library_browser(
                 ui,
                 self.library,
                 self.scene,
                 self.selection,
                 self.camera,
                 self.lib,
+                self.lib_prefs,
                 self.open_share,
+                self.gdtf_textures,
             ),
             Tab::Inspector => {
-                panels::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile)
+                let mut e = panels::InspectorEdit::default();
+                let render_active = self.render_active;
+                ui.add_enabled_ui(!render_active, |ui| {
+                    inspector::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, self.inspector_state, &mut e, self.render, self.settings);
+                });
+                self.inspector_edit.started |= e.started;
+                self.inspector_edit.stopped |= e.stopped;
             }
             Tab::DmxMonitor => panels::dmx_universe_grid(
                 ui,
@@ -1678,6 +1720,7 @@ impl TabViewer for PanelViewer<'_> {
                 self.fm,
             ),
             Tab::Cues => cues::cue_panel(ui, self.cues, self.scene),
+            Tab::Render => render_panel::render_tab(ui, &self.scene.render, self.render),
         }
     }
 
@@ -1686,96 +1729,17 @@ impl TabViewer for PanelViewer<'_> {
         false
     }
 
-    /// The viewport draws an opaque image and handles its own scroll-to-zoom,
-    /// so it must not be wrapped in a scroll area.
+    /// The viewport + render preview draw an opaque image and manage their own
+    /// content rect, so they must not be wrapped in a scroll area.
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
+        // `[horizontal, vertical]`. The Inspector / outliner / list panels must FIT
+        // their width and never scroll sideways (the inspector horizontal-scroll bug);
+        // only the genuinely WIDE data tables (the 512-channel DMX grid + the Fixtures
+        // schedule) keep horizontal scroll.
         match tab {
-            Tab::Viewport => [false, false],
-            _ => [true, true],
+            Tab::Viewport | Tab::Render => [false, false], // draw their own image
+            Tab::DmxMonitor | Tab::Patch => [true, true], // wide tables
+            _ => [false, true], // fit width, vertical scroll only
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dmx::DmxIo;
-    use crate::scene::Scene;
-
-    #[test]
-    fn remap_index_after_delete() {
-        // Delete fixtures 1 and 3 from a 5-fixture scene (0..5).
-        let removed = [1usize, 3];
-        assert_eq!(remap_index(0, &removed), Some(0));
-        assert_eq!(remap_index(1, &removed), None); // deleted
-        assert_eq!(remap_index(2, &removed), Some(1)); // one below removed
-        assert_eq!(remap_index(3, &removed), None); // deleted
-        assert_eq!(remap_index(4, &removed), Some(2)); // two below removed
-    }
-
-    /// Extract one GDTF archive's bytes from the bundled Basic Festival MVR.
-    fn gdtf_bytes(member: &str) -> Option<Vec<u8>> {
-        let candidates = [
-            format!("{}/.context/attachments/05W1Dh/Basic Festival.mvr", env!("CARGO_MANIFEST_DIR")),
-            format!("{}/Downloads/Basic Festival/Basic Festival.mvr", std::env::var("HOME").unwrap_or_default()),
-        ];
-        for path in candidates {
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else { continue };
-            let Ok(mut f) = zip.by_name(member) else { continue };
-            let mut buf = Vec::new();
-            if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() {
-                return Some(buf);
-            }
-        }
-        None
-    }
-
-    /// Round-trip a real GDTF fixture through `.archie`: save bundles the archive
-    /// bytes, open re-parses + re-links them, and per-fixture state (cells, beam,
-    /// dimmer) plus the camera survive the trip.
-    #[test]
-    fn archie_save_load_relinks_gdtf_and_state() {
-        let member = "Astera LED Technology@AX2-100 PixelBar.gdtf";
-        let Some(bytes) = gdtf_bytes(member) else {
-            eprintln!("skip archie_save_load: Basic Festival.mvr not found");
-            return;
-        };
-        let mut g = crate::gdtf::GdtfFixture::load_bytes(&bytes).expect("parse gdtf");
-        g.spec = member.to_string();
-        g.raw = Some(Arc::new(bytes));
-
-        let mut ui = Ui::new();
-        let mut scene = Scene::default();
-        let base = scene.fixtures.len();
-        let idx = scene.add_gdtf(Arc::new(g), Vec3::new(1.0, 4.0, -2.0));
-        scene.fixtures[idx].beam = 0.5;
-        scene.fixtures[idx].optics.dimmer = 0.8;
-        let cells = scene.fixtures[idx].cells.len();
-        let mut camera = OrbitCamera::default();
-        camera.distance = 21.0;
-        let dmx = DmxIo::new();
-
-        let path = std::env::temp_dir().join("previz-archie-relink-test.archie");
-        ui.write_project(&path, &scene, &camera, &dmx).expect("write project");
-
-        // Open into a completely fresh app state.
-        let project = project::read(&path).expect("read project");
-        let _ = std::fs::remove_file(&path);
-        let mut ui2 = Ui::new();
-        let mut scene2 = Scene::default();
-        let mut camera2 = OrbitCamera::default();
-        let mut dmx2 = DmxIo::new();
-        ui2.apply_project(project, &mut scene2, &mut camera2, &mut dmx2);
-
-        assert_eq!(scene2.fixtures.len(), base + 1);
-        let f = &scene2.fixtures[idx];
-        let linked = f.gdtf.as_ref().expect("gdtf re-linked");
-        assert_eq!(linked.spec, member);
-        assert!(linked.raw.is_some(), "archive bytes restored for re-save");
-        assert_eq!(f.cells.len(), cells, "per-cell colours preserved");
-        assert!((f.beam - 0.5).abs() < 1e-6, "beam intensity round-trips");
-        assert!((f.optics.dimmer - 0.8).abs() < 1e-6, "dimmer round-trips");
-        assert!((camera2.distance - 21.0).abs() < 1e-6, "camera round-trips");
     }
 }

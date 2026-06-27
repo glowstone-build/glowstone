@@ -1,0 +1,7 @@
+# Cross-compiling the Windows build from a Unix host (macOS/Linux) needs the
+# mingw-w64 toolchain as the linker for the `*-pc-windows-gnu` target.
+#   macOS:  brew install mingw-w64
+#   rustup: rustup target add x86_64-pc-windows-gnu
+# (On a native Windows host with the MSVC toolchain this section is simply ignored.)
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

@@ -1,6 +1,9 @@
-//! The renderer: owns the wgpu device/queue/surface, the scene pipelines, the
-//! offscreen HDR viewport target, the volumetric + post passes, and the egui
-//! paint pass.
+//! **Spectre** — glowstone's custom GPU rendering engine. Owns the wgpu
+//! device/queue/surface, the scene pipelines, the offscreen HDR viewport target,
+//! the volumetric + post passes, and the egui paint pass.
+//!
+//! Credits for the research, talks and standards Spectre's techniques build on:
+//! `docs/SPECTRE-CREDITS.md`.
 //!
 //! Per frame the CPU fills a camera uniform, per-object instance rows, the
 //! dynamic line geometry, and the volumetric uniforms (camera inverse, fog box,
@@ -11,17 +14,24 @@
 mod atlas;
 pub mod camera;
 pub mod fixture_model;
+pub mod gpu_timer;
 pub mod mesh;
 mod noise;
+mod particles;
 mod pipeline;
 mod shadow;
 pub mod viewport;
 mod world;
 
+pub use gpu_timer::PassTimings;
+
+/// The display name of this rendering engine (shown in the Render ▸ Engine picker).
+/// glowstone's bespoke wgpu raster + volumetric-raymarch engine.
+pub const ENGINE_NAME: &str = "Spectre";
+
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -29,9 +39,11 @@ use winit::window::Window;
 
 use crate::optics;
 use crate::scene::library::FixtureGeometry;
+use crate::scene::screen::{LedScreen, ScreenContent};
 use crate::scene::{Fixture, RenderSettings, Scene, Selection, ViewportMode};
 use camera::{CameraUniform, OrbitCamera};
-use mesh::{GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance};
+use mesh::{GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance, ParticleInstance, WallInstance};
+use particles::PyroSystem;
 use viewport::Viewport;
 
 /// Camera + scene data for the volumetric raymarch (mirrors `Volumetric` in
@@ -45,6 +57,146 @@ struct VolumetricUniform {
     fog_max_g: [f32; 4],
     albedo_beam: [f32; 4],
     counts: [f32; 4],
+    /// x = Helmholtz–Kohlrausch chroma read-up strength (saturated beams read more
+    /// strongly in haze); yzw reserved. Mirrors `chroma` in volumetric.wgsl.
+    chroma: [f32; 4],
+    /// Tiled light culling: x = tiles_x, y = tiles_y, z = tile size (full-res px),
+    /// w = wide-light count (unused by shader). The ray's screen tile bounds which
+    /// beams it marches. Mirrors `tile` in volumetric.wgsl.
+    tile: [f32; 4],
+    /// Stage-CO2 ambient: rgb = the room's ambient light colour the white smoke
+    /// reflects (so a cyan-lit stage gives a dim-cyan thick plume), w = strength.
+    /// Mirrors `co2_amb` in volumetric.wgsl.
+    co2_amb: [f32; 4],
+}
+
+/// Build the CO2 density 3D texture (+ view) at `res` voxels/axis: one `res`-tall
+/// Z-slab per emitter stacked along Z, R8, clamp-to-edge + linear. Recreated when
+/// the quality-driven resolution changes (see `Renderer::ensure_co2_res`).
+fn create_co2_density_texture(
+    device: &wgpu::Device,
+    res: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("co2-density-3d"),
+        size: wgpu::Extent3d {
+            width: res,
+            height: res,
+            depth_or_array_layers: res * particles::CO2_LAYERS,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D3),
+        ..Default::default()
+    });
+    (tex, view)
+}
+
+/// Temporal-accumulation uniform (mirrors `TemporalU` in vol_temporal.wgsl). Drives
+/// the EMA reproject-resolve that smooths the jittered half-res volumetric.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TemporalUniform {
+    cur_inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],    // xyz = eye, w = far distance
+    params: [f32; 4], // x = history opacity; yzw reserved
+}
+
+/// Froxel volumetric uniform (mirrors `Froxel` in froxel.wgsl / `FroxelU` in
+/// post.wgsl). `dims.w` = shared shadow layer; `planes` = near/far ray distance.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FroxelUniform {
+    inv_view_proj: [[f32; 4]; 4],
+    eye_time: [f32; 4],
+    fog_min_density: [f32; 4],
+    fog_max_g: [f32; 4],
+    albedo_beam: [f32; 4],
+    dims: [f32; 4],
+    planes: [f32; 4],
+}
+
+/// Froxel-volumetric resources (GLOWSTONE_FROXEL). A frustum-aligned 3D grid:
+/// `inject` (compute) writes per-cell scatter+extinction into `inject_tex`,
+/// `integrate` (compute) marches +Z into `result_tex`, and a fragment composite
+/// trilinearly samples `result_tex`. Created only when the adapter supports
+/// rgba16float storage textures.
+struct FroxelState {
+    dims: (u32, u32, u32),
+    inject_view: wgpu::TextureView,
+    result_view: wgpu::TextureView,
+    compute_layout: wgpu::BindGroupLayout,
+    inject_pipeline: wgpu::ComputePipeline,
+    integrate_pipeline: wgpu::ComputePipeline,
+    uniform: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    composite_layout: wgpu::BindGroupLayout,
+    composite_pipeline: wgpu::RenderPipeline,
+}
+
+impl FroxelState {
+    fn new(device: &wgpu::Device) -> Self {
+        let dims = (160u32, 90u32, 64u32);
+        let tex = |label| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: dims.0,
+                        height: dims.1,
+                        depth_or_array_layers: dims.2,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D3,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let inject_view = tex("froxel-inject");
+        let result_view = tex("froxel-result");
+        let compute_layout = pipeline::froxel_compute_layout(device);
+        let (inject_pipeline, integrate_pipeline) =
+            pipeline::froxel_compute_pipelines(device, &compute_layout);
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("froxel-uniform"),
+            size: std::mem::size_of::<FroxelUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("froxel-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let composite_layout = pipeline::froxel_composite_layout(device);
+        let composite_pipeline = pipeline::froxel_composite_pipeline(device, &composite_layout);
+        Self {
+            dims,
+            inject_view,
+            result_view,
+            compute_layout,
+            inject_pipeline,
+            integrate_pipeline,
+            uniform,
+            sampler,
+            composite_layout,
+            composite_pipeline,
+        }
+    }
 }
 
 /// One beam as the GPU sees it — a disc spotlight plus its full optical state
@@ -106,21 +258,138 @@ struct PostUniform {
     _pad: [f32; 2],
 }
 
+/// Per-screen GPU content (image / NDI / CITP / pixel-map), cached by screen
+/// index. Procedural walls (solid / test pattern) have no entry and bind the
+/// shared placeholder. `content_key` detects when to re-upload.
+struct ScreenRuntime {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    content_key: u64,
+    size: (u32, u32),
+    /// A small `SUMMARY_W × SUMMARY_H` per-region average of the content (linear
+    /// RGB, texture order: row 0 = top), driving the per-region area-light samples.
+    summary: Vec<[f32; 3]>,
+}
+
+const SUMMARY_W: usize = 8;
+const SUMMARY_H: usize = 4;
+
+/// Tiled light culling (Gem 3): screen-tile size in full-res pixels. The forward
+/// fragment shader and the volumetric raymarch both index this grid to loop only
+/// the beams overlapping their pixel's tile. 32 px is the sweet spot — tight enough
+/// to cull spots hard, coarse enough that the CPU scatter stays sub-millisecond.
+const LIGHT_TILE_PX: u32 = 32;
+/// Below this lit-fixture count, culling is skipped (every tile gets all lights, i.e.
+/// today's brute-force behaviour) — the build/extra-binding overhead isn't worth it.
+const TILE_MIN_LIGHTS: usize = 16;
+
+/// Box-downsample an RGBA8 (sRGB) frame to a `SUMMARY_W × SUMMARY_H` grid of
+/// linear-RGB averages (row 0 = top) for the per-region area-light samples.
+fn summarize_rgba(rgba: &[u8], w: u32, h: u32) -> Vec<[f32; 3]> {
+    let (w, h) = (w as usize, h as usize);
+    let mut out = vec![[0.0f32; 3]; SUMMARY_W * SUMMARY_H];
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return out;
+    }
+    let lin = |c: u8| {
+        let f = c as f32 / 255.0;
+        f * f // cheap sRGB → ~linear
+    };
+    for gy in 0..SUMMARY_H {
+        let y0 = gy * h / SUMMARY_H;
+        let y1 = (((gy + 1) * h / SUMMARY_H).max(y0 + 1)).min(h);
+        for gx in 0..SUMMARY_W {
+            let x0 = gx * w / SUMMARY_W;
+            let x1 = (((gx + 1) * w / SUMMARY_W).max(x0 + 1)).min(w);
+            let (mut r, mut g, mut b, mut n) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let sy = ((y1 - y0) / 4).max(1);
+            let sx = ((x1 - x0) / 4).max(1);
+            let mut yy = y0;
+            while yy < y1 {
+                let mut xx = x0;
+                while xx < x1 {
+                    let o = (yy * w + xx) * 4;
+                    r += lin(rgba[o]);
+                    g += lin(rgba[o + 1]);
+                    b += lin(rgba[o + 2]);
+                    n += 1.0;
+                    xx += sx;
+                }
+                yy += sy;
+            }
+            let inv = 1.0 / n.max(1.0);
+            out[gy * SUMMARY_W + gx] = [r * inv, g * inv, b * inv];
+        }
+    }
+    out
+}
+
+/// Linear-RGB content colour at surface UV `(u, v)` for the area-light samples:
+/// a live/decoded frame uses its downsampled summary; procedural content is
+/// evaluated directly.
+fn screen_light_color(s: &LedScreen, rt: Option<&ScreenRuntime>, u: f32, v: f32) -> [f32; 3] {
+    if let Some(rt) = rt
+        && rt.summary.len() == SUMMARY_W * SUMMARY_H
+    {
+        let gx = (u.clamp(0.0, 0.999) * SUMMARY_W as f32) as usize;
+        // Texture order has row 0 = top, but wall v = 0 is the bottom edge.
+        let gy = ((1.0 - v).clamp(0.0, 0.999) * SUMMARY_H as f32) as usize;
+        return rt.summary[gy * SUMMARY_W + gx];
+    }
+    s.sample_content(u, v)
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
-    start_time: Instant,
+    /// The scene animation clock (seconds) used for ALL time-driven animation —
+    /// volumetric fog drift (`eye_time.w`) and beam/wheel resolve. Set by the
+    /// caller each frame (NOT wall-clock), so it advances with the logical scene
+    /// time and can be FROZEN: a still render holds it fixed across every
+    /// accumulation frame, and a headless capture is deterministic.
+    anim_time: f32,
 
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
 
     line_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
+    /// Depth-only pre-pass + `Equal`-test main pass (cuts the per-fragment light-loop
+    /// overdraw). Gated on light count: only worth its draw overhead when the fragment
+    /// shader is expensive (many lit fixtures). Beauty/Unlit only; Wireframe keeps
+    /// the single Less+write path.
+    mesh_depth_prepass: wgpu::RenderPipeline,
+    mesh_depth_equal: wgpu::RenderPipeline,
     /// Wireframe variant of the mesh pipeline (None if the GPU lacks line polygon mode).
     mesh_wire_pipeline: Option<wgpu::RenderPipeline>,
     lens_pipeline: wgpu::RenderPipeline,
+    /// LED-wall surfaces (emissive textured quads; camera + content bind groups).
+    wall_pipeline: wgpu::RenderPipeline,
+    /// Transparent / mesh LED walls (premultiplied alpha, no depth write).
+    wall_alpha_pipeline: wgpu::RenderPipeline,
+    /// Cold-spark billboard particles (additive, depth-test no-write → bloom).
+    /// CO2 is NOT a particle pass — it's density injected into the volumetric raymarch.
+    spark_pipeline: wgpu::RenderPipeline,
+    /// Selection silhouette: a mask pass marks selected surfaces into a full-res R8
+    /// target (depth-tested, occlusion-correct), then an edge-detect composite adds
+    /// an amber outline into the HDR before bloom. Two mask pipelines cover the two
+    /// instance layouts (MeshInstance: fixtures + scene geometry; WallInstance: LED
+    /// screens). Camera-only pipeline layout (the mask shader reads group 0 only).
+    sel_mask_mesh_pipeline: wgpu::RenderPipeline,
+    sel_mask_wall_pipeline: wgpu::RenderPipeline,
+    sel_outline_pipeline: wgpu::RenderPipeline,
+    /// Bind-group layout for a wall's content texture (group 1).
+    wall_content_layout: wgpu::BindGroupLayout,
+    /// 1×1 placeholder content bound for procedural (solid/test-pattern) walls.
+    wall_placeholder_bg: wgpu::BindGroup,
+    #[allow(dead_code)]
+    wall_placeholder_tex: wgpu::Texture,
+    /// Sampler for wall content textures (linear, clamp).
+    content_sampler: wgpu::Sampler,
+    /// Per-screen content texture cache (image / live frames), keyed by screen index.
+    screen_runtime: HashMap<usize, ScreenRuntime>,
     light_layout: wgpu::BindGroupLayout,
 
     grid_mesh: GpuMesh,
@@ -128,11 +397,22 @@ pub struct Renderer {
     cylinder_mesh: GpuMesh,
     cone_mesh: GpuMesh,
     disc_mesh: GpuMesh,
+    /// Unit quad for LED-wall surfaces.
+    quad_mesh: GpuMesh,
 
     floor_instances: GrowBuffer,
     fixture_instances: GrowBuffer,
     lens_instances: GrowBuffer,
+    wall_instances: GrowBuffer,
     dynamic_lines: GrowBuffer,
+
+    /// Stage pyro (CO2 + cold spark): the CPU particle simulation (runtime-only,
+    /// keyed by EntityId) plus the per-frame additive-spark / alpha-CO2 instance
+    /// buffers it builds. Advanced once per real frame in [`advance_pyro`].
+    pyro: PyroSystem,
+    spark_instances: GrowBuffer,
+    /// CO2 density columns (storage buffer) the volumetric raymarch reads at binding 13.
+    co2_plumes_storage: GrowBuffer,
 
     // Imported GDTF fixture models: per-fixture-type (Arc ptr) cache of part
     // meshes (keyed by model name), plus a per-frame instance buffer.
@@ -171,19 +451,64 @@ pub struct Renderer {
 
     // Per-beam shadow maps for the hero (sharp moving-head) beams.
     shadow: shadow::ShadowMaps,
+    /// Froxel volumetric (GLOWSTONE_FROXEL); `None` if the adapter lacks rgba16float
+    /// storage textures.
+    froxel: Option<FroxelState>,
+    /// Per-pass GPU timing for the perf overlay; `None` if the adapter lacks
+    /// `TIMESTAMP_QUERY` (the overlay then shows only CPU frame-ms + scene counts).
+    gpu_timers: Option<gpu_timer::GpuTimers>,
+    /// Latest per-pass timings + scene counts, read by the perf overlay each frame.
+    pub last_timings: PassTimings,
 
     // Volumetric raymarch (rendered at half resolution, then upsampled).
     volumetric_pipeline: wgpu::RenderPipeline,
     volumetric_layout: wgpu::BindGroupLayout,
     volumetric_uniform: wgpu::Buffer,
+
+    // Temporal accumulation (EMA) of the half-res volumetric — smooths the per-frame
+    // jittered raymarch into a stable, super-sampled beam (no banding/dither).
+    vol_temporal_layout: wgpu::BindGroupLayout,
+    vol_temporal_pipeline: wgpu::RenderPipeline,
+    temporal_uniform: wgpu::Buffer,
+    vol_linear_sampler: wgpu::Sampler,
+    /// Previous frame's camera view-proj (for reprojection) + the accumulation state.
+    prev_view_proj: glam::Mat4,
+    frame_index: u32,
+    /// How many consecutive static frames have accumulated (resets on motion); ramps
+    /// the history weight n/(n+1) up to a cap.
+    accum_frames: u32,
+    /// Hash of last frame's full beam + wheel state — ANY change (pan/tilt, colour,
+    /// dimmer, gobo/prism rotation, scroll) → drop history so moving beams don't ghost.
+    prev_beam_sig: u64,
+    /// Whether last frame actually wrote a valid EMA we can reproject from (false on
+    /// the first frame, after a resize, or a froxel-only frame with no hero raymarch).
+    ema_valid: bool,
+    /// Viewport size last frame; a change recreates the EMA targets (history reset).
+    prev_size: (u32, u32),
     fixtures_storage: GrowBuffer,
+    /// Tiled light culling (Gem 3): per-screen-tile CSR light lists, shared by the
+    /// forward mesh pass and the volumetric raymarch. `tile_offsets[t]..[t+1]` slices
+    /// `tile_lights` into the beam indices overlapping tile `t`. CPU-built each frame.
+    tile_offsets: GrowBuffer,
+    tile_lights: GrowBuffer,
     /// Flattened per-fixture wheel chains (shared by the volumetric + mesh passes).
     wheels_storage: GrowBuffer,
     composite_pipeline: wgpu::RenderPipeline,
+    /// Layout for the depth-aware volumetric composite (vol + sampler + scene depth).
+    composite_upsample_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
     noise_texture: wgpu::Texture,
     noise_view: wgpu::TextureView,
     noise_sampler: wgpu::Sampler,
+    /// Stage-CO2 smoke density grid: the particle sim splats per-emitter density
+    /// into this 3D texture (one `co2_res`-tall Z-slab per emitter, stacked), and
+    /// the volumetric raymarch samples it (see particles.rs / volumetric.wgsl).
+    co2_density_tex: wgpu::Texture,
+    co2_density_view: wgpu::TextureView,
+    co2_density_samp: wgpu::Sampler,
+    /// Current CO2 grid resolution (voxels/axis) — driven by the max visible CO2
+    /// device's quality preset; the texture is recreated when it changes.
+    co2_res: u32,
 
     // Screen-space AO (Unlit mode only): multiply-blended onto the HDR.
     ssao_pipeline: wgpu::RenderPipeline,
@@ -202,11 +527,115 @@ pub struct Renderer {
 
     egui_renderer: egui_wgpu::Renderer,
     pub viewport: Viewport,
+    /// A SEPARATE offscreen target for a deliberate still render (Blender keeps the
+    /// real-time viewport and the F12 render result wholly separate). Created lazily
+    /// at the chosen output resolution — independent of the live `viewport`, so a
+    /// render never disturbs the interactive preview's size or content. `None` when
+    /// no render has run this session.
+    render_view: Option<Viewport>,
+    /// True while recording a high-quality RENDER (still capture / render-view) vs
+    /// the live preview: the CO2 raymarch uses full beam-blocking + multi-tap
+    /// self-shadow when set, and the cheaper preview path when not (the preview-vs-
+    /// render quality split). Routed to `VolumetricUniform.tile.w`.
+    hq_co2: bool,
+    /// The GPU backend this renderer is running on (Metal / Vulkan / DX12 / GL).
+    active_backend: wgpu::Backend,
+    /// Every backend that has a usable adapter on this machine — the options the
+    /// Engine ▸ Backend dropdown offers (a single entry on macOS = Metal).
+    available_backends: Vec<wgpu::Backend>,
+}
+
+/// Human label for a GPU backend — the dropdown text + the on-disk pref token.
+pub fn backend_label(b: wgpu::Backend) -> &'static str {
+    match b {
+        wgpu::Backend::Vulkan => "Vulkan",
+        wgpu::Backend::Metal => "Metal",
+        wgpu::Backend::Dx12 => "DX12",
+        wgpu::Backend::Gl => "OpenGL",
+        wgpu::Backend::BrowserWebGpu => "WebGPU",
+        wgpu::Backend::Noop => "None",
+    }
+}
+
+fn backend_from_label(s: &str) -> Option<wgpu::Backend> {
+    Some(match s {
+        "Vulkan" => wgpu::Backend::Vulkan,
+        "Metal" => wgpu::Backend::Metal,
+        "DX12" => wgpu::Backend::Dx12,
+        "OpenGL" => wgpu::Backend::Gl,
+        "WebGPU" => wgpu::Backend::BrowserWebGpu,
+        _ => return None,
+    })
+}
+
+/// `<config>/gpu-backend.txt` — the machine-global GPU backend preference (read at
+/// startup, before any project loads; per-project prefs can't choose the backend).
+fn gpu_pref_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("build", "glowstone", "glowstone")
+        .map(|d| d.config_dir().join("gpu-backend.txt"))
+}
+
+/// The user's preferred backend, if one was saved (and is parseable).
+pub fn read_gpu_pref() -> Option<wgpu::Backend> {
+    let s = std::fs::read_to_string(gpu_pref_path()?).ok()?;
+    backend_from_label(s.trim())
+}
+
+/// Persist the chosen backend label (takes effect on the next launch).
+pub fn write_gpu_pref(label: &str) {
+    if let Some(p) = gpu_pref_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, label);
+    }
 }
 
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Self {
-        let instance = wgpu::Instance::default();
+        // Backend selection. On Windows the NVIDIA Vulkan driver (581.95) faults the
+        // device the moment we render to / present the swapchain surface — the 3D
+        // offscreen render is fine, but the on-screen surface is unusable, so the
+        // window only ever showed dropped frames. DX12 is the native, stable Windows
+        // backend and sidesteps that driver bug. Elsewhere keep the platform default
+        // (Metal on macOS, Vulkan on Linux). `WGPU_BACKEND` (e.g. =vulkan) overrides.
+        // Enumerate every backend that has a usable adapter on this machine (a
+        // throwaway all-backends instance) — the options for the Backend dropdown.
+        let enum_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let mut available_backends: Vec<wgpu::Backend> = enum_instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .await
+            .iter()
+            .map(|a| a.get_info().backend)
+            .filter(|b| *b != wgpu::Backend::Noop)
+            .collect();
+        available_backends.sort_by_key(|b| *b as u8);
+        available_backends.dedup();
+        drop(enum_instance);
+
+        // Backend selection: a persisted UI preference (if its backend is available)
+        // overrides the platform default; `WGPU_BACKEND` env (.with_env()) still wins.
+        // On Windows the default is DX12 — the NVIDIA Vulkan driver (581.95) faults the
+        // device the moment we present the surface, so the window only showed dropped
+        // frames; DX12 is the native, stable Windows backend.
+        let pref = read_gpu_pref().filter(|b| available_backends.contains(b));
+        let backends = if let Some(b) = pref {
+            wgpu::Backends::from(b)
+        } else if cfg!(target_os = "windows") {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::PRIMARY
+        };
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor {
+                backends,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            }
+            .with_env(),
+        );
 
         // `window` is an Arc<Window>, which is 'static, so the surface is too.
         let surface = instance
@@ -222,6 +651,7 @@ impl Renderer {
             .await
             .expect("no suitable GPU adapter found");
 
+        let active_backend = adapter.get_info().backend;
         log::info!("using adapter: {:?}", adapter.get_info());
 
         // Wireframe viewport mode needs line polygon mode; request it when the
@@ -230,21 +660,48 @@ impl Renderer {
         let wireframe_supported = adapter
             .features()
             .contains(wgpu::Features::POLYGON_MODE_LINE);
-        let required_features = if wireframe_supported {
-            wgpu::Features::POLYGON_MODE_LINE
-        } else {
-            wgpu::Features::empty()
-        };
+        // The froxel volumetric writes HDR scatter into a 3D rgba16float STORAGE
+        // texture from compute; that needs the adapter-specific-format feature
+        // (rgba16float isn't storage-capable in core WebGPU). Confirmed present on
+        // Apple Silicon — when absent we just keep the fragment raymarch.
+        let froxel_supported = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+        // Per-pass GPU timing for the performance overlay. TIMESTAMP_QUERY enables
+        // RenderPass/ComputePass `timestamp_writes` + `resolve_query_set` — all we need
+        // (NOT the INSIDE_ENCODERS/PASSES variants). Opt-in feature; present on Apple
+        // Silicon but absent on some older drivers, so probe + degrade to a CPU-only HUD.
+        let timestamps_supported = adapter
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY);
+        let mut required_features = wgpu::Features::empty();
+        if wireframe_supported {
+            required_features |= wgpu::Features::POLYGON_MODE_LINE;
+        }
+        if froxel_supported {
+            required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
+        if timestamps_supported {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("previz-device"),
+                label: Some("glowstone-device"),
                 required_features,
                 required_limits: wgpu::Limits::default(),
                 ..Default::default()
             })
             .await
             .expect("request device");
+
+        // Diagnostic: log the reason if the device is ever lost (e.g. a GPU hang /
+        // VK_ERROR_DEVICE_LOST). After a loss every resource creation silently
+        // returns an invalid handle — which is what surfaces downstream as
+        // "Texture 'viewport-hdr' is invalid". This tells us the true cause.
+        device.set_device_lost_callback(|reason, msg| {
+            log::error!("WGPU DEVICE LOST ({reason:?}): {msg}");
+        });
 
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
@@ -319,9 +776,72 @@ impl Renderer {
 
         let line_pipeline = pipeline::line_pipeline(&device, &line_layout);
         let mesh_pipeline = pipeline::mesh_pipeline(&device, &mesh_layout);
+        let mesh_depth_prepass = pipeline::mesh_depth_prepass_pipeline(&device, &mesh_layout);
+        let mesh_depth_equal = pipeline::mesh_depth_equal_pipeline(&device, &mesh_layout);
         let mesh_wire_pipeline =
             wireframe_supported.then(|| pipeline::mesh_wire_pipeline(&device, &mesh_layout));
         let lens_pipeline = pipeline::lens_pipeline(&device, &line_layout);
+        // LED walls: camera (group 0) + a per-wall content texture (group 1).
+        let wall_content_layout = pipeline::single_tex_bind_group_layout(&device);
+        let wall_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("wall-pipeline-layout"),
+            bind_group_layouts: &[Some(&camera_bgl), Some(&wall_content_layout)],
+            immediate_size: 0,
+        });
+        let wall_pipeline = pipeline::wall_pipeline(&device, &wall_layout);
+        let wall_alpha_pipeline = pipeline::wall_alpha_pipeline(&device, &wall_layout);
+        // Cold-spark billboard particles: the quad is built in the VS, so they need
+        // only the camera (group 0). (CO2 is volumetric — no particle pipeline.)
+        let spark_pipeline = pipeline::spark_pipeline(&device, &line_layout);
+        // Selection-mask pipelines: camera-only layout (the mask shader reads only
+        // group 0); the same instance buffers as the forward pass feed them.
+        let sel_mask_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sel-mask-pipeline-layout"),
+            bind_group_layouts: &[Some(&camera_bgl)],
+            immediate_size: 0,
+        });
+        let sel_mask_mesh_pipeline = pipeline::mesh_mask_pipeline(&device, &sel_mask_layout);
+        let sel_mask_wall_pipeline = pipeline::wall_mask_pipeline(&device, &sel_mask_layout);
+        let content_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("content-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // 1×1 white placeholder content (procedural walls ignore it in-shader).
+        let wall_placeholder_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("wall-placeholder"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &wall_placeholder_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let wall_placeholder_view = wall_placeholder_tex.create_view(&Default::default());
+        let wall_placeholder_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wall-placeholder-bg"),
+            layout: &wall_content_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&wall_placeholder_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&content_sampler) },
+            ],
+        });
         let sky_pipeline = pipeline::sky_pipeline(&device, &sky_layout);
 
         let world_tex = world::WorldTexture::placeholder(&device, &queue);
@@ -348,12 +868,19 @@ impl Renderer {
             &mesh::cone(0.45, 0.45 * 12.0_f32.to_radians().tan(), 28),
         );
         let disc_mesh = GpuMesh::new(&device, "lens-disc", &mesh::disc(48));
+        let quad_mesh = GpuMesh::new(&device, "led-wall-quad", &mesh::unit_quad(64, 24));
 
         let vertex = wgpu::BufferUsages::VERTEX;
         let inst = std::mem::size_of::<MeshInstance>() as u64;
         let floor_instances = GrowBuffer::new(&device, "floor-instances", vertex, inst);
         let fixture_instances = GrowBuffer::new(&device, "fixture-instances", vertex, inst * 64);
         let lens_instances = GrowBuffer::new(&device, "lens-instances", vertex, inst * 64);
+        let wall_inst = std::mem::size_of::<WallInstance>() as u64;
+        let wall_instances = GrowBuffer::new(&device, "wall-instances", vertex, wall_inst * 8);
+        let part_inst = std::mem::size_of::<ParticleInstance>() as u64;
+        let spark_instances = GrowBuffer::new(&device, "spark-instances", vertex, part_inst * 4096);
+        let co2_plumes_storage =
+            GrowBuffer::new(&device, "co2-plumes", wgpu::BufferUsages::STORAGE, 64 * 16);
         let dynamic_lines = GrowBuffer::new(&device, "dynamic-lines", vertex, 8192);
         let gdtf_instances = GrowBuffer::new(&device, "gdtf-instances", vertex, inst * 32);
         let scene_geom_instances =
@@ -370,12 +897,31 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let vol_temporal_layout = pipeline::vol_temporal_layout(&device);
+        let vol_temporal_pipeline = pipeline::vol_temporal_pipeline(&device, &vol_temporal_layout);
+        let temporal_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("temporal-uniform"),
+            size: std::mem::size_of::<TemporalUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let vol_linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("vol-linear-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let fixtures_storage = GrowBuffer::new(
             &device,
             "fixtures-gpu",
             wgpu::BufferUsages::STORAGE,
             std::mem::size_of::<FixtureGpu>() as u64 * 16,
         );
+        let tile_offsets = GrowBuffer::new(&device, "tile-offsets", wgpu::BufferUsages::STORAGE, 4096);
+        let tile_lights = GrowBuffer::new(&device, "tile-lights", wgpu::BufferUsages::STORAGE, 4096);
         let wheels_storage = GrowBuffer::new(
             &device,
             "wheels-gpu",
@@ -434,6 +980,21 @@ impl Renderer {
             ..Default::default()
         });
 
+        // --- stage CO2 density grid: per-emitter splatted smoke density, stacked
+        // one `res`-tall Z-slab per emitter. Resolution is dynamic (device quality);
+        // recreated by `ensure_co2_res`. Clamp-to-edge + linear, R8 (256 levels). ---
+        let co2_res = particles::CO2_RES_INIT;
+        let (co2_density_tex, co2_density_view) = create_co2_density_texture(&device, co2_res);
+        let co2_density_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("co2-density-samp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         // --- screen-space AO (Unlit mode) ---
         let ssao_layout = pipeline::ssao_bind_group_layout(&device);
         let ssao_pipeline = pipeline::ssao_pipeline(&device, &ssao_layout);
@@ -446,7 +1007,10 @@ impl Renderer {
 
         // --- post (bloom + tonemap) ---
         let single_tex_layout = pipeline::single_tex_bind_group_layout(&device);
-        let composite_pipeline = pipeline::composite_pipeline(&device, &single_tex_layout);
+        // Selection silhouette edge-detect composite (samples the R8 mask).
+        let sel_outline_pipeline = pipeline::sel_outline_pipeline(&device, &single_tex_layout);
+        let composite_upsample_layout = pipeline::composite_upsample_layout(&device);
+        let composite_pipeline = pipeline::composite_pipeline(&device, &composite_upsample_layout);
         let tonemap_layout = pipeline::tonemap_bind_group_layout(&device);
         let (bloom_bright, bloom_blur_h, bloom_blur_v) =
             pipeline::bloom_pipelines(&device, &single_tex_layout);
@@ -482,28 +1046,50 @@ impl Renderer {
 
         let gobo_atlas = atlas::GoboAtlas::new(&device, &queue);
         let shadow = shadow::ShadowMaps::new(&device);
+        let froxel = froxel_supported.then(|| FroxelState::new(&device));
+        let gpu_timers = timestamps_supported.then(|| gpu_timer::GpuTimers::new(&device));
+        let mut last_timings = PassTimings::default();
+        last_timings.gpu_valid = timestamps_supported;
 
         Self {
             surface,
             device,
             queue,
             config,
-            start_time: Instant::now(),
+            anim_time: 0.0,
             camera_buffer,
             camera_bind_group,
             line_pipeline,
             mesh_pipeline,
+            mesh_depth_prepass,
+            mesh_depth_equal,
             mesh_wire_pipeline,
             lens_pipeline,
+            wall_pipeline,
+            wall_alpha_pipeline,
+            spark_pipeline,
+            sel_mask_mesh_pipeline,
+            sel_mask_wall_pipeline,
+            sel_outline_pipeline,
+            wall_content_layout,
+            wall_placeholder_bg,
+            wall_placeholder_tex,
+            content_sampler,
+            screen_runtime: HashMap::new(),
             light_layout,
             grid_mesh,
             floor_mesh,
             cylinder_mesh,
             cone_mesh,
             disc_mesh,
+            quad_mesh,
             floor_instances,
             fixture_instances,
             lens_instances,
+            wall_instances,
+            pyro: PyroSystem::new(),
+            spark_instances,
+            co2_plumes_storage,
             dynamic_lines,
             gdtf_cache: HashMap::new(),
             gdtf_instances,
@@ -519,18 +1105,38 @@ impl Renderer {
             world_loaded: false,
             gobo_atlas,
             shadow,
+            froxel,
+            gpu_timers,
+            last_timings,
             volumetric_pipeline,
             volumetric_layout,
             volumetric_uniform,
+            vol_temporal_layout,
+            vol_temporal_pipeline,
+            temporal_uniform,
+            vol_linear_sampler,
+            prev_view_proj: glam::Mat4::IDENTITY,
+            frame_index: 0,
+            accum_frames: 0,
+            prev_beam_sig: 0,
+            ema_valid: false,
+            prev_size: (0, 0),
             fixtures_storage,
+            tile_offsets,
+            tile_lights,
             wheels_storage,
             composite_pipeline,
+            composite_upsample_layout,
             ssao_pipeline,
             ssao_layout,
             ao_uniform,
             noise_texture,
             noise_view,
             noise_sampler,
+            co2_density_tex,
+            co2_density_view,
+            co2_density_samp,
+            co2_res,
             bloom_bright,
             bloom_blur_h,
             bloom_blur_v,
@@ -541,6 +1147,53 @@ impl Renderer {
             post_sampler,
             egui_renderer,
             viewport,
+            render_view: None,
+            hq_co2: false,
+            active_backend,
+            available_backends,
+        }
+    }
+
+    /// The label of the GPU backend currently in use (e.g. "Metal").
+    pub fn active_backend_label(&self) -> &'static str {
+        backend_label(self.active_backend)
+    }
+
+    /// Labels of every available GPU backend (the Backend dropdown options).
+    pub fn available_backend_labels(&self) -> Vec<String> {
+        self.available_backends
+            .iter()
+            .map(|b| backend_label(*b).to_string())
+            .collect()
+    }
+
+    /// Acquire the next swapchain texture for this frame, or `None` to skip it.
+    ///
+    /// During a window resize the swapchain is transiently out of date — the Vulkan
+    /// backend reports this as `Outdated`, or (on Windows) as `Validation`. We MUST
+    /// NOT try to recover by reconfiguring the surface and re-acquiring within the
+    /// same frame: on NVIDIA Vulkan the first (failed) acquire can leave an acquire
+    /// semaphore pending, and `configure()` then destroys the swapchain while that
+    /// semaphore is in use → "SwapchainAcquireSemaphore still in use" → the driver
+    /// faults the whole device (`VK_ERROR_DEVICE_LOST`). Instead we simply SKIP the
+    /// frame; the next `WindowEvent::Resized` reconfigures the surface to the final
+    /// size (see `resize_surface`) and acquisition self-heals. Skipped frames are
+    /// invisible — the live loop re-arms the next redraw immediately.
+    fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
+        use wgpu::CurrentSurfaceTexture as St;
+        match self.surface.get_current_texture() {
+            St::Success(f) | St::Suboptimal(f) => Some(f),
+            // Reconfigure for a stale swapchain, but DO NOT re-acquire this frame —
+            // re-acquiring after a configure is what faulted the device. Skip; the
+            // next frame (or the next `Resized`) acquires cleanly.
+            St::Outdated | St::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                None
+            }
+            other => {
+                log::debug!("surface not presentable ({other:?}); skipping frame");
+                None
+            }
         }
     }
 
@@ -549,13 +1202,63 @@ impl Renderer {
         if size.0 == 0 || size.1 == 0 {
             return;
         }
-        self.config.width = size.0;
-        self.config.height = size.1;
+        let max = self.device.limits().max_texture_dimension_2d;
+        self.config.width = size.0.min(max);
+        self.config.height = size.1.min(max);
         self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Set the scene animation clock (seconds) used for the next render — fog
+    /// drift + beam/wheel resolve. The caller advances it with the logical scene
+    /// time for the live view, and FREEZES it (a fixed value) for a still render so
+    /// the fog/beams don't drift across the accumulation frames.
+    pub fn set_anim_time(&mut self, t: f32) {
+        self.anim_time = t;
+    }
+
+    /// Advance the stage-pyro particle simulation by `dt` (once per real frame,
+    /// from the app update tick — NEVER from `record_scene`, which also runs for
+    /// headless capture: the double-advance trap, same rule as wheel motion). The
+    /// camera position drives the distance LOD. Reads the per-device control state
+    /// `dmx::decode::apply_pyro` wrote into the scene this frame.
+    pub fn advance_pyro(&mut self, scene: &Scene, cam_pos: Vec3, dt: f32) {
+        // CO2 grid resolution = the crispest (max quality) visible CO2 device wants;
+        // recreate the density texture when it changes, then splat at that res.
+        let res = scene
+            .pyro
+            .iter()
+            .filter(|d| !d.hidden && d.kind == crate::scene::pyro::PyroKind::Co2Jet)
+            .map(|d| particles::quality_res(d.quality))
+            .max()
+            .unwrap_or(particles::CO2_RES_INIT);
+        self.ensure_co2_res(res);
+        self.pyro.advance(scene, cam_pos, self.anim_time, dt, self.co2_res);
+    }
+
+    /// Recreate the CO2 density texture at `res` voxels/axis if it differs from the
+    /// current resolution (the per-frame bind group picks up the new view).
+    fn ensure_co2_res(&mut self, res: u32) {
+        if res == self.co2_res {
+            return;
+        }
+        let (tex, view) = create_co2_density_texture(&self.device, res);
+        self.co2_density_tex = tex;
+        self.co2_density_view = view;
+        self.co2_res = res;
     }
 
     /// Resize the offscreen 3D target to match the viewport panel.
     pub fn resize_viewport(&mut self, size: (u32, u32)) {
+        // The viewport panel always lives INSIDE the window, so its render target can
+        // never legitimately exceed the surface size. egui can transiently report a
+        // huge (or infinite → saturates to `u32::MAX`) `available_size` during a
+        // layout pass around a resize/maximize; clamping to the surface here is a
+        // no-op in normal use (render_scale ≤ 1) but prevents a multi-gigabyte
+        // allocation that OOMs the GPU and yields an invalid texture (→ abort).
+        let size = (
+            size.0.min(self.config.width).max(1),
+            size.1.min(self.config.height).max(1),
+        );
         self.viewport
             .resize(&self.device, &mut self.egui_renderer, size);
     }
@@ -680,20 +1383,9 @@ impl Renderer {
             self.egui_renderer.free_texture(id);
         }
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
-                log::debug!("surface not presentable; skipping frame");
-                return false;
-            }
-            other => {
-                log::warn!("dropping frame: surface status {other:?}");
-                return false;
-            }
+        let frame = match self.acquire_frame() {
+            Some(f) => f,
+            None => return false,
         };
         let surface_view = frame
             .texture
@@ -713,7 +1405,13 @@ impl Renderer {
             screen_descriptor,
         );
 
-        // The 3D scene + volumetrics + post resolve into the LDR target.
+        // The 3D scene + volumetrics + post resolve into the LDR target. The live
+        // viewport uses the cheaper CO2 raymarch UNLESS a visible CO2 device opts into
+        // full-quality preview (`viewport_hq`); renders are always full quality.
+        self.hq_co2 = scene
+            .pyro
+            .iter()
+            .any(|d| !d.hidden && d.kind == crate::scene::pyro::PyroKind::Co2Jet && d.viewport_hq);
         self.record_scene(&mut encoder, scene, camera, selection, settings);
 
         // egui (panels + the viewport image, which samples the LDR target) -> surface.
@@ -748,6 +1446,17 @@ impl Renderer {
             .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
 
+        // Pump the async per-pass GPU-timing readback (reads data 2 frames stale; never
+        // blocks — the submit above services the pending map callbacks).
+        let period = self.queue.get_timestamp_period();
+        let bars = self.gpu_timers.as_mut().map(|t| {
+            t.pump(period);
+            t.bars
+        });
+        if let Some(b) = bars {
+            self.last_timings.passes = b;
+        }
+
         true
     }
 
@@ -776,6 +1485,32 @@ impl Renderer {
         settings: &RenderSettings,
     ) -> (u32, u32, Vec<u8>) {
         let (width, height) = self.viewport.size;
+        // Headless screenshot = a RENDER → full-quality CO2 (GLOWSTONE_CO2_PREVIEW forces
+        // the cheaper preview path so the split can be A/B'd from the same harness).
+        self.hq_co2 = std::env::var("GLOWSTONE_CO2_PREVIEW").is_err();
+
+        // Warm up the temporal accumulation: a single headless frame would show the raw
+        // jittered (dithered) raymarch, so render several static frames first to let the
+        // EMA converge to the same smooth result the interactive viewport reaches.
+        let warmup: u32 = std::env::var("GLOWSTONE_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(28);
+        // Advance the animation clock + pyro sim each warmup frame so the temporal EMA
+        // converges to the SAME moving-content result the live render shows. A frozen
+        // clock converges to a crisp static pattern the real (time-advancing) render
+        // never sees — the verification trap that made smoke look crisper here than live.
+        let dt = 1.0 / 60.0;
+        let eye = camera.eye();
+        for _ in 0..warmup {
+            self.anim_time += dt;
+            self.advance_pyro(scene, eye, dt);
+            let mut warm = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("warm") });
+            self.record_scene(&mut warm, scene, camera, &Selection::default(), settings);
+            self.queue.submit(std::iter::once(warm.finish()));
+        }
 
         let mut encoder = self
             .device
@@ -837,6 +1572,188 @@ impl Renderer {
         (width, height, pixels)
     }
 
+    // --- Offscreen still render (the dedicated F12 render target) --------------
+    //
+    // The deliberate render runs into `render_view`, a SEPARATE target from the live
+    // `viewport`, so it never changes the interactive preview's size or content
+    // (Blender keeps the 3D view and the render result wholly separate). The render
+    // reuses the real pipeline: each frame the job swaps `render_view` in as the
+    // scene target, records ONE frame (so the temporal volumetric EMA converges over
+    // successive frames), and swaps it back — the live viewport is simply not
+    // re-recorded while a render is in flight, so the EMA state is never thrashed
+    // between two targets.
+
+    /// Create or resize the offscreen render target to `size`, clamped only to the
+    /// GPU's max dimension (NOT the window) so a render can exceed the on-screen
+    /// viewport — e.g. a 4K still from a 1080p window.
+    pub fn ensure_render_view(&mut self, size: (u32, u32)) {
+        let max = self.device.limits().max_texture_dimension_2d;
+        let size = (size.0.clamp(1, max), size.1.clamp(1, max));
+        match self.render_view.as_mut() {
+            Some(v) => v.resize(&self.device, &mut self.egui_renderer, size),
+            None => {
+                self.render_view = Some(Viewport::new(&self.device, &mut self.egui_renderer, size));
+            }
+        }
+    }
+
+    /// The egui texture id of the offscreen render target (for the Render tab),
+    /// or `None` if no render target exists yet.
+    pub fn render_view_texture(&self) -> Option<egui::TextureId> {
+        self.render_view.as_ref().map(|v| v.texture_id)
+    }
+
+    /// Record ONE frame of the scene into the offscreen render target (NOT the live
+    /// viewport). Swaps `render_view` into the scene-target slot, records + submits,
+    /// blocks until the GPU finishes, then swaps back. Returns `false` if no render
+    /// target exists. Each call advances the temporal accumulation by one frame.
+    pub fn record_render_view(
+        &mut self,
+        scene: &Scene,
+        camera: &OrbitCamera,
+        settings: &RenderSettings,
+    ) -> bool {
+        // Take the render target OUT so `record_scene` (which needs `&mut self`) can
+        // run with it installed as `self.viewport`, then restore the live viewport.
+        let Some(mut rv) = self.render_view.take() else {
+            return false;
+        };
+        std::mem::swap(&mut self.viewport, &mut rv); // self.viewport := render target; rv := live
+        self.hq_co2 = true; // deliberate render → full-quality CO2 (preview/render split)
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render-view-encoder") });
+        self.record_scene(&mut encoder, scene, camera, &Selection::default(), settings);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        std::mem::swap(&mut self.viewport, &mut rv); // restore: self.viewport := live; rv := render target
+        self.render_view = Some(rv);
+        true
+    }
+
+    /// Read back the offscreen render target's LDR plate to CPU RGBA8 pixels.
+    pub fn read_render_view_ldr(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.render_view.as_ref().map(|v| self.read_ldr(v))
+    }
+
+    /// Drop the offscreen render target, freeing its GPU memory and unregistering
+    /// its egui texture (after a render finishes/cancels). A subsequent render
+    /// lazily recreates it. Safe to call right after a readback (the GPU is idle).
+    pub fn free_render_view(&mut self) {
+        if let Some(v) = self.render_view.take() {
+            self.egui_renderer.free_texture(&v.texture_id);
+        }
+    }
+
+    /// Present an egui frame to the surface WITHOUT re-recording the live 3D scene —
+    /// used while a render is in flight, so the live viewport keeps its last frame
+    /// (frozen, untouched) while the Render tab shows the converging render target.
+    pub fn present_egui_only(
+        &mut self,
+        paint_jobs: &[egui::ClippedPrimitive],
+        textures_delta: &egui::TexturesDelta,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+    ) -> bool {
+        for (id, delta) in &textures_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+        }
+        for id in &textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+        let frame = match self.acquire_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("egui-only-encoder") });
+        let user_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            paint_jobs,
+            screen_descriptor,
+        );
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui-only-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &surface_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            self.egui_renderer.render(&mut pass, paint_jobs, screen_descriptor);
+        }
+        self.queue
+            .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+        frame.present();
+        true
+    }
+
+    /// Read a viewport's LDR target (the tonemapped `Rgba8Unorm` plate) to CPU
+    /// RGBA8 pixels — shared by the live + offscreen readbacks.
+    fn read_ldr(&self, vp: &Viewport) -> (u32, u32, Vec<u8>) {
+        let (width, height) = vp.size;
+        let unpadded = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ldr-readback"),
+            size: padded as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ldr-readback-encoder") });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: vp.ldr_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().expect("map channel").expect("map readback buffer");
+
+        let data = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity(unpadded as usize * height as usize);
+        for row in 0..height as usize {
+            let start = row * padded as usize;
+            pixels.extend_from_slice(&data[start..start + unpadded as usize]);
+        }
+        drop(data);
+        readback.unmap();
+        (width, height, pixels)
+    }
+
     /// Apply an egui textures delta (font atlas, user images) to the egui
     /// renderer — used by the headless UI capture to settle the atlas across
     /// frames before the final paint.
@@ -851,7 +1768,7 @@ impl Renderer {
 
     /// Render the **whole window** — the 3D viewport image + the egui chrome
     /// (panels, menus, dock) — to an offscreen texture and read it back as RGBA8.
-    /// Used by the headless `PREVIZ_UI` path so the interface can be screenshotted
+    /// Used by the headless `GLOWSTONE_UI` path so the interface can be screenshotted
     /// without a visible window (and without Screen-Recording permission). The
     /// caller supplies a tessellated egui frame at size `(w, h)`.
     #[allow(clippy::too_many_arguments)]
@@ -979,6 +1896,115 @@ impl Renderer {
     /// Record the full offscreen 3D frame into `encoder`: forward scene ->
     /// volumetric beams -> bloom -> tonemap into the LDR target. Shared by
     /// [`render`](Self::render) and [`capture`](Self::capture).
+    /// Ensure screen `idx`'s content texture is current. Returns true if a real
+    /// content texture is bound (image / live frame), false for procedural walls
+    /// (solid / test pattern), which bind the placeholder instead.
+    fn ensure_screen_content(&mut self, idx: usize, s: &LedScreen) -> bool {
+        // A live frame (set by the app for pixel-map / NDI / CITP) wins; else
+        // decode an `Image`'s bytes once (cached by the Arc pointer).
+        if let Some(f) = &s.frame {
+            let key = (Arc::as_ptr(f) as usize as u64)
+                ^ f.generation.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.upload_screen_rgba(idx, key, f.width, f.height, &f.rgba);
+            return self.screen_runtime.contains_key(&idx);
+        }
+        if let ScreenContent::Image { bytes, .. } = &s.content {
+            let key = Arc::as_ptr(bytes) as usize as u64;
+            if self.screen_runtime.get(&idx).map(|r| r.content_key) != Some(key) {
+                match image::load_from_memory(bytes) {
+                    Ok(img) => {
+                        let rgba = img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        self.upload_screen_rgba(idx, key, w, h, &rgba);
+                    }
+                    Err(e) => {
+                        log::warn!("LED screen image decode failed: {e}");
+                        self.screen_runtime.remove(&idx);
+                    }
+                }
+            }
+            return self.screen_runtime.contains_key(&idx);
+        }
+        // Procedural (solid / test pattern): no content texture.
+        self.screen_runtime.remove(&idx);
+        false
+    }
+
+    /// Create-or-reuse screen `idx`'s content texture and upload `rgba` (tightly
+    /// packed RGBA8, `w*h*4` bytes) when the content key changes.
+    fn upload_screen_rgba(&mut self, idx: usize, key: u64, w: u32, h: u32, rgba: &[u8]) {
+        let w = w.max(1);
+        let h = h.max(1);
+        let expected = (w as usize) * (h as usize) * 4;
+        if rgba.len() < expected {
+            return; // malformed frame — keep whatever was there
+        }
+        let need_new = self.screen_runtime.get(&idx).map(|r| r.size != (w, h)).unwrap_or(true);
+        if need_new {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("screen-content"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("screen-content-bg"),
+                layout: &self.wall_content_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.content_sampler) },
+                ],
+            });
+            self.screen_runtime.insert(
+                idx,
+                ScreenRuntime {
+                    texture,
+                    bind_group,
+                    content_key: u64::MAX,
+                    size: (w, h),
+                    summary: Vec::new(),
+                },
+            );
+        }
+        let rt = self.screen_runtime.get_mut(&idx).unwrap();
+        // Always upload when the texture was just (re)created, even if `key` happens
+        // to collide with the `u64::MAX` force-upload sentinel.
+        if need_new || rt.content_key != key {
+            rt.summary = summarize_rgba(rgba, w, h);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &rt.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rgba[..expected],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            rt.content_key = key;
+        }
+    }
+
+    /// `timestamp_writes` for a render/compute pass timing query `pair`, or None when
+    /// GPU timestamps are unavailable / the ring slot is busy (the pass just records
+    /// untimed). Used to populate the perf overlay's per-pass bars.
+    fn ts_rp(&self, pair: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.gpu_timers.as_ref().and_then(|t| t.rp(pair))
+    }
+    fn ts_cp(&self, pair: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        self.gpu_timers.as_ref().and_then(|t| t.cp(pair))
+    }
+
     fn record_scene(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -987,7 +2013,7 @@ impl Renderer {
         selection: &Selection,
         settings: &RenderSettings,
     ) {
-        let time = self.start_time.elapsed().as_secs_f32();
+        let time = self.anim_time;
         let aspect = self.viewport.aspect();
 
         // --- world / HDRI environment (reloads the GPU map only when it changes) ---
@@ -997,6 +2023,15 @@ impl Renderer {
         let mut camera_uniform = camera.uniform(aspect);
         camera_uniform.render_mode[0] = settings.mode.shader_code();
         camera_uniform.render_mode[1] = settings.gobo_sharpness.max(0.0); // floor-pool gobo sharpen
+        // Tiled light culling (Gem 3): the mesh fragment reads its screen tile from
+        // render_mode.zw to index the per-tile light list (the volumetric ray uses the
+        // same full-res grid via VolumetricUniform.tile, so floor pool ↔ beam shaft stay
+        // in lock-step). .z/.w were previously unused.
+        let (vw, vh) = self.viewport.size;
+        let tiles_x = vw.div_ceil(LIGHT_TILE_PX).max(1);
+        let tiles_y = vh.div_ceil(LIGHT_TILE_PX).max(1);
+        camera_uniform.render_mode[2] = tiles_x as f32;
+        camera_uniform.render_mode[3] = LIGHT_TILE_PX as f32;
         {
             let w = &scene.world;
             let has = if self.world_loaded { 1.0 } else { 0.0 };
@@ -1045,6 +2080,9 @@ impl Renderer {
         let gdtf_to_world = Mat4::from_rotation_x(-FRAC_PI_2); // GDTF +Z up -> world +Y up
         let mut gdtf_parts: Vec<MeshInstance> = Vec::new();
         let mut gdtf_draws: Vec<(usize, String, u32)> = Vec::new();
+        // (mesh key, part model, base instance, count) — one instanced forward draw per
+        // unique fixture-model part (shared across all fixtures of that GDTF type).
+        let mut gdtf_groups: Vec<(usize, String, u32, u32)> = Vec::new();
         // GDTF fixtures whose models didn't bake get a placeholder cone instead.
         let mut gdtf_placeholders: Vec<MeshInstance> = Vec::new();
         let mut beam_frames: Vec<Vec<fixture_model::BeamFrame>> =
@@ -1064,9 +2102,31 @@ impl Renderer {
             let root = Mat4::from_translation(fixture.position)
                 * Mat4::from_quat(fixture.orientation)
                 * gdtf_to_world;
-            let asm =
-                fixture_model::assemble(&gdtf, fixture.mode_index, root, fixture.pan_actual, fixture.tilt_actual);
-            beam_frames[i] = asm.beams;
+            // BEAM + articulation always come from the fixture's OWN gdtf (its real
+            // optics + mode). The BODY model may be BORROWED from another GDTF (the
+            // Replace dialog's "mesh/model only"): assemble its parts under ITS own
+            // cache key. With `model_src = None` (every normal fixture) this is the
+            // same single assemble + `key` as before — byte-identical, no regression.
+            let mut own = fixture_model::assemble(
+                &gdtf,
+                fixture.mode_index,
+                root,
+                fixture.pan_actual,
+                fixture.tilt_actual,
+                &fixture.cell_pan,
+                &fixture.cell_tilt,
+            );
+            beam_frames[i] = std::mem::take(&mut own.beams);
+            let (asm, key) = match &fixture.model_src {
+                Some(m) => {
+                    let mk = Arc::as_ptr(m) as usize;
+                    self.ensure_gdtf_loaded(mk, m);
+                    // The borrowed BODY model has no per-head data of its own — it's
+                    // just geometry; its axes (if any) follow the fixture-wide angles.
+                    (fixture_model::assemble(m, 0, root, fixture.pan_actual, fixture.tilt_actual, &[], &[]), mk)
+                }
+                None => (own, key),
+            };
             let selected = if selection.contains_fixture(i) { 1.0 } else { 0.0 };
             let drawn_before = gdtf_draws.len();
             for part in &asm.parts {
@@ -1097,6 +2157,29 @@ impl Renderer {
                 });
             }
         }
+        // Regroup parts by (mesh key, model) so all instances of a part across every
+        // fixture of that type are contiguous → one instanced forward+shadow draw per
+        // part. `gdtf_draws` keeps remapped per-part entries for the shadow loop.
+        {
+            let mut order: Vec<usize> = (0..gdtf_draws.len()).collect();
+            order.sort_by(|&a, &b| {
+                gdtf_draws[a].0.cmp(&gdtf_draws[b].0).then_with(|| gdtf_draws[a].1.cmp(&gdtf_draws[b].1))
+            });
+            let mut parts = Vec::with_capacity(gdtf_parts.len());
+            let mut draws = Vec::with_capacity(gdtf_draws.len());
+            for &old in &order {
+                let new_idx = parts.len() as u32;
+                parts.push(gdtf_parts[old]);
+                let (key, model, _) = (gdtf_draws[old].0, gdtf_draws[old].1.clone(), 0u32);
+                draws.push((key, model.clone(), new_idx));
+                match gdtf_groups.last_mut() {
+                    Some((k, m, _, count)) if *k == key && *m == model => *count += 1,
+                    _ => gdtf_groups.push((key, model, new_idx, 1)),
+                }
+            }
+            gdtf_parts = parts;
+            gdtf_draws = draws;
+        }
         self.gdtf_instances
             .upload(&self.device, &self.queue, &gdtf_parts);
         let gdtf_placeholder_count = self
@@ -1111,6 +2194,8 @@ impl Renderer {
         // (mesh key, instance index, world-space AABB) — the AABB frustum-culls the
         // draw out of shadow passes (and the camera-frustum forward pass).
         let mut scene_geom_draws: Vec<(usize, u32, Vec3, Vec3)> = Vec::new();
+        // (mesh key, base instance, count) — one instanced forward draw per unique mesh.
+        let mut scene_geom_groups: Vec<(usize, u32, u32)> = Vec::new();
         let mut total_models = 0usize;
         for (oi, obj) in scene.geometry.iter().enumerate() {
             if obj.hidden {
@@ -1147,7 +2232,29 @@ impl Renderer {
                 }
             }
         }
-        if std::env::var("PREVIZ_GEOM_STATS").is_ok() {
+        // Regroup instances by mesh key so identical static meshes are contiguous in
+        // the buffer → ONE instanced forward draw per unique mesh instead of one per
+        // instance (the dominant FOH draw-call cost). `scene_geom_draws` keeps a
+        // per-instance entry (with REMAPPED idx) for the per-beam shadow LOD cull.
+        {
+            let mut order: Vec<usize> = (0..scene_geom_draws.len()).collect();
+            order.sort_by_key(|&i| scene_geom_draws[i].0); // stable by mesh key
+            let mut inst = Vec::with_capacity(scene_geom_instances.len());
+            let mut draws = Vec::with_capacity(scene_geom_draws.len());
+            for &old in &order {
+                let new_idx = inst.len() as u32;
+                inst.push(scene_geom_instances[old]);
+                let (key, _, lo, hi) = scene_geom_draws[old];
+                draws.push((key, new_idx, lo, hi));
+                match scene_geom_groups.last_mut() {
+                    Some((k, _, count)) if *k == key => *count += 1,
+                    _ => scene_geom_groups.push((key, new_idx, 1)),
+                }
+            }
+            scene_geom_instances = inst;
+            scene_geom_draws = draws;
+        }
+        if std::env::var("GLOWSTONE_GEOM_STATS").is_ok() {
             let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
             for (k, _, _, _) in &scene_geom_draws {
                 *keys.entry(*k).or_default() += 1;
@@ -1189,6 +2296,9 @@ impl Renderer {
         // --- dynamic lines: fog-box wireframes + beam indicators ---
         let mut lines: Vec<LineVertex> = Vec::new();
         for (i, env) in scene.environments.iter().enumerate() {
+            if env.hidden {
+                continue; // outliner eye: a hidden fog box draws no wireframe
+            }
             let color = if selection.environment == Some(i) {
                 [0.6, 0.95, 1.0]
             } else {
@@ -1219,11 +2329,159 @@ impl Renderer {
                 push_selection_gizmo(&mut lines, (lo + hi) * 0.5);
             }
         }
+        // Infinite axis-constraint line (Blender style): when a modal transform has
+        // an axis locked, draw a long coloured line through the pivot so the user can
+        // see the constraint. The UI threads `(pivot, colour, dir)` via the
+        // (runtime-only) `axis_hint` field on RenderSettings.
+        if let Some((pivot, color, dir)) = settings.axis_hint {
+            let dir = dir.normalize_or_zero();
+            if dir != Vec3::ZERO {
+                let half = camera.zfar * 0.9;
+                lines.push(LineVertex { position: (pivot - dir * half).to_array(), color });
+                lines.push(LineVertex { position: (pivot + dir * half).to_array(), color });
+            }
+        }
         let line_count = self.dynamic_lines.upload(&self.device, &self.queue, &lines);
 
-        // --- volumetric uniforms + fixtures (use the first fog box, if any) ---
-        let fog = scene.environments.first();
-        let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false);
+        // --- volumetric uniforms + fixtures (use the first VISIBLE fog box, if any) ---
+        // Outliner eye: skip hidden fog boxes so toggling a fog volume's visibility
+        // actually removes its haze, not just the wireframe.
+        let fog = scene.environments.iter().find(|e| !e.hidden);
+        // GLOWSTONE_NOVOL disables ALL volumetric work (raymarch + froxel) — a bisection
+        // kill-switch for the Windows/Vulkan device-loss hunt.
+        let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false)
+            && std::env::var("GLOWSTONE_NOVOL").is_err();
+        // Haze uniformity (1 smooth … 0 clustered). Drives the density-noise contrast
+        // AND the temporal history cap below: at low uniformity the user WANTS to see the
+        // moving smoke clusters, so we hold less history (let them live) instead of
+        // smearing them into a smooth average.
+        let fog_uniformity = fog.map(|f| f.uniformity).unwrap_or(1.0);
+
+        // --- stage CO2 plumes: density injected into the raymarch (see particles.rs) ---
+        // Build/upload the density columns; their union AABB EXTENDS the march bounds,
+        // so a tall plume isn't clipped by a small (or absent) fog box. CO2 makes the
+        // volumetric pass run even with no haze box — it's its own participating media,
+        // lit by every beam that scatters through it (the proven volumetric look).
+        // Each active emitter's splatted density grid is written into its own
+        // Z-slab of co2_density_tex; the descriptor (AABB + layer) goes to the
+        // storage buffer the raymarch loops.
+        let res = self.co2_res;
+        let grid_voxels = (res * res * res) as usize;
+        let mut scratch = vec![0u8; grid_voxels];
+        let mut co2_upload: Vec<particles::Co2Volume> = Vec::new();
+        for (layer, &id) in self
+            .pyro
+            .co2_ids
+            .iter()
+            .enumerate()
+            .take(particles::CO2_LAYERS as usize)
+        {
+            let Some(grid) = self.pyro.co2_grid(id) else {
+                continue;
+            };
+            if grid.len() != grid_voxels {
+                continue; // sim hasn't re-splatted at the new res yet (next frame will)
+            }
+            for (o, d) in grid.iter().enumerate() {
+                scratch[o] = (d.clamp(0.0, 1.0) * 255.0) as u8;
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.co2_density_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer as u32 * res,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &scratch,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(res),
+                    rows_per_image: Some(res),
+                },
+                wgpu::Extent3d {
+                    width: res,
+                    height: res,
+                    depth_or_array_layers: res,
+                },
+            );
+            let mut v = self.pyro.co2_vol[layer];
+            v.box_size[3] = layer as f32; // texture Z-slab layer index for the shader
+            co2_upload.push(v);
+        }
+        let has_co2 = !co2_upload.is_empty() && settings.mode == ViewportMode::Beauty;
+        // Media (raymarch) bounds + look = the fog box, UNIONed with the plume AABBs.
+        let mut media_min = fog.map(|f| f.min()).unwrap_or(Vec3::splat(f32::INFINITY));
+        let mut media_max = fog.map(|f| f.max()).unwrap_or(Vec3::splat(f32::NEG_INFINITY));
+        for v in &co2_upload {
+            let lo = Vec3::from_slice(&v.box_min[..3]);
+            media_min = media_min.min(lo);
+            media_max = media_max.max(lo + Vec3::from_slice(&v.box_size[..3]));
+        }
+        if co2_upload.is_empty() {
+            co2_upload.push(particles::Co2Volume::zeroed()); // keep the storage binding non-empty
+        }
+        let co2_n = self
+            .co2_plumes_storage
+            .upload(&self.device, &self.queue, &co2_upload);
+        let media_density = fog.map(|f| f.density).unwrap_or(0.0);
+        let media_color = fog.map(|f| f.color).unwrap_or([1.0, 1.0, 1.0]);
+        let media_g = fog.map(|f| f.anisotropy).unwrap_or(0.4);
+        let media_contrast = fog.map(|f| f.cluster_contrast).unwrap_or(0.0);
+        // Run the volumetric pass when there's haze OR active CO2.
+        let has_media = has_fog || has_co2;
+
+        // Hybrid froxel volumetric — opt-in (off by default; the per-pixel raymarch
+        // is the default renderer). Enabled only when the adapter supports it and the
+        // user turns it on (settings toggle), or GLOWSTONE_NOFROXEL is unset.
+        let use_froxel = has_fog
+            && self.froxel.is_some()
+            && settings.froxel_volumetric
+            && std::env::var("GLOWSTONE_NOFROXEL").is_err();
+
+        // --- LED-wall surfaces: prepare each wall's content texture (image / live
+        // frame), then build ONE emissive quad instance per visible screen (the
+        // whole wall, never per-pixel). `wall_draws[j]` = the screen index for
+        // instance j, so the forward pass can bind the right content texture. ---
+        self.screen_runtime.retain(|&k, _| k < scene.screens.len());
+        let mut wall_instances: Vec<WallInstance> = Vec::with_capacity(scene.screens.len());
+        // (screen index, is_transparent) per drawn wall instance.
+        let mut wall_draws: Vec<(usize, bool)> = Vec::new();
+        for (i, s) in scene.screens.iter().enumerate() {
+            if s.hidden {
+                continue;
+            }
+            let res = s.resolution();
+            let textured = self.ensure_screen_content(i, s);
+            let (kind, tp, solid) = if textured {
+                (2.0, 0.0, [0.0; 3]) // sample the content texture
+            } else {
+                match &s.content {
+                    ScreenContent::SolidColor(c) => (0.0, 0.0, *c),
+                    ScreenContent::TestPattern(p) => (1.0, p.code(), [0.0; 3]),
+                    // Live/image content with no frame yet → a "no signal" grid.
+                    _ => (1.0, 0.0, [0.0; 3]),
+                }
+            };
+            // nits → HDR scale (1500 nits ≈ reference white): white content sits
+            // near paper-white and only bright/over-driven walls bloom — a screen
+            // displays its content tones, it is not a beam.
+            let nits_scale = (s.nits / 1500.0).clamp(0.05, 6.0) * 1.25;
+            let seam = if s.gap_mm > 0.0 { 0.06 } else { 0.015 };
+            wall_instances.push(WallInstance {
+                model: s.surface_matrix().to_cols_array_2d(),
+                grid: [res[0] as f32, res[1] as f32, s.panels_wide as f32, s.panels_high as f32],
+                color: [solid[0], solid[1], solid[2], nits_scale],
+                look: [kind, tp, s.opacity, if selection.contains_screen(i) { 1.0 } else { 0.0 }],
+                extra: [s.gamma, seam, s.curvature_deg.to_radians(), s.pixel_shape.code()],
+            });
+            wall_draws.push((i, s.opacity < 0.99));
+        }
+        self.wall_instances.upload(&self.device, &self.queue, &wall_instances);
+
         // Resolve each fixture's optics → its GPU beams (per lit emitter, per
         // prism facet; uniform LED arrays collapse to one aggregate). The
         // shaders loop `arrayLength(&fixtures)`, so the expansion is
@@ -1235,7 +2493,7 @@ impl Renderer {
         // Per-fixture wheel chains, flattened into one buffer; each FixtureGpu
         // indexes its slice via cookie_r.w (offset) + cookie_u.w (count).
         let mut gpu_wheels: Vec<WheelGpu> = Vec::new();
-        let beam_dump = std::env::var("PREVIZ_BEAM_DUMP").is_ok();
+        let beam_dump = std::env::var("GLOWSTONE_BEAM_DUMP").is_ok();
         for (i, f) in scene.fixtures.iter().enumerate() {
             if f.hidden {
                 continue;
@@ -1287,22 +2545,28 @@ impl Renderer {
         });
         // Shadows only matter in the lit Beauty view (unlit/wireframe skip lighting).
         let max_shadows = if settings.mode == ViewportMode::Beauty
-            && std::env::var("PREVIZ_NOSHADOW").is_err()
+            && std::env::var("GLOWSTONE_NOSHADOW").is_err()
         {
-            shadow::MAX
+            // Capped by the user's `shadow_max` lever (each hero map is a depth pass,
+            // ~2-3 ms at Retina) — can only reduce below the atlas-sized `shadow::MAX`.
+            (settings.shadow_max as usize).min(shadow::MAX)
         } else {
             0
         };
-        let mut sample_mats: Vec<[[f32; 4]; 4]> = Vec::with_capacity(max_shadows);
+        // sample_mats holds ALL atlas layers (heroes 0..n_shadows + the shared
+        // occluder at shadow::SHARED); identity for the unused middle slots.
+        let mut sample_mats: Vec<[[f32; 4]; 4]> =
+            vec![Mat4::IDENTITY.to_cols_array_2d(); shadow::LAYERS];
         let mut shadowed_fixtures: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut n_shadows = 0usize;
         for fi in shadow_order {
-            if sample_mats.len() >= max_shadows {
+            if n_shadows >= max_shadows {
                 break;
             }
             if !shadowed_fixtures.insert(beam_fixture[fi]) {
                 continue;
             }
-            let layer = sample_mats.len();
+            let layer = n_shadows;
             let f = &gpu_fixtures[fi];
             let origin = Vec3::new(f.pos_range[0], f.pos_range[1], f.pos_range[2]);
             let bdir = Vec3::new(f.dir_cos[0], f.dir_cos[1], f.dir_cos[2]);
@@ -1326,17 +2590,264 @@ impl Renderer {
                 layer as u64 * self.shadow.align,
                 bytemuck::bytes_of(&cols),
             );
-            sample_mats.push(cols);
+            sample_mats[layer] = cols;
             gpu_fixtures[fi].misc[3] = layer as f32;
+            n_shadows += 1;
         }
-        let n_shadows = sample_mats.len();
-        if !sample_mats.is_empty() {
+
+        // SHARED occluder: ONE ortho depth pass fit to the union of every lit beam's
+        // volume, used as the fallback occluder for every NON-hero beam. DISABLED by
+        // default (opt-in via GLOWSTONE_SHARED): the single mean-direction projection stamped
+        // a truss/set into the fog of EVERY non-hero beam — including beams whose path
+        // never crosses it — producing phantom occluder outlines in the haze (occlusion is
+        // per-light-to-sample, which one shared direction can't represent). Dropping it
+        // means non-hero beams just don't self-occlude mid-air (hero beams keep correct
+        // per-beam shadows); zero phantoms, and it reclaims the pass (~0.5 ms). A future
+        // direction-binned version could restore correct occlusion for all beams.
+        let mut shared_layer = -1i32;
+        if max_shadows > 0 && std::env::var("GLOWSTONE_SHARED").is_ok() {
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            let mut mean_dir = Vec3::ZERO;
+            let mut any = false;
+            for f in &gpu_fixtures {
+                if f.dir_cos[3] <= 1e-4 {
+                    continue;
+                }
+                let o = Vec3::new(f.pos_range[0], f.pos_range[1], f.pos_range[2]);
+                let d = Vec3::new(f.dir_cos[0], f.dir_cos[1], f.dir_cos[2]);
+                let r = f.pos_range[3].min(50.0);
+                lo = lo.min(o).min(o + d * r);
+                hi = hi.max(o).max(o + d * r);
+                mean_dir += d;
+                any = true;
+            }
+            if any {
+                let dir = if mean_dir.length_squared() > 1e-6 {
+                    mean_dir.normalize()
+                } else {
+                    Vec3::NEG_Y
+                };
+                let center = (lo + hi) * 0.5;
+                let radius = ((hi - lo).length() * 0.5).max(1.0);
+                let eye = center - dir * (radius + 5.0);
+                let up = if dir.y.abs() > 0.95 { Vec3::Z } else { Vec3::Y };
+                let vp = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 2.0 + 10.0)
+                    * Mat4::look_to_rh(eye, dir, up);
+                let cols = vp.to_cols_array_2d();
+                self.queue.write_buffer(
+                    &self.shadow.render_matrices,
+                    shadow::SHARED as u64 * self.shadow.align,
+                    bytemuck::bytes_of(&cols),
+                );
+                sample_mats[shadow::SHARED] = cols;
+                shared_layer = shadow::SHARED as i32;
+            }
+        }
+        if n_shadows > 0 || shared_layer >= 0 {
             self.queue
                 .write_buffer(&self.shadow.sample_matrices, 0, bytemuck::cast_slice(&sample_mats));
         }
 
+        // --- LED walls as cheap, blurred area lights. One wide, soft "beam" per
+        // screen coloured by the wall's AVERAGE (summary) colour — the wall's
+        // entire contribution to surface lighting + volumetric haze, never
+        // per-pixel (docs/RESEARCH-led-ndi.md). Appended AFTER shadow selection so
+        // a wall never consumes a hero shadow map; the wide cone + plain sentinel
+        // keep it nearly free (the radial pre-cull rejects off-axis samples). ---
+        for (si, s) in scene.screens.iter().enumerate() {
+            if s.hidden || s.emit <= 0.0 {
+                continue;
+            }
+            let nits_gain = (s.nits / 1500.0).clamp(0.05, 6.0);
+            let total = s.emit * 0.45 * nits_gain;
+            let normal = s.world_normal();
+            if total <= 1e-4 || normal.length_squared() < 1e-6 {
+                continue;
+            }
+            let right = s.transform.x_axis.truncate().normalize_or_zero();
+            let up_axis = s.transform.y_axis.truncate().normalize_or_zero();
+            // Aim the wash forward AND slightly down so it lights the floor + haze
+            // IN FRONT of the wall (a flat normal alone never reaches the floor).
+            let dir = (normal - up_axis * 0.35).normalize_or_zero();
+            let up = right.cross(dir).normalize_or_zero();
+            let [w, h] = s.size_m();
+            let surf = s.surface_matrix();
+            // Sample a small grid of emitters ACROSS the screen face, each coloured
+            // by the content at that region — so a gradient/bars wall throws the
+            // RIGHT COLOURS into the haze and reads as a broad AREA source, not one
+            // point. More horizontal samples on wider walls. (`emit` scales it.)
+            // More, tighter emitters so each region's colour stays LOCALISED in
+            // front of it (wide overlapping cones would blend red+green+blue → white).
+            let aspect = (w / h.max(1e-3)).max(0.2);
+            let nx = ((aspect * 3.0).round() as i32).clamp(3, 10);
+            let ny: i32 = 2;
+            let per = total / (nx * ny) as f32;
+            let lens_r = (0.5 * w / nx as f32).clamp(0.15, 0.7);
+            // Narrow cone so adjacent colours don't all overlap into a white wash.
+            let tan_half = (1.4 * w / nx as f32 / (h * 2.0)).clamp(0.18, 0.45);
+            let range = (h * 2.0).max(4.0);
+            let rt = self.screen_runtime.get(&si);
+            for j in 0..ny {
+                for i in 0..nx {
+                    let u = (i as f32 + 0.5) / nx as f32;
+                    let v = (j as f32 + 0.5) / ny as f32;
+                    let c = screen_light_color(s, rt, u, v);
+                    let p = surf.transform_point3(Vec3::new(u - 0.5, v - 0.5, 0.0));
+                    gpu_fixtures.push(FixtureGpu {
+                        pos_range: [p.x, p.y, p.z, range],
+                        dir_cos: [dir.x, dir.y, dir.z, tan_half], // localized forward cone
+                        color: [c[0] * per, c[1] * per, c[2] * per, lens_r],
+                        cookie_r: [right.x, right.y, right.z, 0.0], // no wheel chain
+                        cookie_u: [up.x, up.y, up.z, 0.0],
+                        extra: [-1.0, 0.0, -1.0, 0.0], // no anim; plain; NO white wash
+                        shape: [1.0, 0.0, 1.0, 0.0],   // n_order, focus, IRIS OPEN, frost
+                        misc: [0.0, 0.0, 0.0, -1.0],   // no CA/laser/atlas; no shadow
+                        cmyf: [0.0, 0.0, 0.0, 1.2],    // wash → blurred
+                    });
+                }
+            }
+        }
+
         self.fixtures_storage
             .upload(&self.device, &self.queue, &gpu_fixtures);
+
+        // --- tiled light culling (Gem 3) ---
+        // Bucket each beam's screen-projected cull cone into a 2D tile grid so the
+        // forward light loop AND the volumetric raymarch each iterate only the beams
+        // overlapping their pixel's tile, not all N. CPU-built (cheap at this fixture
+        // count), CSR-packed (`tile_offsets`/`tile_lights`), uploaded like fixtures.
+        // CONSERVATIVE by construction: a beam lands in a tile iff its cull cone — using
+        // the EXACT shader cull radius (mesh.wgsl/volumetric.wgsl `cull`) — could light
+        // any pixel there, and the per-light gates still run in-shader, so a tiled light
+        // is only ever extra work, never a dropped contributor. Wide beams (covering most
+        // of the screen) go in a global prefix every tile scans, keeping spot lists tight.
+        // GLOWSTONE_NOCULL forces the all-lights fallback (the pixel-identity test harness).
+        // `avg_tile_beams` (set in the block) = the beams an average ray actually marches;
+        // the volumetric step budget divides by THIS, not the full count, so culling's freed
+        // per-ray budget is spent on more march steps (the banding fix) — see the fog block.
+        let mut avg_tile_beams = gpu_fixtures.len().max(1);
+        {
+            let n_tiles = (tiles_x * tiles_y) as usize;
+            let view_proj = camera.view_proj(aspect);
+            let eye = camera.eye();
+            // The 8-point ring INSCRIBES the cull disc, reaching only cos(π/8)≈0.924·r
+            // between vertices; scale it up so the octagon CIRCUMSCRIBES the disc (its
+            // edges touch r) — otherwise the screen AABB under-covers the projected disc
+            // and an edge fragment lands in an unscattered tile (a beam pop).
+            const RING_CIRCUM: f32 = 1.082_392_3; // 1/cos(π/8)
+            let build_tiles = gpu_fixtures.len() >= TILE_MIN_LIGHTS
+                && std::env::var("GLOWSTONE_NOCULL").is_err();
+            let mut wide: Vec<u32> = Vec::new();
+            let mut per_tile: Vec<Vec<u32>> = vec![Vec::new(); n_tiles];
+            let to_screen = |p: Vec3| -> Option<(f32, f32)> {
+                let clip = view_proj * p.extend(1.0);
+                if clip.w <= 1e-4 {
+                    return None; // at/behind the near plane — unbounded screen extent
+                }
+                let nx = clip.x / clip.w;
+                let ny = clip.y / clip.w;
+                // NDC → framebuffer px (y flipped, matching the volumetric duv mapping).
+                Some(((nx * 0.5 + 0.5) * vw as f32, (0.5 - ny * 0.5) * vh as f32))
+            };
+            for (i, fx) in gpu_fixtures.iter().enumerate() {
+                let idx = i as u32;
+                let range = fx.pos_range[3];
+                let tan_half = fx.dir_cos[3];
+                if !build_tiles || range <= 0.0 || tan_half <= 0.0 {
+                    wide.push(idx); // disabled/degenerate or culling off → everywhere
+                    continue;
+                }
+                let lpos = Vec3::new(fx.pos_range[0], fx.pos_range[1], fx.pos_range[2]);
+                let bdir = Vec3::new(fx.dir_cos[0], fx.dir_cos[1], fx.dir_cos[2]);
+                let right = Vec3::new(fx.cookie_r[0], fx.cookie_r[1], fx.cookie_r[2]);
+                let up = Vec3::new(fx.cookie_u[0], fx.cookie_u[1], fx.cookie_u[2]);
+                let lens_r = fx.color[3];
+                let iris = fx.shape[2];
+                let n_order = fx.shape[0];
+                let ca = fx.misc[0];
+                // The SHADER's conservative cull multiplier (mesh.wgsl / volumetric.wgsl).
+                let k = 2.5 + ca.abs() + (2.0 - n_order.clamp(1.0, 2.0));
+                // Camera inside/near this beam's cone → its projected silhouette wraps or
+                // explodes under perspective and the sampled-ring AABB can't bound it
+                // (the inter-slice bulge the reviewer flagged). Mark it wide — both correct
+                // and cheap, since such a beam genuinely floods most of the view anyway.
+                let rel_eye = eye - lpos;
+                let along = rel_eye.dot(bdir).clamp(0.0, range);
+                let perp = (rel_eye - bdir * along).length();
+                if perp < (lens_r + along * tan_half) * iris * k * 2.5 {
+                    wide.push(idx);
+                    continue;
+                }
+                let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+                let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                let mut cover_all = false;
+                // 9 axial slices (vs the cone widening linearly) bound the inter-slice
+                // perspective bulge; the circumscribed ring bounds each disc.
+                'depths: for sd in 0..9 {
+                    let d = (sd as f32) / 8.0 * range;
+                    let center = lpos + bdir * d;
+                    let r = (lens_r + d * tan_half) * iris * k * RING_CIRCUM; // cull radius at d
+                    for s in 0..8 {
+                        let a = std::f32::consts::TAU * (s as f32) / 8.0;
+                        let p = center + (right * a.cos() + up * a.sin()) * r;
+                        match to_screen(p) {
+                            Some((sx, sy)) => {
+                                min_x = min_x.min(sx);
+                                min_y = min_y.min(sy);
+                                max_x = max_x.max(sx);
+                                max_y = max_y.max(sy);
+                            }
+                            None => {
+                                cover_all = true;
+                                break 'depths;
+                            }
+                        }
+                    }
+                }
+                if cover_all || !min_x.is_finite() {
+                    wide.push(idx);
+                    continue;
+                }
+                let tpx = LIGHT_TILE_PX as f32;
+                let txi = tiles_x as i32;
+                let tyi = tiles_y as i32;
+                let tx0 = ((min_x / tpx).floor() as i32 - 1).clamp(0, txi - 1);
+                let tx1 = ((max_x / tpx).floor() as i32 + 1).clamp(0, txi - 1);
+                let ty0 = ((min_y / tpx).floor() as i32 - 1).clamp(0, tyi - 1);
+                let ty1 = ((max_y / tpx).floor() as i32 + 1).clamp(0, tyi - 1);
+                // Spans most of the screen → cheaper as a wide light (one shared block
+                // every tile scans) than scattered into ~every per-tile list.
+                if ((tx1 - tx0 + 1) * 2 >= txi) && ((ty1 - ty0 + 1) * 2 >= tyi) {
+                    wide.push(idx);
+                    continue;
+                }
+                for ty in ty0..=ty1 {
+                    let row = (ty as u32 * tiles_x) as usize;
+                    for tx in tx0..=tx1 {
+                        per_tile[row + tx as usize].push(idx);
+                    }
+                }
+            }
+            // Flatten to CSR: each tile's slice is [wide-prefix..., its narrow beams].
+            let mut offsets: Vec<u32> = Vec::with_capacity(n_tiles + 1);
+            let mut flat: Vec<u32> = Vec::with_capacity(n_tiles * wide.len() + 64);
+            offsets.push(0);
+            for tile in &per_tile {
+                flat.extend_from_slice(&wide);
+                flat.extend_from_slice(tile);
+                offsets.push(flat.len() as u32);
+            }
+            if flat.is_empty() {
+                flat.push(0); // storage buffers can't bind 0 bytes
+            }
+            self.tile_offsets.upload(&self.device, &self.queue, &offsets);
+            self.tile_lights.upload(&self.device, &self.queue, &flat);
+            // Beams an average ray marches (wide prefix + tile-local). Drives the
+            // volumetric step budget below.
+            avg_tile_beams = (flat.len() / n_tiles).max(1);
+        }
+
         // Keep the storage binding non-empty (≥1 element) even with no wheels.
         if gpu_wheels.is_empty() {
             gpu_wheels.push(WheelGpu::zeroed());
@@ -1347,7 +2858,7 @@ impl Renderer {
             .lens_instances
             .upload(&self.device, &self.queue, &lens_instances);
 
-        if let Some(fog) = fog {
+        if has_media {
             let inv_vp = camera.view_proj(aspect).inverse();
             let eye = camera.eye();
             // Constant-dt target for the raymarch: a full-diagonal ray spends the
@@ -1360,30 +2871,139 @@ impl Renderer {
             // haze density, so no dither and no banding) — while a busy many-beam rig
             // floors out for frame rate. `target_dt` is derived from the cap so the
             // extra steps actually apply (a full-box ray then takes `step_cap` samples).
-            let nbeams = gpu_fixtures.len().max(1);
-            let budget = settings.steps.max(64) as f32 * 6.0;
-            let step_cap = (budget / nbeams as f32).clamp(64.0, 176.0);
-            let target_dt = (fog.max() - fog.min()).length() / step_cap;
+            // In HYBRID mode the raymarch only marches the few hero beams (the froxel
+            // carries the rest), so divide the step budget by the hero count, not all
+            // beams → each hero gets MANY steps = crisp, smooth shafts.
+            // Step budget divides by the beams a ray ACTUALLY marches. Pre-tiling that
+            // was all N (so a 168-beam rig floored at 40 steps → bad longitudinal banding
+            // in a big fog box, worst during camera motion when temporal can't accumulate).
+            // Tiled culling means a ray now marches only its tile's beams (avg_tile_beams),
+            // so the SAME per-ray beam cost buys far more steps — spend that on step count
+            // (the ghost-free banding fix; raising temporal history instead would smear,
+            // since the volumetric reprojects against scene depth, not the mid-air haze).
+            // Isolated beams (sparse tiles → where banding reads most) get the most steps.
+            let march_beams = if use_froxel {
+                n_shadows.max(1)
+            } else {
+                avg_tile_beams
+            };
+            // Per-ray work budget in beam-samples (steps × beams-marched). Pre-tiling a ray
+            // marched all N beams, so this budget floored the step count (40) and the big
+            // fog box banded; now a ray marches only `avg_tile_beams`, so the same budget
+            // buys ~N/avg× more steps — spent on killing the banding (and the motion flicker,
+            // since a denser per-frame march bands far less when temporal can't accumulate).
+            // Stays well under the pre-tiling per-ray cost. Scale with the `steps` quality knob.
+            let beam_sample_budget = settings.steps.max(40) as f32 * 40.0;
+            let step_cap = (beam_sample_budget / march_beams as f32).clamp(64.0, 176.0);
+            let target_dt = (media_max - media_min).length() / step_cap;
+            // Ambient stage colour the white CO2 reflects: the intensity-weighted
+            // average HUE of the beams (a cyan rig → a dim-cyan plume), neutral-cool
+            // fallback when dark. Thick white smoke reads DIM in this, with bright
+            // beam highlights layered on by the scatter loop.
+            let mut amb_col = Vec3::ZERO;
+            let mut amb_w = 0.0_f32;
+            for fxg in &gpu_fixtures {
+                let c = Vec3::new(fxg.color[0], fxg.color[1], fxg.color[2]);
+                let m = c.max_element();
+                if m > 1e-3 {
+                    let wgt = m.min(50.0);
+                    amb_col += (c / m) * wgt;
+                    amb_w += wgt;
+                }
+            }
+            let amb_hue = if amb_w > 1e-3 {
+                amb_col / amb_w
+            } else {
+                Vec3::new(0.70, 0.78, 0.92)
+            };
+            // Ambient STRENGTH from the scene's actual ambient light (world IBL + how
+            // lit the room is by beams) — a dark stage gives dark smoke, a bright one
+            // brighter (not a fixed value). Kept modest: thick white smoke reads DIM
+            // in ambient, with the beams doing the bright lighting.
+            let world_amb = (scene.world.ambient * scene.world.brightness).clamp(0.0, 4.0);
+            let beam_level = (amb_w / 300.0).min(1.0);
+            let co2_amb_strength = (0.10 + 0.12 * world_amb + 0.26 * beam_level).clamp(0.08, 0.5);
             let vol = VolumetricUniform {
                 inv_view_proj: inv_vp.to_cols_array_2d(),
                 eye_time: [eye.x, eye.y, eye.z, time],
-                fog_min_density: [fog.min().x, fog.min().y, fog.min().z, fog.density],
-                fog_max_g: [fog.max().x, fog.max().y, fog.max().z, fog.anisotropy],
+                fog_min_density: [media_min.x, media_min.y, media_min.z, media_density],
+                fog_max_g: [media_max.x, media_max.y, media_max.z, media_g],
                 albedo_beam: [
-                    fog.color[0],
-                    fog.color[1],
-                    fog.color[2],
+                    media_color[0],
+                    media_color[1],
+                    media_color[2],
                     settings.beam_intensity,
                 ],
                 counts: [
-                    nbeams as f32,
+                    // x: HYBRID sentinel -2 = raymarch heroes only (froxel does the
+                    // masses); otherwise the shared-occluder atlas layer (-1 = none).
+                    if use_froxel { -2.0 } else { shared_layer as f32 },
                     step_cap,
                     target_dt,
-                    if std::env::var("PREVIZ_JITTER").is_ok() { 1.0 } else { 0.0 },
+                    if std::env::var("GLOWSTONE_JITTER").is_ok() { 1.0 } else { 0.0 },
                 ],
+                // Same chroma read-up strength as the froxel pass (below) so the
+                // hybrid masses/heroes seam lifts saturated colours identically.
+                // y = frame index (mod 64): the volumetric uses it to ANIMATE its
+                // interleaved-gradient-noise ray-start jitter (a fresh blue-noise pattern
+                // each frame). Was a screen-coherent golden phase, which shifted the whole
+                // step-band pattern rigidly each frame → read as flicker; per-pixel blue
+                // grain instead resolves via the EMA when static and reads as faint grain
+                // (not coherent bands) during motion.
+                chroma: [
+                    settings.chroma_haze,
+                    (self.frame_index % 64) as f32,
+                    fog_uniformity, // z = haze uniformity (1 smooth … 0 clustered)
+                    media_contrast, // w = cluster vs haze density contrast
+                ],
+                // Tiled light culling: same full-res grid the mesh pass uses (render_mode.zw),
+                // so the ray scans exactly the beams its tile holds. w = CO2 quality flag
+                // (1 = full-quality render: beam-blocking + multi-tap self-shadow; 0 =
+                // cheaper live preview — the preview-vs-render split).
+                tile: [
+                    tiles_x as f32,
+                    tiles_y as f32,
+                    LIGHT_TILE_PX as f32,
+                    if self.hq_co2 { 1.0 } else { 0.0 },
+                ],
+                // rgb = ambient room hue the CO2 reflects; w = scene-driven strength
+                // (dim — the smoke is thick white, so it reads dim-coloured + beam highlights).
+                co2_amb: [amb_hue.x, amb_hue.y, amb_hue.z, co2_amb_strength],
             };
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
+
+            if use_froxel {
+                if let Some(fx) = &self.froxel {
+                    let (lo, hi) = (media_min, media_max);
+                    let near = 0.3_f32;
+                    // Far = distance to the farthest fog-box corner, so the grid
+                    // spans the whole box along every ray.
+                    let mut far = near + 1.0;
+                    for cx in [lo.x, hi.x] {
+                        for cy in [lo.y, hi.y] {
+                            for cz in [lo.z, hi.z] {
+                                far = far.max((Vec3::new(cx, cy, cz) - eye).length());
+                            }
+                        }
+                    }
+                    let fu = FroxelUniform {
+                        inv_view_proj: inv_vp.to_cols_array_2d(),
+                        eye_time: [eye.x, eye.y, eye.z, time],
+                        fog_min_density: [lo.x, lo.y, lo.z, media_density],
+                        fog_max_g: [hi.x, hi.y, hi.z, media_g],
+                        albedo_beam: [media_color[0], media_color[1], media_color[2], settings.beam_intensity],
+                        dims: [
+                            fx.dims.0 as f32,
+                            fx.dims.1 as f32,
+                            fx.dims.2 as f32,
+                            shared_layer as f32,
+                        ],
+                        planes: [near, far, settings.chroma_haze, 0.0],
+                    };
+                    self.queue.write_buffer(&fx.uniform, 0, bytemuck::bytes_of(&fu));
+                }
+            }
         }
 
         let post = PostUniform {
@@ -1447,6 +3067,14 @@ impl Renderer {
                     binding: 6,
                     resource: wheels_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.tile_offsets.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.tile_lights.buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -1498,9 +3126,175 @@ impl Renderer {
                     binding: 10,
                     resource: wheels_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.tile_offsets.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: self.tile_lights.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    // 13: stage CO2 volume descriptors (AABB + Z-slab layer) — bind
+                    // only the used portion so `arrayLength` returns the real emitter
+                    // count (>= 1; a zero dummy when none, contributing no density).
+                    binding: 13,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.co2_plumes_storage.buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            co2_n as u64 * std::mem::size_of::<particles::Co2Volume>() as u64,
+                        ),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    // 14/15: the splatted CO2 smoke density grid + its sampler.
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(&self.co2_density_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::Sampler(&self.co2_density_samp),
+                },
             ],
         });
-        let composite_bg = self.single_tex_bg(self.viewport.vol_view());
+        // Froxel compute + composite bind groups (only when the froxel path runs).
+        // inject writes inject_view + reads result_view (dummy); integrate writes
+        // result_view + reads inject_view.
+        let froxel_bgs = if use_froxel {
+            self.froxel.as_ref().map(|fx| {
+                let compute_bg = |out: &wgpu::TextureView, inp: &wgpu::TextureView| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("froxel-compute-bg"),
+                        layout: &fx.compute_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: fx.uniform.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: fixtures_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.noise_view) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.noise_sampler) },
+                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.gobo_atlas.view) },
+                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.gobo_atlas.sampler) },
+                            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.shadow.array_view) },
+                            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.shadow.sampler) },
+                            wgpu::BindGroupEntry { binding: 8, resource: self.shadow.sample_matrices.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 9, resource: wheels_binding() },
+                            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(out) },
+                            wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(inp) },
+                        ],
+                    })
+                };
+                let inject_bg = compute_bg(&fx.inject_view, &fx.result_view);
+                let integrate_bg = compute_bg(&fx.result_view, &fx.inject_view);
+                let comp_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("froxel-composite-bg"),
+                    layout: &fx.composite_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: fx.uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&fx.result_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&fx.sampler) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+                    ],
+                });
+                (inject_bg, integrate_bg, comp_bg)
+            })
+        } else {
+            None
+        };
+
+        // --- temporal accumulation (EMA) state for the half-res volumetric ---
+        // The raymarch jitters per-frame; this resolve reprojects the previous EMA and
+        // blends it in, converging the jitter into a smooth beam. History weight ramps
+        // up while STATIC and drops when the camera or any beam moves (so moving beams
+        // don't ghost). Runs whenever the raymarch path renders fog.
+        let temporal_on = has_media && settings.mode == ViewportMode::Beauty;
+        // The raymarch (and thus the temporal pass) actually runs unless we're in
+        // froxel-only mode with no hero beams (mirrors the pass gate below).
+        let raymarch_ran = temporal_on && (!use_froxel || n_shadows > 0);
+        let cur_view_proj = camera.view_proj(aspect);
+        let cur_ema = (self.frame_index & 1) as usize;
+        let prev_ema = cur_ema ^ 1;
+        if temporal_on {
+            // Hash the FULL per-beam + per-wheel GPU state (position, direction, colour,
+            // dimmer, gobo/prism/wheel rotation + scroll, CMY) so ANY in-beam motion —
+            // not just pan/tilt — invalidates history and avoids ghosting a moving look.
+            let mut sig: u64 = 0xcbf2_9ce4_8422_2325;
+            for &w in bytemuck::cast_slice::<FixtureGpu, u32>(&gpu_fixtures) {
+                sig = (sig ^ w as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            for &w in bytemuck::cast_slice::<WheelGpu, u32>(&gpu_wheels) {
+                sig = (sig ^ w as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            // History is trustworthy only if last frame wrote the EMA at this size.
+            let resized = self.viewport.size != self.prev_size;
+            let history_valid = self.ema_valid
+                && !resized
+                && self.frame_index != 0
+                && std::env::var("GLOWSTONE_NOTEMPORAL").is_err();
+            let moving = cur_view_proj != self.prev_view_proj || sig != self.prev_beam_sig;
+            if moving || !history_valid {
+                self.accum_frames = 0;
+            } else {
+                self.accum_frames = (self.accum_frames + 1).min(64);
+            }
+            // History cap scales with uniformity: smooth fog accumulates hard (0.92) for
+            // glass-smooth beams; clustered fog holds little (down to ~0.55) so the moving
+            // smoke pockets stay crisp and alive instead of averaging into a smear.
+            let mut hist_cap = 0.55 + 0.37 * fog_uniformity;
+            // Active CO2 is fine, fast-MOVING cauliflower detail — same as clustered
+            // smoke, it must NOT be hard-accumulated or the temporal EMA averages the
+            // lumps into a smooth blob (the "crisp in a frozen still, smooth when it
+            // actually animates" trap). Hold little history so the pockets stay crisp.
+            if has_co2 {
+                hist_cap = hist_cap.min(0.42);
+            }
+            let opacity = if !history_valid {
+                0.0 // first frame / resize / froxel-skip → trust this frame fully
+            } else if moving {
+                (0.35_f32).min(hist_cap)
+            } else {
+                (self.accum_frames as f32 / (self.accum_frames as f32 + 1.0)).min(hist_cap)
+            };
+            let eye = camera.eye();
+            let tu = TemporalUniform {
+                cur_inv_view_proj: cur_view_proj.inverse().to_cols_array_2d(),
+                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                eye: [eye.x, eye.y, eye.z, 250.0],
+                params: [opacity, 0.0, 0.0, 0.0],
+            };
+            self.queue.write_buffer(&self.temporal_uniform, 0, bytemuck::bytes_of(&tu));
+            self.prev_beam_sig = sig;
+        }
+        let temporal_bg = if temporal_on {
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vol-temporal-bg"),
+                layout: &self.vol_temporal_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.temporal_uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(self.viewport.vol_view()) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(self.viewport.vol_ema_view(prev_ema)) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.vol_linear_sampler) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+                ],
+            }))
+        } else {
+            None
+        };
+        // The composite reads the temporally-resolved EMA when temporal ran, else the raw
+        // vol — plus the scene depth, for the depth-aware (edge-preserving) upsample.
+        let composite_src = if temporal_on {
+            self.viewport.vol_ema_view(cur_ema)
+        } else {
+            self.viewport.vol_view()
+        };
+        let composite_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite-bg"),
+            layout: &self.composite_upsample_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(composite_src) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+            ],
+        });
         let bright_bg = self.single_tex_bg(self.viewport.hdr_view());
         let blur_h_bg = self.single_tex_bg(self.viewport.bloom_view(0));
         let blur_v_bg = self.single_tex_bg(self.viewport.bloom_view(1));
@@ -1539,10 +3333,15 @@ impl Renderer {
         const SHADOW_MAX_CASTERS: usize = 96;
         let mut casters: Vec<(usize, f32)> = Vec::new();
 
-        // Pass 0: hero-beam shadow maps — one depth-only pass per selected beam,
-        // rendering the solid occluders (floor + MVR geometry + fixture models)
-        // from that beam's point of view into its atlas layer.
-        for layer in 0..n_shadows {
+        // Pass 0: shadow maps — one depth-only pass per hero beam (layers 0..n)
+        // plus the ONE shared occluder (layer shadow::SHARED), each rendering the
+        // solid occluders (floor + MVR geometry + fixture models) from that layer's
+        // viewpoint into its atlas layer.
+        let mut render_layers: Vec<usize> = (0..n_shadows).collect();
+        if shared_layer >= 0 {
+            render_layers.push(shadow::SHARED);
+        }
+        for &layer in &render_layers {
             let mut spass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-pass"),
                 color_attachments: &[],
@@ -1554,6 +3353,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
+                timestamp_writes: self.ts_rp(gpu_timer::P_SHADOW_BASE + layer as u32),
                 ..Default::default()
             });
             spass.set_pipeline(&self.shadow.pipeline);
@@ -1601,6 +3401,81 @@ impl Renderer {
             }
         }
 
+        // Pass 0.5: DEPTH PRE-PASS — write the opaque scene depth with NO fragment work
+        // so the main forward pass runs its heavy per-fragment light loop EXACTLY once per
+        // visible pixel (Equal test, no overdraw). The pre-pass adds draws/vertex work, so
+        // it only pays off when that loop is expensive — gate it on the lit-fixture count
+        // (a sparse scene keeps the plain single Less+write pass, no regression). Wireframe
+        // (lines, not fill) always skips it. The opaque-mesh draws here MUST stay identical
+        // to the forward pass's, or DEPTH_EQUAL would reject pixels — keep them in sync.
+        const PREPASS_MIN_LIGHTS: usize = 16;
+        // The pre-pass re-draws all opaque geometry, so it only pays off when those draws
+        // are cheap — i.e. instancing collapsed the scene into few mesh groups. If geometry
+        // failed to dedup (thousands of unique meshes), the extra draw calls cost more than
+        // the light-loop overdraw they save (measured: a non-deduped 5932-group scene
+        // regressed 61→56 fps; the same scene deduped to 236 groups gained 72→75). Both load
+        // paths dedup — MVR import shares resource Arcs, `.glow` load re-interns them
+        // (project::intern_geometry_resources) — so real scenes stay well under the cap.
+        const PREPASS_MAX_GROUPS: usize = 1500;
+        let geom_groups = ranges.len() + gdtf_groups.len() + scene_geom_groups.len();
+        let use_prepass = settings.mode != ViewportMode::Wireframe
+            && gpu_fixtures.len() >= PREPASS_MIN_LIGHTS
+            && geom_groups <= PREPASS_MAX_GROUPS;
+        if use_prepass {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("depth-prepass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.viewport.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: self.ts_rp(gpu_timer::P_DEPTH),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.mesh_depth_prepass);
+            // Shares the mesh layout (camera+light+world), so bind all three even though
+            // only group 0 is read by the vertex stage.
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(1, &light_bg, &[]);
+            pass.set_bind_group(2, &self.world_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.floor_instances.buffer.slice(..));
+            pass.draw(0..self.floor_mesh.vertex_count, 0..1);
+            pass.set_vertex_buffer(1, self.fixture_instances.buffer.slice(..));
+            for (geometry, start, count) in &ranges {
+                let m = self.mesh_for(*geometry);
+                pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
+                pass.draw(0..m.vertex_count, *start..*start + *count);
+            }
+            if !gdtf_groups.is_empty() {
+                pass.set_vertex_buffer(1, self.gdtf_instances.buffer.slice(..));
+                for (key, model, base, count) in &gdtf_groups {
+                    if let Some(mesh) = self.gdtf_cache.get(key).and_then(|m| m.get(model)) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
+                    }
+                }
+            }
+            if !scene_geom_groups.is_empty() {
+                pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
+                for (key, base, count) in &scene_geom_groups {
+                    if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
+                    }
+                }
+            }
+            if gdtf_placeholder_count > 0 {
+                pass.set_vertex_buffer(0, self.cone_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.gdtf_placeholder_instances.buffer.slice(..));
+                pass.draw(0..self.cone_mesh.vertex_count, 0..gdtf_placeholder_count);
+            }
+        }
+
         // Pass 1: forward opaque scene -> HDR target.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1622,11 +3497,18 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: self.viewport.depth_view(),
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        // Pre-pass already wrote depth → load it (mesh draws test Equal,
+                        // no write). Without it, clear here (plain Less+write path).
+                        load: if use_prepass {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(1.0)
+                        },
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
+                timestamp_writes: self.ts_rp(gpu_timer::P_FORWARD),
                 ..Default::default()
             });
 
@@ -1647,9 +3529,15 @@ impl Renderer {
             pass.set_bind_group(1, &light_bg, &[]);
             pass.set_bind_group(2, &self.world_bind_group, &[]); // mesh IBL ambient
 
-            let mesh_pipe = match (settings.mode, self.mesh_wire_pipeline.as_ref()) {
-                (ViewportMode::Wireframe, Some(wire)) => wire,
-                _ => &self.mesh_pipeline,
+            // Wireframe → line pipeline (no pre-pass). Else if the pre-pass ran, test
+            // Equal (once per visible pixel); otherwise the plain Less+write pipeline
+            // against the depth cleared this pass.
+            let mesh_pipe = if settings.mode == ViewportMode::Wireframe {
+                self.mesh_wire_pipeline.as_ref().unwrap_or(&self.mesh_pipeline)
+            } else if use_prepass {
+                &self.mesh_depth_equal
+            } else {
+                &self.mesh_pipeline
             };
             pass.set_pipeline(mesh_pipe);
             pass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));
@@ -1664,29 +3552,29 @@ impl Renderer {
             }
 
             // GDTF fixture model parts (each part is one instance).
-            if !gdtf_draws.is_empty() {
+            // GDTF fixture-model parts — ONE instanced draw per unique part (shared
+            // across every fixture of that GDTF type) instead of one per part per fixture.
+            if !gdtf_groups.is_empty() {
                 pass.set_vertex_buffer(1, self.gdtf_instances.buffer.slice(..));
-                for (key, model, idx) in &gdtf_draws {
+                for (key, model, base, count) in &gdtf_groups {
                     if let Some(mesh) = self.gdtf_cache.get(key).and_then(|m| m.get(model)) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
                     }
                 }
             }
 
-            // Imported MVR static geometry (each model is one instance). Camera-
-            // frustum culled: off-screen crowd/set objects are skipped (lossless),
-            // so orbiting/zooming into part of a big rig doesn't pay for the rest.
-            if !scene_geom_draws.is_empty() {
-                let cam_vp = camera.view_proj(aspect);
+            // Imported MVR static geometry — ONE instanced draw per unique mesh (truss
+            // segments, deck tiles, set pieces are overwhelmingly repeats). Off-screen
+            // instances are GPU-clipped (vertex-only); the per-instance camera-frustum
+            // cull is dropped here since the draw-call collapse is the real win (a future
+            // GPU compute cull can prune off-screen instances before the draw).
+            if !scene_geom_groups.is_empty() {
                 pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
-                for (key, idx, lo, hi) in &scene_geom_draws {
-                    if aabb_outside_clip(&cam_vp, *lo, *hi) {
-                        continue;
-                    }
+                for (key, base, count) in &scene_geom_groups {
                     if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        pass.draw(0..mesh.vertex_count, *idx..*idx + 1);
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
                     }
                 }
             }
@@ -1696,6 +3584,38 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.cone_mesh.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, self.gdtf_placeholder_instances.buffer.slice(..));
                 pass.draw(0..self.cone_mesh.vertex_count, 0..gdtf_placeholder_count);
+            }
+
+            // LED video-wall surfaces: one emissive quad per screen, each binding
+            // its own content texture (procedural walls bind the placeholder).
+            // Opaque walls draw first (REPLACE, write depth) so beams behind them
+            // are occluded; transparent / mesh walls draw after with premultiplied
+            // alpha + NO depth write, so the scene shows through their gaps.
+            if !wall_draws.is_empty() {
+                pass.set_vertex_buffer(0, self.quad_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.wall_instances.buffer.slice(..));
+                // Pass A: opaque walls (REPLACE, write depth).
+                pass.set_pipeline(&self.wall_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                for (j, &(si, transparent)) in wall_draws.iter().enumerate() {
+                    if transparent {
+                        continue;
+                    }
+                    let bg = self.screen_runtime.get(&si).map(|r| &r.bind_group).unwrap_or(&self.wall_placeholder_bg);
+                    pass.set_bind_group(1, bg, &[]);
+                    pass.draw(0..self.quad_mesh.vertex_count, j as u32..j as u32 + 1);
+                }
+                // Pass B: transparent / mesh walls (premultiplied alpha, no depth write).
+                pass.set_pipeline(&self.wall_alpha_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                for (j, &(si, transparent)) in wall_draws.iter().enumerate() {
+                    if !transparent {
+                        continue;
+                    }
+                    let bg = self.screen_runtime.get(&si).map(|r| &r.bind_group).unwrap_or(&self.wall_placeholder_bg);
+                    pass.set_bind_group(1, bg, &[]);
+                    pass.draw(0..self.quad_mesh.vertex_count, j as u32..j as u32 + 1);
+                }
             }
 
             // Glass/dust front lenses (one disc per fixture, camera-only pipeline).
@@ -1712,10 +3632,90 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.grid_mesh.vertex_buffer.slice(..));
                 pass.draw(0..self.grid_mesh.vertex_count, 0..1);
             }
-            // The fog-box border + gizmos (dynamic_lines) are always drawn.
-            if line_count > 0 {
+            // The fog-box border + gizmos (dynamic_lines) — drawn for the live view,
+            // suppressed for a clean still render (settings.show_gizmos).
+            if line_count > 0 && settings.show_gizmos {
                 pass.set_vertex_buffer(0, self.dynamic_lines.buffer.slice(..));
                 pass.draw(0..line_count, 0..1);
+            }
+        }
+
+        // Pass 1.25: SELECTION MASK — mark every selected object's VISIBLE surface
+        // into the R8 sel_mask (1 = selected, depth-tested against the scene depth so
+        // an occluded part doesn't mark it), so the composite below can edge-detect a
+        // true per-object silhouette outline. Re-issues the SAME opaque draw groups as
+        // the forward pass (fixtures, GDTF parts, MVR geometry, placeholder cones, LED
+        // walls); the mask shader discards non-selected fragments, so the draws stay
+        // identical to the forward pass — only the marked subset survives. Skipped
+        // entirely when nothing is selected (the common case → zero added cost).
+        let any_selected = !selection.fixtures.is_empty()
+            || !selection.geometry.is_empty()
+            || !selection.screens.is_empty();
+        if any_selected {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sel-mask-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.viewport.sel_mask_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                // Depth-TEST (LessEqual) against the forward pass's depth, NO write.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.viewport.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                ..Default::default()
+            });
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_pipeline(&self.sel_mask_mesh_pipeline);
+            // Fixtures with a simple primitive body.
+            pass.set_vertex_buffer(1, self.fixture_instances.buffer.slice(..));
+            for (geometry, start, count) in &ranges {
+                let m = self.mesh_for(*geometry);
+                pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
+                pass.draw(0..m.vertex_count, *start..*start + *count);
+            }
+            // GDTF fixture model parts.
+            if !gdtf_groups.is_empty() {
+                pass.set_vertex_buffer(1, self.gdtf_instances.buffer.slice(..));
+                for (key, model, base, count) in &gdtf_groups {
+                    if let Some(mesh) = self.gdtf_cache.get(key).and_then(|m| m.get(model)) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
+                    }
+                }
+            }
+            // Imported MVR static geometry.
+            if !scene_geom_groups.is_empty() {
+                pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
+                for (key, base, count) in &scene_geom_groups {
+                    if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, *base..*base + *count);
+                    }
+                }
+            }
+            // Placeholder cones for GDTF fixtures with no baked model.
+            if gdtf_placeholder_count > 0 {
+                pass.set_vertex_buffer(0, self.cone_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.gdtf_placeholder_instances.buffer.slice(..));
+                pass.draw(0..self.cone_mesh.vertex_count, 0..gdtf_placeholder_count);
+            }
+            // LED screens (WallInstance layout; selected = look.w).
+            if !wall_draws.is_empty() {
+                pass.set_pipeline(&self.sel_mask_wall_pipeline);
+                pass.set_vertex_buffer(0, self.quad_mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.wall_instances.buffer.slice(..));
+                pass.draw(0..self.quad_mesh.vertex_count, 0..wall_draws.len() as u32);
             }
         }
 
@@ -1754,6 +3754,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
+                timestamp_writes: self.ts_rp(gpu_timer::P_SSAO),
                 ..Default::default()
             });
             pass.set_pipeline(&self.ssao_pipeline);
@@ -1763,34 +3764,158 @@ impl Renderer {
 
         // Pass 2a: volumetric raymarch -> half-res vol target (scatter, transmit).
         // Pass 2b: upsample + composite into the HDR scene.
-        if has_fog && settings.mode == ViewportMode::Beauty {
+        if has_media && settings.mode == ViewportMode::Beauty {
+            // HYBRID stage 1 — the froxel volume carries the wide/dim "masses"
+            // (all non-hero beams) at a cost decoupled from beam count, with no
+            // dither/banding and full mid-air occlusion. inject → integrate →
+            // trilinear composite into HDR.
+            if let (Some((inject_bg, integrate_bg, comp_bg)), Some(fx)) =
+                (&froxel_bgs, self.froxel.as_ref())
             {
+                let gx = fx.dims.0.div_ceil(8);
+                let gy = fx.dims.1.div_ceil(8);
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("froxel-inject"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&fx.inject_pipeline);
+                    cpass.set_bind_group(0, inject_bg, &[]);
+                    cpass.dispatch_workgroups(gx, gy, fx.dims.2);
+                }
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("froxel-integrate"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&fx.integrate_pipeline);
+                    cpass.set_bind_group(0, integrate_bg, &[]);
+                    cpass.dispatch_workgroups(gx, gy, 1);
+                }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("volumetric-pass"),
+                    label: Some("froxel-composite-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: self.viewport.vol_view(),
+                        view: self.viewport.hdr_view(),
                         depth_slice: None,
                         resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: None,
                     ..Default::default()
                 });
-                pass.set_pipeline(&self.volumetric_pipeline);
-                pass.set_bind_group(0, &volumetric_bg, &[]);
+                pass.set_pipeline(&fx.composite_pipeline);
+                pass.set_bind_group(0, comp_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
-            // Composite (blend One/SrcAlpha) is configured on the pipeline.
+
+            // HYBRID stage 2 — the per-pixel raymarch lays the SHARP hero shafts
+            // over the froxel masses (in hybrid mode the shader skips non-heroes,
+            // so it only marches the few sharpest beams = crisp gobo/CA/prism
+            // detail at low cost). In raymarch-only mode this marches every beam.
+            // Skipped entirely in hybrid when there are no hero beams.
+            if !use_froxel || n_shadows > 0 {
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("volumetric-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: self.viewport.vol_view(),
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: self.ts_rp(gpu_timer::P_VOL),
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.volumetric_pipeline);
+                    pass.set_bind_group(0, &volumetric_bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                // Temporal resolve: blend the raw raymarch (vol) with the reprojected
+                // previous EMA into vol_ema[cur]; the composite then reads that. This is
+                // what converges the per-frame jitter into a smooth, uniform beam.
+                if let Some(temporal_bg) = &temporal_bg {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("vol-temporal-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: self.viewport.vol_ema_view(cur_ema),
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: self.ts_rp(gpu_timer::P_VOLTEMP),
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.vol_temporal_pipeline);
+                    pass.set_bind_group(0, temporal_bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                // Composite (blend One/SrcAlpha) is configured on the pipeline.
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("composite-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: self.viewport.hdr_view(),
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: self.ts_rp(gpu_timer::P_COMPOSITE),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.composite_pipeline);
+                pass.set_bind_group(0, &composite_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+
+        // Pass 2.8: COLD-SPARK billboard particles — additive emissive embers drawn
+        // into the HDR AFTER the volumetric composite (beams read behind them) and
+        // BEFORE bloom (so they glow). Depth-TESTED against the forward depth
+        // (occluded by geometry), NO depth write. The quad is built in the VS, so the
+        // only vertex buffer is the per-particle instance stream (group 0 = camera).
+        // (CO2 is participating media, injected into the volumetric raymarch above —
+        // not drawn here.)
+        let spark_count = self
+            .spark_instances
+            .upload(&self.device, &self.queue, &self.pyro.spark);
+        if spark_count > 0 && settings.mode != ViewportMode::Wireframe {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("composite-pass"),
+                label: Some("spark-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.viewport.hdr_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.viewport.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                ..Default::default()
+            });
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_pipeline(&self.spark_pipeline);
+            pass.set_vertex_buffer(0, self.spark_instances.buffer.slice(..));
+            pass.draw(0..6, 0..spark_count);
+        }
+
+        // Pass 2.9: SELECTION OUTLINE — edge-detect the sel_mask and ADD a bright
+        // amber silhouette ring into the HDR (blend One/One), BEFORE bloom so the
+        // outline glows slightly. Only when something selectable is selected.
+        if any_selected {
+            let outline_bg = self.single_tex_bg(self.viewport.sel_mask_view());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sel-outline-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self.viewport.hdr_view(),
                     depth_slice: None,
@@ -1801,20 +3926,44 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
                 ..Default::default()
             });
-            pass.set_pipeline(&self.composite_pipeline);
-            pass.set_bind_group(0, &composite_bg, &[]);
+            pass.set_pipeline(&self.sel_outline_pipeline);
+            pass.set_bind_group(0, &outline_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
         // Pass 3: bloom bright-pass (HDR -> bloom[0]).
-        self.fullscreen(encoder, "bloom-bright", &self.bloom_bright, self.viewport.bloom_view(0), &bright_bg);
+        self.fullscreen(encoder, "bloom-bright", &self.bloom_bright, self.viewport.bloom_view(0), &bright_bg, self.ts_rp(gpu_timer::P_BLOOM_BRIGHT));
         // Pass 4: separable blur (bloom[0] -> bloom[1] -> bloom[0]).
-        self.fullscreen(encoder, "bloom-blur-h", &self.bloom_blur_h, self.viewport.bloom_view(1), &blur_h_bg);
-        self.fullscreen(encoder, "bloom-blur-v", &self.bloom_blur_v, self.viewport.bloom_view(0), &blur_v_bg);
+        self.fullscreen(encoder, "bloom-blur-h", &self.bloom_blur_h, self.viewport.bloom_view(1), &blur_h_bg, self.ts_rp(gpu_timer::P_BLOOM_H));
+        self.fullscreen(encoder, "bloom-blur-v", &self.bloom_blur_v, self.viewport.bloom_view(0), &blur_v_bg, self.ts_rp(gpu_timer::P_BLOOM_V));
+
         // Pass 5: tonemap/resolve (HDR + bloom -> LDR, sRGB-encoded).
-        self.fullscreen(encoder, "tonemap", &self.tonemap_pipeline, self.viewport.ldr_view(), &tonemap_bg);
+        self.fullscreen(encoder, "tonemap", &self.tonemap_pipeline, self.viewport.ldr_view(), &tonemap_bg, self.ts_rp(gpu_timer::P_TONEMAP));
+
+        // Resolve this frame's per-pass GPU timestamps into the ring (read back async in
+        // render()); skipped automatically if the ring slot is still being read.
+        if let Some(t) = self.gpu_timers.as_ref() {
+            t.resolve(encoder);
+        }
+        // "What's being rendered" counts for the perf overlay — populated every frame even
+        // when GPU timestamps are unavailable (the bars come from the render() ring pump).
+        self.last_timings.fixtures = scene.fixtures.len() as u32;
+        self.last_timings.beams = gpu_fixtures.len() as u32;
+        self.last_timings.shadow_maps = n_shadows as u32;
+        self.last_timings.geom_draws =
+            (ranges.len() + gdtf_groups.len() + scene_geom_groups.len()) as u32;
+        self.last_timings.render_px = self.viewport.size;
+
+        // Advance temporal-accumulation state for next frame. `ema_valid` reflects
+        // whether the EMA was actually written this frame (so next frame knows whether
+        // its `prev_ema` target holds real history or stale/zeroed content).
+        self.prev_view_proj = cur_view_proj;
+        self.prev_size = self.viewport.size;
+        self.ema_valid = raymarch_ran;
+        self.frame_index = self.frame_index.wrapping_add(1);
     }
 
     fn single_tex_bg(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
@@ -1842,6 +3991,7 @@ impl Renderer {
         pipeline: &wgpu::RenderPipeline,
         target: &wgpu::TextureView,
         bind_group: &wgpu::BindGroup,
+        ts: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -1855,6 +4005,7 @@ impl Renderer {
                 },
             })],
             depth_stencil_attachment: None,
+            timestamp_writes: ts,
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
@@ -2462,8 +4613,10 @@ fn transform_aabb(m: &Mat4, lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
 }
 
 /// True if the world AABB is fully outside `vp`'s clip volume (conservative;
-/// wgpu clip z ∈ [0, w]) — i.e. the draw can be skipped for this view. Used to
-/// frustum-cull shadow casters (narrow hero cone) and off-screen forward draws.
+/// wgpu clip z ∈ [0, w]) — i.e. the draw can be skipped for this view. Retained for
+/// the planned GPU compute frustum-cull of instanced static geometry (the forward
+/// per-instance CPU cull was removed in favour of one instanced draw per mesh).
+#[allow(dead_code)]
 fn aabb_outside_clip(vp: &Mat4, lo: Vec3, hi: Vec3) -> bool {
     let (mut nx, mut px, mut ny, mut py, mut nz, mut pz) = (true, true, true, true, true, true);
     for i in 0..8u32 {
@@ -2549,10 +4702,12 @@ fn clip_proj_px(vp: &Mat4, lo: Vec3, hi: Vec3, res: f32) -> Option<f32> {
     Some((maxx - minx).max(maxy - miny) * 0.5 * res)
 }
 
-/// Append a selection gizmo at `p`: RGB world axes plus a small amber marker
-/// box, so the selected fixture's position/orientation is clear in the view.
+/// Append a small RGB world-axes pivot marker at `p`, so the selected object's
+/// position/orientation reads at a glance. The object's actual selection cue is
+/// the screen-space SILHOUETTE OUTLINE (the sel_mask edge-detect composite) — this
+/// is just a complementary pivot indicator, no longer a misleading fixed-size box.
 fn push_selection_gizmo(out: &mut Vec<LineVertex>, p: Vec3) {
-    let len = 0.6;
+    let len = 0.4;
     for (dir, color) in [
         (Vec3::X, [0.95, 0.3, 0.3]),
         (Vec3::Y, [0.4, 0.9, 0.4]),
@@ -2561,8 +4716,6 @@ fn push_selection_gizmo(out: &mut Vec<LineVertex>, p: Vec3) {
         out.push(LineVertex { position: p.to_array(), color });
         out.push(LineVertex { position: (p + dir * len).to_array(), color });
     }
-    let h = Vec3::splat(0.22);
-    mesh::push_box_wireframe(out, (p - h).to_array(), (p + h).to_array(), [1.0, 0.75, 0.2]);
 }
 
 /// Append a wireframe cone showing a beam (axis, end ring, a few generatrices)

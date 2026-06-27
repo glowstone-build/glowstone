@@ -169,7 +169,7 @@ fn de_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error>
 // ---------------------------------------------------------------------------
 
 fn project_dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("dev", "Embedder", "previz")
+    directories::ProjectDirs::from("build", "glowstone", "glowstone")
 }
 
 /// The shared directory that holds every downloaded `.gdtf` (reused across
@@ -177,7 +177,7 @@ fn project_dirs() -> Option<directories::ProjectDirs> {
 pub fn gdtf_dir() -> PathBuf {
     let dir = project_dirs()
         .map(|d| d.data_dir().join("gdtf"))
-        .unwrap_or_else(|| std::env::temp_dir().join("previz-gdtf"));
+        .unwrap_or_else(|| std::env::temp_dir().join("glowstone-gdtf"));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -524,6 +524,10 @@ pub struct Share {
     /// rids the user asked to add — downloaded in the background, then imported +
     /// placed on the main thread once the file lands.
     pub pending_add: HashSet<i64>,
+    /// rids successfully imported into THIS project's Library this session — the
+    /// catalogue row then shows a green, disabled "Added" instead of an add button.
+    /// Project-scoped (not the disk `downloaded` set), so it isn't persisted.
+    pub added: HashSet<i64>,
 
     // derived view, rebuilt only when the inputs change (cheap with 1000s of rows)
     filtered: Vec<usize>,
@@ -578,6 +582,7 @@ impl Share {
             downloaded_only: false,
             updates_only: false,
             pending_add: HashSet::new(),
+            added: HashSet::new(),
             filtered: Vec::new(),
             mfr_list: Vec::new(),
             uuid_max_rid: HashMap::new(),
@@ -776,7 +781,7 @@ impl Share {
     }
 
     /// Inject demo data so the catalogue can be screenshotted headlessly without
-    /// real credentials (used only by the PREVIZ_UI screenshot path).
+    /// real credentials (used only by the GLOWSTONE_UI screenshot path).
     pub fn debug_demo(&mut self) {
         self.logged_in = true;
         let mk = |rid: i64, mfr: &str, fix: &str, rev: &str, rating: f64, modes: &[(&str, i64)], size: i64, uuid: &str| ListEntry {
@@ -857,10 +862,10 @@ mod tests {
 
     /// Live end-to-end check against the real GDTF Share API. No-op unless saved
     /// credentials exist (so CI / other machines skip it); set
-    /// PREVIZ_SHARE_SKIP_LIVE=1 to force-skip even with credentials.
+    /// GLOWSTONE_SHARE_SKIP_LIVE=1 to force-skip even with credentials.
     #[test]
     fn live_login_and_list() {
-        if std::env::var("PREVIZ_SHARE_SKIP_LIVE").is_ok() {
+        if std::env::var("GLOWSTONE_SHARE_SKIP_LIVE").is_ok() {
             return;
         }
         let Some(creds) = load_credentials() else {

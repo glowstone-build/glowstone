@@ -53,7 +53,8 @@ pub fn glb_yup_to_zup() -> Mat4 {
 /// One DMX patch entry: a DMX `break` plus the absolute address. MVR stores the
 /// address as a single integer spanning universes (`(addr-1)/512` = universe,
 /// `(addr-1)%512` = channel, both effectively 1-based for display).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct MvrAddress {
     pub break_id: u32,
     pub absolute: u32,
@@ -75,6 +76,7 @@ impl MvrAddress {
 ///
 /// [`Fixture`]: crate::scene::Fixture
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MvrFixtureMeta {
     pub uuid: String,
     pub fixture_id: String,
@@ -103,6 +105,7 @@ pub struct MvrFixtureMeta {
 
 /// The MVR-specific fields of a static `<SceneObject>` / `<GroupObject>`.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MvrObjectMeta {
     pub uuid: String,
     pub classing: Option<String>,
@@ -113,7 +116,8 @@ pub struct MvrObjectMeta {
 }
 
 /// A named UUID entry (a Class or a Position in `<AUXData>`, or a `<Layer>`).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct MvrNamed {
     pub uuid: String,
     pub name: String,
@@ -123,6 +127,7 @@ pub struct MvrNamed {
 /// so export can reproduce the `<Scene>` scaffolding. Object membership is
 /// driven by the per-object `layer` UUID, not by this table.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MvrHeader {
     pub ver_major: u32,
     pub ver_minor: u32,
@@ -139,7 +144,7 @@ impl Default for MvrHeader {
         Self {
             ver_major: 1,
             ver_minor: 5,
-            provider: "previz".into(),
+            provider: "glowstone".into(),
             provider_version: env!("CARGO_PKG_VERSION").into(),
             layers: Vec::new(),
             classes: Vec::new(),
@@ -155,7 +160,8 @@ impl Default for MvrHeader {
 /// One 3D model reference: the archive file name (also the export reference and
 /// the renderer's cache key) plus its raw bytes (a glTF/GLB blob in metres,
 /// authored +Y-up).
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct GeometryModel {
     pub file: String,
     pub glb: Arc<Vec<u8>>,
@@ -204,6 +210,9 @@ pub struct MvrImport {
     pub header: MvrHeader,
     pub fixtures: Vec<ImportedFixture>,
     pub objects: Vec<ImportedObject>,
+    /// LED video walls parsed from `<VideoScreen>` nodes (placement + the
+    /// `glowstone:` round-trip attributes; falls back to defaults for foreign MVRs).
+    pub screens: Vec<crate::scene::LedScreen>,
     /// Every non-XML archive entry, verbatim (gdtf / glb / 3ds / textures).
     pub resources: HashMap<String, Arc<Vec<u8>>>,
 }
@@ -269,6 +278,7 @@ impl MvrImport {
 
         let mut fixtures = Vec::new();
         let mut objects = Vec::new();
+        let mut screens = Vec::new();
 
         if let Some(layers) = scene.children().find(|n| n.has_tag_name("Layers")) {
             for layer in layers.children().filter(|n| n.has_tag_name("Layer")) {
@@ -282,6 +292,7 @@ impl MvrImport {
                         &mut gdtf_cache,
                         &mut fixtures,
                         &mut objects,
+                        &mut screens,
                     );
                 }
             }
@@ -302,6 +313,7 @@ impl MvrImport {
             header,
             fixtures,
             objects,
+            screens,
             resources,
         })
     }
@@ -319,6 +331,7 @@ fn walk_children(
     gdtf_cache: &mut HashMap<String, Option<Arc<GdtfFixture>>>,
     fixtures: &mut Vec<ImportedFixture>,
     objects: &mut Vec<ImportedObject>,
+    screens: &mut Vec<crate::scene::LedScreen>,
 ) {
     for child in list.children().filter(|n| n.is_element()) {
         let local = child
@@ -334,15 +347,20 @@ fn walk_children(
                 if let Some(grandkids) = child.children().find(|n| n.has_tag_name("ChildList")) {
                     walk_children(
                         &grandkids, mvr_xform, layer_uuid, resources, gdtf_cache, fixtures,
-                        objects,
+                        objects, screens,
                     );
                 }
             }
             "Fixture" => {
                 fixtures.push(parse_fixture(&child, mvr_xform, layer_uuid, resources, gdtf_cache));
             }
-            // Static geometry: stage decks, trusses, set pieces, screens, etc.
-            "SceneObject" | "Truss" | "Support" | "VideoScreen" | "Projector" => {
+            // An LED video wall → a first-class LedScreen (placement + the
+            // glowstone round-trip attributes; foreign MVRs get sensible defaults).
+            "VideoScreen" => {
+                screens.push(parse_video_screen(&child, mvr_xform));
+            }
+            // Static geometry: stage decks, trusses, set pieces, projectors, etc.
+            "SceneObject" | "Truss" | "Support" | "Projector" => {
                 if let Some(obj) = parse_object(&child, mvr_xform, layer_uuid, resources) {
                     objects.push(obj);
                 }
@@ -490,6 +508,115 @@ fn parse_object(
     })
 }
 
+/// Parse a `<VideoScreen>` into an [`LedScreen`](crate::scene::LedScreen). MVR has
+/// no native cabinet/pitch concept, so the full parametric build is carried in
+/// `glowstone*` round-trip attributes our export writes; a foreign MVR (no such
+/// attributes) falls back to a sensible default panel and a `<Sources>`-derived
+/// content type.
+fn parse_video_screen(node: &roxmltree::Node, mvr_xform: Mat4) -> crate::scene::LedScreen {
+    use crate::scene::LedScreen;
+    let a_u32 = |k: &str, d: u32| node.attribute(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let a_f32 = |k: &str, d: f32| node.attribute(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+
+    // Content: prefer our explicit round-trip attributes; else read a `<Source>`
+    // node's type (NDI / File / CITP) if present; else a test pattern.
+    let content = if let Some(kind) = node.attribute("glowstoneContent") {
+        decode_content(kind, node.attribute("glowstoneContentArg").unwrap_or(""))
+    } else {
+        let src = node
+            .descendants()
+            .find(|n| n.has_tag_name("Source"));
+        match src.and_then(|n| n.attribute("type")) {
+            Some("NDI") => crate::scene::screen::ScreenContent::Ndi {
+                source: src.and_then(|n| n.text()).unwrap_or("").trim().to_string(),
+            },
+            Some("CITP") => crate::scene::screen::ScreenContent::Citp {
+                source: src.and_then(|n| n.text()).unwrap_or("").trim().to_string(),
+            },
+            _ => crate::scene::screen::ScreenContent::TestPattern(
+                crate::scene::screen::TestPattern::Grid,
+            ),
+        }
+    };
+
+    LedScreen {
+        name: attr(node, "name"),
+        panel_type: node.attribute("glowstonePanelType").unwrap_or("Imported").to_string(),
+        transform: mvr_to_world() * mvr_xform,
+        cabinet_mm: [a_f32("glowstoneCabinetW", 500.0), a_f32("glowstoneCabinetH", 500.0)],
+        cabinet_px: [a_u32("glowstoneCabPxX", 128), a_u32("glowstoneCabPxY", 128)],
+        panels_wide: a_u32("glowstonePanelsWide", 4).max(1),
+        panels_high: a_u32("glowstonePanelsHigh", 2).max(1),
+        gap_mm: a_f32("glowstoneGap", 0.0),
+        curvature_deg: a_f32("glowstoneCurvature", 0.0),
+        nits: a_f32("glowstoneNits", 1200.0),
+        gamma: a_f32("glowstoneGamma", 2.2),
+        opacity: a_f32("glowstoneOpacity", 1.0),
+        emit: a_f32("glowstoneEmit", 1.0),
+        pixel_shape: match a_u32("glowstonePixel", 0) {
+            1 => crate::scene::screen::PixelShape::SmdSquare,
+            2 => crate::scene::screen::PixelShape::DiscreteRgb,
+            _ => crate::scene::screen::PixelShape::SmdRound,
+        },
+        hidden: false,
+        id: 0, // assigned by Scene::ensure_ids after import
+        content,
+        frame: None,
+    }
+}
+
+/// Encode an LED-screen content source into `(kind, arg)` round-trip attributes.
+fn encode_content(c: &crate::scene::screen::ScreenContent) -> (&'static str, String) {
+    use crate::scene::screen::ScreenContent as C;
+    match c {
+        C::TestPattern(p) => ("test", (p.code() as i32).to_string()),
+        C::SolidColor(rgb) => ("solid", format!("{},{},{}", rgb[0], rgb[1], rgb[2])),
+        C::Image { name, .. } => ("image", name.clone()),
+        C::Ndi { source } => ("ndi", source.clone()),
+        C::Citp { source } => ("citp", source.clone()),
+        C::PixelMapDmx(pm) => {
+            ("dmx", format!("{},{},{},{}", pm.cols, pm.rows, pm.universe, pm.start_address))
+        }
+    }
+}
+
+/// Inverse of [`encode_content`]. Image bytes don't round-trip through MVR (only
+/// the file name), so a re-imported image shows "no image" until re-picked.
+fn decode_content(kind: &str, arg: &str) -> crate::scene::screen::ScreenContent {
+    use crate::scene::screen::{PixelMap, ScreenContent as C, TestPattern};
+    match kind {
+        "solid" => {
+            let v: Vec<f32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            C::SolidColor([
+                *v.first().unwrap_or(&0.5),
+                *v.get(1).unwrap_or(&0.5),
+                *v.get(2).unwrap_or(&0.5),
+            ])
+        }
+        "image" => C::Image { name: arg.to_string(), bytes: std::sync::Arc::new(Vec::new()) },
+        "ndi" => C::Ndi { source: arg.to_string() },
+        "citp" => C::Citp { source: arg.to_string() },
+        "dmx" => {
+            let v: Vec<u32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            C::PixelMapDmx(PixelMap {
+                cols: (*v.first().unwrap_or(&16)).clamp(1, 256),
+                rows: (*v.get(1).unwrap_or(&9)).clamp(1, 256),
+                universe: *v.get(2).unwrap_or(&1) as u16,
+                start_address: *v.get(3).unwrap_or(&1) as u16,
+            })
+        }
+        _ => {
+            let idx: i32 = arg.trim().parse().unwrap_or(0);
+            let p = match idx {
+                1 => TestPattern::Bars,
+                2 => TestPattern::Gradient,
+                _ => TestPattern::Grid,
+            };
+            C::TestPattern(p)
+        }
+    }
+}
+
 fn parse_header(root: &roxmltree::Node) -> MvrHeader {
     let scene = root.children().find(|n| n.has_tag_name("Scene"));
     let aux = scene
@@ -541,6 +668,7 @@ fn load_gdtf_named(name: &str, resources: &HashMap<String, Arc<Vec<u8>>>) -> Opt
         Ok(mut g) => {
             g.spec = name.to_string();
             g.raw = Some(bytes);
+            g.source = crate::gdtf::FixtureSource::Mvr;
             Some(Arc::new(g))
         }
         Err(e) => {
@@ -774,7 +902,7 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
     let header = scene.mvr.as_ref().map(|m| &m.header);
     let ver_major = header.map(|h| h.ver_major).unwrap_or(1);
     let ver_minor = header.map(|h| h.ver_minor).unwrap_or(5);
-    let provider = "previz";
+    let provider = "glowstone";
     let provider_version = env!("CARGO_PKG_VERSION");
 
     // Group fixtures + objects by layer UUID, preserving the imported layer
@@ -797,7 +925,7 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
         if !order.iter().any(|u| u == uuid) {
             order.push(uuid.to_string());
             names.entry(uuid.to_string()).or_insert_with(|| {
-                if uuid == DEFAULT_LAYER_UUID { "previz".into() } else { "Layer".into() }
+                if uuid == DEFAULT_LAYER_UUID { "glowstone".into() } else { "Layer".into() }
             });
         }
     };
@@ -810,6 +938,11 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
         let l = layer_uuid_of(o.mvr.as_ref().map(|m| m.layer.as_str()).unwrap_or(""));
         ensure_layer(&l, &mut order, &mut names);
         obj_by_layer.entry(l).or_default().push(i);
+    }
+    // LED screens have no per-screen layer membership — emit them all in the
+    // default layer.
+    if !scene.screens.is_empty() {
+        ensure_layer(DEFAULT_LAYER_UUID, &mut order, &mut names);
     }
 
     let mut s = String::with_capacity(64 * 1024);
@@ -825,7 +958,8 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
         let lname = names.get(layer_uuid).cloned().unwrap_or_else(|| "Layer".into());
         let fxs = fx_by_layer.get(layer_uuid).cloned().unwrap_or_default();
         let objs = obj_by_layer.get(layer_uuid).cloned().unwrap_or_default();
-        if fxs.is_empty() && objs.is_empty() {
+        let write_screens = layer_uuid == DEFAULT_LAYER_UUID && !scene.screens.is_empty();
+        if fxs.is_empty() && objs.is_empty() && !write_screens {
             s.push_str(&format!(
                 "      <Layer name=\"{}\" uuid=\"{}\"/>\n",
                 xml_escape(&lname),
@@ -843,6 +977,11 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
         }
         for &i in &objs {
             write_object(&mut s, &scene.geometry[i], i);
+        }
+        if write_screens {
+            for (i, sc) in scene.screens.iter().enumerate() {
+                write_video_screen(&mut s, sc, i);
+            }
         }
         s.push_str("        </ChildList>\n      </Layer>\n");
     }
@@ -1018,6 +1157,43 @@ fn write_object(s: &mut String, o: &crate::scene::SceneGeometry, idx: usize) {
     s.push_str(&format!("          </{kind}>\n"));
 }
 
+/// Write an [`LedScreen`](crate::scene::LedScreen) as a `<VideoScreen>` node. The
+/// full parametric build (cabinet grid / pitch / nits / content) is carried in
+/// `glowstone*` attributes for a faithful glowstone round-trip; a `<Sources>` child
+/// describes the content type for foreign MVR readers.
+fn write_video_screen(s: &mut String, sc: &crate::scene::LedScreen, idx: usize) {
+    use crate::scene::screen::ScreenContent as C;
+    let uuid = synth_uuid(0x2000 + idx);
+    let (kind, arg) = encode_content(&sc.content);
+    s.push_str(&format!(
+        "          <VideoScreen name=\"{}\" uuid=\"{}\"",
+        xml_escape(&sc.name),
+        uuid
+    ));
+    s.push_str(&format!(
+        " glowstonePanelType=\"{}\" glowstoneCabinetW=\"{}\" glowstoneCabinetH=\"{}\" glowstoneCabPxX=\"{}\" glowstoneCabPxY=\"{}\" glowstonePanelsWide=\"{}\" glowstonePanelsHigh=\"{}\" glowstoneGap=\"{}\" glowstoneCurvature=\"{}\" glowstoneNits=\"{}\" glowstoneGamma=\"{}\" glowstoneOpacity=\"{}\" glowstoneEmit=\"{}\" glowstonePixel=\"{}\" glowstoneContent=\"{}\" glowstoneContentArg=\"{}\">\n",
+        xml_escape(&sc.panel_type), sc.cabinet_mm[0], sc.cabinet_mm[1], sc.cabinet_px[0], sc.cabinet_px[1],
+        sc.panels_wide, sc.panels_high, sc.gap_mm, sc.curvature_deg, sc.nits, sc.gamma, sc.opacity, sc.emit,
+        sc.pixel_shape.code() as i32, kind, xml_escape(&arg),
+    ));
+    s.push_str(&format!("            <Matrix>{}</Matrix>\n", format_matrix(sc.transform)));
+    let src_type = match &sc.content {
+        C::Ndi { .. } => Some("NDI"),
+        C::Citp { .. } => Some("CITP"),
+        C::Image { .. } => Some("File"),
+        _ => None,
+    };
+    if let Some(t) = src_type {
+        s.push_str(&format!(
+            "            <Sources>\n              <Source linkedGeometry=\"\" type=\"{t}\">{}</Source>\n            </Sources>\n",
+            xml_escape(&arg)
+        ));
+    }
+    s.push_str("            <Geometries/>\n");
+    s.push_str("            <GDTFSpec></GDTFSpec>\n            <GDTFMode></GDTFMode>\n");
+    s.push_str("          </VideoScreen>\n");
+}
+
 /// Convert linear RGB to a CIE `x,y,Y` string triple (sRGB primaries; `Y` as a
 /// 0..100 luminance percentage), the inverse of [`crate::gdtf::parse_cie_xyy`].
 fn linear_rgb_to_cie_xyy(rgb: [f32; 3]) -> (f32, f32, f32) {
@@ -1052,6 +1228,50 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_screen_round_trips_through_mvr() {
+        use crate::scene::screen::{LedScreen, ScreenContent};
+        use crate::scene::ScreenProfile;
+        let prof = ScreenProfile {
+            name: "Indoor 3.9mm",
+            category: "LED Wall",
+            cabinet_mm: [500.0, 500.0],
+            cabinet_px: [128, 128],
+            gap_mm: 0.0,
+            transparent: false,
+            default_nits: 1200.0,
+        };
+        let mut sc = LedScreen::from_profile(
+            &prof,
+            "Wall A",
+            Mat4::from_translation(Vec3::new(1.0, 2.5, -3.0)),
+        );
+        sc.panels_wide = 6;
+        sc.panels_high = 4;
+        sc.nits = 4500.0;
+        sc.curvature_deg = 20.0;
+        sc.content = ScreenContent::Ndi { source: "HOST (Out)".into() };
+
+        let mut scene = crate::scene::Scene::demo();
+        scene.fixtures.clear();
+        scene.geometry.clear();
+        scene.screens.clear();
+        scene.screens.push(sc);
+
+        let bytes = export_bytes(&scene).expect("export");
+        let imp = MvrImport::load_bytes(&bytes).expect("reimport");
+        assert_eq!(imp.screens.len(), 1, "one screen round-trips");
+        let s = &imp.screens[0];
+        assert_eq!(s.name, "Wall A");
+        assert_eq!((s.panels_wide, s.panels_high), (6, 4));
+        assert_eq!(s.resolution(), [6 * 128, 4 * 128]);
+        assert!((s.nits - 4500.0).abs() < 1e-3);
+        assert!((s.curvature_deg - 20.0).abs() < 1e-3);
+        assert!(matches!(&s.content, ScreenContent::Ndi { source } if source == "HOST (Out)"));
+        let t = s.transform.w_axis.truncate();
+        assert!((t - Vec3::new(1.0, 2.5, -3.0)).length() < 1e-2, "translation {t:?}");
+    }
 
     #[test]
     fn matrix_columns_and_units() {

@@ -92,13 +92,16 @@ pub fn profile_editor_window(
     let key = Arc::as_ptr(&gdtf) as usize;
     let tex = gdtf_textures
         .entry(key)
-        .or_insert_with(|| crate::ui::panels::load_gdtf_textures(ctx, &gdtf));
+        .or_insert_with(|| crate::ui::inspector::load_gdtf_textures(ctx, &gdtf));
 
     let mut keep = true;
     #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
     let center = ctx.screen_rect().center();
     let title = format!("{}  Fixture Profile — {}", theme::icon::PROFILE, gdtf.name);
+    let max_h = ctx.input(|i| i.content_rect().height()) * 0.8;
     egui::Window::new(title)
+        .vscroll(true)
+        .max_height(max_h)
         .open(&mut keep)
         .resizable(true)
         .collapsible(false)
@@ -181,11 +184,11 @@ pub fn profile_editor_window(
     let _ = selection;
 }
 
-/// Badge marking a value as modeled by previz, not present in the GDTF file.
+/// Badge marking a value as modeled by glowstone, not present in the GDTF file.
 fn modeled(ui: &mut egui::Ui) {
     let ink = theme::ink(!ui.visuals().dark_mode);
     ui.label(RichText::new("modeled").small().italics().color(ink.muted))
-        .on_hover_text("Synthesized by previz — not carried in the GDTF file");
+        .on_hover_text("Synthesized by glowstone — not carried in the GDTF file");
 }
 
 /// A read-only key/value grid row: the key reads as a quiet label (secondary
@@ -273,7 +276,7 @@ fn tab_optics(
         modeled(ui);
         ui.end_row();
         let (pmax, tmax) = fixture.max_slew();
-        ui.label(RichText::new("→ pan / tilt").color(ink.tertiary));
+        ui.label(RichText::new(format!("{}  pan / tilt", theme::icon::ARROW_RIGHT)).color(ink.tertiary));
         ui.label(RichText::new(format!("{pmax:.0} / {tmax:.0} °/s")).monospace().color(ink.primary));
         ui.label("");
         ui.end_row();

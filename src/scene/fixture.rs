@@ -14,7 +14,8 @@ use crate::mvr::MvrFixtureMeta;
 use crate::optics::{OpticalControls, ShutterKind, WheelMotion};
 
 /// One controllable fixture.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct Fixture {
     /// Instance name (e.g. "PAR Can 1").
     pub name: String,
@@ -27,6 +28,24 @@ pub struct Fixture {
     /// beam comes from its Beam geometry.
     #[serde(skip)]
     pub gdtf: Option<Arc<GdtfFixture>>,
+    /// Borrowed 3D MODEL: when set, the renderer draws THIS GDTF's geometry for the
+    /// body in place of the fixture's own — the Replace dialog's "mesh/model only"
+    /// (give a model-less fixture a real model while keeping its profile, channels,
+    /// patch, mode + optics; the BEAM + articulation still come from `gdtf`).
+    /// serde-skip + reattached across undo, exactly like `gdtf` (runtime-only).
+    #[serde(skip)]
+    pub model_src: Option<Arc<GdtfFixture>>,
+    /// Session-stable identity (serde-skip → reassigned by `Scene::ensure_ids`
+    /// on load). The Scene outliner keys rows by this so reorder/delete stays
+    /// robust; never serialized (reseeded on load).
+    #[serde(skip)]
+    pub id: super::EntityId,
+    /// Stable, user-facing SEQUENCE number for this patchable fixture — the "channel
+    /// number" a designer sorts/renumbers by (shown + editable in the outliner + the
+    /// Fixture Manager). `0` = unassigned; [`Scene::ensure_sequences`] fills it on
+    /// load/import (inferred from the imported MVR FixtureID/UnitNumber, else the next
+    /// free number). Persisted with the show.
+    pub sequence: u32,
 
     /// World position of the fixture head, in metres. Y is up.
     pub position: Vec3,
@@ -84,6 +103,22 @@ pub struct Fixture {
     /// aligned with the mode's emitters. White at rest; live DMX rewrites it
     /// every frame from the per-cell color layers.
     pub cells: Vec<[f32; 3]>,
+    /// Per-emitter tilt angle in degrees, for fixtures whose individual heads
+    /// tilt independently (e.g. the Clay Paky Volero Wave — eight separately
+    /// tilting bodies). Aligned with the mode's emitters; 0 = the head's rest
+    /// aim. Re-derived from live DMX every frame and resized by [`sync_mode`],
+    /// so it's `#[serde(skip)]` — runtime-only, not persisted.
+    ///
+    /// [`sync_mode`]: Self::sync_mode
+    #[serde(skip)]
+    pub cell_tilt: Vec<f32>,
+    /// Per-emitter pan angle in degrees (companion to [`cell_tilt`] for a
+    /// fixture whose heads pan independently). Empty/0 for the common
+    /// single-yoke fixture.
+    ///
+    /// [`cell_tilt`]: Self::cell_tilt
+    #[serde(skip)]
+    pub cell_pan: Vec<f32>,
 
     /// The optical-chain control values (focus / frost / prism / color / gobo /
     /// animation / shutter …). Drives the GDTF optical model; neutral by default.
@@ -96,6 +131,11 @@ pub struct Fixture {
     /// custom commands) when this fixture came from — or is destined for — an
     /// MVR scene. `None` for purely app-created fixtures.
     pub mvr: Option<Box<MvrFixtureMeta>>,
+
+    /// Where this fixture came from (built-in / disk import / GDTF Share / MVR).
+    /// Drives the colored provenance chip in the Inspector header (`source_chip`).
+    /// Persisted with the show so chips survive save / load.
+    pub source: crate::gdtf::FixtureSource,
 }
 
 impl Fixture {
@@ -112,6 +152,9 @@ impl Fixture {
             category: profile.category.to_string(),
             geometry: profile.geometry,
             gdtf: None,
+            model_src: None,
+            id: 0, // a real id is assigned by the Scene add_* / ensure_ids caller
+            sequence: 0,
             is_laser: profile.laser,
             hidden: false,
             beam: 1.0,
@@ -129,10 +172,13 @@ impl Fixture {
             beam_angle: profile.default_beam_angle,
             mode_index: 0,
             cells: Vec::new(),
+            cell_tilt: Vec::new(),
+            cell_pan: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: None,
             shutter: ShutterKind::None,
+            source: crate::gdtf::FixtureSource::Builtin,
         }
     }
 
@@ -141,12 +187,16 @@ impl Fixture {
         let beam_angle = gdtf.beam_angle.max(1.0);
         let is_laser = gdtf.beam.lamp_type.to_lowercase().contains("laser");
         let shutter = default_shutter(&gdtf);
+        let source = gdtf.source; // read before the Arc moves into the struct
         let mut f = Self {
             name: name.into(),
             profile: gdtf.name.clone(),
             category: gdtf.manufacturer.clone(),
             geometry: FixtureGeometry::Cylinder,
             gdtf: Some(gdtf),
+            model_src: None,
+            id: 0, // assigned by Scene::add_gdtf / ensure_ids
+            sequence: 0,
             is_laser,
             hidden: false,
             beam: 1.0,
@@ -164,10 +214,13 @@ impl Fixture {
             beam_angle,
             mode_index: 0,
             cells: Vec::new(),
+            cell_tilt: Vec::new(),
+            cell_pan: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: None,
             shutter,
+            source,
         };
         f.sync_mode();
         f
@@ -202,6 +255,9 @@ impl Fixture {
             category,
             geometry: FixtureGeometry::Cylinder,
             gdtf: imported.gdtf,
+            model_src: None,
+            id: 0, // assigned by import_mvr's ensure_ids
+            sequence: 0,
             is_laser,
             hidden: false,
             beam: 1.0,
@@ -221,10 +277,13 @@ impl Fixture {
             beam_angle,
             mode_index,
             cells: Vec::new(),
+            cell_tilt: Vec::new(),
+            cell_pan: Vec::new(),
             optics: OpticalControls::default(),
             motion: WheelMotion::default(),
             mvr: Some(Box::new(imported.meta)),
             shutter,
+            source: crate::gdtf::FixtureSource::Mvr,
         };
         // Imported rigs start blacked out — with no DMX feeding levels, a real
         // rig emits nothing, and importing 100+ fixtures at full would white out
@@ -267,6 +326,14 @@ impl Fixture {
         }
         if self.cells.len() != mode.emitters.len() {
             self.cells = vec![[1.0, 1.0, 1.0]; mode.emitters.len()];
+        }
+        // Per-emitter articulation arrays (serde-skip → empty after a load):
+        // size them to the emitter count so per-head tilt/pan has a slot each.
+        if self.cell_tilt.len() != mode.emitters.len() {
+            self.cell_tilt = vec![0.0; mode.emitters.len()];
+        }
+        if self.cell_pan.len() != mode.emitters.len() {
+            self.cell_pan = vec![0.0; mode.emitters.len()];
         }
     }
 
@@ -394,6 +461,44 @@ impl Fixture {
             .transform_vector3(Vec3::new(0.0, -1.0, 0.0))
             .normalize_or_zero()
     }
+
+    /// Solve the commanded **pan/tilt** (degrees) that aims this head's beam axis at
+    /// `target` (world). This is the inverse of [`model_matrix`]'s beam mapping: the
+    /// beam exits along local `-Y`, so for a desired world direction `dir` we strip
+    /// the base hang [`orientation`] (`dir_local = orientation⁻¹ · dir`) and invert
+    /// the `RotY(pan) · RotX(tilt)` chain. With `RotX(tilt)·(0,-1,0) = (0,-cos t,-sin t)`
+    /// then `RotY(pan)` applied, the local beam dir is
+    /// `(-sin t·sin p, -cos t, -sin t·cos p)`, giving
+    /// `tilt = acos(-y)` and `pan = atan2(-x, -z)`. The Aim tool writes these to the
+    /// commanded `pan`/`tilt`; the slew engine then drives `pan_actual`/`tilt_actual`
+    /// toward them (so Aim cooperates with the motion model — no raw quaternion poke).
+    ///
+    /// Returns `None` when `target` coincides with the head (no defined direction).
+    /// The returned pan is kept near the current commanded `pan` (adding/removing full
+    /// turns) so the yoke takes the short way and doesn't unwind across `±180°`.
+    ///
+    /// [`model_matrix`]: Self::model_matrix
+    /// [`orientation`]: Self::orientation
+    pub fn aim_pan_tilt(&self, target: Vec3) -> Option<(f32, f32)> {
+        let dir = (target - self.position).normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return None;
+        }
+        // Beam exits the lens, not the head origin, but for aiming the lens is ~at the
+        // head (BODY_LENGTH along the beam) — using the head position is the standard
+        // look-at and avoids a feedback loop (the lens moves as we aim).
+        let dl = self.orientation.inverse() * dir;
+        let tilt = (-dl.y).clamp(-1.0, 1.0).acos().to_degrees();
+        let mut pan = (-dl.x).atan2(-dl.z).to_degrees();
+        // Unwrap toward the current commanded pan so the head doesn't spin the long way.
+        while pan - self.pan > 180.0 {
+            pan -= 360.0;
+        }
+        while pan - self.pan < -180.0 {
+            pan += 360.0;
+        }
+        Some((pan, tilt))
+    }
 }
 
 /// One axis of an accel-limited follower (trapezoidal velocity profile): ramp
@@ -466,6 +571,39 @@ mod tests {
         assert!(max_fast <= 270.0 + 0.5, "no overshoot, peaked at {max_fast}");
         assert!((max_fast - 270.0).abs() < 1.0, "reaches target, got {max_fast}");
         assert!(n_slow > n_fast * 3, "slow motor is much slower: {n_slow} vs {n_fast}");
+    }
+
+    /// `aim_pan_tilt` is the inverse of `beam_direction`: solving pan/tilt for a
+    /// target then snapping the head makes the beam point at it. Covers straight
+    /// down, sideways, and an angled target.
+    #[test]
+    fn aim_round_trips_through_beam_direction() {
+        let lib = Library::standard();
+        let check = |target: Vec3| {
+            let mut f = Fixture::from_profile(&lib.fixtures[0], "t", Vec3::new(0.0, 5.0, 0.0));
+            let (pan, tilt) = f.aim_pan_tilt(target).expect("solvable");
+            f.pan = pan;
+            f.tilt = tilt;
+            f.snap_movement();
+            let want = (target - f.position).normalize();
+            let got = f.beam_direction();
+            assert!(
+                got.distance(want) < 1e-3,
+                "aim at {target:?}: beam {got:?} != want {want:?} (pan {pan}, tilt {tilt})"
+            );
+        };
+        check(Vec3::new(0.0, 0.0, 0.0)); // straight down
+        check(Vec3::new(10.0, 5.0, 0.0)); // due +X, level
+        check(Vec3::new(4.0, 0.0, -6.0)); // down-and-forward
+        check(Vec3::new(-3.0, 8.0, 2.0)); // up-and-back
+    }
+
+    /// Aiming at the head's own position has no defined direction → `None`.
+    #[test]
+    fn aim_at_self_is_none() {
+        let lib = Library::standard();
+        let f = Fixture::from_profile(&lib.fixtures[0], "t", Vec3::new(1.0, 2.0, 3.0));
+        assert!(f.aim_pan_tilt(Vec3::new(1.0, 2.0, 3.0)).is_none());
     }
 
     /// `snap_movement` settles instantly to the commanded pose.
