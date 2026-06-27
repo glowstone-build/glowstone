@@ -661,6 +661,9 @@ pub fn viewport(
     selection: &mut Selection,
     scene_anchor: &mut Option<usize>,
     viewport_focused: &mut bool,
+    // One-shot "box-select armed" flag (set by `dispatch_action` on `B`); the viewport
+    // consumes it and latches marquee mode for the next drag.
+    box_select_armed: &mut bool,
     duplicate: &mut Option<DuplicateDialog>,
     texture: egui::TextureId,
     requested_px: &mut (u32, u32),
@@ -1279,7 +1282,7 @@ pub fn viewport(
         // quick-select) and `R` to Rotate (Shift+R = Replace stays in Global).
         let kind = shortcuts::poll(
             ui.ctx(),
-            shortcuts::ActiveContext { viewport_focused: true, transform_active: false },
+            shortcuts::ActiveContext { viewport_focused: true, transform_active: false, box_select_active: false },
             &ov,
         )
         .into_iter()
@@ -1352,46 +1355,164 @@ pub fn viewport(
     // currently marqueeing. Stashing the anchor here makes the release computation
     // independent of egui's `press_origin()` lifetime (cleared at button-up).
     let box_anchor_id = ui.id().with("viewport_box_anchor");
+    let box_filter_id = ui.id().with("viewport_box_filter");
     let mut box_anchor: Option<egui::Pos2> = ui.data(|d| d.get_temp(box_anchor_id));
-    if !consumed
-        && active_tool == ActiveTool::Select
+
+    // === Box-select (B) — driven by RAW pointer state ======================
+    // egui's click/drag classification on the viewport response proved unreliable here
+    // (the marquee never anchored → it never selected or auto-exited). So B-mode reads
+    // the pointer buttons directly: PRESS = anchor, HELD = draw, RELEASE = select +
+    // auto-exit (press B again to box more). `*box_select_armed` is the mode flag (set
+    // by `B` via dispatch); while it's set the keymap masks the globals (`gather`'s
+    // `box_select_active`), so F/O (filter) and Esc (cancel) are read here.
+    if *box_select_armed {
+        let pressed = ui.input(|i| i.pointer.primary_pressed());
+        let down = ui.input(|i| i.pointer.primary_down());
+        let released = ui.input(|i| i.pointer.primary_released());
+        let pos = ui.input(|i| i.pointer.latest_pos());
+
+        // Pre-drag (no anchor, button up): Esc / right-click cancels; F/O set the filter
+        // (0 = all, 1 = fixtures/pyro/screens, 2 = objects/geometry — never fog boxes).
+        if box_anchor.is_none() && !down {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+                || response.secondary_clicked()
+            {
+                *box_select_armed = false;
+                ui.data_mut(|d| {
+                    d.remove_temp::<egui::Pos2>(box_anchor_id);
+                    d.remove_temp::<u8>(box_filter_id);
+                });
+            } else {
+                let mut filter: u8 = ui.data(|d| d.get_temp(box_filter_id).unwrap_or(0));
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
+                    filter = if filter == 1 { 0 } else { 1 };
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::O)) {
+                    filter = if filter == 2 { 0 } else { 2 };
+                }
+                ui.data_mut(|d| d.insert_temp(box_filter_id, filter));
+            }
+        }
+
+        // Anchor at the press point (inside the viewport).
+        if box_anchor.is_none()
+            && pressed
+            && let Some(p) = pos.filter(|p| rect.contains(*p))
+        {
+            box_anchor = Some(p);
+            ui.data_mut(|d| d.insert_temp(box_anchor_id, p));
+        }
+
+        if let Some(anchor) = box_anchor {
+            let cur = pos.unwrap_or(anchor);
+            let marquee = egui::Rect::from_two_pos(anchor, cur);
+            consumed = true; // box-select owns the pointer this frame
+            if down {
+                // Rubber-band: 30% gray fill + a dashed border a shade lighter (spec).
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(marquee, 0.0, egui::Color32::from_rgba_unmultiplied(130, 130, 130, 77));
+                let pts = [
+                    marquee.left_top(),
+                    marquee.right_top(),
+                    marquee.right_bottom(),
+                    marquee.left_bottom(),
+                    marquee.left_top(),
+                ];
+                painter.extend(egui::Shape::dashed_line(
+                    &pts,
+                    egui::Stroke::new(1.5, egui::Color32::from_gray(200)),
+                    6.0,
+                    4.0,
+                ));
+            }
+            if released {
+                // Commit (boxes > a few px; a click leaves the selection as-is) then
+                // AUTO-EXIT box mode.
+                if marquee.width() > 3.0 || marquee.height() > 3.0 {
+                    // B box-select is ADDITIVE — it never clears the existing selection
+                    // (press B repeatedly to keep adding). ⌘/Ctrl removes the boxed items.
+                    let m = ui.input(|i| i.modifiers);
+                    let op = if m.command || m.ctrl {
+                        SelectOp::Subtract
+                    } else {
+                        SelectOp::Add
+                    };
+                    let filter: u8 = ui.data(|d| d.get_temp(box_filter_id).unwrap_or(0));
+                    let vp = camera.view_proj(aspect);
+                    let hits = marquee_hits(scene, vp, rect, marquee, filter);
+                    *selection = apply_select(selection, &hits, op);
+                    *scene_anchor = None;
+                }
+                box_anchor = None;
+                *box_select_armed = false;
+                ui.data_mut(|d| {
+                    d.remove_temp::<egui::Pos2>(box_anchor_id);
+                    d.remove_temp::<u8>(box_filter_id);
+                });
+            }
+        } else if let Some(p) = pos.filter(|p| rect.contains(*p)) {
+            // Armed, not yet dragging: full-viewport crosshair + the active filter cue.
+            let painter = ui.painter_at(rect);
+            let s = egui::Stroke::new(1.0, egui::Color32::from_gray(170).gamma_multiply(0.5));
+            painter.line_segment([egui::pos2(rect.left(), p.y), egui::pos2(rect.right(), p.y)], s);
+            painter.line_segment([egui::pos2(p.x, rect.top()), egui::pos2(p.x, rect.bottom())], s);
+            let label = match ui.data(|d| d.get_temp::<u8>(box_filter_id).unwrap_or(0)) {
+                1 => "Box: fixtures  (O = objects)",
+                2 => "Box: objects  (F = fixtures)",
+                _ => "Box: all  (F fixtures · O objects)",
+            };
+            painter.text(
+                egui::pos2(p.x + 12.0, p.y + 12.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(215),
+            );
+        }
+    } else if !consumed
         && transform.is_none()
         && *viewport_focused
+        && active_tool == ActiveTool::Select
     {
+        // Select-tool marquee (un-armed): a drag that BEGAN on EMPTY space rubber-bands;
+        // a drag that began on an object stays plain orbit. Response-based (it correctly
+        // distinguishes a click from a drag for this tool).
         if response.drag_started()
             && let Some(press) = ui.input(|i| i.pointer.press_origin())
         {
-            // Box only when the press landed on empty space; an object under the
-            // press leaves the drag to orbit (no tweak-move under Select yet).
-            let uv = (press - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
-            let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-            let (ro, rd) = camera.ray(ndc, aspect);
-            box_anchor = (rect.contains(press) && pick(scene, ro, rd).is_none()).then_some(press);
+            let on_empty = {
+                let uv = (press - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+                let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+                let (ro, rd) = camera.ray(ndc, aspect);
+                pick(scene, ro, rd).is_none()
+            };
+            box_anchor = (rect.contains(press) && on_empty).then_some(press);
             ui.data_mut(|d| d.insert_temp(box_anchor_id, box_anchor));
         }
         if let Some(anchor) = box_anchor {
             let cur = ui.input(|i| i.pointer.latest_pos()).unwrap_or(anchor);
             let marquee = egui::Rect::from_two_pos(anchor, cur);
             if response.dragged() {
-                // Draw the rubber-band from the anchor to the live cursor.
-                let accent = theme::Palette::get(ui).accent;
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(marquee, 0.0, accent.gamma_multiply(0.10));
-                painter.rect_stroke(
-                    marquee,
-                    0.0,
-                    egui::Stroke::new(1.0, accent),
-                    egui::StrokeKind::Inside,
-                );
-                consumed = true; // suppress orbit/pan while marqueeing
+                painter.rect_filled(marquee, 0.0, egui::Color32::from_rgba_unmultiplied(130, 130, 130, 77));
+                let pts = [
+                    marquee.left_top(),
+                    marquee.right_top(),
+                    marquee.right_bottom(),
+                    marquee.left_bottom(),
+                    marquee.left_top(),
+                ];
+                painter.extend(egui::Shape::dashed_line(
+                    &pts,
+                    egui::Stroke::new(1.5, egui::Color32::from_gray(200)),
+                    6.0,
+                    4.0,
+                ));
+                consumed = true;
             }
             if response.drag_stopped() {
-                // Ignore a sub-pixel "drag" (really a click) — the click handler
-                // below owns single-pick selection.
                 if marquee.width() > 2.0 || marquee.height() > 2.0 {
                     let m = ui.input(|i| i.modifiers);
-                    // Modifier → op (UE/CAD): plain = Replace, Shift = Add,
-                    // ⌘/Ctrl = Subtract — ONE undo-free selection change.
                     let op = if m.command || m.ctrl {
                         SelectOp::Subtract
                     } else if m.shift {
@@ -1400,10 +1521,10 @@ pub fn viewport(
                         SelectOp::Replace
                     };
                     let vp = camera.view_proj(aspect);
-                    let hits = marquee_hits(scene, vp, rect, marquee);
+                    let hits = marquee_hits(scene, vp, rect, marquee, 0);
                     *selection = apply_select(selection, &hits, op);
                     *scene_anchor = None;
-                    consumed = true; // don't also fire click-select this frame
+                    consumed = true;
                 }
                 ui.data_mut(|d| d.remove_temp::<egui::Pos2>(box_anchor_id));
             }
@@ -1479,7 +1600,10 @@ pub fn viewport(
         }
     }
 
-    if !consumed && response.dragged() {
+    // Drag = orbit / shift-pan — BUT never while box-select is armed (`B`). The whole
+    // point of box mode is that the drag draws a marquee, so the camera is frozen for
+    // the entire armed period regardless of whatever else happens this frame.
+    if !consumed && !*box_select_armed && response.dragged() {
         let delta = response.drag_delta();
         if ui.input(|i| i.modifiers.shift) {
             camera.pan(delta.x, delta.y);
@@ -1487,7 +1611,7 @@ pub fn viewport(
             camera.orbit(delta.x, delta.y);
         }
     }
-    if !consumed && response.contains_pointer() {
+    if !consumed && !*box_select_armed && response.contains_pointer() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
             // Zoom-to-cursor: anchor the dolly on the world point under the
@@ -1509,8 +1633,13 @@ pub fn viewport(
     // ⌘/Ctrl-click toggles into a multi-selection; Shift-click range-selects from
     // the anchor (same as the outliner). A drag with Shift pans, so a stationary
     // Shift-click still range-selects.
+    // A click that merely FOCUSES the viewport (it wasn't the active pane) must do
+    // NOTHING to the selection — not select, not deselect. So the whole click-select is
+    // gated on `was_focused` (the focus state captured at the press, before this click
+    // set it). Once the viewport is the active pane, clicks select/deselect as usual.
     if !consumed
         && response.clicked()
+        && was_focused
         && let Some(pos) = response.interact_pointer_pos()
     {
         let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
@@ -1520,13 +1649,7 @@ pub fn viewport(
         let m = ui.input(|i| i.modifiers);
         let toggle = m.command || m.ctrl;
         let hit = pick(scene, ro, rd);
-        // A click that just FOCUSES the viewport (it wasn't the active pane) on EMPTY
-        // space should only focus — never wipe the current selection. Once the
-        // viewport is focused, an empty click deselects as usual; a click that hits an
-        // object always selects it.
-        if hit.is_none() && !was_focused && !toggle && !m.shift {
-            // focus-only; leave the selection untouched
-        } else if let Some(Hit::Fixture(i)) = hit {
+        if let Some(Hit::Fixture(i)) = hit {
             apply_fixture_click(selection, scene_anchor, i, m.shift, toggle, scene.fixtures.len());
         } else {
             // Modifier → op: plain = replace, ⌘/Ctrl = toggle, Shift = add.
@@ -1779,7 +1902,7 @@ pub fn viewport(
     // started transform, so the poll asks the Viewport keymap with no modal active.
     let dup_pressed = shortcuts::poll(
         ui.ctx(),
-        shortcuts::ActiveContext { viewport_focused: *viewport_focused, transform_active: false },
+        shortcuts::ActiveContext { viewport_focused: *viewport_focused, transform_active: false, box_select_active: false },
         &ov,
     )
     .iter()
@@ -2851,34 +2974,43 @@ fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
 /// and behind-camera entities are skipped (`project_to_screen` returns `None`
 /// when `w <= 0`). Environments are excluded — they're single-only volumes the
 /// marquee shouldn't sweep up. Pure given `vp`/`rect`, so it's unit-testable.
-fn marquee_hits(scene: &Scene, vp: glam::Mat4, rect: egui::Rect, marquee: egui::Rect) -> Vec<SelItem> {
+/// Objects whose screen-projected origin falls inside the marquee. `filter`: 0 = all,
+/// 1 = fixtures/pyro/screens ("devices", the `F` filter), 2 = geometry ("objects", `O`).
+/// Environments (fog boxes) are NEVER box-selectable, by design.
+fn marquee_hits(scene: &Scene, vp: glam::Mat4, rect: egui::Rect, marquee: egui::Rect, filter: u8) -> Vec<SelItem> {
+    let devices = filter != 2; // include fixtures/pyro/screens unless "objects only"
+    let objects = filter != 1; // include geometry unless "devices only"
     let mut hits = Vec::new();
     let inside = |p: Vec3| {
         OrbitCamera::project_to_screen(p, vp, rect)
             .is_some_and(|s| marquee.contains(s))
     };
-    for (i, f) in scene.fixtures.iter().enumerate() {
-        if !f.hidden && inside(f.position) {
-            hits.push(SelItem::Fixture(i));
+    if devices {
+        for (i, f) in scene.fixtures.iter().enumerate() {
+            if !f.hidden && inside(f.position) {
+                hits.push(SelItem::Fixture(i));
+            }
+        }
+        for (i, s) in scene.screens.iter().enumerate() {
+            if !s.hidden && inside(s.world_center()) {
+                hits.push(SelItem::Screen(i));
+            }
+        }
+        for (i, d) in scene.pyro.iter().enumerate() {
+            if !d.hidden && inside(d.world_nozzle()) {
+                hits.push(SelItem::Pyro(i));
+            }
         }
     }
-    for (i, g) in scene.geometry.iter().enumerate() {
-        let c = g
-            .world_bounds()
-            .map(|(lo, hi)| (lo + hi) * 0.5)
-            .unwrap_or_else(|| g.transform.w_axis.truncate());
-        if !g.hidden && inside(c) {
-            hits.push(SelItem::Geometry(i));
-        }
-    }
-    for (i, s) in scene.screens.iter().enumerate() {
-        if !s.hidden && inside(s.world_center()) {
-            hits.push(SelItem::Screen(i));
-        }
-    }
-    for (i, d) in scene.pyro.iter().enumerate() {
-        if !d.hidden && inside(d.world_nozzle()) {
-            hits.push(SelItem::Pyro(i));
+    if objects {
+        for (i, g) in scene.geometry.iter().enumerate() {
+            let c = g
+                .world_bounds()
+                .map(|(lo, hi)| (lo + hi) * 0.5)
+                .unwrap_or_else(|| g.transform.w_axis.truncate());
+            if !g.hidden && inside(c) {
+                hits.push(SelItem::Geometry(i));
+            }
         }
     }
     hits
@@ -2974,7 +3106,7 @@ mod pick_tests {
 
         // A 40px box centred on the dot encloses its centre → hit.
         let around = egui::Rect::from_center_size(dot, egui::vec2(40.0, 40.0));
-        let hits = marquee_hits(&scene, vp, rect, around);
+        let hits = marquee_hits(&scene, vp, rect, around, 0);
         assert!(hits.contains(&SelItem::Fixture(0)), "dot-in-rect → selected");
 
         // A tiny box far from the dot → no hit.
@@ -2982,16 +3114,23 @@ mod pick_tests {
             dot + egui::vec2(300.0, 300.0),
             egui::vec2(8.0, 8.0),
         );
-        let none = marquee_hits(&scene, vp, rect, far);
+        let none = marquee_hits(&scene, vp, rect, far, 0);
         assert!(!none.contains(&SelItem::Fixture(0)), "off-dot rect → not selected");
 
         // A hidden fixture is skipped even when its dot is inside the marquee.
         let mut hidden = Scene::demo();
         hidden.fixtures[0].hidden = true;
         assert!(
-            marquee_hits(&hidden, vp, rect, around).is_empty(),
+            marquee_hits(&hidden, vp, rect, around, 0).is_empty(),
             "hidden fixtures are not marquee-pickable"
         );
+
+        // Filter (F/O): a fixture is caught with "all" (0) and "fixtures" (1) but NOT
+        // with "objects" (2).
+        assert!(marquee_hits(&scene, vp, rect, around, 1).contains(&SelItem::Fixture(0)),
+            "F filter keeps fixtures");
+        assert!(!marquee_hits(&scene, vp, rect, around, 2).contains(&SelItem::Fixture(0)),
+            "O filter (objects-only) drops fixtures");
     }
 
     #[test]

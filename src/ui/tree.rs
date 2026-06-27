@@ -896,9 +896,17 @@ fn draw_row(
             );
             let mut commit = false;
             let mut cancel = false;
+            let focus_pending_id = egui::Id::new("glow_scene_rename_focus");
             ui.scope_builder(egui::UiBuilder::new().max_rect(edit_rect), |ui| {
                 let te = ui.put(edit_rect, egui::TextEdit::singleline(buf).margin(egui::vec2(2.0, 0.0)));
-                te.request_focus();
+                // Grab focus ONCE, the first frame the editor appears; then let egui
+                // own focus so Enter / clicking away fire `lost_focus` → commit.
+                // (Re-requesting every frame re-grabbed focus so the field could never
+                // be left — the rename got stuck with no way to apply or cancel it.)
+                if ui.memory(|m| m.data.get_temp::<bool>(focus_pending_id).unwrap_or(false)) {
+                    te.request_focus();
+                    ui.memory_mut(|m| m.data.remove_temp::<bool>(focus_pending_id));
+                }
                 if te.lost_focus() {
                     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         cancel = true;
@@ -948,9 +956,11 @@ fn draw_row(
         toggle_expand(expanded, row.key);
         return;
     }
-    // Double-click a renameable name → start inline rename.
+    // Double-click a renameable name → start inline rename. Flag the editor to grab
+    // focus once on its first frame (see the editor above).
     if row.renameable && resp.double_clicked() {
         *rename = Some((row.key, row.label.clone()));
+        ui.memory_mut(|m| m.data.insert_temp(egui::Id::new("glow_scene_rename_focus"), true));
         return;
     }
     if resp.clicked() {

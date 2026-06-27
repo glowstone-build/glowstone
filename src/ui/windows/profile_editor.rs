@@ -98,7 +98,10 @@ pub fn profile_editor_window(
     #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
     let center = ctx.screen_rect().center();
     let title = format!("{}  Fixture Profile — {}", theme::icon::PROFILE, gdtf.name);
+    let max_h = ctx.input(|i| i.content_rect().height()) * 0.8;
     egui::Window::new(title)
+        .vscroll(true)
+        .max_height(max_h)
         .open(&mut keep)
         .resizable(true)
         .collapsible(false)

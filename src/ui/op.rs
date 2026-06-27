@@ -193,6 +193,9 @@ impl DocSnapshot {
 
 /// One reversible edit: a name for the menu label plus both document ends.
 pub struct UndoStep {
+    /// Unique, monotonically-minted id — identifies the document state this step
+    /// produces, for the window-title dirty marker (see [`UndoStack::state_id`]).
+    id: u64,
     pub name: String,
     before: DocSnapshot,
     after: DocSnapshot,
@@ -205,6 +208,9 @@ pub struct UndoStep {
 pub struct UndoStack {
     steps: Vec<UndoStep>,
     cursor: usize,
+    /// Monotonic id source for [`UndoStep::id`] — never reused, even after a step is
+    /// pruned, so the dirty marker can't be fooled by two divergent histories.
+    next_id: u64,
     /// The last registered op that ran — see [`LastOp`] (set by `run_op`).
     last_op: Option<LastOp>,
 }
@@ -300,9 +306,23 @@ impl UndoStack {
             before.share_unchanged_from(&prev.after);
         }
         after.share_unchanged_from(&before);
-        self.steps.push(UndoStep { name: name.into(), before, after });
+        self.next_id += 1;
+        self.steps.push(UndoStep { id: self.next_id, name: name.into(), before, after });
         self.cursor = self.steps.len();
         self.enforce_limits();
+    }
+
+    /// A stable identifier of the CURRENT applied document state, for change tracking
+    /// (the window-title dirty marker). `0` is the pristine state (cursor at 0);
+    /// otherwise the unique id of the last-applied step. Undo/redo move between
+    /// existing ids; a new edit always mints a fresh one — so the marker is exact
+    /// even when undoing back to a previously-saved point.
+    pub fn state_id(&self) -> u64 {
+        if self.cursor == 0 {
+            0
+        } else {
+            self.steps[self.cursor - 1].id
+        }
     }
 
     /// Replace the `after` end of the most-recently-pushed step in place, keeping

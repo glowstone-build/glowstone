@@ -325,7 +325,14 @@ impl Ui {
                     || !self.selection.screens.is_empty()
                     || !self.selection.pyro.is_empty()
             }
-            _ => false,
+            // Renumber works on the selection, or ALL fixtures when nothing is selected,
+            // so it's always available.
+            "fixture.renumber" => true,
+            // Any other catalog op is runnable by default — only the ones above gate on
+            // a precondition. (The old blanket `false` silently DISABLED every op not
+            // listed here, e.g. `fixture.renumber`, making them look missing from the
+            // palette.)
+            _ => true,
         }
     }
 
@@ -392,6 +399,28 @@ impl Ui {
                         true,
                         |cx| {
                             unpatch_selection(cx, kind);
+                            op::OpStatus::Finished
+                        },
+                    );
+                }
+                "fixture.renumber" => {
+                    self.run_op(
+                        "fixture.renumber",
+                        "Renumber Sequence",
+                        op::OpFlags::UNDO | op::OpFlags::REGISTER,
+                        scene,
+                        dmx,
+                        true,
+                        |cx| {
+                            // The selected fixtures, or ALL when none are selected.
+                            let sel: Vec<usize> = cx
+                                .selection
+                                .fixtures
+                                .iter()
+                                .copied()
+                                .filter(|&i| i < cx.scene.fixtures.len())
+                                .collect();
+                            cx.scene.renumber_sequences_by_position(&sel);
                             op::OpStatus::Finished
                         },
                     );

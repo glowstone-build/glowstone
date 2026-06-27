@@ -37,7 +37,10 @@ pub fn unpatch_dialog_window(ctx: &egui::Context, dlg: &mut UnpatchDialog) -> bo
         confirm = true;
     }
 
+    let max_h = ctx.input(|i| i.content_rect().height()) * 0.8;
     egui::Window::new(format!("{}  Unpatch", theme::icon::PATCH))
+        .vscroll(true)
+        .max_height(max_h)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])

@@ -105,9 +105,9 @@ impl Workspaces {
             Err(_) => return Self::default(),
         };
         ws.ensure_builtins();
-        if ws.active >= ws.items.len() {
-            ws.active = 0;
-        }
+        // Always open in the Design workspace (the default working layout), regardless
+        // of which workspace was active when the app last closed.
+        ws.active = ws.items.iter().position(|w| w.name == "Design").unwrap_or(0);
         ws
     }
 

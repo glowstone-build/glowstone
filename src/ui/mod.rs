@@ -576,9 +576,17 @@ pub struct Ui {
     /// item after the dock (where the library + scene are reachable). Mirrors Enter
     /// in the Library pane.
     pending_lib_add: bool,
+    /// `B` (box-select) was pressed — set by `dispatch_action`, consumed by the
+    /// viewport, which then latches into marquee mode for the next drag. A flag (not a
+    /// viewport-local key poll) so it rides the single keymap→dispatch path.
+    box_select_armed: bool,
     /// Path of the currently-open `.glow` project (Save vs Save As). `None` =
     /// untitled / never saved.
     current_path: Option<PathBuf>,
+    /// The undo [`state_id`](op::UndoStack::state_id) at the last save / open / new —
+    /// the "clean" anchor. The document is dirty (window-title `*`) when the live
+    /// state id differs from this.
+    saved_state_id: u64,
     /// The welcome / recover splash is open (shown at startup, on New, and from
     /// Window ▸ Welcome / the operator search).
     show_splash: bool,
@@ -684,6 +692,26 @@ impl Ui {
         self.cues.tick(scene, dt);
     }
 
+    /// True when the document has unsaved edits (the live undo state differs from the
+    /// last save / open / new anchor).
+    pub fn is_dirty(&self) -> bool {
+        self.undo.state_id() != self.saved_state_id
+    }
+
+    /// The window title: `glowstone - <name>`, with a `*` marking unsaved changes and
+    /// `untitled` for a never-saved document. E.g. `glowstone - show.glow` (clean),
+    /// `glowstone -*show.glow` (unsaved), `glowstone - untitled` (new).
+    pub fn window_title(&self) -> String {
+        let name = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".to_string());
+        let sep = if self.is_dirty() { "*" } else { " " };
+        format!("glowstone -{sep}{name}")
+    }
+
     /// Raise a success toast from outside the Ui (e.g. the app loop reporting a
     /// finished render). Mirrors the in-Ui `notify` calls.
     pub fn notify_success(&mut self, msg: impl Into<String>) {
@@ -764,7 +792,7 @@ impl Ui {
             && self.selection.has_object()
             && shortcuts::poll(
                 ctx,
-                shortcuts::ActiveContext { viewport_focused: true, transform_active: false },
+                shortcuts::ActiveContext { viewport_focused: true, transform_active: false, box_select_active: false },
                 &shortcuts::active(),
             )
             .iter()
@@ -814,6 +842,7 @@ impl Ui {
             viewport_texture,
             requested_viewport_px: &mut self.requested_viewport_px,
             viewport_focused: &mut self.viewport_focused,
+            box_select_armed: &mut self.box_select_armed,
             duplicate: &mut self.duplicate,
             profile: &mut self.profile,
             lib: &mut self.lib,
@@ -1463,6 +1492,7 @@ struct PanelViewer<'a> {
     viewport_texture: egui::TextureId,
     requested_viewport_px: &'a mut (u32, u32),
     viewport_focused: &'a mut bool,
+    box_select_armed: &'a mut bool,
     duplicate: &'a mut Option<DuplicateDialog>,
     profile: &'a mut Option<ProfileEditor>,
     lib: &'a mut library::LibState,
@@ -1610,6 +1640,7 @@ impl TabViewer for PanelViewer<'_> {
                     self.selection,
                     self.scene_anchor,
                     self.viewport_focused,
+                    self.box_select_armed,
                     self.duplicate,
                     self.viewport_texture,
                     self.requested_viewport_px,

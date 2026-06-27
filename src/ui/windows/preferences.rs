@@ -124,9 +124,14 @@ pub fn preferences_window(
     keymap_state: &mut KeymapEditorState,
 ) {
     let mut keep = *open;
+    // Cap the height so the window never fills the viewport, and scroll the overflow
+    // (otherwise long content runs off-screen and is unreadable).
+    let max_h = ctx.input(|i| i.content_rect().height()) * 0.8;
     egui::Window::new("Preferences")
         .open(&mut keep)
         .resizable(true)
+        .vscroll(true)
+        .max_height(max_h)
         .default_width(440.0)
         .show(ctx, |ui| {
             let ink = theme::ink(!ui.visuals().dark_mode);

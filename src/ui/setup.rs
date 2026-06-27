@@ -78,6 +78,8 @@ impl Ui {
             share: crate::share::Share::new(),
             show_share: false,
             current_path: None,
+            saved_state_id: 0,
+            box_select_armed: false,
             show_splash: true,
             welcome_tex: None,
             recent: project::load_recent(),

@@ -80,6 +80,7 @@ impl Ui {
         match self.write_project(path, scene, camera, dmx) {
             Ok(()) => {
                 self.current_path = Some(path.to_path_buf());
+                self.saved_state_id = self.undo.state_id(); // mark the document clean
                 project::push_recent(path);
                 self.recent = project::load_recent();
                 let name = path.file_name().map(|s| s.to_string_lossy().into_owned());
@@ -116,6 +117,7 @@ impl Ui {
             Ok(p) => {
                 self.apply_project(p, scene, camera, dmx);
                 self.current_path = Some(path.to_path_buf());
+                self.saved_state_id = self.undo.state_id(); // freshly opened ⇒ clean
                 project::push_recent(path);
                 self.recent = project::load_recent();
                 self.show_splash = false;
@@ -194,6 +196,7 @@ impl Ui {
         self.cues = cues::CueEngine::default();
         self.selection = Selection::default();
         self.current_path = None;
+        self.saved_state_id = self.undo.state_id(); // empty doc ⇒ clean
         camera.frame(Vec3::ZERO, 12.0);
         self.show_splash = false;
     }

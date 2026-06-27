@@ -80,6 +80,9 @@ pub enum Action {
     SelectInvert,
     QuickSelect,
     Replace,
+    /// `B` — Blender box-select: arm a rubber-band marquee; the next viewport drag
+    /// selects everything inside the box. Viewport-owned (polled in `panels::viewport`).
+    BoxSelect,
     // Object / transform.
     Delete,
     Duplicate,
@@ -125,6 +128,10 @@ pub enum Action {
     /// Re-open the welcome / recover splash on demand (Window ▸ Welcome + the
     /// operator search). Impl in `Ui::dispatch_action` (sets `show_splash = true`).
     ShowWelcome,
+    /// Toggle OS-window fullscreen (also F11 / the viewport header / View menu).
+    ToggleFullscreen,
+    /// Start a still-image render (also F12 / the Render Image button).
+    RenderImage,
 }
 
 /// Nudge directions (floor plane + height). The `f32` in [`Action::Nudge`] is the
@@ -428,6 +435,7 @@ pub static COMMANDS: &[Command] = &[
     command_row("select.all", "Select all", Category::Selection, Action::SelectAll),
     command_row("select.invert", "Invert selection", Category::Selection, Action::SelectInvert),
     command_row("select.quick", "Quick-select menu", Category::Selection, Action::QuickSelect),
+    command_row("select.box", "Box select (marquee)", Category::Selection, Action::BoxSelect),
     command_row("select.replace", "Replace selected fixtures", Category::Selection, Action::Replace),
     // "None" (Alt+A) reuses the canonical Deselect command (also bound to Escape).
     command_row("select.deselect", "Deselect all (none)", Category::Selection, Action::Deselect),
@@ -491,6 +499,8 @@ pub static COMMANDS: &[Command] = &[
     command_row("file.new", "New project", Category::File, Action::New),
     // --- App ---
     command_row("app.preferences", "Preferences", Category::App, Action::Preferences),
+    command_row("window.fullscreen", "Toggle fullscreen", Category::App, Action::ToggleFullscreen),
+    command_row("render.image", "Render Image", Category::App, Action::RenderImage),
     command_row("window.report_log", "Report Log", Category::App, Action::ToggleReportLog),
     command_row("window.welcome", "Welcome Screen", Category::App, Action::ShowWelcome),
     // --- Workspaces (S1): switch the soft "mode" — apply a saved layout + default
@@ -659,6 +669,7 @@ pub static VIEWPORT: &[Kmi] = &[
     kmi(Trigger::key(Key::G), "transform.move"),
     kmi(Trigger::key(Key::R), "transform.rotate"),
     kmi(Trigger::key(Key::S), "transform.scale"),
+    kmi(Trigger::key(Key::B), "select.box"),
     kmi(Trigger::key(Key::A).shift(), "kmi.add_menu"),
     kmi(Trigger::key(Key::D), "kmi.duplicate"),
     kmi(Trigger::key(Key::D).shift(), "kmi.duplicate_grab"),
@@ -1126,6 +1137,10 @@ pub enum ModalAction {
 pub struct ActiveContext {
     pub viewport_focused: bool,
     pub transform_active: bool,
+    /// A box-select (`B`) is armed/in-progress: like `transform_active`, it OWNS the
+    /// viewport so plain globals (e.g. `F` = frame) don't fire — the box reads its own
+    /// modal keys (`F`/`O` filter, `Esc` cancel) directly.
+    pub box_select_active: bool,
 }
 
 /// The keymap registered under `id` (resolved from [`KEYMAPS`] by its `id` field).
@@ -1142,10 +1157,13 @@ static STACK_NONE: [KeymapId; 0] = [];
 /// owns the viewport, NO press-keymap is active here (the viewport's plain binds
 /// must not fire mid-op; axis-lock/confirm/cancel go through [`poll_modal`]).
 fn gather(cx: ActiveContext) -> &'static [KeymapId] {
-    match (cx.viewport_focused, cx.transform_active) {
-        (_, true) => &STACK_NONE,
-        (true, false) => &STACK_VIEWPORT,
-        (false, false) => &STACK_GLOBAL,
+    if cx.transform_active || cx.box_select_active {
+        return &STACK_NONE; // a modal viewport op owns the keyboard
+    }
+    if cx.viewport_focused {
+        &STACK_VIEWPORT
+    } else {
+        &STACK_GLOBAL
     }
 }
 
@@ -1338,7 +1356,7 @@ mod tests {
         // The keymap stack must put Viewport before Global so a focused-viewport
         // `S` resolves to Scale, not quick-select. (Pure structural check — no egui
         // input needed: assert the gather order + that both maps bind plain `S`.)
-        let cx = ActiveContext { viewport_focused: true, transform_active: false };
+        let cx = ActiveContext { viewport_focused: true, transform_active: false, box_select_active: false };
         let stack = gather(cx);
         assert_eq!(stack, &[KeymapId::Viewport, KeymapId::Global], "viewport stacks first");
         let first_s =
@@ -1355,7 +1373,7 @@ mod tests {
     fn transform_suppresses_press_maps() {
         // While a transform owns the viewport, no press-keymap is active (modal keys
         // route through poll_modal instead).
-        let cx = ActiveContext { viewport_focused: true, transform_active: true };
+        let cx = ActiveContext { viewport_focused: true, transform_active: true, box_select_active: false };
         assert!(gather(cx).is_empty());
     }
 
@@ -1647,7 +1665,7 @@ mod tests {
         ov.disabled.insert("select.all".into());
         ov.added.push(AddedBind {
             keymap: SerKeymapId::from_id(KeymapId::Viewport),
-            trigger: SerTrigger::from_trigger(&Trigger::key(Key::B)),
+            trigger: SerTrigger::from_trigger(&Trigger::key(Key::K)), // K is unbound by default
             cmd: "view.toggle_n_panel".into(),
         });
         let json = serde_json::to_string_pretty(&ov).unwrap();
@@ -1655,7 +1673,7 @@ mod tests {
         assert!(!back.is_empty());
         assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &back), Some("view.frame_selection"));
         assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &back), None);
-        assert_eq!(resolved_cmd(KeymapId::Viewport, &Trigger::key(Key::B), &back), Some("view.toggle_n_panel"));
+        assert_eq!(resolved_cmd(KeymapId::Viewport, &Trigger::key(Key::K), &back), Some("view.toggle_n_panel"));
         // An empty overrides round-trips to empty (and stays the default fast-path).
         let empty: KeymapOverrides = serde_json::from_str("{}").unwrap();
         assert!(empty.is_empty());

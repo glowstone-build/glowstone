@@ -42,7 +42,10 @@ pub fn fixture_library_window(
     let mut add_clicks: Vec<i64> = Vec::new();
     let title = format!("{}  Fixture Library", theme::icon::ONLINE);
 
+    let max_h = ctx.input(|i| i.content_rect().height()) * 0.8;
     egui::Window::new(title)
+        .vscroll(true)
+        .max_height(max_h)
         .open(&mut keep)
         .resizable(true)
         .default_size([780.0, 560.0])

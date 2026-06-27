@@ -94,6 +94,7 @@ impl Ui {
         shortcuts::ActiveContext {
             viewport_focused: self.viewport_focused,
             transform_active: self.transform.is_some(),
+            box_select_active: self.box_select_armed,
         }
     }
 
@@ -213,6 +214,9 @@ impl Ui {
             // Context gating (Viewport `S` = Scale masks this when the viewport
             // is focused) means QuickSelect only reaches here when it should.
             Action::QuickSelect => self.quick_select = true,
+            // Arm Blender box-select: the next viewport drag rubber-bands a marquee.
+            // Just a flag here (single dispatch path); the viewport consumes it.
+            Action::BoxSelect => self.box_select_armed = true,
             // Select All (#88): every item of the ACTIVE kind (fixtures by default;
             // objects/screens when one of those is the current selection). Mirrors
             // Blender's `A` acting on the active mode's collection.
@@ -341,6 +345,15 @@ impl Ui {
             Action::ToggleReportLog => self.show_report_log = !self.show_report_log,
             // Re-open the welcome / recover splash (Window ▸ Welcome + operator search).
             Action::ShowWelcome => self.show_welcome(),
+            // Fullscreen + still-render: the app applies the toggle / the render runs
+            // from these flags (mirrors the raw F11 / F12 handlers).
+            Action::ToggleFullscreen => self.pending_fullscreen_toggle = true,
+            Action::RenderImage => {
+                if self.render.status.phase != crate::ui::render_panel::RenderPhase::Rendering {
+                    self.render.request_start();
+                    self.ensure_render_tab_focused();
+                }
+            }
             // --- Workspaces (S1) — soft "modes" ---------------------------------
             // Activate the saved workspace at `idx` (layout + tool + overlay
             // emphasis; no locking). An out-of-range slot is a clean no-op (fewer

@@ -64,6 +64,9 @@ struct State {
     /// The GPU backend selection last persisted to the global pref (so a dropdown
     /// change writes + toasts once, not every frame). Seeded to the active backend.
     gpu_pref_written: String,
+    /// The last window title pushed to the OS (so we only `set_title` when the project
+    /// name / dirty marker actually changes, not every frame).
+    last_title: String,
 }
 
 #[derive(Default)]
@@ -124,6 +127,7 @@ impl ApplicationHandler for App {
             render_job: None,
             fullscreen: false,
             gpu_pref_written: String::new(),
+            last_title: String::new(),
         });
 
         // Publish the GPU backend + available backends to the UI (the Engine ▸
@@ -1570,6 +1574,14 @@ impl State {
         // run; push its axis constraint into RenderSettings so the renderer draws the
         // infinite Blender-style axis line through the pivot this same frame.
         self.ui.sync_axis_hint();
+
+        // Reflect the open project + unsaved-changes state in the window title (only
+        // when it actually changes, to avoid a per-frame `set_title`).
+        let title = self.ui.window_title();
+        if title != self.last_title {
+            self.window.set_title(&title);
+            self.last_title = title;
+        }
 
         self.egui_state.handle_platform_output(
             &self.window,

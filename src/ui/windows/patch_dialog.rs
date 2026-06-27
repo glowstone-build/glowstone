@@ -51,7 +51,10 @@ pub fn patch_dialog_window(ctx: &egui::Context, dlg: &mut PatchDialog) -> bool {
         confirm = true;
     }
 
+    let max_h = ctx.input(|i| i.content_rect().height()) * 0.8;
     egui::Window::new(format!("{}  Patch", theme::icon::PATCH))
+        .vscroll(true)
+        .max_height(max_h)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])

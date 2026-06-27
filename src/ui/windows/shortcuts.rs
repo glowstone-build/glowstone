@@ -10,7 +10,10 @@ use crate::ui::theme;
 /// The keyboard-shortcuts cheat sheet.
 pub fn shortcuts_window(ctx: &egui::Context, open: &mut bool) {
     let mut keep = *open;
+    let max_h = ctx.input(|i| i.content_rect().height()) * 0.8;
     egui::Window::new("Keyboard Shortcuts")
+        .vscroll(true)
+        .max_height(max_h)
         .open(&mut keep)
         .resizable(false)
         .show(ctx, |ui| {

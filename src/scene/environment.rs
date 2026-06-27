@@ -60,9 +60,9 @@ impl Environment {
             size: Vec3::from_array(profile.default_size),
             density: profile.default_density,
             color: [0.7, 0.72, 0.78],
-            anisotropy: 0.25,
-            uniformity: 0.0,
-            cluster_contrast: 0.345,
+            anisotropy: 0.56,
+            uniformity: 0.03,
+            cluster_contrast: 1.0,
             hidden: false,
             id: 0, // assigned by Scene::add_environment / ensure_ids
         }
