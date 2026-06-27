@@ -268,25 +268,6 @@ fn reset_arrow(ui: &mut egui::Ui, differs: bool) -> bool {
     }
 }
 
-/// A Grid label cell with a leading reset gutter (#6): `[↺] Label`. Returns
-/// `true` when the revert arrow was clicked this frame. Pair it with the value
-/// widget in the next column; the caller resets on a `true` return.
-fn prop_label(ui: &mut egui::Ui, label: &str, differs: bool) -> bool {
-    let mut clicked = false;
-    let h = ui.spacing().interact_size.y;
-    // Fixed-width label cell so EVERY section's first column lines up (the Blender
-    // 2-column inspector). Reset gutter + label, the label truncated to the cell.
-    ui.allocate_ui_with_layout(
-        egui::vec2(INSPECTOR_LABEL_W, h),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            clicked = reset_arrow(ui, differs);
-            ui.add(egui::Label::new(label).truncate());
-        },
-    );
-    clicked
-}
-
 /// A filter-aware two-column [`Grid`] ROW (S1). When the active filter excludes
 /// `label`, the row is skipped wholesale (label + value widget, balanced
 /// `end_row`); otherwise it renders the (revert-arrow) label, runs `value` for the
@@ -506,34 +487,6 @@ fn category(
         state.save();
     }
     true
-}
-
-/// A nested, filter-aware "Advanced ▾" disclosure inside an inspector category
-/// (#8 + S1): the common rows are shown by the caller unconditionally; the
-/// power-user rows go in `body`, tucked behind this quiet, default-collapsed
-/// caret. `salt` disambiguates the (per-category) collapse state. Hides entirely
-/// when an active filter matches none of its `rows`, and force-opens (overriding
-/// the default-collapsed caret) while a filter is active so matched rows aren't
-/// buried.
-fn advanced_section_filtered(
-    ui: &mut egui::Ui,
-    state: &InspectorState,
-    salt: &str,
-    rows: &[&str],
-    body: impl FnOnce(&mut egui::Ui),
-) {
-    let filtering = state.query().is_some();
-    if filtering && !state.category_visible(rows) {
-        return;
-    }
-    ui.add_space(2.0);
-    let mut h = egui::CollapsingHeader::new(RichText::new("Advanced").small().weak())
-        .id_salt(("inspector-advanced", salt))
-        .default_open(false);
-    if filtering {
-        h = h.open(Some(true));
-    }
-    h.show(ui, body);
 }
 
 /// The editable-property defaults for a placed fixture — the values the per-row

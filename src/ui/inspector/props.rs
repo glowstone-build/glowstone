@@ -30,11 +30,6 @@
 //! auto-collects its row labels (a cheap declare-twice pass), so the filter index can
 //! never drift out of sync with the rows actually rendered.
 
-// Several builder methods (bool/combo/action/sub-head + a few chain options) are part
-// of the property API but only consumed once the remaining inspectors are migrated to
-// it; the migration lands incrementally, so allow the transient dead code here.
-#![allow(dead_code)]
-
 use std::ops::RangeInclusive;
 
 use egui::{DragValue, RichText, Slider};
@@ -374,27 +369,6 @@ impl<'a> Props<'a> {
         }
     }
 
-    /// A boolean checkbox. Returns whether it changed this frame.
-    pub fn bool(&mut self, label: &str, value: &mut bool) -> bool {
-        let state = self.state;
-        match &mut self.mode {
-            PropMode::Collect(labels) => {
-                labels.push(label.to_string());
-                false
-            }
-            PropMode::Render(ui) => {
-                if !state.row_shown(label, false) {
-                    return false;
-                }
-                let mut changed = false;
-                field_shell(ui, label, false, false, true, |ui| {
-                    changed = ui.checkbox(value, "").changed();
-                });
-                changed
-            }
-        }
-    }
-
     /// A dropdown over `options` (value, display). Returns whether the selection changed.
     pub fn combo<T: PartialEq + Clone>(
         &mut self,
@@ -436,19 +410,33 @@ impl<'a> Props<'a> {
         }
     }
 
-    /// A full-width action button row (e.g. "Profile…"). Returns whether it was clicked.
-    pub fn action(&mut self, label: &str) -> bool {
+    /// A labelled row whose value cell is rendered by an arbitrary egui closure — the
+    /// escape hatch for compound/bespoke controls (a w×h pair, a combo with side
+    /// effects, a file picker) that don't map to a single typed field. `label` keeps
+    /// the fixed 2-column alignment + filtering.
+    pub fn custom(&mut self, label: &str, enabled: bool, body: impl FnOnce(&mut egui::Ui)) {
         let state = self.state;
         match &mut self.mode {
-            PropMode::Collect(labels) => {
-                labels.push(label.to_string());
-                false
-            }
+            PropMode::Collect(labels) => labels.push(label.to_string()),
             PropMode::Render(ui) => {
-                if !state.row_visible(label) {
-                    return false;
+                if state.row_shown(label, false) {
+                    field_shell(ui, label, false, false, enabled, body);
                 }
-                ui.add(egui::Button::new(label)).clicked()
+            }
+        }
+    }
+
+    /// A FULL-WIDTH bespoke block (no label column) — for sections that aren't rows at
+    /// all (e.g. the LED content-source editor). `labels` are registered for the
+    /// enclosing group's filter index; `body` renders only when at least one matches.
+    pub fn custom_block(&mut self, labels: &[&str], body: impl FnOnce(&mut egui::Ui)) {
+        let state = self.state;
+        match &mut self.mode {
+            PropMode::Collect(collected) => collected.extend(labels.iter().map(|l| l.to_string())),
+            PropMode::Render(ui) => {
+                if labels.iter().any(|l| state.row_visible(l)) {
+                    body(ui);
+                }
             }
         }
     }
@@ -679,10 +667,6 @@ pub struct Vec3Field<'p, 'a> {
 impl<'p, 'a> Vec3Field<'p, 'a> {
     pub fn speed(mut self, s: f64) -> Self {
         self.speed = s;
-        self
-    }
-    pub fn suffix(mut self, s: &'static str) -> Self {
-        self.suffix = s;
         self
     }
     /// Per-component prefixes (default X/Y/Z) — e.g. `["W", "H", "D"]` for a size.
