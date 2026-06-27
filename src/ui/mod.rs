@@ -558,9 +558,8 @@ pub struct Ui {
     /// Arrow-key nudge accumulated this frame in `handle_shortcuts`; applied in
     /// `show()` where the patch is reachable (so it rides the undo stack).
     pending_nudge: Vec3,
-    /// Saved fixture selection groups + the new-group name buffer.
+    /// Saved fixture selection groups (persisted with the show; remapped on delete).
     groups: Vec<SelectionGroup>,
-    group_name: String,
     /// The cue list + crossfade engine.
     cues: cues::CueEngine,
     /// Full-document undo / redo history (snapshots; not serialized into .archie).
@@ -830,8 +829,6 @@ impl Ui {
             transform_finished: &mut self.transform_finished,
             inspector_edit: &mut self.inspector_edit,
             inspector_state: &mut self.inspector_state,
-            groups: &mut self.groups,
-            group_name: &mut self.group_name,
             cues: &mut self.cues,
             delete_requested: &mut self.pending_delete,
             replace_requested: &mut self.pending_replace,
@@ -1485,8 +1482,6 @@ struct PanelViewer<'a> {
     inspector_edit: &'a mut panels::InspectorEdit,
     /// Persistent Inspector filter + collapse state (the single docked Inspector tab).
     inspector_state: &'a mut inspector::InspectorState,
-    groups: &'a mut Vec<SelectionGroup>,
-    group_name: &'a mut String,
     cues: &'a mut cues::CueEngine,
     delete_requested: &'a mut bool,
     replace_requested: &'a mut bool,
@@ -1646,8 +1641,6 @@ impl TabViewer for PanelViewer<'_> {
                 self.scene_expanded,
                 self.scene_rename,
                 self.pending_tree,
-                self.groups,
-                self.group_name,
             ),
             Tab::Library => library::library_browser(
                 ui,

@@ -419,8 +419,6 @@ impl Ui {
                     // a breathing gap, then the label — the bundled fonts have no
                     // round glyph, and a naked "•" sits too tight against the words.
                     status_dot(ui, dot, txt);
-                    ui.separator();
-                    ui.label(if self.prefs.units_feet { "ft" } else { "m" });
                 });
             });
         });

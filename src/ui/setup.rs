@@ -71,7 +71,6 @@ impl Ui {
             last_nudge: None,
             pending_nudge: Vec3::ZERO,
             groups: Vec::new(),
-            group_name: String::new(),
             cues: cues::CueEngine::default(),
             undo: op::UndoStack::default(),
             pending_delete: false,

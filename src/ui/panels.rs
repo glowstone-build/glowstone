@@ -739,6 +739,9 @@ pub fn viewport(
 
     // Focus follows the most recent pointer press: inside the viewport focuses
     // it, anywhere else releases it (so the `d` shortcut only fires in here).
+    // Capture the PRIOR focus first: a click that merely focuses the viewport (it
+    // wasn't the active pane) must not also wipe the selection — see the click-select.
+    let was_focused = *viewport_focused;
     if ui.input(|i| i.pointer.any_pressed())
         && let Some(p) = ui.input(|i| i.pointer.interact_pos())
     {
@@ -1510,10 +1513,13 @@ pub fn viewport(
         let m = ui.input(|i| i.modifiers);
         let toggle = m.command || m.ctrl;
         let hit = pick(scene, ro, rd);
-        // Fixtures keep the anchor-based Shift = inclusive-range click (it needs
-        // the shared `scene_anchor` the pure SelectOp has no notion of); every
-        // other case routes through the ONE `apply_select` truth table (#24).
-        if let Some(Hit::Fixture(i)) = hit {
+        // A click that just FOCUSES the viewport (it wasn't the active pane) on EMPTY
+        // space should only focus — never wipe the current selection. Once the
+        // viewport is focused, an empty click deselects as usual; a click that hits an
+        // object always selects it.
+        if hit.is_none() && !was_focused && !toggle && !m.shift {
+            // focus-only; leave the selection untouched
+        } else if let Some(Hit::Fixture(i)) = hit {
             apply_fixture_click(selection, scene_anchor, i, m.shift, toggle, scene.fixtures.len());
         } else {
             // Modifier → op: plain = replace, ⌘/Ctrl = toggle, Shift = add.
