@@ -19,9 +19,10 @@ use super::library::ScreenProfile;
 /// (surface-mount) package combines R/G/B in one point (round or square lens),
 /// while a **discrete / DIP** wall has three separate R, G, B emitters visible as
 /// vertical sub-pixel stripes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum PixelShape {
     /// SMD, round lens — a single combined dot (the default).
+    #[default]
     SmdRound,
     /// SMD, square lens — a single combined square.
     SmdSquare,
@@ -52,9 +53,10 @@ impl PixelShape {
 
 /// A procedural test pattern shown on a wall that has no real content yet — what
 /// a real LED processor boots to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum TestPattern {
     /// Per-pixel alignment grid (crosshatch + cabinet ticks).
+    #[default]
     Grid,
     /// SMPTE-style vertical colour bars.
     Bars,
@@ -89,6 +91,7 @@ impl TestPattern {
 /// this is patched INLINE (not through `PatchTable`, not the per-cell `cells`
 /// composite). See `docs/RESEARCH-led-ndi.md`.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PixelMap {
     pub cols: u32,
     pub rows: u32,
@@ -105,7 +108,8 @@ impl Default for PixelMap {
 /// What the wall surface displays. Only stable, serializable descriptors live
 /// here — decoded frames / GPU textures / the blurred lighting summary are
 /// runtime-only ([`LedScreen::frame`] + the renderer cache, keyed by screen
-/// index). New variants go on the END so existing `.archie` files stay loadable.
+/// index). New variants go on the END so existing `.glow` files stay loadable
+/// (enum variants are encoded by position, unlike struct fields which go by name).
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ScreenContent {
     /// A procedural test pattern (the default for a freshly placed wall).
@@ -122,6 +126,15 @@ pub enum ScreenContent {
     Citp { source: String },
     /// A low-res grid driven by Art-Net/sACN (secondary path; not real video).
     PixelMapDmx(PixelMap),
+}
+
+/// A freshly-placed wall shows a test pattern — also the fallback when an older save
+/// is missing the `content` field (it can't `#[derive(Default)]`: the natural default
+/// is a non-unit variant).
+impl Default for ScreenContent {
+    fn default() -> Self {
+        ScreenContent::TestPattern(TestPattern::default())
+    }
 }
 
 impl ScreenContent {
@@ -154,7 +167,8 @@ pub struct ScreenFrame {
 /// An LED video wall placed in the scene: a parametric grid of cabinets plus the
 /// look/photometry and the content source. Drawn as one emissive surface; not a
 /// fixture and not an occluding mesh.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct LedScreen {
     pub name: String,
     /// Library component this was built from (display / info only).

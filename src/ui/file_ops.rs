@@ -89,7 +89,7 @@ impl Ui {
         }
     }
 
-    /// Prompt for a project file (`.glow`, or a legacy `.archie`), then open it.
+    /// Prompt for a project file (`.glow`), then open it.
     pub(super) fn open_project_dialog(
         &mut self,
         scene: &mut Scene,
@@ -97,7 +97,7 @@ impl Ui {
         dmx: &mut crate::dmx::DmxIo,
     ) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("glowstone project", &[project::EXT, project::LEGACY_EXT])
+            .add_filter("glowstone project", &[project::EXT])
             .pick_file()
         {
             self.open_project(&path, scene, camera, dmx);
@@ -293,7 +293,7 @@ mod tests {
     fn glow_save_load_relinks_gdtf_and_state() {
         let member = "Astera LED Technology@AX2-100 PixelBar.gdtf";
         let Some(bytes) = gdtf_bytes(member) else {
-            eprintln!("skip archie_save_load: Basic Festival.mvr not found");
+            eprintln!("skip glow_save_load: Basic Festival.mvr not found");
             return;
         };
         let mut g = crate::gdtf::GdtfFixture::load_bytes(&bytes).expect("parse gdtf");

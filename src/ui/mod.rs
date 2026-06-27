@@ -160,7 +160,8 @@ pub enum Tab {
 /// A saved, named selection of fixtures (console-style "groups"). Recalled by
 /// click in the Scene › Groups folder. Indices are filtered to valid range on
 /// recall, so editing the rig afterwards can't crash a recall.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct SelectionGroup {
     pub name: String,
     pub fixtures: Vec<usize>,
@@ -562,7 +563,7 @@ pub struct Ui {
     groups: Vec<SelectionGroup>,
     /// The cue list + crossfade engine.
     cues: cues::CueEngine,
-    /// Full-document undo / redo history (snapshots; not serialized into .archie).
+    /// Full-document undo / redo history (snapshots; not serialized into .glow).
     undo: op::UndoStack,
     /// The online GDTF Share fixture library + its window toggle.
     share: crate::share::Share,
@@ -575,7 +576,7 @@ pub struct Ui {
     /// item after the dock (where the library + scene are reachable). Mirrors Enter
     /// in the Library pane.
     pending_lib_add: bool,
-    /// Path of the currently-open `.archie` project (Save vs Save As). `None` =
+    /// Path of the currently-open `.glow` project (Save vs Save As). `None` =
     /// untitled / never saved.
     current_path: Option<PathBuf>,
     /// The welcome / recover splash is open (shown at startup, on New, and from
@@ -601,7 +602,7 @@ pub struct Ui {
     xform: TransformPrefs,
     /// The world 3D-cursor point — the [`PivotMode::Cursor3d`] pivot (§2.4 #5).
     /// Starts at the origin; moved by Shift-right-click in the viewport (S1-3d-cursor)
-    /// or the snap/reset commands. Transient (no save-format bump); the viewport draws it.
+    /// or the snap/reset commands. Transient (not persisted); the viewport draws it.
     cursor_3d: Vec3,
     /// Whether the 3D cursor has been positioned this session (via Shift-RMB / "Snap
     /// to selection"). When `true` the Add menu drops new objects AT the cursor instead

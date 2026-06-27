@@ -3414,7 +3414,7 @@ impl Renderer {
         // failed to dedup (thousands of unique meshes), the extra draw calls cost more than
         // the light-loop overdraw they save (measured: a non-deduped 5932-group scene
         // regressed 61→56 fps; the same scene deduped to 236 groups gained 72→75). Both load
-        // paths dedup — MVR import shares resource Arcs, `.archie` load re-interns them
+        // paths dedup — MVR import shares resource Arcs, `.glow` load re-interns them
         // (project::intern_geometry_resources) — so real scenes stay well under the cap.
         const PREPASS_MAX_GROUPS: usize = 1500;
         let geom_groups = ranges.len() + gdtf_groups.len() + scene_geom_groups.len();

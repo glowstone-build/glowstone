@@ -146,7 +146,7 @@ impl ApplicationHandler for App {
             self.state.as_mut().unwrap().ui.settings.chroma_haze = c;
         }
 
-        // Optional .archie project load for profiling: GLOWSTONE_OPEN=show.archie
+        // Optional .glow project load for profiling: GLOWSTONE_OPEN=show.glow
         // loads a saved show (fixtures + geometry + bundled assets) and frames it.
         if let Ok(path) = std::env::var("GLOWSTONE_OPEN") {
             let state = self.state.as_mut().unwrap();
@@ -857,7 +857,7 @@ fn apply_stage_look(state: &mut State) {
         env.anisotropy = 0.35;
     }
     state.ui.settings.exposure = 0.3;
-    state.ui.settings.bloom = 0.8;
+    state.ui.settings.bloom = 0.0;
     state.ui.settings.beam_intensity = 430.0;
 
     // A cool concert palette (blues/teal/lavender) with a single warm amber

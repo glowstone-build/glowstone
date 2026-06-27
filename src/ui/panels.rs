@@ -739,14 +739,21 @@ pub fn viewport(
 
     // Focus follows the most recent pointer press: inside the viewport focuses
     // it, anywhere else releases it (so the `d` shortcut only fires in here).
-    // Capture the PRIOR focus first: a click that merely focuses the viewport (it
-    // wasn't the active pane) must not also wipe the selection — see the click-select.
-    let was_focused = *viewport_focused;
+    // A click that merely focuses the viewport (it wasn't the active pane) must not
+    // also wipe the selection — see the click-select. The catch: `clicked()` fires on
+    // the RELEASE frame, a frame AFTER the press below already set focus, so reading
+    // `*viewport_focused` at click time would always look "already focused". Instead
+    // stash the focus state AS THE PRESS STARTS in egui memory and read THAT at click.
+    let focus_at_press_id = egui::Id::new("glow-viewport-focus-at-press");
     if ui.input(|i| i.pointer.any_pressed())
         && let Some(p) = ui.input(|i| i.pointer.interact_pos())
     {
+        ui.memory_mut(|m| m.data.insert_temp(focus_at_press_id, *viewport_focused));
         *viewport_focused = rect.contains(p);
     }
+    let was_focused = ui
+        .memory(|m| m.data.get_temp::<bool>(focus_at_press_id))
+        .unwrap_or(*viewport_focused);
 
     let aspect = rect.width() / rect.height().max(1.0);
 

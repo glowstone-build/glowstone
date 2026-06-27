@@ -57,6 +57,7 @@ impl MergePolicy {
 
 /// Connectivity configuration, edited in the panel and pushed to the worker.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DmxConfig {
     pub artnet: bool,
     pub sacn: bool,

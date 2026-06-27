@@ -246,8 +246,8 @@ impl SnapSettings {
     }
 }
 
-/// Per-viewport transform-tool options held on [`Ui`](super::Ui) (transient — NOT
-/// in the positional-bincode `RenderSettings`, so no save-format bump). The gizmo
+/// Per-viewport transform-tool options held on [`Ui`](super::Ui) (transient — not
+/// persisted, just live UI state). The gizmo
 /// + modal blocks read `pivot`/`snap`; the header + N-panel write them.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct TransformPrefs {

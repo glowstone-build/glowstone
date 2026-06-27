@@ -47,6 +47,7 @@ impl LabelMode {
 /// App-wide user preferences (theme, units, viewport overlays, DMX defaults).
 /// Applied live each frame; not yet persisted to disk.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Preferences {
     /// Display lengths in feet (else metres). Drives DragValue suffixes + status.
     pub units_feet: bool,

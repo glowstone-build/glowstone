@@ -14,7 +14,8 @@ use crate::mvr::MvrFixtureMeta;
 use crate::optics::{OpticalControls, ShutterKind, WheelMotion};
 
 /// One controllable fixture.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct Fixture {
     /// Instance name (e.g. "PAR Can 1").
     pub name: String,
@@ -31,21 +32,19 @@ pub struct Fixture {
     /// body in place of the fixture's own — the Replace dialog's "mesh/model only"
     /// (give a model-less fixture a real model while keeping its profile, channels,
     /// patch, mode + optics; the BEAM + articulation still come from `gdtf`).
-    /// serde-skip + reattached across undo, exactly like `gdtf` (no .archie bump).
+    /// serde-skip + reattached across undo, exactly like `gdtf` (runtime-only).
     #[serde(skip)]
     pub model_src: Option<Arc<GdtfFixture>>,
     /// Session-stable identity (serde-skip → reassigned by `Scene::ensure_ids`
     /// on load). The Scene outliner keys rows by this so reorder/delete stays
-    /// robust; never serialized → no .archie format bump.
+    /// robust; never serialized (reseeded on load).
     #[serde(skip)]
     pub id: super::EntityId,
     /// Stable, user-facing SEQUENCE number for this patchable fixture — the "channel
     /// number" a designer sorts/renumbers by (shown + editable in the outliner + the
     /// Fixture Manager). `0` = unassigned; [`Scene::ensure_sequences`] fills it on
     /// load/import (inferred from the imported MVR FixtureID/UnitNumber, else the next
-    /// free number). `#[serde(skip)]` → persisted OUT-of-band in the `.glow` trailer
-    /// (like pyro), so it never disturbs the positional bincode core.
-    #[serde(skip)]
+    /// free number). Persisted with the show.
     pub sequence: u32,
 
     /// World position of the fixture head, in metres. Y is up.
@@ -108,7 +107,7 @@ pub struct Fixture {
     /// tilt independently (e.g. the Clay Paky Volero Wave — eight separately
     /// tilting bodies). Aligned with the mode's emitters; 0 = the head's rest
     /// aim. Re-derived from live DMX every frame and resized by [`sync_mode`],
-    /// so it's `#[serde(skip)]` and never bumps the `.archie` layout.
+    /// so it's `#[serde(skip)]` — runtime-only, not persisted.
     ///
     /// [`sync_mode`]: Self::sync_mode
     #[serde(skip)]
@@ -135,10 +134,7 @@ pub struct Fixture {
 
     /// Where this fixture came from (built-in / disk import / GDTF Share / MVR).
     /// Drives the colored provenance chip in the Inspector header (`source_chip`).
-    /// Read via `fixture.source`. A REAL serialized field (so chips survive save /
-    /// load), kept LAST in serde order with `#[serde(default)]` so it lands at
-    /// the end of the positional bincode layout (see the `.archie` FORMAT bump).
-    #[serde(default)]
+    /// Persisted with the show so chips survive save / load.
     pub source: crate::gdtf::FixtureSource,
 }
 

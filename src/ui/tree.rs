@@ -14,11 +14,11 @@
 //! The result reads as ONE root "Scene" node with World / Fixtures / Objects /
 //! Screens nested beneath it — a true hierarchy, not flat categories.
 //!
-// TODO(outliner): drag-reparent + user-created collections require persisted
-// parent/membership (a .archie/bincode format bump) — DEFERRED. See Blender
+// TODO(outliner): drag-reparent + user-created collections require new persisted
+// parent/membership fields — DEFERRED (UI scope). See Blender
 // outliner_dragdrop.cc for INTO vs BEFORE/AFTER drop zones + the cycle guard
 // (outliner_is_collection_dragged_into_itself). Also deferred: render/selectable
-// restriction columns (new persisted bools → format bump); only the EYE ships,
+// restriction columns (new persisted bools); only the EYE ships,
 // reusing the existing `hidden` field.
 
 use std::collections::HashSet;

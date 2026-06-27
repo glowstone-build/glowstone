@@ -1,13 +1,16 @@
 //! Undo / redo via full-document snapshots.
 //!
-//! The undo model is the SAME serialization the `.archie` format proves
-//! ([`project`](super::project)): a [`DocSnapshot`] is a `bincode` dump of the
-//! mutable document — the [`Scene`], the DMX [`PatchTable`], the [`CueEngine`],
-//! the selection groups — plus the live [`Selection`]. A step stores BOTH ends
+//! A [`DocSnapshot`] is a `bincode` dump of the mutable document — the [`Scene`],
+//! the DMX [`PatchTable`], the [`CueEngine`], the selection groups — plus the live
+//! [`Selection`]. It serialises the same serde types the on-disk
+//! [`project`](super::project) format persists, but with positional `bincode` rather
+//! than that format's self-describing MessagePack: undo's two ends are always the
+//! SAME build, so it needs no cross-version tolerance (and bincode is faster). A
+//! step stores BOTH ends
 //! ([`UndoStep::before`] / `after`) so undo and redo are symmetric (no replay).
 //!
 //! THE CORRECTNESS TRAP (verified): `Fixture.gdtf: Option<Arc<GdtfFixture>>` is
-//! `#[serde(skip)]` — it is re-linked from the bundled archive at `.archie` load,
+//! `#[serde(skip)]` — it is re-linked from the bundled archive at `.glow` load,
 //! never serialized. A bincode snapshot of the `Scene` therefore DROPS every
 //! fixture's parsed-GDTF handle. So a snapshot ALSO keeps the handles out of band
 //! ([`DocSnapshot::gdtf`], one cheap `Arc` clone per fixture in order); restore
@@ -17,7 +20,7 @@
 //! next frame.
 //!
 //! The stack lives on [`Ui`](super::Ui), travels with the document in memory, and
-//! is NOT serialized into `.archie` (a fresh open starts with an empty history).
+//! is NOT serialized into `.glow` (a fresh open starts with an empty history).
 
 use std::sync::Arc;
 
@@ -80,8 +83,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// An immutable picture of the whole mutable document at one instant. The four
-/// blobs are positional `bincode` dumps of the same serde types the `.archie`
-/// format round-trips, each behind a delta-compressed [`Blob`] (#12) so unchanged
+/// blobs are positional `bincode` dumps of the same serde types the on-disk `.glow`
+/// format persists, each behind a delta-compressed [`Blob`] (#12) so unchanged
 /// sub-documents are shared between adjacent steps; [`gdtf`](Self::gdtf) carries
 /// the parsed-GDTF `Arc`s out of band (see the module docs — they are
 /// `serde(skip)`).

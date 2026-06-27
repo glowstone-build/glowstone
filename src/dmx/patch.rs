@@ -34,9 +34,10 @@ pub trait Patchable {
 }
 
 /// Where a fixture's patch entry came from (display + auto-assign policy).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum PatchSource {
     /// Imported from an MVR scene's `<Addresses>`.
+    #[default]
     Mvr,
     /// A GDTF fixture, footprint known, address assigned in-app.
     Gdtf,
@@ -59,7 +60,8 @@ impl PatchSource {
 }
 
 /// One fixture's DMX patch entry.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct Patch {
     /// 1-based universe.
     pub universe: u16,
@@ -176,7 +178,8 @@ pub fn channel_map(fixture: &Fixture, mode_index: usize) -> ChannelMap {
 /// Internal: one fixture's patch plus a fingerprint of the fixture it was built
 /// for, so [`PatchTable::sync`] can tell an *append* (keep entries) from a
 /// *wholesale replacement* like an MVR import (rebuild entries).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 struct Entry {
     fp: u64,
     patch: Option<Patch>,
@@ -185,6 +188,7 @@ struct Entry {
 /// The scene's patch: one optional entry per fixture, index-parallel to
 /// `scene.fixtures`.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PatchTable {
     entries: Vec<Entry>,
 }

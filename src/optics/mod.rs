@@ -63,6 +63,7 @@ impl ShutterKind {
 /// Controls for one wheel component, aligned with the GDTF mode's
 /// [`components`](crate::gdtf::DmxMode::components) list.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct WheelControl {
     /// Slot selection (gobo/color wheels) or insertion amount
     /// (prism/frost/animation), `0..1`. 0 = open / removed.
@@ -86,6 +87,7 @@ impl Default for WheelControl {
 /// edited in the UI and fed by DMX. Defaults are neutral (open white beam,
 /// dimmer up, wheels open, prisms out, no strobe).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct OpticalControls {
     pub dimmer: f32,
     /// Beam angle: 0 = narrow end of the GDTF Zoom range, 1 = wide.

@@ -4,18 +4,18 @@
 //! which is the *live viewport* look: this is the recipe for a deliberate
 //! still-image render (chosen resolution, sample budget, output file).
 //!
-//! It lives on [`Scene`](super::Scene) as a `#[serde(skip)]` field — a per-session
-//! recipe, NOT part of the saved SHOW, so it never rides the positional bincode
-//! `.archie` stream (which a new serialized field would corrupt). It defaults on
-//! every load, exactly like the other machine/session render knobs
-//! (`render_scale`, `shadow_max`, `froxel_volumetric`).
+//! It lives on [`Scene`](super::Scene) and is persisted with the show, so a saved
+//! project keeps its render setup. (The genuinely machine/session-specific knobs —
+//! `render_scale`, `shadow_max`, `froxel_volumetric` — are the `#[serde(skip)]` ones
+//! that default on every load instead.)
 
 use super::{RenderSettings, ViewportMode};
 
 /// Output image file format for a saved render.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum RenderFormat {
     /// Lossless 8-bit RGBA — the default, universally viewable.
+    #[default]
     Png,
     /// Lossy 8-bit RGB — small files for quick shares (no alpha).
     Jpeg,
@@ -48,9 +48,10 @@ impl RenderFormat {
 
 /// Where a finished render is shown (Blender's Output ▸ Display dropdown). We
 /// route everything to the in-app Render tab; `NewWindow` is a greyed stub.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum RenderDisplay {
     /// Show the result in the dockable Render tab (auto-focused on render).
+    #[default]
     RenderTab,
     /// Open a separate OS window (not implemented — greyed).
     NewWindow,
@@ -78,8 +79,9 @@ impl RenderDisplay {
 /// Sampling quality preset — sets the progressive sample budget + volumetric
 /// step count in one click (Blender's Render ▸ Sampling presets). `Custom` lets
 /// the two numbers be dialled independently.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum QualityPreset {
+    #[default]
     Draft,
     Medium,
     Final,
@@ -117,9 +119,10 @@ impl QualityPreset {
 /// sampling budget, output, render-side quality). Following Blender, the *look*
 /// (exposure / bloom / beam / gobo / chroma + the world + fog) is SHARED with the
 /// live viewport — it lives on [`RenderSettings`] / the [`Scene`] and the render
-/// inherits it, so the preview matches the render. Persisted in the `.archie`
+/// inherits it, so the preview matches the render. Persisted in the `.glow`
 /// project (serde-derived) so a saved show keeps its render setup.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RenderConfig {
     // --- Output ---
     /// Base render width / height, pixels (before the percentage scale).

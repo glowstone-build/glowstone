@@ -9,9 +9,10 @@ use crate::dmx::PatchTable;
 use crate::scene::{Scene, Selection};
 
 /// How the Scene panel's fixture list is ordered.
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum SceneSort {
     /// DMX patch (universe, address); unpatched fall to the end, by head number.
+    #[default]
     Patch,
     Name,
     /// By fixture profile / type, then name.

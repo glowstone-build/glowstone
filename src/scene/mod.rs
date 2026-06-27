@@ -24,15 +24,16 @@ use glam::{Mat4, Vec3};
 use crate::mvr::{GeometryModel, MvrHeader, MvrImport, MvrObjectMeta};
 
 /// Session-stable per-entity identity. Assigned at create + reconstructed on
-/// load (serde-skip → never serialized → NO .archie format bump, same trick as
-/// `Fixture.gdtf`). The outliner addresses rows by this so expand-state + the
+/// load (serde-skip → never serialized; reseeded by `ensure_ids`, the same trick
+/// as `Fixture.gdtf`). The outliner addresses rows by this so expand-state + the
 /// range anchor survive add/delete reordering (Blender's `TreeStoreElem.id` role).
 pub type EntityId = u64;
 
 /// A static, non-fixture object placed in the scene — a stage deck, truss,
 /// set piece, or screen imported from MVR. Drawn as lit geometry that occludes
 /// beams; not a light source.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct SceneGeometry {
     pub name: String,
     /// World-space placement (Y-up, metres) of the object's frame. The renderer
@@ -114,7 +115,8 @@ fn dup_name(name: &str) -> String {
 /// back out: the header (version/provider, layer/class/position tables) and
 /// every original resource blob (the `.gdtf`/`.glb`/texture bytes), keyed by
 /// archive file name.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct MvrSceneData {
     pub header: MvrHeader,
     pub resources: HashMap<String, Arc<Vec<u8>>>,
@@ -156,6 +158,7 @@ impl ViewportMode {
 /// Global look/post-processing controls, edited in the UI and read by the
 /// renderer each frame (exposure/bloom tonemapping + the volumetric beam look).
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RenderSettings {
     pub exposure: f32,
     pub bloom: f32,
@@ -166,16 +169,15 @@ pub struct RenderSettings {
     /// are far cleaner (the froxel's coarse 160×90×64 grid produces blocky/
     /// duplicated "fog circle" artifacts near the camera, flicker, and mushy gobos
     /// in the masses). Kept as an opt-in toggle for the perf win on huge rigs only.
-    /// `skip`-ped from (de)serialization: the .archie format is bincode (positional,
-    /// NOT self-describing), so a newly-added serialized field misaligns every older
-    /// save. Kept out of the byte stream entirely and defaulted on each load.
+    /// `skip`-ped from (de)serialization: it's a machine/GPU-specific perf preference,
+    /// not part of the SHOW — so it's never written and defaults on each load.
     #[serde(skip, default = "default_false")]
     pub froxel_volumetric: bool,
     /// Chroma read-up of saturated beams in haze (Helmholtz–Kohlrausch): lifts
     /// dim-saturated hues (blue/deep-red/magenta) so they read in fog without
     /// flattening to neon; white/pastel and bright-whitened cells are untouched.
     /// 0 = off (exact pre-feature look). A shared look setting — persisted with the
-    /// show (`.archie` FORMAT 7), shown in Render Properties ▸ Color Management.
+    /// show, shown in Render Properties ▸ Color Management.
     pub chroma_haze: f32,
     /// Floor-pool gobo edge sharpening amount (0 = off). Drives the contour
     /// steepening in mesh.wgsl via `camera.render_mode.y`.
@@ -207,14 +209,13 @@ pub struct RenderSettings {
     /// Active modal-transform axis constraint, for the Blender-style infinite
     /// constraint line: `(pivot, axis colour, axis direction)`. Set by the UI each
     /// frame from the live `TransformOp` (None when no axis is locked). Purely a
-    /// per-frame render hint — never persisted (bincode .archie is positional, so a
-    /// new serialized field would corrupt older saves, like the fields above).
+    /// per-frame render hint — never persisted (it's transient UI state, not show data).
     #[serde(skip, default)]
     pub axis_hint: Option<(glam::Vec3, [f32; 3], glam::Vec3)>,
     /// Draw the decorative scene lines — the fog-box border, gizmos, 3D cursor and
     /// the modal axis-constraint line. ON for the live viewport; a still render
-    /// turns it OFF for a clean plate. `skip`-ped (positional bincode); defaults to
-    /// `true` on load so the live view is unchanged.
+    /// turns it OFF for a clean plate. `skip`-ped (a render-time hint, not show data);
+    /// defaults to `true` on load so the live view is unchanged.
     #[serde(skip, default = "default_true")]
     pub show_gizmos: bool,
 }
@@ -247,7 +248,7 @@ impl Default for RenderSettings {
     fn default() -> Self {
         Self {
             exposure: 1.0,
-            bloom: 0.85,
+            bloom: 0.0,
             beam_intensity: 650.0,
             // Max marching steps for a full-fog-box ray; the constant-dt cap scales
             // it down for shorter rays at the SAME per-metre density. Kept at the
@@ -800,6 +801,7 @@ pub fn apply_fixture_click(
 /// brightness, a yaw rotation, and an ambient-fill strength. When no map is
 /// loaded the renderer keeps the dark void + a faint flat fill.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct World {
     /// Equirectangular map file bytes (`.hdr` / `.png` / `.jpg`), if loaded.
     pub hdri: Option<std::sync::Arc<Vec<u8>>>,
@@ -829,6 +831,7 @@ impl Default for World {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Scene {
     pub fixtures: Vec<Fixture>,
     pub environments: Vec<Environment>,
@@ -844,19 +847,14 @@ pub struct Scene {
     pub mvr: Option<MvrSceneData>,
     /// The deliberate still-render recipe (resolution / sampling / output),
     /// edited in the World ▸ Render Properties inspector. Persisted with the show
-    /// (`.archie` FORMAT 7) so a saved project keeps its render setup — the look is
+    /// so a saved project keeps its render setup — the look is
     /// shared with the live viewport, so only render-specific knobs live here.
     pub render: RenderConfig,
     /// Placed pyro devices (CO2 cannons + cold-spark machines) — drawn as a
-    /// billboard particle / fog pass, patched inline to DMX. The live particle
-    /// simulation is runtime-only in the renderer.
-    ///
-    /// `#[serde(skip)]` so it stays OUT of the positional bincode core: pyro is
-    /// persisted by [`ui::project`](crate::ui::project) as a separate, self-describing
-    /// JSON trailer instead. That keeps the core layout stable (old `.archie` files
-    /// still decode) and lets `PyroDevice` evolve via plain `#[serde(default)]`
-    /// fields — no version-aware decode, no FORMAT-per-field bumps.
-    #[serde(skip)]
+    /// billboard particle / fog pass, patched inline to DMX. Persisted with the show
+    /// (it rides the bincode core like everything else); only the live particle
+    /// simulation and `PyroDevice.id` are runtime-only (`#[serde(skip)]`), so
+    /// [`ensure_ids`](Self::ensure_ids) reseeds ids after every load / undo.
     pub pyro: Vec<PyroDevice>,
     /// Monotonic [`EntityId`] allocator. serde-skip → reset to 0 on load;
     /// [`ensure_ids`](Self::ensure_ids) reseeds it past the max live id after

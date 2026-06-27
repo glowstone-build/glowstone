@@ -6,9 +6,10 @@
 //! carry default geometry/params — is what those importers will populate.
 
 /// How a fixture body is drawn. Maps to a mesh the renderer holds.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum FixtureGeometry {
     /// A PAR-can-style cylinder with a glowing lens.
+    #[default]
     Cylinder,
     /// A tapered cone (moving heads / beams).
     Cone,
@@ -30,9 +31,10 @@ pub struct FixtureProfile {
 }
 
 /// What kind of environment volume this is.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum EnvironmentKind {
     /// A box of participating media (haze/fog) the beams will scatter through.
+    #[default]
     FogBox,
 }
 
@@ -257,7 +259,7 @@ impl Library {
                         category: "Pyro",
                         kind: Co2Jet,
                         default_height_m: 0.0,
-                        default_throw_m: 9.0,
+                        default_throw_m: 5.5,
                         default_color_t0_k: 0.0,
                         default_max_particles: 1300,
                         moving: false,

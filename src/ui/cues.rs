@@ -39,7 +39,8 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// The controllable look of one fixture, captured into / restored from a cue.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct FixtureLook {
     pub pan: f32,
     pub tilt: f32,
@@ -85,7 +86,8 @@ impl FixtureLook {
 
 /// A saved look: one [`FixtureLook`] per fixture (aligned to fixture index at
 /// capture time), plus a fade time.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct Cue {
     pub name: String,
     pub looks: Vec<FixtureLook>,
@@ -101,6 +103,7 @@ struct Fade {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CueEngine {
     pub cues: Vec<Cue>,
     /// The last cue fully reached (for Go / highlight).

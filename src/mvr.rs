@@ -53,7 +53,8 @@ pub fn glb_yup_to_zup() -> Mat4 {
 /// One DMX patch entry: a DMX `break` plus the absolute address. MVR stores the
 /// address as a single integer spanning universes (`(addr-1)/512` = universe,
 /// `(addr-1)%512` = channel, both effectively 1-based for display).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct MvrAddress {
     pub break_id: u32,
     pub absolute: u32,
@@ -75,6 +76,7 @@ impl MvrAddress {
 ///
 /// [`Fixture`]: crate::scene::Fixture
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MvrFixtureMeta {
     pub uuid: String,
     pub fixture_id: String,
@@ -103,6 +105,7 @@ pub struct MvrFixtureMeta {
 
 /// The MVR-specific fields of a static `<SceneObject>` / `<GroupObject>`.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MvrObjectMeta {
     pub uuid: String,
     pub classing: Option<String>,
@@ -113,7 +116,8 @@ pub struct MvrObjectMeta {
 }
 
 /// A named UUID entry (a Class or a Position in `<AUXData>`, or a `<Layer>`).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct MvrNamed {
     pub uuid: String,
     pub name: String,
@@ -123,6 +127,7 @@ pub struct MvrNamed {
 /// so export can reproduce the `<Scene>` scaffolding. Object membership is
 /// driven by the per-object `layer` UUID, not by this table.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MvrHeader {
     pub ver_major: u32,
     pub ver_minor: u32,
@@ -155,7 +160,8 @@ impl Default for MvrHeader {
 /// One 3D model reference: the archive file name (also the export reference and
 /// the renderer's cache key) plus its raw bytes (a glTF/GLB blob in metres,
 /// authored +Y-up).
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct GeometryModel {
     pub file: String,
     pub glb: Arc<Vec<u8>>,
@@ -1153,7 +1159,7 @@ fn write_object(s: &mut String, o: &crate::scene::SceneGeometry, idx: usize) {
 
 /// Write an [`LedScreen`](crate::scene::LedScreen) as a `<VideoScreen>` node. The
 /// full parametric build (cabinet grid / pitch / nits / content) is carried in
-/// `glowstone*` attributes for a faithful archie round-trip; a `<Sources>` child
+/// `glowstone*` attributes for a faithful glowstone round-trip; a `<Sources>` child
 /// describes the content type for foreign MVR readers.
 fn write_video_screen(s: &mut String, sc: &crate::scene::LedScreen, idx: usize) {
     use crate::scene::screen::ScreenContent as C;

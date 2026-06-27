@@ -22,7 +22,7 @@ mod props;
 mod pyro;
 mod screen;
 mod world;
-pub use props::{Inspect, Props};
+pub use props::Inspect;
 
 use super::panels::InspectorEdit;
 use super::render_panel::RenderUiState;
@@ -714,7 +714,19 @@ fn inspector_body(
     // Pyro devices (CO2 cannons + cold-spark machines) take the Inspector.
     let pyro: Vec<usize> = selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
     if let Some(&primary) = pyro.first() {
-        pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state);
+        if pyro.len() > 1 {
+            // Bulk: edit the active device, then propagate every effect/look field the
+            // user just changed to the rest of the selection (snapshot → inspect → diff
+            // → apply). Identity, placement and the DMX patch stay per-device.
+            let before = scene.pyro[primary].clone();
+            pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state);
+            let after = scene.pyro[primary].clone();
+            for &i in pyro.iter().skip(1) {
+                apply_pyro_bulk_delta(&before, &after, &mut scene.pyro[i]);
+            }
+        } else {
+            pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state);
+        }
         return;
     }
 
@@ -848,7 +860,11 @@ fn pyro_inspector(ui: &mut egui::Ui, d: &mut crate::scene::PyroDevice, count: us
     ui.heading(d.name.as_str());
     ui.label(RichText::new(format!("{} · {}", d.kind.label(), d.profile_name)).weak().small());
     if count > 1 {
-        ui.label(RichText::new(format!("{count} devices — editing the active one")).weak().small());
+        ui.label(
+            RichText::new(format!("{count} devices — edits apply to all selected"))
+                .weak()
+                .small(),
+        );
     }
     ui.separator();
 
@@ -878,6 +894,31 @@ fn pyro_inspector(ui: &mut egui::Ui, d: &mut crate::scene::PyroDevice, count: us
     } else if pos_changed {
         d.transform.w_axis = pos.extend(1.0);
     }
+}
+
+/// Bulk-edit propagation for pyro: copy to `target` every effect/look/quality field the
+/// user just changed on the active device (`before` → `after`). Only fields that ACTUALLY
+/// changed are copied, so editing one knob in a multi-selection nudges only that knob on
+/// the rest. Per-device data is deliberately left alone: name, kind, the world transform,
+/// and the inline DMX patch (each device keeps its own address).
+#[allow(clippy::float_cmp)] // exact change-detection — propagate only what the user touched
+fn apply_pyro_bulk_delta(
+    before: &crate::scene::PyroDevice,
+    after: &crate::scene::PyroDevice,
+    target: &mut crate::scene::PyroDevice,
+) {
+    macro_rules! prop {
+        ($($f:ident),+ $(,)?) => { $(
+            if before.$f != after.$f {
+                target.$f = after.$f;
+            }
+        )+ };
+    }
+    prop!(
+        height_m, throw_m, speed, density, cone_deg, color_t0_k, color_t1_k, brightness,
+        opacity, tint, spin_rpm, pan, tilt, max_particles, quality, dissipation,
+        viewport_hq, thickness, mode, hidden,
+    );
 }
 
 /// Inspector for an imported GDTF fixture: identity + thumbnail, editable

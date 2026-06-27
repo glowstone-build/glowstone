@@ -51,8 +51,15 @@ ureq = { version = "2", default-features = false, features = ["tls", "gzip", "js
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.150"
 directories = "6.0.0"
-# Proprietary `.archie` project format: a binary serde dump of the whole project
+# `.glow` project format: a SELF-DESCRIBING binary serde dump of the whole project
 # state (scene + fixtures + bundled GDTF/model bytes + settings + patch + cues).
+# MessagePack with named struct fields (`to_vec_named`) — fields are matched by NAME
+# on load, so older saves open in newer builds (missing fields take their serde
+# defaults) and unknown fields from newer saves are ignored. Binary, so the bundled
+# GDTF/model/HDRI bytes stay compact (no base64 bloat).
+rmp-serde = "1.3"
+# Still used for the in-memory undo/redo snapshots (same-version, positional is fine
+# and fast there) — NOT for the on-disk project format.
 bincode = "1.3"
 
 # NDI receive (optional): the NDI SDK is proprietary and NOT bundled — enabling
@@ -65,6 +72,12 @@ grafton-ndi = { version = "1", optional = true }
 # Off by default: a default `cargo build` needs no NDI SDK. `--features ndi`
 # requires the NDI 6 SDK + Clang at build time and the runtime at run time.
 ndi = ["dep:grafton-ndi"]
+
+[build-dependencies]
+# Embeds the Windows app icon (assets/icons/glowstone.ico) + version info into the
+# .exe. Only does work when the TARGET is Windows (see build.rs) — a no-op for native
+# macOS/Linux builds, though it is still compiled on the host as a build dependency.
+winresource = "0.1"
 
 # Faster, smoother dev: the wgpu/naga/egui stacks are slow in pure debug.
 [profile.dev]

@@ -21,9 +21,10 @@
 use glam::{Mat4, Quat, Vec3};
 
 /// Which pyro device this is — selects the rendering model + parameter ranges.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum PyroKind {
     /// CO2 cannon / cryo jet — a rising white fog column.
+    #[default]
     Co2Jet,
     /// Cold-spark machine ("cold pyro" / Sparkular-type) — a golden fountain.
     ColdSpark,
@@ -41,9 +42,10 @@ impl PyroKind {
 /// DMX footprint mode. Both modes share the same channel order, so the minimal
 /// mode is a strict prefix of the rich one (mirrors GDTF modes / the two-mode
 /// LED-screen idea). Channel counts: CO2 → 1 / 7, Spark → 3 / 5.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum PyroMode {
     /// CO2 "Blast" (1ch) / Spark "Spark" (3ch).
+    #[default]
     Minimal,
     /// CO2 "Safe Jet" (7ch, incl. arm + duration + pan/tilt) / Spark "Spark+" (5ch).
     Rich,
@@ -75,6 +77,7 @@ impl PyroMode {
 /// NOT through the fixture `PatchTable` — so it never churns fixture
 /// fingerprints and persists with the show.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PyroPatch {
     pub universe: u16,
     /// 1-based start channel.
@@ -89,10 +92,10 @@ impl Default for PyroPatch {
 
 /// A placed pyro device. Only stable, serializable descriptor fields live here;
 /// the live particle simulation is runtime-only in the renderer (keyed by `id`).
-/// New serialized fields go on the END so the positional `.archie` stream stays
-/// aligned (the format version is bumped when this struct changes — see
-/// `ui/project.rs` FORMAT).
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// New fields can be added freely: the `.glow` format matches by field NAME and an
+/// older save simply falls back to the field's `#[serde(default)]` (see `ui/project.rs`).
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct PyroDevice {
     pub name: String,
     pub kind: PyroKind,
@@ -149,26 +152,22 @@ pub struct PyroDevice {
     /// CO2 smoke hang time in **seconds** — the nominal puff lifetime, so the smoke
     /// lingers ~this long after the valve shuts (jittered per-puff so the cauliflower
     /// edges dissolve raggedly). Output stays INSTANT regardless. No hard limit — the
-    /// inspector slider has a suggested range but accepts any raw value. FORMAT 10.
-    #[serde(default = "default_dissipation")]
+    /// inspector slider has a suggested range but accepts any raw value.
     pub dissipation: f32,
 
     /// CO2 jet **exit velocity** (m/s) — the launch speed, decoupled from `throw_m`
-    /// (which now only sets how high it billows). No hard limit. FORMAT 11.
-    #[serde(default = "default_speed")]
+    /// (which now only sets how high it billows). No hard limit.
     pub speed: f32,
 
     /// Live-VIEWPORT CO2 quality: `false` = Fast preview (the expensive per-beam
     /// smoke shadowing is skipped — smooth editing); `true` = Full quality live
     /// (matches a render, heavier). **Exports/renders are ALWAYS full quality** —
-    /// this only trades preview speed vs fidelity. FORMAT 12.
-    #[serde(default)]
+    /// this only trades preview speed vs fidelity.
     pub viewport_hq: bool,
 
     /// CO2 visual **density** (multiplies the smoke extinction). Higher = denser, with
     /// a darker self-shadowed core whose dark region spreads + a lighter rim. Distinct
-    /// from `opacity` (per-puff) and `density` (output rate). No hard limit. FORMAT 13.
-    #[serde(default = "default_thickness")]
+    /// from `opacity` (per-puff) and `density` (output rate). No hard limit.
     pub thickness: f32,
 
     // --- runtime control (serde-skip — written by DMX decode each frame) ---
@@ -187,17 +186,13 @@ pub struct PyroDevice {
     pub id: super::EntityId,
 }
 
-/// Default CO2 hang time, in seconds (FORMAT-10 `dissipation`).
+/// Default CO2 hang time, in seconds (the `dissipation` field).
 pub(crate) fn default_dissipation() -> f32 {
-    2.5
+    0.9
 }
-/// Default CO2 jet exit velocity, m/s (FORMAT-11 `speed`).
-pub(crate) fn default_speed() -> f32 {
-    11.0
-}
-/// Default CO2 visual density multiplier (FORMAT-13 `thickness`).
+/// Default CO2 visual density multiplier (the `thickness` field).
 pub(crate) fn default_thickness() -> f32 {
-    1.0
+    3.63
 }
 
 impl crate::dmx::patch::Patchable for PyroDevice {
@@ -238,7 +233,7 @@ impl PyroDevice {
             // Free-run at a visible default so a freshly-placed device shows its
             // effect immediately (DMX overrides this once patched + live).
             density: if spark { 0.55 } else { 0.0 },
-            cone_deg: if spark { 10.0 } else { 8.0 },
+            cone_deg: if spark { 10.0 } else { 6.6 },
             color_t0_k: profile.default_color_t0_k,
             color_t1_k: 1100.0,
             brightness: 8.0,
@@ -251,7 +246,7 @@ impl PyroDevice {
             quality: 2,
             hidden: false,
             dissipation: default_dissipation(),
-            speed: (profile.default_throw_m * 1.3).max(6.0),
+            speed: if spark { (profile.default_throw_m * 1.3).max(6.0) } else { 11.7 },
             viewport_hq: false,
             thickness: default_thickness(),
             driven: false,
@@ -340,11 +335,10 @@ mod tests {
         PyroDevice::from_profile(p, "Spark", Mat4::IDENTITY)
     }
 
-    /// Pyro now persists as a self-describing JSON trailer (see `ui::project`), so a
-    /// plain derive round-trips AND an older save missing newer fields loads via
-    /// `#[serde(default)]` — no positional/version-aware decode, no FORMAT-per-field.
+    /// `PyroDevice` is a plain derive, so it round-trips through serde — it rides the
+    /// `.glow` bincode core like the rest of the show.
     #[test]
-    fn pyro_device_roundtrips_and_defaults_missing_fields() {
+    fn pyro_device_roundtrips() {
         let mut d = spark();
         d.name = "blast".into();
         d.throw_m = 2.5;
@@ -356,20 +350,6 @@ mod tests {
         assert_eq!(back.throw_m, 2.5);
         assert_eq!(back.thickness, 2.2);
         assert!(back.viewport_hq);
-
-        // Simulate an OLDER save: drop the fields added after pyro shipped. The
-        // remaining show data still loads; the absent fields take their defaults.
-        let mut obj: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let map = obj.as_object_mut().unwrap();
-        for f in ["thickness", "viewport_hq", "speed", "dissipation"] {
-            map.remove(f);
-        }
-        let old: PyroDevice = serde_json::from_value(obj).unwrap();
-        assert_eq!(old.throw_m, 2.5); // pre-existing field preserved
-        assert_eq!(old.thickness, default_thickness());
-        assert_eq!(old.speed, default_speed());
-        assert_eq!(old.dissipation, default_dissipation());
-        assert!(!old.viewport_hq);
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub struct CameraUniform {
 /// A camera that orbits a target point: drag to rotate, scroll to dolly.
 #[derive(Clone, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct OrbitCamera {
     /// Point the camera looks at and orbits around (world space).
     pub target: Vec3,
@@ -41,7 +42,7 @@ pub struct OrbitCamera {
     pub zfar: f32,
 
     /// Orthographic projection toggle (session UI state — numpad 5 / axis views).
-    /// Serde-skipped: defaults to false on load, no .archie version bump.
+    /// Serde-skipped: defaults to false on load.
     #[serde(skip)]
     pub ortho: bool,
 
@@ -110,8 +111,9 @@ impl Default for OrbitCamera {
 /// bookmark (S1) stores: where it looks (`target`), the orbit angles, the dolly
 /// `distance`, the `fov_y`, and the `ortho` projection flag. Plain `f32`/array
 /// fields so it round-trips cleanly through `bookmarks.json` (and could ride in
-/// `.archie` later). Animation/aspect session state is deliberately excluded.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+/// `.glow` later). Animation/aspect session state is deliberately excluded.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
 pub struct CameraPose {
     pub target: [f32; 3],
     pub yaw: f32,

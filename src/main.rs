@@ -2,6 +2,10 @@
 //!
 //! Pure wgpu + winit (no game engine, no ECS). This binary wires up the winit
 //! event loop and hands control to [`app::App`].
+//!
+//! On Windows a RELEASE build uses the "windows" subsystem so it doesn't pop up a
+//! console window next to the viewport (debug keeps the console for `RUST_LOG=…`).
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
 mod citp;

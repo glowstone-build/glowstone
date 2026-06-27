@@ -642,7 +642,7 @@ pub fn apply_screens(screens: &mut [crate::scene::LedScreen], snap: &UniverseSna
         let ScreenContent::PixelMapDmx(pm) = &s.content else {
             continue;
         };
-        // Clamp the grid so a crafted .archie / MVR file can't force a huge
+        // Clamp the grid so a crafted .glow / MVR file can't force a huge
         // allocation (the UI caps at 64; this is a hard safety bound).
         let cols = pm.cols.clamp(1, 256);
         let rows = pm.rows.clamp(1, 256);
