@@ -51,10 +51,11 @@ installers) are produced by the scripts in `scripts/`, writing to `dist/`:
 
 | command | output |
 | --- | --- |
-| `scripts/gen-icons.sh [src.png]` | `assets/icons/glowstone.icns` + `glowstone.ico` from a square source (default `~/Downloads/glowstone.png`). The macOS icon is a squircle on Apple's Big Sur grid; committed to the repo. |
+| `scripts/gen-icons.sh <src.png>` | `assets/icons/glowstone.icns` + `glowstone.ico` from a large square source PNG. The macOS icon is a squircle on Apple's Big Sur grid. The icons are committed — only re-run this when the logo changes. |
 | `scripts/package-macos.sh` | `Glowstone.app` + `Glowstone-<ver>-macos-<arch>.dmg` (ad-hoc signed). |
 | `scripts/package-windows.sh` | `glowstone.exe` (icon embedded by `build.rs`) → portable `.zip`, plus an NSIS `setup.exe` when `makensis` is installed. |
-| `scripts/package-all.sh` | icons + every package this host can build. |
+| `scripts/package-all.sh` | every package this host can build. |
+| `scripts/release.sh [tag]` | build the packages and publish a GitHub release (prerelease) with the artifacts. Defaults the tag to `v<ver>-alpha`. |
 
 The Windows package **cross-compiles from macOS/Linux** via mingw-w64 — one-time setup:
 

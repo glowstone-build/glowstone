@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # Regenerate the app icons (macOS .icns + Windows .ico) from a square source PNG.
 #
-#   scripts/gen-icons.sh [SOURCE_PNG]
+#   scripts/gen-icons.sh SOURCE_PNG
 #
-# Default source: ~/Downloads/glowstone.png. Outputs to assets/icons/. The macOS
+# Outputs to assets/icons/ (the .icns/.ico are committed — only re-run this when the
+# logo changes). The macOS
 # `.icns` is packed with `iconutil` (macOS only); the Windows `.ico` is produced on
 # any OS. A throwaway venv (scripts/.venv) holds Pillow + numpy.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="${1:-$HOME/Downloads/glowstone.png}"
+SRC="${1:-}"
 OUT="$ROOT/assets/icons"
 VENV="$ROOT/scripts/.venv"
 
+if [ -z "$SRC" ]; then
+  echo "usage: $0 <source.png>   (a large square PNG of the app logo)" >&2
+  echo "the committed icons live in assets/icons/ — only re-run this when the logo changes." >&2
+  exit 1
+fi
 [ -f "$SRC" ] || { echo "source image not found: $SRC" >&2; exit 1; }
 mkdir -p "$OUT"
 
