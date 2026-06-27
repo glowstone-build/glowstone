@@ -319,7 +319,7 @@ mod dock_serde {
 /// `<config>/workspaces.json` — the per-user store, alongside `bookmarks.json` /
 /// `keymap.json`.
 fn workspaces_path() -> Option<PathBuf> {
-    let d = directories::ProjectDirs::from("dev", "Embedder", "glowstone")?;
+    let d = directories::ProjectDirs::from("build", "glowstone", "glowstone")?;
     let dir = d.config_dir();
     std::fs::create_dir_all(dir).ok()?;
     Some(dir.join("workspaces.json"))

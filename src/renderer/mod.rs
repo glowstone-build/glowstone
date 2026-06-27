@@ -571,7 +571,7 @@ fn backend_from_label(s: &str) -> Option<wgpu::Backend> {
 /// `<config>/gpu-backend.txt` — the machine-global GPU backend preference (read at
 /// startup, before any project loads; per-project prefs can't choose the backend).
 fn gpu_pref_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "Embedder", "glowstone")
+    directories::ProjectDirs::from("build", "glowstone", "glowstone")
         .map(|d| d.config_dir().join("gpu-backend.txt"))
 }
 

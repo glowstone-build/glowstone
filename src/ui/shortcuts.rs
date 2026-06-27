@@ -1101,7 +1101,7 @@ pub fn active() -> Arc<KeymapOverrides> {
 
 /// `<config>/keymap.json` — the per-user override store, alongside `library.json`.
 fn overrides_path() -> Option<std::path::PathBuf> {
-    let d = directories::ProjectDirs::from("dev", "Embedder", "glowstone")?;
+    let d = directories::ProjectDirs::from("build", "glowstone", "glowstone")?;
     let dir = d.config_dir();
     std::fs::create_dir_all(dir).ok()?;
     Some(dir.join("keymap.json"))

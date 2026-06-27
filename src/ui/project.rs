@@ -221,7 +221,7 @@ fn intern_geometry_resources(scene: &mut Scene) {
 // --- recent projects + autosave locations (per-user dirs) -------------------
 
 fn dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("dev", "Embedder", "glowstone")
+    directories::ProjectDirs::from("build", "glowstone", "glowstone")
 }
 
 /// The crash-recovery autosave path (`<cache>/last-session.glow`).

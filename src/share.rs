@@ -169,7 +169,7 @@ fn de_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error>
 // ---------------------------------------------------------------------------
 
 fn project_dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("dev", "Embedder", "glowstone")
+    directories::ProjectDirs::from("build", "glowstone", "glowstone")
 }
 
 /// The shared directory that holds every downloaded `.gdtf` (reused across
