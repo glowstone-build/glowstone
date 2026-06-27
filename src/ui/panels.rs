@@ -1987,6 +1987,13 @@ fn inspector_body(
         return;
     }
 
+    // Pyro devices (CO2 cannons + cold-spark machines) take the Inspector.
+    let pyro: Vec<usize> = selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
+    if let Some(&primary) = pyro.first() {
+        pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state);
+        return;
+    }
+
     // Keep only still-valid fixture indices.
     let ids: Vec<usize> = selection
         .fixtures
@@ -3055,6 +3062,271 @@ fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sour
     );
 }
 
+/// Inspector for a selected stage **pyro device** (CO2 cannon or cold-spark
+/// machine): identity, transform, the kind-aware effect tunables (the physical +
+/// look knobs from RESEARCH-pyro §4), nozzle movement, a quality/perf group, and
+/// the inline DMX patch (universe/address/mode). When the device is patched AND
+/// receiving live DMX these values are driven by the console; otherwise they are
+/// the free-run preview values.
+fn pyro_inspector(ui: &mut egui::Ui, d: &mut crate::scene::PyroDevice, count: usize, state: &mut InspectorState) {
+    use crate::scene::pyro::{PyroKind, PyroMode, PyroPatch};
+    ui.heading(d.name.as_str());
+    ui.label(RichText::new(format!("{} · {}", d.kind.label(), d.profile_name)).weak().small());
+    if count > 1 {
+        ui.label(RichText::new(format!("{count} devices — editing the active one")).weak().small());
+    }
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        let mut visible = !d.hidden;
+        if ui.checkbox(&mut visible, "Visible").changed() {
+            d.hidden = !visible;
+        }
+    });
+
+    // --- Transform (position + rotation; nozzle at origin, fires +Y) ---
+    let mut pos = d.transform.w_axis.truncate();
+    let (ryr, rxr, rzr) = glam::Quat::from_mat4(&d.transform).to_euler(glam::EulerRot::YXZ);
+    let (mut ey, mut ex, mut ez) = (ryr.to_degrees(), rxr.to_degrees(), rzr.to_degrees());
+    let mut pos_changed = false;
+    let mut rot_changed = false;
+    category(
+        ui,
+        state,
+        "Transform",
+        format!("{}  Transform", theme::icon::INSPECTOR),
+        true,
+        &["Position", "Rotation"],
+        |ui, fs| {
+            let fw = ((ui.available_width() - 92.0) / 3.0).clamp(30.0, 84.0);
+            let fh = ui.spacing().interact_size.y;
+            Grid::new("pyro-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                row(ui, fs, "Position", false, |ui| {
+                    ui.horizontal(|ui| {
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.x).speed(0.05).prefix("x ")).changed();
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.y).speed(0.05).prefix("y ")).changed();
+                        pos_changed |= ui.add_sized([fw, fh], DragValue::new(&mut pos.z).speed(0.05).prefix("z ")).changed();
+                    });
+                });
+                row(ui, fs, "Rotation", false, |ui| {
+                    ui.horizontal(|ui| {
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ex).speed(0.5).suffix("°").prefix("x ")).changed();
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ey).speed(0.5).suffix("°").prefix("y ")).changed();
+                        rot_changed |= ui.add_sized([fw, fh], DragValue::new(&mut ez).speed(0.5).suffix("°").prefix("z ")).changed();
+                    });
+                });
+            });
+        },
+    );
+    if rot_changed {
+        let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
+        d.transform = Mat4::from_rotation_translation(rot, pos);
+    } else if pos_changed {
+        d.transform.w_axis = pos.extend(1.0);
+    }
+
+    // --- Effect (kind-aware physical + look tunables) ---
+    let spark = d.kind == PyroKind::ColdSpark;
+    let effect_rows: &[&str] = if spark {
+        &["Height", "Amount", "Spread", "Brightness", "Hot colour", "Tip colour"]
+    } else {
+        &["Throw", "Speed", "Output", "Spread", "Opacity", "Density", "Dissipation", "Tint"]
+    };
+    // Sliders show a suggested range but NEVER clamp — the user can type any raw value.
+    let nc = egui::SliderClamping::Never;
+    category(
+        ui,
+        state,
+        "Effect",
+        format!("{}  Effect", theme::icon::PYRO),
+        true,
+        effect_rows,
+        |ui, fs| {
+            Grid::new("pyro-effect").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                if spark {
+                    row(ui, fs, "Height", false, |ui| {
+                        ui.add(Slider::new(&mut d.height_m, 0.5..=8.0).clamping(nc).suffix(" m"));
+                    });
+                    row(ui, fs, "Amount", false, |ui| {
+                        ui.add(Slider::new(&mut d.density, 0.0..=1.0).clamping(nc));
+                    });
+                    row(ui, fs, "Spread", false, |ui| {
+                        ui.add(Slider::new(&mut d.cone_deg, 0.0..=45.0).clamping(nc).suffix("°"));
+                    });
+                    row(ui, fs, "Brightness", false, |ui| {
+                        ui.add(Slider::new(&mut d.brightness, 1.0..=20.0).clamping(nc));
+                    });
+                    row(ui, fs, "Hot colour", false, |ui| {
+                        ui.add(Slider::new(&mut d.color_t0_k, 1500.0..=3500.0).clamping(nc).suffix(" K"));
+                    });
+                    row(ui, fs, "Tip colour", false, |ui| {
+                        ui.add(Slider::new(&mut d.color_t1_k, 900.0..=1600.0).clamping(nc).suffix(" K"));
+                    });
+                } else {
+                    row(ui, fs, "Throw", false, |ui| {
+                        ui.add(Slider::new(&mut d.throw_m, 3.0..=20.0).clamping(nc).suffix(" m"))
+                            .on_hover_text("How high the plume billows up (buoyant rise).");
+                    });
+                    row(ui, fs, "Speed", false, |ui| {
+                        ui.add(Slider::new(&mut d.speed, 2.0..=22.0).clamping(nc).suffix(" m/s"))
+                            .on_hover_text("Jet exit velocity — the launch blast, separate from Throw.");
+                    });
+                    row(ui, fs, "Output", false, |ui| {
+                        ui.add(Slider::new(&mut d.density, 0.0..=1.0).clamping(nc));
+                    });
+                    row(ui, fs, "Spread", false, |ui| {
+                        ui.add(Slider::new(&mut d.cone_deg, 0.0..=20.0).clamping(nc).suffix("°"));
+                    });
+                    row(ui, fs, "Opacity", false, |ui| {
+                        ui.add(Slider::new(&mut d.opacity, 0.05..=1.0).clamping(nc));
+                    });
+                    row(ui, fs, "Density", false, |ui| {
+                        ui.add(Slider::new(&mut d.thickness, 0.1..=4.0).clamping(nc).suffix("×"))
+                            .on_hover_text(
+                                "Visual density of the smoke. Higher = denser, with a \
+                                 darker self-shadowed core (the dark region spreads) and \
+                                 a lighter rim. Type any value.",
+                            );
+                    });
+                    row(ui, fs, "Dissipation", false, |ui| {
+                        ui.add(Slider::new(&mut d.dissipation, 0.3..=10.0).clamping(nc).suffix(" s"))
+                            .on_hover_text(
+                                "Hang time in seconds — how long the smoke lingers after \
+                                 the valve shuts (per-puff jittered so edges dissolve \
+                                 raggedly). Output itself is instant. Type any value.",
+                            );
+                    });
+                    row(ui, fs, "Tint", false, |ui| {
+                        ui.color_edit_button_rgb(&mut d.tint);
+                    });
+                }
+            });
+        },
+    );
+
+    // --- Movement (nozzle aim; meaningful on the moving / spin variants) ---
+    category(
+        ui,
+        state,
+        "Movement",
+        format!("{}  Movement", theme::icon::INSPECTOR),
+        false,
+        &["Pan", "Tilt", "Spin"],
+        |ui, fs| {
+            Grid::new("pyro-move").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                row(ui, fs, "Pan", false, |ui| {
+                    ui.add(Slider::new(&mut d.pan, -90.0..=90.0).clamping(nc).suffix("°"));
+                });
+                row(ui, fs, "Tilt", false, |ui| {
+                    ui.add(Slider::new(&mut d.tilt, -60.0..=60.0).clamping(nc).suffix("°"));
+                });
+                row(ui, fs, "Spin", false, |ui| {
+                    ui.add(Slider::new(&mut d.spin_rpm, -100.0..=100.0).clamping(nc).suffix(" rpm"));
+                });
+            });
+        },
+    );
+
+    // --- Quality (smoke grid resolution + cap). Expanded: the Detail preset is the
+    // crisp-edges lever, and renders are sharper than the half-res live preview. ---
+    category(
+        ui,
+        state,
+        "Quality",
+        format!("{}  Quality", theme::icon::PERF),
+        true,
+        &["Detail", "Viewport", "Max particles"],
+        |ui, fs| {
+            Grid::new("pyro-quality").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                if !spark {
+                    row(ui, fs, "Viewport", false, |ui| {
+                        let names = ["Fast", "Full"];
+                        let mut v = d.viewport_hq as usize;
+                        let resp = egui::ComboBox::from_id_salt("pyro-viewport-q")
+                            .selected_text(names[v])
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut v, 0, "Fast");
+                                ui.selectable_value(&mut v, 1, "Full");
+                            });
+                        resp.response.on_hover_text(
+                            "LIVE preview quality. Fast = skip the per-beam smoke \
+                             shadowing for smooth editing; Full = render-accurate live \
+                             (heavier). EXPORTED RENDERS ARE ALWAYS FULL QUALITY.",
+                        );
+                        d.viewport_hq = v == 1;
+                    });
+                }
+                row(ui, fs, "Detail", false, |ui| {
+                    let names = ["Low", "Medium", "High", "Ultra"];
+                    let mut q = d.quality.min(3) as usize;
+                    let resp = egui::ComboBox::from_id_salt("pyro-quality-preset")
+                        .selected_text(names[q])
+                        .show_ui(ui, |ui| {
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(&mut q, i, *n);
+                            }
+                        });
+                    resp.response.on_hover_text(
+                        "CO2 smoke grid resolution — higher = crisper cauliflower edges \
+                         (Low 40³ … Ultra 84³ voxels) at more CPU cost. NOTE: the live \
+                         viewport renders volumetrics at half-resolution for speed, so an \
+                         exported render is always the sharpest.",
+                    );
+                    d.quality = q as u8;
+                });
+                row(ui, fs, "Max particles", false, |ui| {
+                    // No upper limit (the user can enter any value); soft lower floor only.
+                    ui.add(DragValue::new(&mut d.max_particles).speed(50.0).range(1..=u32::MAX));
+                });
+            });
+        },
+    );
+
+    // --- DMX patch (inline; NOT through the fixture patch table) ---
+    category(
+        ui,
+        state,
+        "DMX",
+        format!("{}  DMX", theme::icon::PATCH),
+        true,
+        &["Patched", "Mode", "Universe", "Address", "Footprint"],
+        |ui, fs| {
+            Grid::new("pyro-dmx").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                let mut patched = d.patch.is_some();
+                row(ui, fs, "Patched", false, |ui| {
+                    if ui.checkbox(&mut patched, "").changed() {
+                        d.patch = patched.then(PyroPatch::default);
+                    }
+                });
+                row(ui, fs, "Mode", false, |ui| {
+                    egui::ComboBox::from_id_salt("pyro-mode")
+                        .selected_text(d.mode.label())
+                        .show_ui(ui, |ui| {
+                            for m in PyroMode::ALL {
+                                ui.selectable_value(&mut d.mode, m, m.label());
+                            }
+                        });
+                });
+                if let Some(patch) = &mut d.patch {
+                    row(ui, fs, "Universe", false, |ui| {
+                        ui.add(DragValue::new(&mut patch.universe).speed(1.0).range(1..=63999));
+                    });
+                    row(ui, fs, "Address", false, |ui| {
+                        ui.add(DragValue::new(&mut patch.address).speed(1.0).range(1..=512));
+                    });
+                }
+                row(ui, fs, "Footprint", false, |ui| {
+                    let n = d.mode.footprint(d.kind);
+                    ui.label(RichText::new(format!("{n} ch")).weak());
+                });
+            });
+        },
+    );
+    if d.patch.is_none() {
+        ui.label(RichText::new("Unpatched — free-runs at the Amount/Output above for preview.").weak().small());
+    }
+}
+
 /// Inspector for an imported GDTF fixture: identity + thumbnail, editable
 /// instance params, wheels (with slot images), and the DMX modes/channels.
 fn gdtf_inspector(
@@ -3724,11 +3996,18 @@ fn compute_pivot(scene: &Scene, objs: &[ObjectRef], mode: PivotMode, cursor_3d: 
 /// (fixtures, then geometry, screens, environment) — the order the pivot's
 /// "active" element and the gizmo read. The single place selection → object list
 /// happens for the transform path.
-fn obj_refs(fids: &[usize], gids: &[usize], sids: &[usize], eids: &[usize]) -> Vec<ObjectRef> {
+fn obj_refs(
+    fids: &[usize],
+    gids: &[usize],
+    sids: &[usize],
+    pids: &[usize],
+    eids: &[usize],
+) -> Vec<ObjectRef> {
     fids.iter()
         .map(|&i| ObjectRef::Fixture(i))
         .chain(gids.iter().map(|&i| ObjectRef::Geometry(i)))
         .chain(sids.iter().map(|&i| ObjectRef::Screen(i)))
+        .chain(pids.iter().map(|&i| ObjectRef::Pyro(i)))
         .chain(eids.iter().map(|&i| ObjectRef::Environment(i)))
         .collect()
 }
@@ -3744,17 +4023,25 @@ fn snapshot_starts(
     fids: &[usize],
     gids: &[usize],
     sids: &[usize],
+    pids: &[usize],
     eids: &[usize],
-) -> (Vec<(usize, Vec3, Quat)>, Vec<(usize, Mat4)>, Vec<(usize, Mat4)>, Vec<(usize, Vec3, Vec3)>) {
+) -> (
+    Vec<(usize, Vec3, Quat)>,
+    Vec<(usize, Mat4)>,
+    Vec<(usize, Mat4)>,
+    Vec<(usize, Mat4)>,
+    Vec<(usize, Vec3, Vec3)>,
+) {
     let start = fids
         .iter()
         .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
         .collect();
     let geo_start = gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
     let screen_start = sids.iter().map(|&i| (i, scene.screens[i].transform)).collect();
+    let pyro_start = pids.iter().map(|&i| (i, scene.pyro[i].transform)).collect();
     let env_start =
         eids.iter().map(|&i| (i, scene.environments[i].center, scene.environments[i].size)).collect();
-    (start, geo_start, screen_start, env_start)
+    (start, geo_start, screen_start, pyro_start, env_start)
 }
 
 /// Resolve the transform-orientation (#37) to a 3×3 whose COLUMNS are the X/Y/Z
@@ -4105,6 +4392,12 @@ fn apply_transform(
                     s.transform = Mat4::from_translation(world) * *m0;
                 }
             }
+            // Pyro devices ride the identical Mat4 path too.
+            for (i, m0) in &op.pyro_start {
+                if let Some(p) = scene.pyro.get_mut(*i) {
+                    p.transform = Mat4::from_translation(world) * *m0;
+                }
+            }
             // Fog volumes: slide the centre (size unchanged).
             for (i, c0, _sz) in &op.env_start {
                 if let Some(e) = scene.environments.get_mut(*i) {
@@ -4156,6 +4449,15 @@ fn apply_transform(
                     * Mat4::from_translation(-pivot);
                 if let Some(s) = scene.screens.get_mut(*i) {
                     s.transform = about * *m0;
+                }
+            }
+            for (i, m0) in &op.pyro_start {
+                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let about = Mat4::from_translation(pivot)
+                    * Mat4::from_quat(rot)
+                    * Mat4::from_translation(-pivot);
+                if let Some(p) = scene.pyro.get_mut(*i) {
+                    p.transform = about * *m0;
                 }
             }
             for (i, c0, _sz) in &op.env_start {
@@ -4225,6 +4527,15 @@ fn apply_transform(
                     s.transform = about * *m0;
                 }
             }
+            for (i, m0) in &op.pyro_start {
+                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let about = Mat4::from_translation(pivot)
+                    * about4
+                    * Mat4::from_translation(-pivot);
+                if let Some(p) = scene.pyro.get_mut(*i) {
+                    p.transform = about * *m0;
+                }
+            }
             for (i, c0, sz0) in &op.env_start {
                 // Fog box: scale the centre about the pivot and grow the size by the
                 // same (directional or uniform) factor — a lone box scales in place.
@@ -4257,6 +4568,8 @@ fn dup_grab_delta(op: &TransformOp, scene: &Scene) -> Vec3 {
         scene.geometry.get(*i).map(|g| (g.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
     } else if let Some((i, m0)) = op.screen_start.first() {
         scene.screens.get(*i).map(|s| (s.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
+    } else if let Some((i, m0)) = op.pyro_start.first() {
+        scene.pyro.get(*i).map(|p| (p.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
     } else if let Some((i, c0, _)) = op.env_start.first() {
         scene.environments.get(*i).map(|e| e.center - *c0).unwrap_or(Vec3::ZERO)
     } else {
@@ -4280,6 +4593,10 @@ fn truncate_objects(scene: &mut Scene, kind: ObjectRef, count: usize) {
         ObjectRef::Screen(_) => {
             let l = scene.screens.len();
             scene.screens.truncate(l.saturating_sub(count));
+        }
+        ObjectRef::Pyro(_) => {
+            let l = scene.pyro.len();
+            scene.pyro.truncate(l.saturating_sub(count));
         }
         ObjectRef::Environment(_) => {
             let l = scene.environments.len();
@@ -4307,6 +4624,11 @@ fn place_array_extra(scene: &mut Scene, op: &TransformOp, k: usize, b: usize, of
         ObjectRef::Screen(e) => {
             if let (Some((_, m0)), Some(s)) = (op.screen_start.get(b), scene.screens.get_mut(e)) {
                 s.transform = Mat4::from_translation(off) * *m0;
+            }
+        }
+        ObjectRef::Pyro(e) => {
+            if let (Some((_, m0)), Some(p)) = (op.pyro_start.get(b), scene.pyro.get_mut(e)) {
+                p.transform = Mat4::from_translation(off) * *m0;
             }
         }
         ObjectRef::Environment(e) => {
@@ -4618,13 +4940,15 @@ pub fn viewport(
             selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
         let sids: Vec<usize> =
             selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+        let pids: Vec<usize> =
+            selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
         let eids: Vec<usize> =
             selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
-        let objs = obj_refs(&fids, &gids, &sids, &eids);
+        let objs = obj_refs(&fids, &gids, &sids, &pids, &eids);
         if !objs.is_empty() {
             let pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
-            let (start, geo_start, screen_start, env_start) =
-                snapshot_starts(scene, &fids, &gids, &sids, &eids);
+            let (start, geo_start, screen_start, pyro_start, env_start) =
+                snapshot_starts(scene, &fids, &gids, &sids, &pids, &eids);
             *transform = Some(TransformOp {
                 kind: TransformKind::Move,
                 axis: None,
@@ -4634,6 +4958,7 @@ pub fn viewport(
                 start,
                 geo_start,
                 screen_start,
+                pyro_start,
                 env_start,
                 gizmo_hovered_axis: None,
                 gizmo_plane_normal: None,
@@ -4670,9 +4995,11 @@ pub fn viewport(
             selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
         let sids: Vec<usize> =
             selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+        let pids: Vec<usize> =
+            selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
         let eids: Vec<usize> =
             selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
-        let objs = obj_refs(&fids, &gids, &sids, &eids);
+        let objs = obj_refs(&fids, &gids, &sids, &pids, &eids);
         if !objs.is_empty() {
             let gizmo_pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
             gizmo_screen = OrbitCamera::project_to_screen(gizmo_pivot, camera.view_proj(aspect), rect);
@@ -4703,8 +5030,8 @@ pub fn viewport(
                 // `fids`/`gids`/`sids`/`eids` are the validated, selection-order
                 // indices computed above for the pivot — reused here for the
                 // per-element snapshots (every kind, via `snapshot_starts`).
-                let (start, geo_start, screen_start, env_start) =
-                    snapshot_starts(scene, &fids, &gids, &sids, &eids);
+                let (start, geo_start, screen_start, pyro_start, env_start) =
+                    snapshot_starts(scene, &fids, &gids, &sids, &pids, &eids);
                 *transform = Some(TransformOp {
                     kind: start_spec.kind,
                     // Move locks via `gizmo_hovered_axis` (matching P3a); rotate/scale
@@ -4717,6 +5044,7 @@ pub fn viewport(
                     start,
                     geo_start,
                     screen_start,
+                    pyro_start,
                     env_start,
                     gizmo_hovered_axis: if start_spec.kind == TransformKind::Move {
                         start_spec.axis
@@ -5094,16 +5422,18 @@ pub fn viewport(
                 selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
             let sids: Vec<usize> =
                 selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+        let pids: Vec<usize> =
+            selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
             let eids: Vec<usize> =
                 selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
-            let objs = obj_refs(&fids, &gids, &sids, &eids);
+            let objs = obj_refs(&fids, &gids, &sids, &pids, &eids);
             if !objs.is_empty() {
                 // #5: pivot per the chosen mode (Median / Active / 3D-Cursor; the
                 // Individual flag makes apply_transform pivot each element about its
                 // own origin). Per-element snapshots for the live re-apply / cancel.
                 let pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
-                let (start, geo_start, screen_start, env_start) =
-                    snapshot_starts(scene, &fids, &gids, &sids, &eids);
+                let (start, geo_start, screen_start, pyro_start, env_start) =
+                    snapshot_starts(scene, &fids, &gids, &sids, &pids, &eids);
                 *transform = Some(TransformOp {
                     kind,
                     axis: None,
@@ -5113,6 +5443,7 @@ pub fn viewport(
                     start,
                     geo_start,
                     screen_start,
+                    pyro_start,
                     env_start,
                     gizmo_hovered_axis: None,
                     gizmo_plane_normal: None,
@@ -5325,6 +5656,7 @@ pub fn viewport(
             let hits: &[SelItem] = match hit {
                 Some(Hit::Geometry(i)) => &[SelItem::Geometry(i)],
                 Some(Hit::Screen(i)) => &[SelItem::Screen(i)],
+                Some(Hit::Pyro(i)) => &[SelItem::Pyro(i)],
                 Some(Hit::Environment(i)) => &[SelItem::Environment(i)],
                 Some(Hit::Fixture(_)) => unreachable!("fixture handled above"),
                 None => &[],
@@ -5381,6 +5713,10 @@ pub fn viewport(
                 }
                 Some(Hit::Screen(i)) if !selection.contains_screen(i) => {
                     *selection = Selection::screen(i);
+                    *scene_anchor = None;
+                }
+                Some(Hit::Pyro(i)) if !selection.contains_pyro(i) => {
+                    *selection = Selection::pyro(i);
                     *scene_anchor = None;
                 }
                 _ => {}
@@ -5449,6 +5785,45 @@ pub fn viewport(
                     for &i in &selection.screens {
                         if let Some(s) = scene.screens.get_mut(i) {
                             s.hidden = true;
+                        }
+                    }
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Deselect").clicked() {
+                    *selection = Selection::default();
+                    ui.close();
+                }
+                if ui
+                    .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
+                    .clicked()
+                {
+                    *delete_requested = true;
+                    ui.close();
+                }
+            } else if !selection.pyro.is_empty() {
+                // Pyro-device selection menu (mirrors the screens menu).
+                let n = selection.pyro.len();
+                ui.label(egui::RichText::new(format!("{n} pyro device{}", if n == 1 { "" } else { "s" })).small().weak());
+                if ui.button(format!("{}  Frame selection", theme::icon::FRAME)).clicked() {
+                    let mut lo = Vec3::splat(f32::INFINITY);
+                    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+                    for &i in &selection.pyro {
+                        if let Some(p) = scene.pyro.get(i) {
+                            let (l, h) = p.world_bounds();
+                            lo = lo.min(l);
+                            hi = hi.max(h);
+                        }
+                    }
+                    if lo.is_finite() {
+                        camera.frame_aabb(lo, hi);
+                    }
+                    ui.close();
+                }
+                if ui.button(format!("{}  Hide", theme::icon::EYE_OFF)).clicked() {
+                    for &i in &selection.pyro {
+                        if let Some(p) = scene.pyro.get_mut(i) {
+                            p.hidden = true;
                         }
                     }
                     ui.close();
@@ -5587,6 +5962,11 @@ pub fn viewport(
         let extra = selection.screens.len().saturating_sub(1);
         selection.primary_screen().and_then(|i| scene.screens.get(i)).map(|s| {
             if extra > 0 { format!("{}  +{extra}", s.name) } else { s.name.clone() }
+        })
+    } else if !selection.pyro.is_empty() {
+        let extra = selection.pyro.len().saturating_sub(1);
+        selection.primary_pyro().and_then(|i| scene.pyro.get(i)).map(|p| {
+            if extra > 0 { format!("{}  +{extra}", p.name) } else { p.name.clone() }
         })
     } else if !selection.fixtures.is_empty() {
         let extra = selection.fixtures.len().saturating_sub(1);
@@ -6466,6 +6846,7 @@ fn format_universes(us: &[u16]) -> String {
 enum Hit {
     Fixture(usize),
     Screen(usize),
+    Pyro(usize),
     Geometry(usize),
     Environment(usize),
 }
@@ -6516,6 +6897,21 @@ fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
     }
     if let Some((_, i)) = scr {
         return Some(Hit::Screen(i));
+    }
+    // Pyro devices: ray vs a small body box at the nozzle (so they're clickable).
+    let mut pyro: Option<(f32, usize)> = None;
+    for (i, d) in scene.pyro.iter().enumerate() {
+        if d.hidden {
+            continue;
+        }
+        if let Some(t) = d.ray_hit(ro, rd)
+            && pyro.is_none_or(|(bt, _)| t < bt)
+        {
+            pyro = Some((t, i));
+        }
+    }
+    if let Some((_, i)) = pyro {
+        return Some(Hit::Pyro(i));
     }
     // Static geometry: ray vs each object's world-space AABB.
     let mut geo: Option<(f32, usize)> = None;
@@ -6578,6 +6974,11 @@ fn marquee_hits(scene: &Scene, vp: glam::Mat4, rect: egui::Rect, marquee: egui::
     for (i, s) in scene.screens.iter().enumerate() {
         if !s.hidden && inside(s.world_center()) {
             hits.push(SelItem::Screen(i));
+        }
+    }
+    for (i, d) in scene.pyro.iter().enumerate() {
+        if !d.hidden && inside(d.world_nozzle()) {
+            hits.push(SelItem::Pyro(i));
         }
     }
     hits
@@ -6926,7 +7327,7 @@ mod transform_tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, gizmo_view: false, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), dup_extra: Vec::new(), orientation }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, gizmo_view: false, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), dup_extra: Vec::new(), orientation }
     }
 
     #[test]
@@ -6999,7 +7400,7 @@ mod transform_tests {
             viewport: rect,
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
-            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: Some(Axis::Z),
             gizmo_view: false,
@@ -7036,7 +7437,7 @@ mod transform_tests {
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
-            screen_start: Vec::new(),
+            screen_start: Vec::new(), pyro_start: Vec::new(),
             env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
@@ -7075,7 +7476,7 @@ mod transform_tests {
             pivot,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
-            screen_start: Vec::new(),
+            screen_start: Vec::new(), pyro_start: Vec::new(),
             env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
@@ -7129,7 +7530,7 @@ mod transform_tests {
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
-            screen_start: Vec::new(),
+            screen_start: Vec::new(), pyro_start: Vec::new(),
             env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
@@ -7328,7 +7729,7 @@ mod transform_tests {
             viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
             pivot: median,
             start: vec![(0, p0a, q0a), (1, p0b, scene.fixtures[1].orientation)],
-            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,
@@ -7371,7 +7772,7 @@ mod transform_tests {
                 (0, p0a, scene.fixtures[0].orientation),
                 (1, p0b, scene.fixtures[1].orientation),
             ],
-            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,

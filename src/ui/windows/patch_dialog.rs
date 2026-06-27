@@ -3,6 +3,7 @@
 //! fixtures (committed after the dock, where the patch table is reachable —
 //! mirrors `commit_delete`). Esc cancels, Enter confirms. State lives on `Ui`.
 
+use crate::scene::SelKind;
 use crate::ui::theme;
 
 /// State of the open Patch dialog. `open == false` = closed. The starting
@@ -10,12 +11,23 @@ use crate::ui::theme;
 #[derive(Default)]
 pub struct PatchDialog {
     pub open: bool,
-    /// How many fixtures will be (re)patched — shown in the prompt.
+    /// How many entities will be (re)patched — shown in the prompt.
     pub count: usize,
+    /// Which selection kind is being patched (drives the confirm branch + noun).
+    pub kind: SelKind,
     /// 1-based universe to start packing from.
     pub start_universe: u16,
     /// 1-based start channel to start packing from.
     pub start_address: u16,
+}
+
+/// Singular display noun for a patchable selection kind.
+pub fn patch_noun(kind: SelKind) -> &'static str {
+    match kind {
+        SelKind::Pyro => "pyro device",
+        SelKind::Screens => "screen",
+        _ => "fixture",
+    }
 }
 
 /// Render the modeless Patch dialog. Returns `true` exactly once on confirm (the
@@ -45,8 +57,9 @@ pub fn patch_dialog_window(ctx: &egui::Context, dlg: &mut PatchDialog) -> bool {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.label(format!(
-                "Patch {} fixture{} from:",
+                "Patch {} {}{} from:",
                 dlg.count,
+                patch_noun(dlg.kind),
                 if dlg.count == 1 { "" } else { "s" }
             ));
             ui.add_space(4.0);

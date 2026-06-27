@@ -19,6 +19,7 @@ struct Volumetric {
     counts: vec4<f32>,          // y = max step count, z = constant-dt target (world m)
     chroma: vec4<f32>,          // x = Helmholtz–Kohlrausch chroma read-up strength; yzw reserved
     tile: vec4<f32>,            // x = tiles_x, y = tiles_y, z = tile size (full-res px), w unused
+    co2_amb: vec4<f32>,         // rgb = ambient room colour the white CO2 reflects, w = strength
 };
 
 struct Fixture {
@@ -53,6 +54,19 @@ struct Fixture {
 // sample (the whole saving amortizes over the march).
 @group(0) @binding(11) var<storage, read> tile_offsets: array<u32>;
 @group(0) @binding(12) var<storage, read> tile_lights: array<u32>;
+// Stage CO2: a real particle SMOKE SIM (particles.rs) splats per-emitter density
+// into co2_density (one CO2_GRID-tall Z-slab per emitter, stacked). Each Co2Volume
+// maps a world sample into its grid; the density is added to the haze so the beams
+// scatter through the SIMULATED plume (mushroom shape, churn + thickness all from
+// the sim — the shader no longer fakes any of it).
+struct Co2Volume {
+    box_min: vec4<f32>,  // xyz = grid AABB min (world m), w = σ-scale (density → extinction)
+    box_size: vec4<f32>, // xyz = grid AABB size (world m), w = texture Z-slab layer index
+};
+@group(0) @binding(13) var<storage, read> co2_vols: array<Co2Volume>;
+@group(0) @binding(14) var co2_density: texture_3d<f32>; // R8, GRID³ per layer stacked in Z
+@group(0) @binding(15) var co2_density_samp: sampler;
+const CO2_LAYERS_F: f32 = 8.0;
 
 const PI: f32 = 3.14159265359;
 
@@ -123,6 +137,71 @@ fn density_at(p: vec3<f32>, t: f32) -> f32 {
     // uniformity so the clusters stay crisp + drifting instead of being averaged away.
     let clump = 1.0 - clamp(u.chroma.z, 0.0, 1.0);
     return mix(1.0, structured, clump);
+}
+
+// CO2 density at `p` from the splatted smoke-sim grids: x = extinction σₜ summed
+// over emitters, y = max raw grid density (0..1, drives the extra core darkening).
+// Each emitter's grid is one Z-slab of co2_density; layer L occupies normalized w
+// in [L/LAYERS, (L+1)/LAYERS). A half-texel inset stops bilinear bleed between
+// stacked layers. The SHAPE (mushroom, churn, thickness) is entirely the sim's; the
+// fine CAULIFLOWER detail is added on top in `co2_density_at` below.
+fn co2_base_at(p: vec3<f32>) -> vec2<f32> {
+    var sig = 0.0;
+    var dmax = 0.0;
+    let n = arrayLength(&co2_vols);
+    // Half-texel inset along stacked Z (texture depth = res·layers) so linear
+    // filtering can't bleed between adjacent emitters' Z-slabs. Uses the live
+    // texture size, so it tracks the dynamic (quality-driven) resolution.
+    let inset = 0.5 / f32(textureDimensions(co2_density).z);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let v = co2_vols[i];
+        if (v.box_size.x <= 0.0) { continue; }
+        let uvw = (p - v.box_min.xyz) / v.box_size.xyz;
+        if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) { continue; }
+        let wz = (v.box_size.w + clamp(uvw.z, inset, 1.0 - inset)) / CO2_LAYERS_F;
+        let d = textureSampleLevel(co2_density, co2_density_samp, vec3<f32>(uvw.x, uvw.y, wz), 0.0).r;
+        sig = sig + d * v.box_min.w;   // density → extinction
+        dmax = max(dmax, d);
+    }
+    return vec2<f32>(sig, dmax);
+}
+
+// CO2 density WITH fine cauliflower detail. The splatted grid is a SMOOTH blob (so
+// no grid resolution alone yields crisp edges); here a multi-octave noise CARVES it
+// into lumpy wisps with sharp boundaries — the core stays solid, the rim gets eaten
+// into the ragged cauliflower silhouette the reference shows. Drifts upward + churns
+// over time. Returns (extinction σₜ, carved density 0..1). x = sigma, y = core mask.
+fn co2_density_at(p: vec3<f32>, t: f32) -> vec2<f32> {
+    // Quick reject far from any plume (skip the warp noise). The grid's soft Gaussian
+    // edge keeps near-edge points nonzero, so the warp still has density to displace.
+    if (co2_base_at(p).x <= 1e-5) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let scroll = vec3<f32>(0.0, -t * 0.10, 0.0);
+    // DOMAIN WARP — the key to a lumpy cauliflower SILHOUETTE. The grid is a smooth
+    // Gaussian blob, so its edge is a smooth funnel no matter the resolution or how
+    // much you modulate the interior (multiplying density can't move the boundary
+    // outward, only erode it inward — which deletes faint plumes). Instead, sample
+    // the grid at a NOISE-DISPLACED position: the smooth boundary is pushed in AND out
+    // into ragged florets, density is preserved (no erosion → faint plumes survive),
+    // and it churns as the field drifts. ~0.4 m coarse warp + a finer one for florets.
+    let q = p * 0.42 + scroll;
+    let wx = textureSampleLevel(noise_tex, noise_samp, q, 0.0).r;
+    let wy = textureSampleLevel(noise_tex, noise_samp, q + vec3<f32>(11.3, 2.1, 5.1), 0.0).r;
+    let wz = textureSampleLevel(noise_tex, noise_samp, q + vec3<f32>(3.7, 7.7, 13.9), 0.0).r;
+    let q2 = p * 1.05 + scroll * 1.6;
+    let fx = textureSampleLevel(noise_tex, noise_samp, q2, 0.0).r;
+    let fy = textureSampleLevel(noise_tex, noise_samp, q2 + vec3<f32>(9.2, 4.4, 1.3), 0.0).r;
+    let fz = textureSampleLevel(noise_tex, noise_samp, q2 + vec3<f32>(2.6, 8.1, 6.5), 0.0).r;
+    let warp = (vec3<f32>(wx, wy, wz) - 0.5) * 0.85   // ±0.42 m coarse florets
+             + (vec3<f32>(fx, fy, fz) - 0.5) * 0.34;  // ±0.17 m fine bumps
+    let base = co2_base_at(p + warp);
+    if (base.x <= 1e-5) {
+        return base;
+    }
+    // Mild interior modulation (NOT an erosion) for light/dark variation within.
+    let mvar = mix(0.78, 1.42, smoothstep(0.34, 0.66, fx * 0.5 + wy * 0.5));
+    return vec2<f32>(base.x * mvar, base.y * mvar);
 }
 
 @fragment
@@ -243,11 +322,41 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     for (var i = 0; i < nsteps; i = i + 1) {
         let t = t_near + dt * (f32(i) + jitter);
         let p = ro + rd * t;
-        let dens = base * density_at(p, time);
+        // Haze density + any stage-CO2 plume density at this sample (the beams
+        // scatter through both identically → the CO2 is lit like real volumetric smoke).
+        let haze_d = base * density_at(p, time);
+        let co2v = co2_density_at(p, time);
+        let co2_d = co2v.x;     // extinction σₜ from the splatted sim grid
+        let co2_core = co2v.y;  // raw grid density 0..1 (densest voxels → darker)
+        let dens = haze_d + co2_d;
         let sigma_t = max(dens, 1e-5);
         let sigma_s = sigma_t * albedo;
 
-        var lin = ambient;
+        // CO2 SELF-SHADOW — the single most important cue for reading the cauliflower
+        // as a 3D MASS (and the user's "denser = darker core, lighter edges"): a thick
+        // plume's own lumps shadow each other from the rig/sky above. Crucially it uses
+        // the DETAILED density (co2_density_at) so the LUMPS — not the smooth grid —
+        // cast the shadows, giving dark cores + bright rims = crisp cauliflower even
+        // under bright beams (a uniformly-lit plume reads as a smooth blob no matter how
+        // much noise detail the density has). Floored so cores are deep grey, not black;
+        // scales with density (faint plumes barely darken → stay visible).
+        // tile.w = CO2 quality (1 = render, 0 = preview — fewer shadow taps live).
+        let co2_hq = u.tile.w > 0.5;
+        var co2_shadow = 1.0;
+        if (co2_d > 1e-4) {
+            let up = vec3<f32>(0.0, 1.0, 0.0);
+            var sh = co2_density_at(p + up * 0.5, time).x * 3.0;
+            if (co2_hq) {
+                sh = co2_density_at(p + up * 0.35, time).x
+                   + co2_density_at(p + up * 0.9, time).x
+                   + co2_density_at(p + up * 1.8, time).x;
+            }
+            co2_shadow = (0.45 + 0.55 * exp(-sh * 0.4)) * (1.0 - 0.25 * co2_core);
+        }
+        let co2_frac = co2_d / sigma_t;
+        // Self-ambient: thick white fog reads as a dim mass in the room's ambient.
+        let co2_amb_in = u.co2_amb.rgb * u.co2_amb.w * co2_frac;
+        var lin = ambient + co2_amb_in;
         for (var j = v_lo; j < v_hi; j = j + 1u) {
             let f = i32(tile_lights[j]);
             let fx = fixtures[f];
@@ -362,6 +471,19 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
                 let self_od = (s1 + s2) * 0.5 * base * depth;
                 vis = vis * exp(-self_od * 0.07 * clump_s);
             }
+            // THICK CO2 BLOCKS THE BEAM: the optical depth of CO2 between the lens
+            // and this sample dims the beam here, so a dense plume casts a real
+            // shadow into the beams AND self-shadows its own far side → the high
+            // contrast (bright lit face, dark core) the reference shows. (3-tap proxy
+            // along the light ray through the splatted density grid.) RENDER-ONLY —
+            // this is the per-beam-per-step cost the preview path skips (the split).
+            if (!laser && co2_hq) {
+                let c1 = co2_base_at(mix(lpos, p, 0.4)).x;
+                let c2 = co2_base_at(mix(lpos, p, 0.7)).x;
+                let c3 = co2_base_at(mix(lpos, p, 0.9)).x;
+                let co2_od = (c1 + c2 + c3) * (depth / 3.0);
+                vis = vis * exp(-co2_od * 0.16);
+            }
             // Per-cell HDR whiten + boost (accuracy): for a plain pixel cell,
             // extra.w carries its peak raw DMX level. A bright/white cell pulls its
             // shaft core toward neutral luminance (so it clips WHITE through the
@@ -391,6 +513,11 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             let hk = clamp(1.0 + hk_strength * hk_sat * hk_sat, 1.0, 3.5);
             lin += (whitened * hk) * trans * (rad3 * (atten * hotspot * phase * beam * vis * tyndall * boost));
         }
+
+        // Self-shadow the in-scattered light (ambient + beams) in CO2, scaled by the
+        // CO2 fraction so haze keeps its own look. THIS is what carves the dark cores /
+        // bright edges out of an otherwise uniformly-bright plume → the cauliflower reads.
+        lin = lin * mix(1.0, co2_shadow, co2_frac);
 
         let step_tr = exp(-sigma_t * dt);
         let integ = (lin * sigma_s) * ((1.0 - step_tr) / sigma_t);

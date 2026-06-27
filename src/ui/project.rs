@@ -39,7 +39,28 @@ const MAGIC: &[u8] = b"ARCHIE\0";
 ///     rather than mis-decoding — positional bincode never sees the missing
 ///     trailing field. The `#[serde(default)]` keeps the in-memory struct sound
 ///     and future-proofs any optional/skipped-field shifts above it.
-pub const FORMAT: u32 = 8;
+/// v9: `Scene` gained `pyro: Vec<PyroDevice>` (CO2 cannons + cold-spark machines),
+///     appended LAST in `Scene`'s serde order (after `render`). The per-device
+///     `PyroPatch` (universe/address) persists with the device — pyro is NOT in
+///     the fixture `PatchTable`. The transient particle sim + `armed`/`fire`/`id`
+///     stay `#[serde(skip)]` (runtime-only, like `LedScreen::frame`).
+/// v10: `PyroDevice` gained `dissipation` (CO2 smoke hang time), LAST in its serde
+///     order with `#[serde(default)]` — show data for the new inspector slider, so
+///     persisted with the device (NOT serde-skip).
+/// v11: `PyroDevice` gained `speed` (CO2 jet exit velocity, decoupled from throw),
+///     LAST after `dissipation`. `PyroDevice` decodes via a hand-written, version-
+///     aware `Deserialize` (see `scene::pyro`) that reads each trailing field only
+///     when the file's FORMAT is new enough — so v9/v10 files keep loading.
+/// v12: `PyroDevice` gained `viewport_hq` (live-preview CO2 quality toggle), LAST
+///     after `speed`. Same version-aware decode keeps v9–v11 files loading.
+/// v13: `PyroDevice` gained `thickness` (CO2 visual density), LAST after `viewport_hq`.
+///     Version-aware decode keeps v9–v12 files loading.
+pub const FORMAT: u32 = 13;
+/// Oldest on-disk FORMAT this build can still decode. Versions in
+/// `MIN_READ_FORMAT..=FORMAT` load via the version-aware deserializers (which skip
+/// trailing fields that postdate the file — see [`crate::scene::pyro::LOADING_FORMAT`]);
+/// older files predate fields we don't down-migrate and are rejected cleanly.
+pub const MIN_READ_FORMAT: u32 = 9;
 /// The project file extension (no dot).
 pub const EXT: &str = "archie";
 
@@ -107,14 +128,24 @@ pub fn read(path: &Path) -> Result<Project, String> {
         bytes[MAGIC.len() + 2],
         bytes[MAGIC.len() + 3],
     ]);
-    if ver != FORMAT {
-        return Err(format!("unsupported project version {ver} (expected {FORMAT})"));
+    if ver > FORMAT {
+        return Err(format!(
+            "project version {ver} is newer than this build supports (max {FORMAT}); update the app"
+        ));
     }
-    let mut project: Project =
-        bincode::deserialize(&bytes[head..]).map_err(|e| format!("decode: {e}"))?;
-    if project.format != FORMAT {
-        return Err(format!("project body version {} mismatches header", project.format));
+    if ver < MIN_READ_FORMAT {
+        return Err(format!(
+            "project version {ver} is too old to open in this build (min {MIN_READ_FORMAT})"
+        ));
     }
+    // The decode is version-aware: structs skip trailing fields that postdate `ver`
+    // (positional bincode has no field names — see `scene::pyro::LOADING_FORMAT`).
+    // Reset the flag whatever the outcome so later (non-file) decodes read everything.
+    crate::scene::pyro::LOADING_FORMAT.with(|v| v.set(ver));
+    let decoded = bincode::deserialize::<Project>(&bytes[head..]);
+    crate::scene::pyro::LOADING_FORMAT.with(|v| v.set(u32::MAX));
+    let mut project = decoded.map_err(|e| format!("decode: {e}"))?;
+    project.format = FORMAT; // migrated up to the current format in memory
     intern_geometry_resources(&mut project.scene);
     Ok(project)
 }

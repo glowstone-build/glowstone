@@ -67,13 +67,35 @@ pub struct ScreenProfile {
     pub default_nits: f32,
 }
 
+/// A pyro-device definition: one CO2 cannon / cold-spark-machine type with its
+/// default effect envelope. A placed [`PyroDevice`](crate::scene::PyroDevice)
+/// inherits these defaults. See `docs/RESEARCH-pyro.md`.
+#[derive(Clone)]
+pub struct PyroProfile {
+    pub name: &'static str,
+    pub category: &'static str,
+    pub kind: crate::scene::pyro::PyroKind,
+    /// Default cold-spark fountain apex height (m).
+    pub default_height_m: f32,
+    /// Default CO2 column throw height (m).
+    pub default_throw_m: f32,
+    /// Default cold-spark hot-base blackbody temperature (K).
+    pub default_color_t0_k: f32,
+    /// Default hard particle cap for this emitter (perf bound).
+    pub default_max_particles: u32,
+    /// A motorised / moving-nozzle variant (exposes pan/tilt/spin in the UI).
+    pub moving: bool,
+}
+
 /// The whole catalog, grouped into built-in fixtures, environments, LED-wall
-/// components, and imported GDTF fixture definitions.
+/// components, pyro devices, and imported GDTF fixture definitions.
 pub struct Library {
     pub fixtures: Vec<FixtureProfile>,
     pub environments: Vec<EnvironmentProfile>,
     /// Built-in LED-wall component types (indoor / outdoor / transparent / …).
     pub screens: Vec<ScreenProfile>,
+    /// Built-in pyro devices (CO2 cannons + cold-spark machines).
+    pub pyro: Vec<PyroProfile>,
     /// GDTF fixtures imported at runtime.
     pub gdtf: Vec<std::sync::Arc<crate::gdtf::GdtfFixture>>,
 }
@@ -193,6 +215,75 @@ impl Library {
                     default_nits: 1500.0,
                 },
             ],
+            // Generic pyro devices with realistic effect envelopes. See
+            // docs/RESEARCH-pyro.md (verified vs MagicFX / Showven / Club Cannon).
+            pyro: {
+                use crate::scene::pyro::PyroKind::{Co2Jet, ColdSpark};
+                vec![
+                    // --- Cold-spark machines (Sparkular-type golden fountains) ---
+                    PyroProfile {
+                        name: "Cold Spark Machine",
+                        category: "Pyro",
+                        kind: ColdSpark,
+                        default_height_m: 3.5,
+                        default_throw_m: 0.0,
+                        default_color_t0_k: 2600.0,
+                        default_max_particles: 5000,
+                        moving: false,
+                    },
+                    PyroProfile {
+                        name: "Cold Spark — Mini",
+                        category: "Pyro",
+                        kind: ColdSpark,
+                        default_height_m: 2.0,
+                        default_throw_m: 0.0,
+                        default_color_t0_k: 2500.0,
+                        default_max_particles: 3000,
+                        moving: false,
+                    },
+                    PyroProfile {
+                        name: "Cold Spark — Moving Head",
+                        category: "Pyro",
+                        kind: ColdSpark,
+                        default_height_m: 4.0,
+                        default_throw_m: 0.0,
+                        default_color_t0_k: 2650.0,
+                        default_max_particles: 5000,
+                        moving: true,
+                    },
+                    // --- CO2 cannons / cryo jets (rising white plumes) ---
+                    PyroProfile {
+                        name: "CO2 Jet",
+                        category: "Pyro",
+                        kind: Co2Jet,
+                        default_height_m: 0.0,
+                        default_throw_m: 9.0,
+                        default_color_t0_k: 0.0,
+                        default_max_particles: 1300,
+                        moving: false,
+                    },
+                    PyroProfile {
+                        name: "CO2 Jet — Long Throw",
+                        category: "Pyro",
+                        kind: Co2Jet,
+                        default_height_m: 0.0,
+                        default_throw_m: 14.0,
+                        default_color_t0_k: 0.0,
+                        default_max_particles: 1500,
+                        moving: false,
+                    },
+                    PyroProfile {
+                        name: "CO2 Jet — Moving (PSYCO2)",
+                        category: "Pyro",
+                        kind: Co2Jet,
+                        default_height_m: 0.0,
+                        default_throw_m: 10.0,
+                        default_color_t0_k: 0.0,
+                        default_max_particles: 1400,
+                        moving: true,
+                    },
+                ]
+            },
             gdtf: Vec::new(),
         }
     }

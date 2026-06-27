@@ -40,17 +40,20 @@ pub enum TypeChip {
     Fixtures,
     Objects,
     Screens,
+    Pyro,
 }
 
 impl TypeChip {
     /// The chip strip's left-to-right order + labels.
-    pub const ORDER: [TypeChip; 4] = [TypeChip::All, TypeChip::Fixtures, TypeChip::Objects, TypeChip::Screens];
+    pub const ORDER: [TypeChip; 5] =
+        [TypeChip::All, TypeChip::Fixtures, TypeChip::Objects, TypeChip::Screens, TypeChip::Pyro];
     pub fn label(self) -> &'static str {
         match self {
             TypeChip::All => "All",
             TypeChip::Fixtures => "Fixtures",
             TypeChip::Objects => "Objects",
             TypeChip::Screens => "Screens",
+            TypeChip::Pyro => "Pyro",
         }
     }
     /// Whether the `Fixtures` group + its leaves should be visible.
@@ -62,6 +65,9 @@ impl TypeChip {
     }
     fn screens(self) -> bool {
         matches!(self, TypeChip::All | TypeChip::Screens)
+    }
+    fn pyro(self) -> bool {
+        matches!(self, TypeChip::All | TypeChip::Pyro)
     }
     /// World/Environment only show when the type filter is unrestricted.
     fn world(self) -> bool {
@@ -140,6 +146,7 @@ pub enum GroupKind {
     Fixtures,
     Objects,
     Screens,
+    Pyro,
 }
 
 /// A deferred outliner action returned to the caller. The tree is drawn mid-dock
@@ -184,6 +191,7 @@ enum RowKind {
     Fixture(usize),
     Object(usize),
     Screen(usize),
+    Pyro(usize),
     Environment(usize),
 }
 
@@ -305,6 +313,11 @@ pub fn scene_tree(
     } else {
         Vec::new()
     };
+    let visible_pyro: Vec<usize> = if filter.kind.pyro() && show_others {
+        (0..scene.pyro.len()).filter(|&i| matches(&scene.pyro[i].name)).collect()
+    } else {
+        Vec::new()
+    };
     let visible_envs: Vec<usize> = if filter.kind.world() && show_others {
         (0..scene.environments.len()).filter(|&i| matches(&scene.environments[i].name)).collect()
     } else {
@@ -320,6 +333,7 @@ pub fn scene_tree(
         &visible_fixtures,
         &visible_objects,
         &visible_screens,
+        &visible_pyro,
         &visible_envs,
     );
 
@@ -394,6 +408,7 @@ pub fn scene_tree(
                     &visible_fixtures,
                     &visible_objects,
                     &visible_screens,
+                    &visible_pyro,
                     &mut action,
                 );
             }
@@ -429,6 +444,7 @@ fn build_rows(
     visible_fixtures: &[usize],
     visible_objects: &[usize],
     visible_screens: &[usize],
+    visible_pyro: &[usize],
     visible_envs: &[usize],
 ) -> Vec<TreeRow> {
     use theme::icon;
@@ -613,6 +629,40 @@ fn build_rows(
         }
     }
 
+    // 6) Pyro group → CO2 cannon + cold-spark leaves. Gated like Objects/Screens.
+    if filter.kind.pyro() && !filter.state.any() {
+        push_group(
+            &mut rows,
+            GroupKind::Pyro,
+            icon::PYRO,
+            "Pyro",
+            visible_pyro.len(),
+            VisState::fold(scene.pyro.iter().map(|x| x.hidden)),
+        );
+        if open(NodeKey::Group(GroupKind::Pyro)) {
+            for &i in visible_pyro {
+                let d = &scene.pyro[i];
+                let patch_tag = match d.patch {
+                    Some(p) => format!("{}.{:03}", p.universe, p.address),
+                    None => "none".into(),
+                };
+                rows.push(TreeRow {
+                    key: NodeKey::Entity(d.id),
+                    kind: RowKind::Pyro(i),
+                    depth: 2,
+                    icon: icon::PYRO,
+                    label: d.name.clone(),
+                    secondary: d.kind.label().to_string(),
+                    has_children: false,
+                    vis: leaf_vis(d.hidden),
+                    patch_tag,
+                    conflict: false,
+                    renameable: true,
+                });
+            }
+        }
+    }
+
     rows
 }
 
@@ -682,6 +732,7 @@ fn draw_row(
     visible_fixtures: &[usize],
     visible_objects: &[usize],
     visible_screens: &[usize],
+    visible_pyro: &[usize],
     action: &mut TreeAction,
 ) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(full_w, ROW_H), Sense::click());
@@ -903,6 +954,7 @@ fn draw_row(
             visible_fixtures,
             visible_objects,
             visible_screens,
+            visible_pyro,
         );
     }
 }
@@ -914,6 +966,7 @@ fn row_selection_state(row: &TreeRow, selection: &Selection) -> (bool, bool) {
         RowKind::Fixture(i) => (selection.contains_fixture(i), selection.primary_fixture() == Some(i)),
         RowKind::Object(i) => (selection.contains_geometry(i), selection.primary_geometry() == Some(i)),
         RowKind::Screen(i) => (selection.contains_screen(i), selection.primary_screen() == Some(i)),
+        RowKind::Pyro(i) => (selection.contains_pyro(i), selection.primary_pyro() == Some(i)),
         RowKind::Environment(i) => {
             let s = selection.environment == Some(i);
             (s, s)
@@ -935,6 +988,7 @@ fn select_row(
     visible_fixtures: &[usize],
     visible_objects: &[usize],
     visible_screens: &[usize],
+    visible_pyro: &[usize],
 ) {
     match row.kind {
         RowKind::Root => {
@@ -954,6 +1008,7 @@ fn select_row(
                 selection.fixtures = visible_fixtures.to_vec();
                 selection.geometry.clear();
                 selection.screens.clear();
+                selection.pyro.clear();
                 selection.environment = None;
                 selection.world = false;
             }
@@ -963,6 +1018,7 @@ fn select_row(
             selection.geometry = visible_objects.to_vec();
             selection.fixtures.clear();
             selection.screens.clear();
+            selection.pyro.clear();
             selection.environment = None;
             selection.world = false;
             *anchor = None;
@@ -971,6 +1027,16 @@ fn select_row(
             selection.screens = visible_screens.to_vec();
             selection.fixtures.clear();
             selection.geometry.clear();
+            selection.pyro.clear();
+            selection.environment = None;
+            selection.world = false;
+            *anchor = None;
+        }
+        RowKind::Group(GroupKind::Pyro) => {
+            selection.pyro = visible_pyro.to_vec();
+            selection.fixtures.clear();
+            selection.geometry.clear();
+            selection.screens.clear();
             selection.environment = None;
             selection.world = false;
             *anchor = None;
@@ -1011,6 +1077,34 @@ fn select_row(
                 *selection = Selection::screen(i);
             }
             *anchor = None;
+        }
+        RowKind::Pyro(i) => {
+            if shift {
+                // Range over VISIBLE order — same as the Fixture arm. The shared
+                // `anchor` holds a bare data-index; if it was set by another kind it
+                // simply won't be found in visible_pyro → unwrap_or(click_pos) → a
+                // safe single-row select (no cross-kind range, no panic).
+                let click_pos = visible_pyro.iter().position(|&x| x == i).unwrap_or(0);
+                let anchor_pos = anchor
+                    .and_then(|a| visible_pyro.iter().position(|&x| x == a))
+                    .unwrap_or(click_pos);
+                let (lo, hi) = (anchor_pos.min(click_pos), anchor_pos.max(click_pos));
+                selection.pyro = visible_pyro[lo..=hi].to_vec();
+                selection.fixtures.clear();
+                selection.geometry.clear();
+                selection.screens.clear();
+                selection.environment = None;
+                selection.world = false;
+                if anchor.is_none() {
+                    *anchor = Some(i);
+                }
+            } else if cmd {
+                selection.toggle_pyro(i);
+                *anchor = Some(i);
+            } else {
+                *selection = Selection::pyro(i);
+                *anchor = Some(i);
+            }
         }
         RowKind::Environment(i) => {
             // Environment has no toggle helper — plain select only.

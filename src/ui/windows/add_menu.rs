@@ -24,18 +24,24 @@ use crate::ui::GdtfTextures;
 pub enum AddCategory {
     Fixtures,
     Screens,
+    Pyro,
     Environment,
 }
 
 impl AddCategory {
     /// Stable left-column order.
-    const ORDER: [AddCategory; 3] =
-        [AddCategory::Fixtures, AddCategory::Screens, AddCategory::Environment];
+    const ORDER: [AddCategory; 4] = [
+        AddCategory::Fixtures,
+        AddCategory::Screens,
+        AddCategory::Pyro,
+        AddCategory::Environment,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             AddCategory::Fixtures => "Fixtures",
             AddCategory::Screens => "Screens",
+            AddCategory::Pyro => "Pyro",
             AddCategory::Environment => "Environment",
         }
     }
@@ -44,6 +50,7 @@ impl AddCategory {
         match self {
             AddCategory::Fixtures => theme::icon::FIXTURE,
             AddCategory::Screens => theme::icon::SCREEN,
+            AddCategory::Pyro => theme::icon::PYRO,
             AddCategory::Environment => theme::icon::ENVIRONMENT,
         }
     }
@@ -58,6 +65,8 @@ pub enum AddAction {
     Gdtf(usize),
     /// An LED-wall component (`library.screens[i]`).
     Screen(usize),
+    /// A stage pyro device (`library.pyro[i]`).
+    Pyro(usize),
     /// An environment volume (`library.environments[i]`).
     Environment(usize),
 }
@@ -101,6 +110,7 @@ fn action_item(a: &AddAction) -> LibItem {
         AddAction::Fixture(i) => LibItem::Fixture(i),
         AddAction::Gdtf(i) => LibItem::Gdtf(i),
         AddAction::Screen(i) => LibItem::Screen(i),
+        AddAction::Pyro(i) => LibItem::Pyro(i),
         AddAction::Environment(i) => LibItem::Env(i),
     }
 }
@@ -158,6 +168,15 @@ fn category_entries(
                     AddAction::Screen(si),
                     theme::icon::SCREEN,
                     format!("{} · {}", s.category, s.name),
+                ));
+            }
+        }
+        AddCategory::Pyro => {
+            for (pi, p) in library.pyro.iter().enumerate() {
+                out.push(mk(
+                    AddAction::Pyro(pi),
+                    theme::icon::PYRO,
+                    format!("{} · {}", p.category, p.name),
                 ));
             }
         }
@@ -228,6 +247,7 @@ fn clone_entry(e: &Entry) -> Entry {
         AddAction::Fixture(i) => AddAction::Fixture(i),
         AddAction::Gdtf(i) => AddAction::Gdtf(i),
         AddAction::Screen(i) => AddAction::Screen(i),
+        AddAction::Pyro(i) => AddAction::Pyro(i),
         AddAction::Environment(i) => AddAction::Environment(i),
     };
     Entry { icon: e.icon, label: e.label.clone(), action, score: e.score, key: e.key.clone(), thumb: e.thumb }
@@ -509,6 +529,7 @@ fn action_of(e: &Entry) -> Option<AddAction> {
         AddAction::Fixture(i) => AddAction::Fixture(i),
         AddAction::Gdtf(i) => AddAction::Gdtf(i),
         AddAction::Screen(i) => AddAction::Screen(i),
+        AddAction::Pyro(i) => AddAction::Pyro(i),
         AddAction::Environment(i) => AddAction::Environment(i),
     })
 }

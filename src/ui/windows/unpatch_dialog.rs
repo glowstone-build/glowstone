@@ -3,14 +3,17 @@
 //! the dock, where the patch table is reachable — mirrors `commit_delete`).
 //! Esc / Cancel close without confirming; Enter confirms. State lives on `Ui`.
 
+use crate::scene::SelKind;
 use crate::ui::theme;
 
 /// State of the open Unpatch dialog. `open == false` = closed.
 #[derive(Default)]
 pub struct UnpatchDialog {
     pub open: bool,
-    /// How many fixtures will be unpatched — shown in the prompt.
+    /// How many entities will be unpatched — shown in the prompt.
     pub count: usize,
+    /// Which selection kind is being unpatched (drives the confirm branch + noun).
+    pub kind: SelKind,
 }
 
 /// Render the modeless Unpatch confirm. Returns `true` exactly once on confirm;
@@ -40,8 +43,9 @@ pub fn unpatch_dialog_window(ctx: &egui::Context, dlg: &mut UnpatchDialog) -> bo
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.label(format!(
-                "Unpatch {} fixture{}?",
+                "Unpatch {} {}{}?",
                 dlg.count,
+                super::patch_dialog::patch_noun(dlg.kind),
                 if dlg.count == 1 { "" } else { "s" }
             ));
             ui.label(

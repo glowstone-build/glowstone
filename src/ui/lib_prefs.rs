@@ -24,6 +24,7 @@ pub enum LibItem {
     Fixture(usize),
     Env(usize),
     Screen(usize),
+    Pyro(usize),
 }
 
 /// The stable identity string for a library entry, or `None` if the index is out
@@ -40,6 +41,7 @@ pub fn entry_key(library: &Library, item: LibItem) -> Option<String> {
             .map(|p| format!("fixture:{}/{}", p.category, p.name)),
         LibItem::Env(i) => library.environments.get(i).map(|p| format!("env:{}", p.name)),
         LibItem::Screen(i) => library.screens.get(i).map(|p| format!("screen:{}", p.name)),
+        LibItem::Pyro(i) => library.pyro.get(i).map(|p| format!("pyro:{}", p.name)),
     }
 }
 
