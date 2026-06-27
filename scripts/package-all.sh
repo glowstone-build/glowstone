@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# One-shot release: regenerate icons, then build every package this host can into
-# dist/. macOS packaging (.app/.dmg) runs only on macOS; the Windows package
-# cross-compiles wherever the mingw-w64 toolchain is available.
+# Build every package this host can into dist/ (using the committed icons). macOS
+# packaging (.app/.dmg) runs only on macOS; the Windows package cross-compiles
+# wherever the mingw-w64 toolchain is available. (Icons are regenerated separately by
+# scripts/gen-icons.sh, only when the logo changes.)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-"$ROOT/scripts/gen-icons.sh"
 
 if [ "$(uname)" = "Darwin" ]; then
   "$ROOT/scripts/package-macos.sh"
