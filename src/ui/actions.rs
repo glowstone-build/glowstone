@@ -301,6 +301,15 @@ impl Ui {
                     self.unpatch_dialog = windows::UnpatchDialog { open: true, count, kind };
                 }
             }
+            // Renumber the selected fixtures' sequence by stage position (rows then
+            // columns); all fixtures if none selected.
+            Action::RenumberSequence => {
+                let sel: Vec<usize> =
+                    self.selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+                scene.renumber_sequences_by_position(&sel);
+                let n = if sel.is_empty() { scene.fixtures.len() } else { sel.len() };
+                self.notify.success(format!("Renumbered {n} fixtures by position"));
+            }
             // --- 3D cursor (S1-3d-cursor) --------------------------------------
             // Snap the world cursor to the selection median (Blender's Shift+S →
             // "Cursor to Selected"); mark it set so Add places there. A no-op when

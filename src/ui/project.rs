@@ -79,6 +79,21 @@ pub struct ProjectRef<'a> {
     pub dmx_config: &'a DmxConfig,
 }
 
+/// The self-describing (JSON) trailer appended after the bincode core — the home for
+/// evolving show data that must stay version-tolerant without disturbing the positional
+/// core. Every field is `#[serde(default)]`, so adding one needs no FORMAT bump and an
+/// older save simply lacks the key. Absent entirely in legacy `.archie`.
+#[derive(Serialize, Deserialize, Default)]
+struct Trailer {
+    /// Placed pyro devices (CO2 cannons + cold-spark machines).
+    #[serde(default)]
+    pyro: Vec<crate::scene::PyroDevice>,
+    /// Per-fixture sequence numbers, aligned to `scene.fixtures` order. Empty ⇒
+    /// unassigned (the loader calls `ensure_sequences` to fill them).
+    #[serde(default)]
+    fixture_seq: Vec<u32>,
+}
+
 /// Owned project read back from disk.
 #[derive(Deserialize)]
 pub struct Project {
@@ -102,15 +117,19 @@ pub fn write(path: &Path, project: &ProjectRef) -> Result<(), String> {
     // The positional bincode CORE (pyro is `#[serde(skip)]` on Scene, so it is NOT in
     // here) ...
     let body = bincode::serialize(project).map_err(|e| format!("encode: {e}"))?;
-    // ... then the SELF-DESCRIBING pyro trailer (JSON). `read` reads the core with
-    // `deserialize_from` (which stops exactly at the core's end), so the trailer needs
-    // no length prefix — it's simply the rest of the file.
-    let pyro_json = serde_json::to_vec(&project.scene.pyro).map_err(|e| format!("encode pyro: {e}"))?;
-    let mut bytes = Vec::with_capacity(MAGIC.len() + 4 + body.len() + pyro_json.len());
+    // ... then the SELF-DESCRIBING trailer (JSON: pyro + fixture sequences). `read`
+    // reads the core with `deserialize_from` (which stops exactly at the core's end),
+    // so the trailer needs no length prefix — it's simply the rest of the file.
+    let trailer = Trailer {
+        pyro: project.scene.pyro.clone(),
+        fixture_seq: project.scene.fixtures.iter().map(|f| f.sequence).collect(),
+    };
+    let trailer_json = serde_json::to_vec(&trailer).map_err(|e| format!("encode trailer: {e}"))?;
+    let mut bytes = Vec::with_capacity(MAGIC.len() + 4 + body.len() + trailer_json.len());
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&project.format.to_le_bytes());
     bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(&pyro_json);
+    bytes.extend_from_slice(&trailer_json);
     let tmp = path.with_extension("glow.tmp");
     std::fs::write(&tmp, &bytes).map_err(|e| format!("write: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
@@ -152,14 +171,20 @@ pub fn read(path: &Path) -> Result<Project, String> {
     let mut cur = std::io::Cursor::new(&bytes[head..]);
     let mut project: Project =
         bincode::deserialize_from(&mut cur).map_err(|e| format!("decode: {e}"))?;
-    // The self-describing pyro trailer (JSON), if present. Absent in legacy `.archie`;
-    // skipped (with a warning) rather than failing the whole load if it can't decode.
+    // The self-describing trailer (JSON: pyro + fixture sequences), if present. Absent
+    // in legacy `.archie`; skipped (with a warning) rather than failing the whole load
+    // if it can't decode. Unassigned sequences are filled by `ensure_sequences` below.
     let consumed = cur.position() as usize;
     let rest = &bytes[head + consumed..];
     if !rest.is_empty() {
-        match serde_json::from_slice::<Vec<crate::scene::PyroDevice>>(rest) {
-            Ok(pyro) => project.scene.pyro = pyro,
-            Err(e) => log::warn!("skipping unreadable pyro section in {}: {e}", path.display()),
+        match serde_json::from_slice::<Trailer>(rest) {
+            Ok(trailer) => {
+                project.scene.pyro = trailer.pyro;
+                for (f, seq) in project.scene.fixtures.iter_mut().zip(trailer.fixture_seq) {
+                    f.sequence = seq;
+                }
+            }
+            Err(e) => log::warn!("skipping unreadable project trailer in {}: {e}", path.display()),
         }
     }
     project.format = FORMAT; // migrated up to the current format in memory

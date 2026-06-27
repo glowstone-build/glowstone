@@ -1302,6 +1302,85 @@ impl Scene {
             }
         }
         self.next_id = n;
+        self.ensure_sequences();
+    }
+
+    /// Fill any unassigned fixture SEQUENCE numbers (post-load / import / add). An
+    /// unassigned (`0`) fixture is inferred from its imported MVR identity — the
+    /// UnitNumber, then a numeric FixtureID — and otherwise gets the next free number.
+    /// Existing non-zero sequences are kept; a collision is pushed to the next free
+    /// slot, so every fixture ends with a unique, stable sequence.
+    pub fn ensure_sequences(&mut self) {
+        use std::collections::HashSet;
+        let mut used: HashSet<u32> =
+            self.fixtures.iter().map(|f| f.sequence).filter(|&s| s != 0).collect();
+        let mut next = self.fixtures.iter().map(|f| f.sequence).max().unwrap_or(0);
+        // Pass 1: infer unassigned sequences from the MVR import where it's free.
+        for f in &mut self.fixtures {
+            if f.sequence != 0 {
+                continue;
+            }
+            let inferred = f.mvr.as_ref().and_then(|m| {
+                if m.unit_number > 0 {
+                    Some(m.unit_number as u32)
+                } else {
+                    m.fixture_id.trim().parse::<u32>().ok().filter(|&v| v > 0)
+                }
+            });
+            if let Some(seq) = inferred.filter(|s| !used.contains(s)) {
+                f.sequence = seq;
+                used.insert(seq);
+                next = next.max(seq);
+            }
+        }
+        // Pass 2: anything still unassigned (no import, or a taken number) gets the
+        // next free sequence.
+        for f in &mut self.fixtures {
+            if f.sequence != 0 {
+                continue;
+            }
+            next += 1;
+            while used.contains(&next) {
+                next += 1;
+            }
+            f.sequence = next;
+            used.insert(next);
+        }
+    }
+
+    /// Renumber the given fixtures' sequences by SPATIAL position in reading order —
+    /// ROWS first (by height Y, top→bottom), then COLUMNS within a row (by X,
+    /// left→right) — assigning `1..=n`. So a grid numbers
+    /// ```text
+    /// 1 2 3
+    /// 4 5 6
+    /// ```
+    /// Empty `indices` renumbers ALL fixtures. Used by the "Renumber by position"
+    /// command + its shortcut.
+    pub fn renumber_sequences_by_position(&mut self, indices: &[usize]) {
+        let mut ids: Vec<usize> = if indices.is_empty() {
+            (0..self.fixtures.len()).collect()
+        } else {
+            indices.iter().copied().filter(|&i| i < self.fixtures.len()).collect()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        // Bucket into rows by height (Y) so fixtures on the same truss/line share a row
+        // (ROW_EPS tolerates a slightly ragged line), then order each row left→right by
+        // X. Top rows (higher Y) come first.
+        const ROW_EPS: f32 = 0.75;
+        ids.sort_by(|&a, &b| {
+            let (pa, pb) = (self.fixtures[a].position, self.fixtures[b].position);
+            if (pa.y - pb.y).abs() > ROW_EPS {
+                pb.y.partial_cmp(&pa.y).unwrap_or(std::cmp::Ordering::Equal) // higher first
+            } else {
+                pa.x.partial_cmp(&pb.x).unwrap_or(std::cmp::Ordering::Equal) // left→right
+            }
+        });
+        for (slot, &i) in ids.iter().enumerate() {
+            self.fixtures[i].sequence = slot as u32 + 1;
+        }
     }
 
     /// Resolve an [`EntityId`] to its current `fixtures` index (`None` if stale
@@ -1565,5 +1644,47 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "ids unique across entity kinds");
+    }
+
+    #[test]
+    fn ensure_sequences_fills_unique_nonzero() {
+        let library = Library::standard();
+        let mut scene = Scene::demo();
+        for _ in 0..4 {
+            scene.add_fixture(&library.fixtures[0]);
+        }
+        for f in &mut scene.fixtures {
+            f.sequence = 0; // simulate a fresh/legacy load (no trailer sequences)
+        }
+        scene.ensure_sequences();
+        let seqs: Vec<u32> = scene.fixtures.iter().map(|f| f.sequence).collect();
+        assert!(seqs.iter().all(|&s| s != 0), "all assigned");
+        let uniq: std::collections::HashSet<u32> = seqs.iter().copied().collect();
+        assert_eq!(uniq.len(), seqs.len(), "sequences unique");
+        // A pre-set sequence is preserved (not clobbered).
+        scene.fixtures[0].sequence = 42;
+        for f in scene.fixtures.iter_mut().skip(1) {
+            f.sequence = 0;
+        }
+        scene.ensure_sequences();
+        assert_eq!(scene.fixtures[0].sequence, 42, "existing sequence kept");
+    }
+
+    #[test]
+    fn renumber_by_position_orders_rows_then_cols() {
+        let library = Library::standard();
+        let mut scene = Scene::demo();
+        scene.fixtures.clear();
+        // A 2×2 grid: top row (y = 5) before bottom row (y = 3); within a row, left
+        // (x = −1) before right (x = +1). Reading order → 1,2 / 3,4.
+        let bl = scene.add_fixture_at(&library.fixtures[0], Vec3::new(-1.0, 3.0, 0.0)); // bottom-left
+        let tr = scene.add_fixture_at(&library.fixtures[0], Vec3::new(1.0, 5.0, 0.0)); // top-right
+        let tl = scene.add_fixture_at(&library.fixtures[0], Vec3::new(-1.0, 5.0, 0.0)); // top-left
+        let br = scene.add_fixture_at(&library.fixtures[0], Vec3::new(1.0, 3.0, 0.0)); // bottom-right
+        scene.renumber_sequences_by_position(&[]); // all
+        assert_eq!(scene.fixtures[tl].sequence, 1, "top-left first");
+        assert_eq!(scene.fixtures[tr].sequence, 2, "top-right second");
+        assert_eq!(scene.fixtures[bl].sequence, 3, "bottom-left third");
+        assert_eq!(scene.fixtures[br].sequence, 4, "bottom-right fourth");
     }
 }

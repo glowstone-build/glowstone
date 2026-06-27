@@ -16,6 +16,9 @@ pub enum SceneSort {
     Name,
     /// By fixture profile / type, then name.
     Type,
+    /// By the user-facing sequence number. (Appended LAST — bincode keys enum
+    /// variants by index, so the legacy Patch/Name/Type ordinals stay valid.)
+    Sequence,
 }
 
 impl SceneSort {
@@ -24,6 +27,7 @@ impl SceneSort {
             Self::Patch => "Patch",
             Self::Name => "Name",
             Self::Type => "Type",
+            Self::Sequence => "Seq",
         }
     }
 }
@@ -64,6 +68,15 @@ pub(super) fn fixture_order(scene: &Scene, patch: &PatchTable, sort: SceneSort) 
                     .to_lowercase()
                     .cmp(&fb.profile.to_lowercase())
                     .then(fa.name.to_lowercase().cmp(&fb.name.to_lowercase()))
+            });
+        }
+        SceneSort::Sequence => {
+            // By sequence number, then name as a stable tiebreak.
+            order.sort_by(|&a, &b| {
+                scene.fixtures[a]
+                    .sequence
+                    .cmp(&scene.fixtures[b].sequence)
+                    .then(scene.fixtures[a].name.to_lowercase().cmp(&scene.fixtures[b].name.to_lowercase()))
             });
         }
     }
@@ -156,7 +169,7 @@ pub fn scene_outliner(
     // flat CollapsingHeader folders. See src/ui/tree.rs.
     ui.horizontal(|ui| {
         ui.label(theme::ico(icon::SORT).weak()).on_hover_text("Sort fixtures by");
-        for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type] {
+        for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type, SceneSort::Sequence] {
             ui.selectable_value(sort, s, s.label());
         }
     });

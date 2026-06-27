@@ -779,7 +779,7 @@ fn draw_row(
     let content_x = rect.left() + PAD_X + row.depth as f32 * INDENT;
     let disc_rect = egui::Rect::from_min_size(egui::pos2(content_x, rect.top()), egui::vec2(DISCLOSURE_W, ROW_H));
     let icon_x = content_x + DISCLOSURE_W + ICON_DX;
-    let name_x = icon_x + ICON_W + ICON_GAP;
+    let mut name_x = icon_x + ICON_W + ICON_GAP;
 
     // ---- disclosure triangle ----
     if row.has_children {
@@ -801,6 +801,19 @@ fn draw_row(
         egui::FontId::proportional(15.0),
         (if selected { accent } else { ink.secondary }).gamma_multiply(dim),
     );
+
+    // ---- leading SEQUENCE number (lighting-console style: the channel number reads
+    // before the name) on fixture rows; shifts the name right by its width.
+    if let RowKind::Fixture(i) = row.kind {
+        let g = painter.layout_no_wrap(
+            scene.fixtures[i].sequence.to_string(),
+            egui::FontId::monospace(11.0),
+            ink.tertiary.gamma_multiply(dim),
+        );
+        let gw = g.size().x;
+        painter.galley(egui::pos2(name_x, rect.center().y - g.size().y * 0.5), g, ink.tertiary);
+        name_x += gw + ICON_GAP * 1.5;
+    }
 
     // ---- RIGHT-ALIGNED metadata columns, marched leftward from the right edge:
     // [eye] (always) → [channel "Nch"] → [patch "uni.addr"] (the last two fixtures

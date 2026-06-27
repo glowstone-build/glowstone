@@ -39,6 +39,14 @@ pub struct Fixture {
     /// robust; never serialized → no .archie format bump.
     #[serde(skip)]
     pub id: super::EntityId,
+    /// Stable, user-facing SEQUENCE number for this patchable fixture — the "channel
+    /// number" a designer sorts/renumbers by (shown + editable in the outliner + the
+    /// Fixture Manager). `0` = unassigned; [`Scene::ensure_sequences`] fills it on
+    /// load/import (inferred from the imported MVR FixtureID/UnitNumber, else the next
+    /// free number). `#[serde(skip)]` → persisted OUT-of-band in the `.glow` trailer
+    /// (like pyro), so it never disturbs the positional bincode core.
+    #[serde(skip)]
+    pub sequence: u32,
 
     /// World position of the fixture head, in metres. Y is up.
     pub position: Vec3,
@@ -150,6 +158,7 @@ impl Fixture {
             gdtf: None,
             model_src: None,
             id: 0, // a real id is assigned by the Scene add_* / ensure_ids caller
+            sequence: 0,
             is_laser: profile.laser,
             hidden: false,
             beam: 1.0,
@@ -191,6 +200,7 @@ impl Fixture {
             gdtf: Some(gdtf),
             model_src: None,
             id: 0, // assigned by Scene::add_gdtf / ensure_ids
+            sequence: 0,
             is_laser,
             hidden: false,
             beam: 1.0,
@@ -251,6 +261,7 @@ impl Fixture {
             gdtf: imported.gdtf,
             model_src: None,
             id: 0, // assigned by import_mvr's ensure_ids
+            sequence: 0,
             is_laser,
             hidden: false,
             beam: 1.0,

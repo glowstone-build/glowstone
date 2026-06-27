@@ -96,6 +96,9 @@ pub enum Action {
     AddMenu,
     Patch,
     Unpatch,
+    /// Renumber the selected fixtures' sequence by stage position (rows then columns;
+    /// all fixtures if none selected). Impl in `Ui::dispatch_action`.
+    RenumberSequence,
     /// Snap the 3D cursor to the selection's median (impl in `Ui::dispatch_action`).
     SnapCursorToSelection,
     /// Reset the 3D cursor to the world origin (impl in `Ui::dispatch_action`).
@@ -462,11 +465,13 @@ pub static COMMANDS: &[Command] = &[
     op_row("fixture.duplicate", "Duplicate / Array…", Category::Object, Action::Duplicate, OpInvoke::Dialog),
     op_row("fixture.patch", "Patch Fixtures…", Category::Object, Action::Patch, OpInvoke::Dialog),
     op_row("fixture.unpatch", "Unpatch Fixtures", Category::Object, Action::Unpatch, OpInvoke::Direct),
+    op_row("fixture.renumber", "Renumber Sequence by Position", Category::Object, Action::RenumberSequence, OpInvoke::Direct),
     op_row("object.delete", "Delete Selected", Category::Object, Action::Delete, OpInvoke::Direct),
     // The bare Patch/Unpatch keymap labels differ from the catalog labels above, so
     // they get their own keymap-only commands (the P/U binds point here).
     command_row("kmi.patch", "Patch selected fixtures", Category::Object, Action::Patch),
     command_row("kmi.unpatch", "Unpatch selected fixtures", Category::Object, Action::Unpatch),
+    command_row("kmi.renumber", "Renumber sequence by position", Category::Object, Action::RenumberSequence),
     command_row("kmi.duplicate", "Duplicate / array", Category::Object, Action::Duplicate),
     command_row("kmi.duplicate_grab", "Duplicate & grab", Category::Object, Action::DuplicateGrab),
     command_row("kmi.delete", "Delete selected", Category::Object, Action::Delete),
@@ -625,6 +630,9 @@ pub static GLOBAL: &[Kmi] = &[
     kmi(Trigger::key(Key::Backspace), "kmi.delete_alias"),
     kmi(Trigger::key(Key::P), "kmi.patch"),
     kmi(Trigger::key(Key::U), "kmi.unpatch"),
+    // Renumber sequence by stage position (Cmd/Ctrl+Shift+R — modified so it doesn't
+    // clash with the viewport R = rotate).
+    kmi(Trigger::key(Key::R).cmd().shift(), "kmi.renumber"),
     // --- Edit / history ---
     kmi(Trigger::key(Key::Z).cmd(), "edit.undo"),
     kmi(Trigger::key(Key::Z).cmd().shift(), "edit.redo"),

@@ -2461,7 +2461,7 @@ impl Default for FmState {
 /// bulk patch editing. Replaces the old one-row-at-a-time patch editor.
 pub fn fixture_manager(
     ui: &mut egui::Ui,
-    scene: &Scene,
+    scene: &mut Scene,
     patch: &mut PatchTable,
     selection: &mut Selection,
     anchor: &mut Option<usize>,
@@ -2502,8 +2502,19 @@ pub fn fixture_manager(
         ui.add(egui::TextEdit::singleline(&mut fm.search).hint_text("Filter…").desired_width(120.0));
         ui.separator();
         ui.label(theme::ico(icon::SORT).weak());
-        for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type] {
+        for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type, SceneSort::Sequence] {
             ui.selectable_value(&mut fm.sort, s, s.label());
+        }
+        ui.separator();
+        // Renumber the selected fixtures' sequence by stage position (rows then
+        // columns); with nothing selected, renumbers every fixture.
+        if ui
+            .button(format!("{}  Renumber", icon::SORT))
+            .on_hover_text("Renumber sequence by position — rows (top→bottom) then columns (left→right). Selected only, or all if none selected.")
+            .clicked()
+        {
+            let sel: Vec<usize> = selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+            scene.renumber_sequences_by_position(&sel);
         }
         ui.separator();
         ui.toggle_value(&mut fm.conflicts_only, format!("{} {nconf}", icon::WARNING))
@@ -2628,13 +2639,17 @@ pub fn fixture_manager(
 
     let mut click: Option<(usize, bool, bool)> = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        Grid::new("fixtures-grid").num_columns(7).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
-            for h in ["Fixture", "Type", "Univ", "Addr", "Mode", "Ch", ""] {
+        Grid::new("fixtures-grid").num_columns(8).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
+            for h in ["Seq", "Fixture", "Type", "Univ", "Addr", "Mode", "Ch", ""] {
                 ui.strong(RichText::new(h).small().color(ink.tertiary));
             }
             ui.end_row();
 
             for &i in &order {
+                // Seq cell (editable): the user-facing sequence/channel number, first
+                // (console-style). Mutates the fixture, so it precedes the immutable
+                // borrow used for the rest of the row.
+                ui.add(DragValue::new(&mut scene.fixtures[i].sequence).range(1..=u32::MAX).speed(0.2));
                 let fixture = &scene.fixtures[i];
                 // Name cell: selects the row (syncs the 3D/Inspector selection);
                 // shift = range, ⌘/Ctrl = toggle.
