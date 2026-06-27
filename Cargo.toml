@@ -62,16 +62,18 @@ rmp-serde = "1.3"
 # and fast there) — NOT for the on-disk project format.
 bincode = "1.3"
 
-# NDI receive (optional): the NDI SDK is proprietary and NOT bundled — enabling
-# the `ndi` feature links the user-installed NDI 6 runtime via grafton-ndi
-# (building it requires the NDI SDK present). The default build compiles WITHOUT
-# the SDK and uses a graceful no-op stub. See docs/RESEARCH-led-ndi.md.
-grafton-ndi = { version = "1", optional = true }
+# NDI receive (ON by default): the `ndi` feature LOADS the NDI runtime at run time
+# (dlopen/LoadLibrary via libloading — see src/ndi). Nothing links the NDI SDK, so the
+# binary always launches even with no runtime installed (graceful no-op) and the build
+# needs no SDK. The user installs the proprietary NDI runtime to enable NDI sources.
+# See docs/RESEARCH-led-ndi.md.
+libloading = { version = "0.8", optional = true }
 
 [features]
-# Off by default: a default `cargo build` needs no NDI SDK. `--features ndi`
-# requires the NDI 6 SDK + Clang at build time and the runtime at run time.
-ndi = ["dep:grafton-ndi"]
+# `ndi` is default-on (it's a runtime-loaded, graceful no-op when the runtime is
+# absent). Drop it with `--no-default-features` to compile out NDI entirely.
+default = ["ndi"]
+ndi = ["dep:libloading"]
 
 [build-dependencies]
 # Embeds the Windows app icon (assets/icons/glowstone.ico) + version info into the
