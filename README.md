@@ -2,10 +2,10 @@
 
 An open-source **visualization software**. 
 
-> Status: in development. Heavy work in progress.
-> See [Roadmap](#roadmap).
+<img width="2684" height="1574" alt="CleanShot 2026-06-27 at 04 30 24@2x" src="https://github.com/user-attachments/assets/9535b27a-cd8e-4bc5-8cf1-672971f7e343" />
 
-## resources, documentation & references
+
+## resources, documentation, references & demo files
 
 You can find full documentation, research reference, installation instructions, requirements and other guides on [glowstone.build](https://glowstone.build)
 
@@ -25,7 +25,7 @@ R&D References available at [glowstone.build/docs/resources/references](https://
 
 I've built this project out of pure passion for lighting design and no access to cool-ass rigs or money to pay for expensive industry software to practise my programming skills; I also care about small details a lot, which is why I spent the majority amout of time engineering the rendering engine. You can read more about the capabilities of it at [glowstone.build/docs/rendering.](https://glowstone.build/docs/rendering).
 
-All though I work as a full time SWE, I have zero background in graphical or rendering engineering, but had this exact project on my mind for a very long time. Thanks to AI capalibities I was able to ship a relatively well working PoC that I hope to develop further with the help of the OSS community!
+Whilst I do have a full time engineering job, I had this exact project on my mind for a very long time. Thanks to AI capalibities I was able to ship a relatively well working PoC that I hope to develop further with the help of the OSS community!
 
 If you have tokens to waste, feel free to glance over the `CONTRIBUTING.md` file. 
 
