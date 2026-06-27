@@ -848,9 +848,15 @@ pub struct Scene {
     /// shared with the live viewport, so only render-specific knobs live here.
     pub render: RenderConfig,
     /// Placed pyro devices (CO2 cannons + cold-spark machines) — drawn as a
-    /// billboard particle / fog pass, patched inline to DMX. Persisted with the
-    /// show (`.archie` FORMAT 9); the live particle simulation is runtime-only in
-    /// the renderer. Appended LAST in the serialized stream (after `render`).
+    /// billboard particle / fog pass, patched inline to DMX. The live particle
+    /// simulation is runtime-only in the renderer.
+    ///
+    /// `#[serde(skip)]` so it stays OUT of the positional bincode core: pyro is
+    /// persisted by [`ui::project`](crate::ui::project) as a separate, self-describing
+    /// JSON trailer instead. That keeps the core layout stable (old `.archie` files
+    /// still decode) and lets `PyroDevice` evolve via plain `#[serde(default)]`
+    /// fields — no version-aware decode, no FORMAT-per-field bumps.
+    #[serde(skip)]
     pub pyro: Vec<PyroDevice>,
     /// Monotonic [`EntityId`] allocator. serde-skip → reset to 0 on load;
     /// [`ensure_ids`](Self::ensure_ids) reseeds it past the max live id after

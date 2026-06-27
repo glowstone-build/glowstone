@@ -1,7 +1,8 @@
-//! The `.archie` project format — one self-contained binary file holding the
+//! The `.glow` project format — one self-contained binary file holding the
 //! WHOLE show: the scene (fixtures, environments, world, imported geometry — with
 //! the GDTF / model / HDRI bytes BUNDLED inline), the camera, render settings,
-//! preferences, DMX patch + config, selection groups and cues.
+//! preferences, DMX patch + config, selection groups and cues. Legacy `.archie`
+//! files (the previous extension/magic) are still read.
 //!
 //! It's a `bincode` dump of the same serde types the app runs on, so it captures
 //! the exact in-memory state — not a lossy interchange (that's what MVR is for).
@@ -24,45 +25,39 @@ use crate::dmx::{DmxConfig, PatchTable};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::{RenderSettings, Scene};
 
-/// File magic — `ARCHIE` + a NUL + the byte form of the major version.
-const MAGIC: &[u8] = b"ARCHIE\0";
-/// On-disk format version. Bumped on an incompatible layout change.
-/// v2: `mvr::GeometryModel` gained a per-`<Geometry3D>` `matrix` field.
-/// v3: `Scene` gained `screens: Vec<LedScreen>` (LED walls).
-/// v4: `LedScreen` gained content sources (Image/NDI/CITP/PixelMap) + `pixel_shape`.
-/// v5: `Environment` gained `uniformity` (haze cluster control).
-/// v6: `Environment` gained `cluster_contrast`.
-/// v7: `Scene` gained `render: RenderConfig` (the persisted render-target setup).
-/// v8: `Fixture` gained `source` (provenance chip). Field is LAST in serde
-///     order with `#[serde(default)]`. NOTE: `read` rejects any version != FORMAT
-///     up front, so pre-v8 files surface a clean "unsupported version" error
-///     rather than mis-decoding — positional bincode never sees the missing
-///     trailing field. The `#[serde(default)]` keeps the in-memory struct sound
-///     and future-proofs any optional/skipped-field shifts above it.
-/// v9: `Scene` gained `pyro: Vec<PyroDevice>` (CO2 cannons + cold-spark machines),
-///     appended LAST in `Scene`'s serde order (after `render`). The per-device
-///     `PyroPatch` (universe/address) persists with the device — pyro is NOT in
-///     the fixture `PatchTable`. The transient particle sim + `armed`/`fire`/`id`
-///     stay `#[serde(skip)]` (runtime-only, like `LedScreen::frame`).
-/// v10: `PyroDevice` gained `dissipation` (CO2 smoke hang time), LAST in its serde
-///     order with `#[serde(default)]` — show data for the new inspector slider, so
-///     persisted with the device (NOT serde-skip).
-/// v11: `PyroDevice` gained `speed` (CO2 jet exit velocity, decoupled from throw),
-///     LAST after `dissipation`. `PyroDevice` decodes via a hand-written, version-
-///     aware `Deserialize` (see `scene::pyro`) that reads each trailing field only
-///     when the file's FORMAT is new enough — so v9/v10 files keep loading.
-/// v12: `PyroDevice` gained `viewport_hq` (live-preview CO2 quality toggle), LAST
-///     after `speed`. Same version-aware decode keeps v9–v11 files loading.
-/// v13: `PyroDevice` gained `thickness` (CO2 visual density), LAST after `viewport_hq`.
-///     Version-aware decode keeps v9–v12 files loading.
-pub const FORMAT: u32 = 13;
-/// Oldest on-disk FORMAT this build can still decode. Versions in
-/// `MIN_READ_FORMAT..=FORMAT` load via the version-aware deserializers (which skip
-/// trailing fields that postdate the file — see [`crate::scene::pyro::LOADING_FORMAT`]);
-/// older files predate fields we don't down-migrate and are rejected cleanly.
-pub const MIN_READ_FORMAT: u32 = 9;
+/// File magic for a glowstone project (`.glow`).
+const MAGIC: &[u8] = b"GLOW\0";
+/// Legacy magic — files saved as `.archie` by older builds. Still readable.
+const LEGACY_MAGIC: &[u8] = b"ARCHIE\0";
+
+/// On-disk format version of the **core** (the positional `bincode` body). Bumped
+/// only on an incompatible core-layout change; evolving show data that needs to stay
+/// version-tolerant (currently the pyro devices) lives in a SELF-DESCRIBING trailer
+/// instead, so it never forces a core bump.
+///
+/// History (core layout):
+/// v2–v7: incremental `Scene`/`Environment`/`LedScreen` field additions.
+/// v8: `Fixture` gained `source` (the last `.archie` core layout — pre-pyro).
+/// v9: the `.glow` container — IDENTICAL core layout to v8 (pyro was moved OUT of the
+///     positional core into a JSON trailer; see below), plus that trailer. So a v8
+///     `.archie` and a v9 `.glow` share the exact same bincode body; only `.glow`
+///     carries the trailing pyro section.
+///
+/// Pyro persistence (the trailer): after the bincode core we append
+/// `serde_json(scene.pyro)` — a self-describing section. `PyroDevice` is a plain
+/// `#[derive(Serialize, Deserialize)]` with `#[serde(default)]` on its evolving
+/// fields, so adding a field needs NO version bump and NO hand-written decode: an
+/// older save simply lacks the key and it defaults. `read` skips the trailer silently
+/// if it's absent (legacy `.archie`) or fails to decode.
+pub const FORMAT: u32 = 9;
+/// Oldest core layout this build can decode. Pre-v8 cores have different field
+/// layouts we don't down-migrate, so they're rejected cleanly (the loader reports
+/// and skips them rather than mis-decoding).
+pub const MIN_READ_FORMAT: u32 = 8;
 /// The project file extension (no dot).
-pub const EXT: &str = "archie";
+pub const EXT: &str = "glow";
+/// Legacy extension still accepted by the open dialog.
+pub const LEGACY_EXT: &str = "archie";
 
 /// Borrowed view of everything to save — avoids cloning the (possibly large)
 /// scene. Field order MUST match [`Project`] (bincode is positional).
@@ -104,30 +99,44 @@ pub struct Project {
 /// Serialise + write atomically (write a temp sibling, then rename) so a crash
 /// mid-write can't corrupt an existing project.
 pub fn write(path: &Path, project: &ProjectRef) -> Result<(), String> {
+    // The positional bincode CORE (pyro is `#[serde(skip)]` on Scene, so it is NOT in
+    // here) ...
     let body = bincode::serialize(project).map_err(|e| format!("encode: {e}"))?;
-    let mut bytes = Vec::with_capacity(body.len() + MAGIC.len());
+    // ... then the SELF-DESCRIBING pyro trailer (JSON). `read` reads the core with
+    // `deserialize_from` (which stops exactly at the core's end), so the trailer needs
+    // no length prefix — it's simply the rest of the file.
+    let pyro_json = serde_json::to_vec(&project.scene.pyro).map_err(|e| format!("encode pyro: {e}"))?;
+    let mut bytes = Vec::with_capacity(MAGIC.len() + 4 + body.len() + pyro_json.len());
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&project.format.to_le_bytes());
     bytes.extend_from_slice(&body);
-    let tmp = path.with_extension("archie.tmp");
+    bytes.extend_from_slice(&pyro_json);
+    let tmp = path.with_extension("glow.tmp");
     std::fs::write(&tmp, &bytes).map_err(|e| format!("write: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
 }
 
-/// Read + validate magic/version, then decode.
+/// Read + validate magic/version, decode the bincode core, then the (optional)
+/// self-describing pyro trailer. Tolerant by design — see [`FORMAT`]:
+/// * a version newer than this build → clean error (update the app);
+/// * a core layout older than [`MIN_READ_FORMAT`] → clean error (skipped, not crashed);
+/// * a missing or unreadable pyro trailer → silently skipped (the rest still loads).
 pub fn read(path: &Path) -> Result<Project, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
-    let head = MAGIC.len() + 4;
-    if bytes.len() < head || &bytes[..MAGIC.len()] != MAGIC {
-        return Err("not an .archie project (bad magic)".into());
+    // Accept either the current `.glow` magic or the legacy `.archie` magic.
+    let magic_len = if bytes.starts_with(MAGIC) {
+        MAGIC.len()
+    } else if bytes.starts_with(LEGACY_MAGIC) {
+        LEGACY_MAGIC.len()
+    } else {
+        return Err("not a glowstone project (bad magic)".into());
+    };
+    let head = magic_len + 4;
+    if bytes.len() < head {
+        return Err("truncated project file".into());
     }
-    let ver = u32::from_le_bytes([
-        bytes[MAGIC.len()],
-        bytes[MAGIC.len() + 1],
-        bytes[MAGIC.len() + 2],
-        bytes[MAGIC.len() + 3],
-    ]);
+    let ver = u32::from_le_bytes([bytes[magic_len], bytes[magic_len + 1], bytes[magic_len + 2], bytes[magic_len + 3]]);
     if ver > FORMAT {
         return Err(format!(
             "project version {ver} is newer than this build supports (max {FORMAT}); update the app"
@@ -135,16 +144,24 @@ pub fn read(path: &Path) -> Result<Project, String> {
     }
     if ver < MIN_READ_FORMAT {
         return Err(format!(
-            "project version {ver} is too old to open in this build (min {MIN_READ_FORMAT})"
+            "project version {ver} predates this build's readable formats (min {MIN_READ_FORMAT}) — skipping"
         ));
     }
-    // The decode is version-aware: structs skip trailing fields that postdate `ver`
-    // (positional bincode has no field names — see `scene::pyro::LOADING_FORMAT`).
-    // Reset the flag whatever the outcome so later (non-file) decodes read everything.
-    crate::scene::pyro::LOADING_FORMAT.with(|v| v.set(ver));
-    let decoded = bincode::deserialize::<Project>(&bytes[head..]);
-    crate::scene::pyro::LOADING_FORMAT.with(|v| v.set(u32::MAX));
-    let mut project = decoded.map_err(|e| format!("decode: {e}"))?;
+    // Decode the bincode CORE from a cursor so it stops exactly at the core's end,
+    // leaving any trailing pyro section for the next step.
+    let mut cur = std::io::Cursor::new(&bytes[head..]);
+    let mut project: Project =
+        bincode::deserialize_from(&mut cur).map_err(|e| format!("decode: {e}"))?;
+    // The self-describing pyro trailer (JSON), if present. Absent in legacy `.archie`;
+    // skipped (with a warning) rather than failing the whole load if it can't decode.
+    let consumed = cur.position() as usize;
+    let rest = &bytes[head + consumed..];
+    if !rest.is_empty() {
+        match serde_json::from_slice::<Vec<crate::scene::PyroDevice>>(rest) {
+            Ok(pyro) => project.scene.pyro = pyro,
+            Err(e) => log::warn!("skipping unreadable pyro section in {}: {e}", path.display()),
+        }
+    }
     project.format = FORMAT; // migrated up to the current format in memory
     intern_geometry_resources(&mut project.scene);
     Ok(project)
@@ -182,12 +199,12 @@ fn dirs() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("dev", "Embedder", "previz")
 }
 
-/// The crash-recovery autosave path (`<cache>/last-session.archie`).
+/// The crash-recovery autosave path (`<cache>/last-session.glow`).
 pub fn autosave_path() -> Option<PathBuf> {
     let d = dirs()?;
     let dir = d.cache_dir();
     std::fs::create_dir_all(dir).ok()?;
-    Some(dir.join("last-session.archie"))
+    Some(dir.join("last-session.glow"))
 }
 
 fn recent_path() -> Option<PathBuf> {
@@ -268,7 +285,7 @@ mod tests {
         let config = DmxConfig::default();
         let pr = empty_ref(&scene, &camera, &settings, &prefs, &cues, &patch, &config);
 
-        let path = std::env::temp_dir().join("previz-roundtrip-test.archie");
+        let path = std::env::temp_dir().join("glowstone-roundtrip-test.glow");
         write(&path, &pr).expect("write");
         let loaded = read(&path).expect("read");
         let _ = std::fs::remove_file(&path);
@@ -288,11 +305,71 @@ mod tests {
     }
 
     #[test]
-    fn read_rejects_non_archie_file() {
-        let path = std::env::temp_dir().join("previz-bad-magic-test.archie");
+    fn read_rejects_non_project_file() {
+        let path = std::env::temp_dir().join("glowstone-bad-magic-test.glow");
         std::fs::write(&path, b"this is not a project file at all").unwrap();
         let err = read(&path);
         let _ = std::fs::remove_file(&path);
         assert!(err.is_err());
+    }
+
+    /// A legacy `.archie` file (old magic, v8 core, NO pyro trailer) still loads: the
+    /// core layout is unchanged (pyro moved out of the positional stream), pyro is empty.
+    #[test]
+    fn reads_legacy_archie_without_trailer() {
+        let mut scene = Scene::default();
+        scene.world.brightness = 1.7;
+        let camera = OrbitCamera::default();
+        let settings = RenderSettings::default();
+        let prefs = Preferences::default();
+        let cues = CueEngine::default();
+        let patch = PatchTable::default();
+        let config = DmxConfig::default();
+        // Build a legacy-shaped file by hand: ARCHIE magic + v8 + bincode core, no trailer.
+        let mut pr = empty_ref(&scene, &camera, &settings, &prefs, &cues, &patch, &config);
+        pr.format = 8;
+        let body = bincode::serialize(&pr).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LEGACY_MAGIC);
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        let path = std::env::temp_dir().join("glowstone-legacy-archie.archie");
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = read(&path).expect("legacy .archie loads");
+        let _ = std::fs::remove_file(&path);
+        assert!((loaded.scene.world.brightness - 1.7).abs() < 1e-6);
+        assert!(loaded.scene.pyro.is_empty());
+        assert_eq!(loaded.format, FORMAT); // migrated up in memory
+    }
+
+    /// Pyro persists via the self-describing JSON trailer (NOT the positional core),
+    /// so devices survive the round-trip and the core stays untouched.
+    #[test]
+    fn pyro_devices_roundtrip_via_trailer() {
+        use crate::scene::pyro::{PyroDevice, PyroKind};
+        let mut scene = Scene::default();
+        let lib = crate::scene::Library::standard();
+        let prof = lib.pyro.iter().find(|p| p.kind == PyroKind::Co2Jet).unwrap();
+        let mut dev = PyroDevice::from_profile(prof, "Cannon 1", glam::Mat4::IDENTITY);
+        dev.throw_m = 14.0;
+        dev.thickness = 3.3;
+        scene.pyro.push(dev);
+        let camera = OrbitCamera::default();
+        let settings = RenderSettings::default();
+        let prefs = Preferences::default();
+        let cues = CueEngine::default();
+        let patch = PatchTable::default();
+        let config = DmxConfig::default();
+        let pr = empty_ref(&scene, &camera, &settings, &prefs, &cues, &patch, &config);
+
+        let path = std::env::temp_dir().join("glowstone-pyro-roundtrip.glow");
+        write(&path, &pr).expect("write");
+        let loaded = read(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.scene.pyro.len(), 1);
+        assert_eq!(loaded.scene.pyro[0].name, "Cannon 1");
+        assert!((loaded.scene.pyro[0].throw_m - 14.0).abs() < 1e-6);
+        assert!((loaded.scene.pyro[0].thickness - 3.3).abs() < 1e-6);
     }
 }

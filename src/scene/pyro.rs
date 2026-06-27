@@ -92,7 +92,7 @@ impl Default for PyroPatch {
 /// New serialized fields go on the END so the positional `.archie` stream stays
 /// aligned (the format version is bumped when this struct changes — see
 /// `ui/project.rs` FORMAT).
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PyroDevice {
     pub name: String,
     pub kind: PyroKind,
@@ -215,119 +215,6 @@ impl crate::dmx::patch::Patchable for PyroDevice {
     }
 }
 
-thread_local! {
-    /// The on-disk `.archie` FORMAT currently being decoded, set by
-    /// [`crate::ui::project::read`] around the bincode pass. The positional stream
-    /// has no field names, so a [`PyroDevice`] written by an older build is missing
-    /// the trailing fields added since — this lets the deserializer skip exactly
-    /// those (defaulting them) instead of misreading the next record's bytes.
-    /// Defaults to `MAX` (decode every field) for any non-file deserialization.
-    pub(crate) static LOADING_FORMAT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
-}
-
-// Hand-written so trailing fields added in later FORMATs (currently `dissipation`,
-// FORMAT 10) are read ONLY when the file is new enough — otherwise the positional
-// bincode stream would desync. New trailing fields extend the gated tail below; the
-// derived `Serialize` always writes them all. Keep field order in lock-step with the
-// struct (and with `Serialize`).
-impl<'de> serde::Deserialize<'de> for PyroDevice {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{Error, SeqAccess, Visitor};
-        use std::fmt;
-
-        struct PyroVisitor;
-        impl<'de> Visitor<'de> for PyroVisitor {
-            type Value = PyroDevice;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("struct PyroDevice")
-            }
-            fn visit_seq<A>(self, mut seq: A) -> Result<PyroDevice, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                macro_rules! req {
-                    ($i:expr) => {
-                        seq.next_element()?
-                            .ok_or_else(|| A::Error::invalid_length($i, &"struct PyroDevice"))?
-                    };
-                }
-                // --- fields present since FORMAT 9 (pyro introduced) ---
-                let name = req!(0);
-                let kind = req!(1);
-                let profile_name = req!(2);
-                let transform = req!(3);
-                let mode = req!(4);
-                let patch = req!(5);
-                let height_m = req!(6);
-                let throw_m = req!(7);
-                let density = req!(8);
-                let cone_deg = req!(9);
-                let color_t0_k = req!(10);
-                let color_t1_k = req!(11);
-                let brightness = req!(12);
-                let opacity = req!(13);
-                let tint = req!(14);
-                let spin_rpm = req!(15);
-                let pan = req!(16);
-                let tilt = req!(17);
-                let max_particles = req!(18);
-                let quality = req!(19);
-                let hidden = req!(20);
-                // --- gated trailing fields; older files default them ---
-                let fmt = LOADING_FORMAT.with(|v| v.get());
-                let dissipation = if fmt >= 10 { req!(21) } else { default_dissipation() };
-                let speed = if fmt >= 11 { req!(22) } else { default_speed() };
-                let viewport_hq = if fmt >= 12 { req!(23) } else { false };
-                let thickness = if fmt >= 13 { req!(24) } else { default_thickness() };
-                Ok(PyroDevice {
-                    name,
-                    kind,
-                    profile_name,
-                    transform,
-                    mode,
-                    patch,
-                    height_m,
-                    throw_m,
-                    density,
-                    cone_deg,
-                    color_t0_k,
-                    color_t1_k,
-                    brightness,
-                    opacity,
-                    tint,
-                    spin_rpm,
-                    pan,
-                    tilt,
-                    max_particles,
-                    quality,
-                    hidden,
-                    dissipation,
-                    speed,
-                    viewport_hq,
-                    thickness,
-                    // serde-skip runtime fields (match the previous derive: Default).
-                    driven: false,
-                    armed: false,
-                    fire: 0.0,
-                    id: 0,
-                })
-            }
-        }
-
-        // `FIELDS.len()` caps how many elements bincode's seq will yield; list every
-        // serialized field (incl. the gated tail) so a current-FORMAT read sees them all.
-        const FIELDS: &[&str] = &[
-            "name", "kind", "profile_name", "transform", "mode", "patch", "height_m",
-            "throw_m", "density", "cone_deg", "color_t0_k", "color_t1_k", "brightness",
-            "opacity", "tint", "spin_rpm", "pan", "tilt", "max_particles", "quality",
-            "hidden", "dissipation", "speed", "viewport_hq", "thickness",
-        ];
-        deserializer.deserialize_struct("PyroDevice", FIELDS, PyroVisitor)
-    }
-}
 
 impl PyroDevice {
     /// Build a device from a library profile at `transform` (nozzle at origin,
@@ -453,90 +340,36 @@ mod tests {
         PyroDevice::from_profile(p, "Spark", Mat4::IDENTITY)
     }
 
+    /// Pyro now persists as a self-describing JSON trailer (see `ui::project`), so a
+    /// plain derive round-trips AND an older save missing newer fields loads via
+    /// `#[serde(default)]` — no positional/version-aware decode, no FORMAT-per-field.
     #[test]
-    fn version_aware_deser_roundtrips_and_skips_old_trailing_field() {
-        // Distinct value per field so a transposed field in the hand-written
-        // `Deserialize` (vs the derived `Serialize`) is caught, not silently wrong.
+    fn pyro_device_roundtrips_and_defaults_missing_fields() {
         let mut d = spark();
         d.name = "blast".into();
-        d.profile_name = "prof".into();
-        d.height_m = 1.5;
         d.throw_m = 2.5;
-        d.density = 0.3;
-        d.cone_deg = 4.5;
-        d.color_t0_k = 5500.0;
-        d.color_t1_k = 1200.0;
-        d.brightness = 7.5;
-        d.opacity = 0.85;
-        d.tint = [0.1, 0.2, 0.3];
-        d.spin_rpm = 9.5;
-        d.pan = 10.5;
-        d.tilt = 11.5;
-        d.max_particles = 321;
-        d.quality = 3;
-        d.hidden = true;
-        d.dissipation = 1.7;
-        d.speed = 9.9;
-        d.viewport_hq = true;
         d.thickness = 2.2;
-
-        // Current FORMAT: every field round-trips (LOADING_FORMAT defaults to MAX).
-        let bytes = bincode::serialize(&d).unwrap();
-        let back: PyroDevice = bincode::deserialize(&bytes).unwrap();
+        d.viewport_hq = true;
+        let json = serde_json::to_string(&d).unwrap();
+        let back: PyroDevice = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "blast");
-        assert_eq!(back.profile_name, "prof");
         assert_eq!(back.throw_m, 2.5);
-        assert_eq!(back.density, 0.3);
-        assert_eq!(back.cone_deg, 4.5);
-        assert_eq!(back.color_t0_k, 5500.0);
-        assert_eq!(back.color_t1_k, 1200.0);
-        assert_eq!(back.brightness, 7.5);
-        assert_eq!(back.opacity, 0.85);
-        assert_eq!(back.tint, [0.1, 0.2, 0.3]);
-        assert_eq!(back.spin_rpm, 9.5);
-        assert_eq!(back.pan, 10.5);
-        assert_eq!(back.tilt, 11.5);
-        assert_eq!(back.max_particles, 321);
-        assert_eq!(back.quality, 3);
-        assert!(back.hidden);
-        assert_eq!(back.dissipation, 1.7);
-        assert_eq!(back.speed, 9.9);
-        assert!(back.viewport_hq);
         assert_eq!(back.thickness, 2.2);
+        assert!(back.viewport_hq);
 
-        // Trailing fields: `... hidden, dissipation(4B), speed(4B), viewport_hq(1B),
-        // thickness(4B)`. Drop the tail bytes for each older FORMAT and decode with its
-        // version flag — exactly the absent fields default, the rest hold.
-        let v12 = &bytes[..bytes.len() - 4]; // no thickness
-        LOADING_FORMAT.with(|v| v.set(12));
-        let d12: PyroDevice = bincode::deserialize(v12).unwrap();
-        assert_eq!(d12.thickness, default_thickness());
-        assert!(d12.viewport_hq);
-
-        let v11 = &bytes[..bytes.len() - 5]; // no viewport_hq, thickness
-        LOADING_FORMAT.with(|v| v.set(11));
-        let d11: PyroDevice = bincode::deserialize(v11).unwrap();
-        assert!(!d11.viewport_hq);
-        assert_eq!(d11.speed, 9.9);
-
-        let v10 = &bytes[..bytes.len() - 9]; // no speed, viewport_hq, thickness
-        LOADING_FORMAT.with(|v| v.set(10));
-        let d10: PyroDevice = bincode::deserialize(v10).unwrap();
-        assert_eq!(d10.speed, default_speed());
-        assert_eq!(d10.dissipation, 1.7);
-        assert!(!d10.viewport_hq);
-
-        let v9 = &bytes[..bytes.len() - 13]; // no dissipation, speed, viewport_hq, thickness
-        LOADING_FORMAT.with(|v| v.set(9));
-        let d9: PyroDevice = bincode::deserialize(v9).unwrap();
-        LOADING_FORMAT.with(|v| v.set(u32::MAX)); // don't leak to sibling tests
-        assert_eq!(d9.speed, default_speed());
-        assert_eq!(d9.dissipation, default_dissipation());
-        assert_eq!(d9.thickness, default_thickness());
-        assert!(!d9.viewport_hq);
-        assert_eq!(d9.tilt, 11.5);
-        assert_eq!(d9.max_particles, 321);
-        assert!(d9.hidden);
+        // Simulate an OLDER save: drop the fields added after pyro shipped. The
+        // remaining show data still loads; the absent fields take their defaults.
+        let mut obj: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let map = obj.as_object_mut().unwrap();
+        for f in ["thickness", "viewport_hq", "speed", "dissipation"] {
+            map.remove(f);
+        }
+        let old: PyroDevice = serde_json::from_value(obj).unwrap();
+        assert_eq!(old.throw_m, 2.5); // pre-existing field preserved
+        assert_eq!(old.thickness, default_thickness());
+        assert_eq!(old.speed, default_speed());
+        assert_eq!(old.dissipation, default_dissipation());
+        assert!(!old.viewport_hq);
     }
 
     #[test]

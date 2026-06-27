@@ -50,7 +50,7 @@ impl Ui {
         }
     }
 
-    /// Prompt for a destination, then save (forcing the `.archie` extension).
+    /// Prompt for a destination, then save (forcing the `.glow` extension).
     pub(super) fn save_project_as(&mut self, scene: &Scene, camera: &OrbitCamera, dmx: &crate::dmx::DmxIo) {
         let name = self
             .current_path
@@ -59,7 +59,7 @@ impl Ui {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("show.{}", project::EXT));
         if let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("Archie project", &[project::EXT])
+            .add_filter("glowstone project", &[project::EXT])
             .set_file_name(&name)
             .save_file()
         {
@@ -89,7 +89,7 @@ impl Ui {
         }
     }
 
-    /// Prompt for a `.archie` file, then open it.
+    /// Prompt for a project file (`.glow`, or a legacy `.archie`), then open it.
     pub(super) fn open_project_dialog(
         &mut self,
         scene: &mut Scene,
@@ -97,7 +97,7 @@ impl Ui {
         dmx: &mut crate::dmx::DmxIo,
     ) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Archie project", &[project::EXT])
+            .add_filter("glowstone project", &[project::EXT, project::LEGACY_EXT])
             .pick_file()
         {
             self.open_project(&path, scene, camera, dmx);
@@ -286,11 +286,11 @@ mod tests {
         None
     }
 
-    /// Round-trip a real GDTF fixture through `.archie`: save bundles the archive
+    /// Round-trip a real GDTF fixture through `.glow`: save bundles the archive
     /// bytes, open re-parses + re-links them, and per-fixture state (cells, beam,
     /// dimmer) plus the camera survive the trip.
     #[test]
-    fn archie_save_load_relinks_gdtf_and_state() {
+    fn glow_save_load_relinks_gdtf_and_state() {
         let member = "Astera LED Technology@AX2-100 PixelBar.gdtf";
         let Some(bytes) = gdtf_bytes(member) else {
             eprintln!("skip archie_save_load: Basic Festival.mvr not found");
@@ -311,7 +311,7 @@ mod tests {
         camera.distance = 21.0;
         let dmx = DmxIo::new();
 
-        let path = std::env::temp_dir().join("previz-archie-relink-test.archie");
+        let path = std::env::temp_dir().join("glowstone-relink-test.glow");
         ui.write_project(&path, &scene, &camera, &dmx).expect("write project");
 
         // Open into a completely fresh app state.
