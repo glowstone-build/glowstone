@@ -110,9 +110,9 @@ pub(super) fn render_properties(
         // --- Fixed header: engine, backend, actions, display (non-collapsing) ---
         p.custom("Engine", true, |ui| {
             egui::ComboBox::from_id_salt("render-engine")
-                .selected_text("glowstone Raymarch")
+                .selected_text(crate::renderer::ENGINE_NAME)
                 .show_ui(ui, |ui| {
-                    ui.selectable_label(true, "glowstone Raymarch");
+                    ui.selectable_label(true, crate::renderer::ENGINE_NAME);
                 });
         });
 
@@ -383,7 +383,7 @@ pub(super) fn render_properties(
                 ui.add_enabled_ui(false, |ui| {
                     ui.checkbox(&mut scene.render.motion_blur, "Enable");
                 });
-                ui.label(RichText::new("Not yet supported by the raymarch engine").weak().small().color(ink.muted));
+                ui.label(RichText::new(format!("Not yet supported by {}", crate::renderer::ENGINE_NAME)).weak().small().color(ink.muted));
             });
         });
 

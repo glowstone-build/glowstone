@@ -1,6 +1,6 @@
-//! The renderer: owns the wgpu device/queue/surface, the scene pipelines, the
-//! offscreen HDR viewport target, the volumetric + post passes, and the egui
-//! paint pass.
+//! **Spectre** — glowstone's custom GPU rendering engine. Owns the wgpu
+//! device/queue/surface, the scene pipelines, the offscreen HDR viewport target,
+//! the volumetric + post passes, and the egui paint pass.
 //!
 //! Per frame the CPU fills a camera uniform, per-object instance rows, the
 //! dynamic line geometry, and the volumetric uniforms (camera inverse, fog box,
@@ -21,6 +21,10 @@ pub mod viewport;
 mod world;
 
 pub use gpu_timer::PassTimings;
+
+/// The display name of this rendering engine (shown in the Render ▸ Engine picker).
+/// glowstone's bespoke wgpu raster + volumetric-raymarch engine.
+pub const ENGINE_NAME: &str = "Spectre";
 
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
