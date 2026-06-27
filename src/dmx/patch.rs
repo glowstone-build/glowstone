@@ -13,6 +13,26 @@ use std::hash::{Hash, Hasher};
 
 use crate::scene::{Fixture, Scene};
 
+/// A DMX-patchable scene entity whose patch (universe + 1-based start address)
+/// lives INLINE on the entity — pyro devices today, LED screens (pixel-maps) next.
+/// Fixtures deliberately do NOT implement this: their patch lives in the side
+/// [`PatchTable`] (see the module note) and is packed in batch by
+/// [`PatchTable::assign_indices`]. The trait lets the patch/unpatch keybinds drive
+/// the inline kinds through one code path instead of per-kind special-casing.
+pub trait Patchable {
+    /// DMX channels this entity consumes.
+    fn footprint(&self) -> u16;
+    /// `(universe, 1-based start address)` when patched, else `None`.
+    fn patch_slot(&self) -> Option<(u16, u16)>;
+    /// Patch (and enable) at `universe` / 1-based `address`.
+    fn set_patch(&mut self, universe: u16, address: u16);
+    /// Unpatch — free the channels.
+    fn clear_patch(&mut self);
+    fn is_patched(&self) -> bool {
+        self.patch_slot().is_some()
+    }
+}
+
 /// Where a fixture's patch entry came from (display + auto-assign policy).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum PatchSource {

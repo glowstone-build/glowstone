@@ -94,7 +94,7 @@ impl Ui {
             None => scene.fixtures.iter().enumerate().filter(|(_, f)| f.is_gdtf()).map(|(i, _)| i).take(n).collect(),
         };
         if !pick.is_empty() {
-            self.selection = Selection { fixtures: pick, geometry: Vec::new(), screens: Vec::new(), environment: None, world: false };
+            self.selection = Selection { fixtures: pick, ..Default::default() };
         }
     }
 }

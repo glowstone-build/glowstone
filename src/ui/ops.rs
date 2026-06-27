@@ -172,6 +172,13 @@ impl Ui {
                 f.snap_movement();
             }
         }
+        // Pyro devices translate their transform (nozzle = origin), same as the
+        // gizmo's ObjectRef::Pyro path — so arrow-nudge moves a selected pyro too.
+        for &pi in &self.selection.pyro {
+            if let Some(p) = scene.pyro.get_mut(pi) {
+                p.transform.w_axis += nudge.extend(0.0);
+            }
+        }
 
         if coalesce {
             let after = self.undo.begin(scene, dmx.patch(), &self.cues, &self.groups, &self.selection);
@@ -210,6 +217,9 @@ impl Ui {
                         } else if let Some(i) = scene.screen_index_of(id) {
                             scene.screens[i].hidden = !scene.screens[i].hidden;
                             true
+                        } else if let Some(i) = scene.pyro_index_of(id) {
+                            scene.pyro[i].hidden = !scene.pyro[i].hidden;
+                            true
                         } else if let Some(i) = scene.environment_index_of(id) {
                             scene.environments[i].hidden = !scene.environments[i].hidden;
                             true
@@ -237,6 +247,13 @@ impl Ui {
                             s.hidden = hide;
                         }
                         !scene.screens.is_empty()
+                    }
+                    NodeKey::Group(GroupKind::Pyro) => {
+                        let hide = scene.pyro.iter().any(|d| !d.hidden);
+                        for d in &mut scene.pyro {
+                            d.hidden = hide;
+                        }
+                        !scene.pyro.is_empty()
                     }
                     NodeKey::EnvGroup | NodeKey::World => {
                         // Toggle all environments (World/HDRI has no hidden field).
@@ -266,6 +283,9 @@ impl Ui {
                         } else if let Some(i) = scene.screen_index_of(id) {
                             scene.screens[i].name = name;
                             true
+                        } else if let Some(i) = scene.pyro_index_of(id) {
+                            scene.pyro[i].name = name;
+                            true
                         } else if let Some(i) = scene.environment_index_of(id) {
                             scene.environments[i].name = name;
                             true
@@ -294,13 +314,16 @@ impl Ui {
             "object.add" => true,
             // Needs a primary fixture to duplicate.
             "fixture.duplicate" => self.selection.primary_fixture().is_some(),
-            // Patch / unpatch operate on the selected fixtures.
-            "fixture.patch" | "fixture.unpatch" => !self.selection.fixtures.is_empty(),
-            // Delete acts on any selected entity (fixtures / geometry / screens).
+            // Patch / unpatch operate on the active patchable kind (fixtures or pyro).
+            "fixture.patch" | "fixture.unpatch" => {
+                patchable_count(&self.selection, self.selection.active_kind()) > 0
+            }
+            // Delete acts on any selected entity (fixtures / geometry / screens / pyro).
             "object.delete" => {
                 !self.selection.fixtures.is_empty()
                     || !self.selection.geometry.is_empty()
                     || !self.selection.screens.is_empty()
+                    || !self.selection.pyro.is_empty()
             }
             _ => false,
         }
@@ -341,19 +364,25 @@ impl Ui {
                     }
                 }
                 "fixture.patch" => {
-                    let (u, a) = next_free_slot(dmx.patch_mut(), scene);
-                    self.patch_dialog = windows::PatchDialog {
-                        open: true,
-                        count: self.selection.fixtures.len(),
-                        start_universe: u,
-                        start_address: a,
-                    };
+                    let kind = self.selection.active_kind();
+                    let count = patchable_count(&self.selection, kind);
+                    if count > 0 {
+                        let (u, a) = next_free_slot(dmx.patch_mut(), scene);
+                        self.patch_dialog = windows::PatchDialog {
+                            open: true,
+                            count,
+                            kind,
+                            start_universe: u,
+                            start_address: a,
+                        };
+                    }
                 }
                 _ => {}
             },
             // Direct — run immediately through the operator pipeline.
             op::OpInvoke::Direct => match id {
                 "fixture.unpatch" => {
+                    let kind = self.selection.active_kind();
                     self.run_op(
                         "fixture.unpatch",
                         "Unpatch",
@@ -362,9 +391,7 @@ impl Ui {
                         dmx,
                         true,
                         |cx| {
-                            for &fi in &cx.selection.fixtures {
-                                cx.patch.unpatch(fi);
-                            }
+                            unpatch_selection(cx, kind);
                             op::OpStatus::Finished
                         },
                     );
@@ -441,7 +468,8 @@ impl Ui {
         self.pending_delete = false;
         let poll = !self.selection.fixtures.is_empty()
             || !self.selection.geometry.is_empty()
-            || !self.selection.screens.is_empty();
+            || !self.selection.screens.is_empty()
+            || !self.selection.pyro.is_empty();
         let status = self.run_op(
             "object.delete",
             "Delete",
@@ -499,7 +527,15 @@ fn delete_selection(cx: &mut op::OpCtx) -> op::OpStatus {
     for &i in scr.iter().rev() {
         cx.scene.screens.remove(i);
     }
-    if !removed.is_empty() || !geo.is_empty() || !scr.is_empty() {
+    // --- pyro devices: a plain removal (patched inline, not in PatchTable) ---
+    let mut pyro: Vec<usize> =
+        cx.selection.pyro.iter().copied().filter(|&i| i < cx.scene.pyro.len()).collect();
+    pyro.sort_unstable();
+    pyro.dedup();
+    for &i in pyro.iter().rev() {
+        cx.scene.pyro.remove(i);
+    }
+    if !removed.is_empty() || !geo.is_empty() || !scr.is_empty() || !pyro.is_empty() {
         *cx.selection = Selection::default();
         op::OpStatus::Finished
     } else {
@@ -529,6 +565,62 @@ pub(super) fn next_free_slot(patch: &mut crate::dmx::PatchTable, scene: &Scene) 
         Some((u, a)) if a <= 512 => (u, a),
         Some((u, _)) => (u + 1, 1),
         None => (1, 1),
+    }
+}
+
+/// How many of the active selection are DMX-patchable via the Patch dialog
+/// (fixtures + pyro; objects/screens are not patchable there → 0, guarding the
+/// dialog off).
+pub(super) fn patchable_count(sel: &Selection, kind: crate::scene::SelKind) -> usize {
+    use crate::scene::SelKind;
+    match kind {
+        SelKind::Fixtures => sel.fixtures.len(),
+        SelKind::Pyro => sel.pyro.len(),
+        _ => 0,
+    }
+}
+
+/// Sequentially patch pyro devices (inline patch, via the [`Patchable`] trait)
+/// from a start slot, packing onto the next universe at 512 — the inline-kind twin
+/// of [`crate::dmx::PatchTable::assign_indices`]. Pyro lives in its own universes
+/// by convention, so this packs without cross-fixture clash-avoidance.
+///
+/// [`Patchable`]: crate::dmx::patch::Patchable
+pub(super) fn patch_pyro_inline(scene: &mut Scene, ids: &[usize], start_u: u16, start_a: u16) {
+    use crate::dmx::patch::Patchable;
+    let (mut u, mut a) = (start_u.max(1), start_a.max(1));
+    for &i in ids {
+        if let Some(d) = scene.pyro.get_mut(i) {
+            d.set_patch(u, a);
+            a += d.footprint().max(1);
+            if a > 512 {
+                u += 1;
+                a = 1;
+            }
+        }
+    }
+}
+
+/// Unpatch the active patchable selection (kind-aware): fixtures clear via the
+/// side PatchTable, pyro clears its inline [`PyroPatch`](crate::scene::pyro::PyroPatch)
+/// through the [`Patchable`](crate::dmx::patch::Patchable) trait. The captured scene
+/// snapshot covers `scene.pyro`, so undo works for both.
+pub(super) fn unpatch_selection(cx: &mut op::OpCtx, kind: crate::scene::SelKind) {
+    use crate::scene::SelKind;
+    match kind {
+        SelKind::Pyro => {
+            use crate::dmx::patch::Patchable;
+            for &i in &cx.selection.pyro {
+                if let Some(d) = cx.scene.pyro.get_mut(i) {
+                    d.clear_patch();
+                }
+            }
+        }
+        _ => {
+            for &fi in &cx.selection.fixtures {
+                cx.patch.unpatch(fi);
+            }
+        }
     }
 }
 

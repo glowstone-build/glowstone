@@ -5,12 +5,14 @@
 pub mod environment;
 pub mod fixture;
 pub mod library;
+pub mod pyro;
 pub mod render;
 pub mod screen;
 
 pub use environment::Environment;
 pub use fixture::Fixture;
-pub use library::{EnvironmentProfile, FixtureProfile, Library, ScreenProfile};
+pub use library::{EnvironmentProfile, FixtureProfile, Library, PyroProfile, ScreenProfile};
+pub use pyro::PyroDevice;
 pub use render::{QualityPreset, RenderConfig, RenderDisplay, RenderFormat};
 pub use screen::LedScreen;
 
@@ -274,11 +276,13 @@ impl Default for RenderSettings {
 /// screens, mirroring `apply_select`'s precedence). Fixtures is the default
 /// when nothing is selected, so a bare Select-All / Invert acts on fixtures
 /// (the catalog #88 "within the active kind" target).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SelKind {
+    #[default]
     Fixtures,
     Objects,
     Screens,
+    Pyro,
 }
 
 /// What the UI currently has selected. Drives the Inspector and the
@@ -295,6 +299,8 @@ pub struct Selection {
     pub geometry: Vec<usize>,
     /// Selected LED-screen (Screens) indices; the first is the "primary".
     pub screens: Vec<usize>,
+    /// Selected pyro-device (Pyro) indices; the first is the "primary".
+    pub pyro: Vec<usize>,
     /// Selected environment volume, if any.
     pub environment: Option<usize>,
     /// Whether the top-level World node (HDRI sky + ambient) is selected. World
@@ -306,27 +312,32 @@ pub struct Selection {
 impl Selection {
     /// Select a single fixture (clearing any other selection).
     pub fn fixture(i: usize) -> Self {
-        Self { fixtures: vec![i], geometry: Vec::new(), screens: Vec::new(), environment: None, world: false }
+        Self { fixtures: vec![i], ..Default::default() }
     }
 
     /// Select a single static-geometry object (clearing any other selection).
     pub fn geometry(i: usize) -> Self {
-        Self { fixtures: Vec::new(), geometry: vec![i], screens: Vec::new(), environment: None, world: false }
+        Self { geometry: vec![i], ..Default::default() }
     }
 
     /// Select a single LED screen (clearing any other selection).
     pub fn screen(i: usize) -> Self {
-        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: vec![i], environment: None, world: false }
+        Self { screens: vec![i], ..Default::default() }
+    }
+
+    /// Select a single pyro device (clearing any other selection).
+    pub fn pyro(i: usize) -> Self {
+        Self { pyro: vec![i], ..Default::default() }
     }
 
     /// Select a single environment.
     pub fn environment(i: usize) -> Self {
-        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: Vec::new(), environment: Some(i), world: false }
+        Self { environment: Some(i), ..Default::default() }
     }
 
     /// Select the top-level World node (clearing any other selection).
     pub fn world() -> Self {
-        Self { fixtures: Vec::new(), geometry: Vec::new(), screens: Vec::new(), environment: None, world: true }
+        Self { world: true, ..Default::default() }
     }
 
     /// Toggle the World node selection on/off (clearing everything else when on).
@@ -349,6 +360,10 @@ impl Selection {
         self.screens.contains(&i)
     }
 
+    pub fn contains_pyro(&self, i: usize) -> bool {
+        self.pyro.contains(&i)
+    }
+
     /// The primary (first) selected fixture, if any.
     pub fn primary_fixture(&self) -> Option<usize> {
         self.fixtures.first().copied()
@@ -364,6 +379,11 @@ impl Selection {
         self.screens.first().copied()
     }
 
+    /// The primary (first) selected pyro device, if any.
+    pub fn primary_pyro(&self) -> Option<usize> {
+        self.pyro.first().copied()
+    }
+
     /// Toggle a fixture in/out of the selection (for ctrl/cmd-click multi-select).
     /// Click selection now flows through the pure [`apply_select`] truth table
     /// (#24); kept for selection-API symmetry with `toggle_geometry`/`_screen`
@@ -374,6 +394,7 @@ impl Selection {
         self.environment = None;
         self.geometry.clear();
         self.screens.clear();
+        self.pyro.clear();
         if let Some(p) = self.fixtures.iter().position(|&x| x == i) {
             self.fixtures.remove(p);
         } else {
@@ -387,6 +408,7 @@ impl Selection {
         self.environment = None;
         self.fixtures.clear();
         self.screens.clear();
+        self.pyro.clear();
         if let Some(p) = self.geometry.iter().position(|&x| x == i) {
             self.geometry.remove(p);
         } else {
@@ -400,10 +422,25 @@ impl Selection {
         self.environment = None;
         self.fixtures.clear();
         self.geometry.clear();
+        self.pyro.clear();
         if let Some(p) = self.screens.iter().position(|&x| x == i) {
             self.screens.remove(p);
         } else {
             self.screens.push(i);
+        }
+    }
+
+    /// Toggle a pyro device in/out of the selection (ctrl/cmd-click).
+    pub fn toggle_pyro(&mut self, i: usize) {
+        self.world = false;
+        self.environment = None;
+        self.fixtures.clear();
+        self.geometry.clear();
+        self.screens.clear();
+        if let Some(p) = self.pyro.iter().position(|&x| x == i) {
+            self.pyro.remove(p);
+        } else {
+            self.pyro.push(i);
         }
     }
 
@@ -413,7 +450,20 @@ impl Selection {
         self.environment = None;
         self.geometry.clear();
         self.screens.clear();
+        self.pyro.clear();
         self.fixtures = (a.min(b)..=a.max(b)).collect();
+    }
+
+    /// Select a contiguous pyro-device data-index range (the by-index twin of
+    /// [`set_fixture_range`]; the tree builds its slice from visible order instead,
+    /// since sort/filter break contiguous data indices).
+    pub fn set_pyro_range(&mut self, a: usize, b: usize) {
+        self.world = false;
+        self.environment = None;
+        self.fixtures.clear();
+        self.geometry.clear();
+        self.screens.clear();
+        self.pyro = (a.min(b)..=a.max(b)).collect();
     }
 
     /// The active multi-select KIND (catalog #88): whichever multi-select
@@ -426,6 +476,8 @@ impl Selection {
             SelKind::Objects
         } else if !self.screens.is_empty() {
             SelKind::Screens
+        } else if !self.pyro.is_empty() {
+            SelKind::Pyro
         } else {
             SelKind::Fixtures
         }
@@ -433,14 +485,16 @@ impl Selection {
 
     /// Replace the selection with EVERY item of `kind` (Select All, catalog #88).
     /// Clears the other kinds + World/Environment to keep the single-target
-    /// invariant. The `counts` are the scene's entity totals for each kind.
-    pub fn select_all_of(&mut self, kind: SelKind, counts: (usize, usize, usize)) {
-        let (nf, no, ns) = counts;
+    /// invariant. The `counts` are the scene's entity totals for each kind
+    /// (fixtures, objects, screens, pyro).
+    pub fn select_all_of(&mut self, kind: SelKind, counts: (usize, usize, usize, usize)) {
+        let (nf, no, ns, np) = counts;
         *self = Selection::default();
         match kind {
             SelKind::Fixtures => self.fixtures = (0..nf).collect(),
             SelKind::Objects => self.geometry = (0..no).collect(),
             SelKind::Screens => self.screens = (0..ns).collect(),
+            SelKind::Pyro => self.pyro = (0..np).collect(),
         }
     }
 
@@ -448,12 +502,13 @@ impl Selection {
     /// currently selected becomes selected, and vice-versa. Other kinds +
     /// World/Environment are cleared (selection stays single-kind). The result is
     /// kept ascending so range/anchor logic and equality stay stable.
-    pub fn invert_within(&mut self, kind: SelKind, counts: (usize, usize, usize)) {
-        let (nf, no, ns) = counts;
+    pub fn invert_within(&mut self, kind: SelKind, counts: (usize, usize, usize, usize)) {
+        let (nf, no, ns, np) = counts;
         let (total, had): (usize, &[usize]) = match kind {
             SelKind::Fixtures => (nf, &self.fixtures),
             SelKind::Objects => (no, &self.geometry),
             SelKind::Screens => (ns, &self.screens),
+            SelKind::Pyro => (np, &self.pyro),
         };
         let inverted: Vec<usize> = (0..total).filter(|i| !had.contains(i)).collect();
         *self = Selection::default();
@@ -461,6 +516,7 @@ impl Selection {
             SelKind::Fixtures => self.fixtures = inverted,
             SelKind::Objects => self.geometry = inverted,
             SelKind::Screens => self.screens = inverted,
+            SelKind::Pyro => self.pyro = inverted,
         }
     }
 
@@ -476,6 +532,7 @@ impl Selection {
         v.extend(self.fixtures.iter().map(|&i| ObjectRef::Fixture(i)));
         v.extend(self.geometry.iter().map(|&i| ObjectRef::Geometry(i)));
         v.extend(self.screens.iter().map(|&i| ObjectRef::Screen(i)));
+        v.extend(self.pyro.iter().map(|&i| ObjectRef::Pyro(i)));
         if let Some(i) = self.environment {
             v.push(ObjectRef::Environment(i));
         }
@@ -497,6 +554,7 @@ impl Selection {
                 ObjectRef::Fixture(i) => s.fixtures.push(i),
                 ObjectRef::Geometry(i) => s.geometry.push(i),
                 ObjectRef::Screen(i) => s.screens.push(i),
+                ObjectRef::Pyro(i) => s.pyro.push(i),
                 ObjectRef::Environment(i) => s.environment = Some(i),
             }
         }
@@ -509,6 +567,7 @@ impl Selection {
         !self.fixtures.is_empty()
             || !self.geometry.is_empty()
             || !self.screens.is_empty()
+            || !self.pyro.is_empty()
             || self.environment.is_some()
     }
 }
@@ -522,6 +581,7 @@ pub enum SelItem {
     Fixture(usize),
     Geometry(usize),
     Screen(usize),
+    Pyro(usize),
     Environment(usize),
     /// The World node — a single-only selection (the viewport doesn't pick it
     /// yet; the outliner's ⌘-click path will yield it). Carried in the enum now so
@@ -543,6 +603,7 @@ pub enum ObjectRef {
     Fixture(usize),
     Geometry(usize),
     Screen(usize),
+    Pyro(usize),
     Environment(usize),
 }
 
@@ -597,15 +658,18 @@ pub fn apply_select(current: &Selection, hits: &[SelItem], op: SelectOp) -> Sele
         Some(1)
     } else if !current.screens.is_empty() {
         Some(2)
+    } else if !current.pyro.is_empty() {
+        Some(3)
     } else {
         None
     };
     let hit_kind = |k: u8| -> Vec<usize> {
         hits.iter()
             .filter_map(|h| match (k, h) {
-                (0, SelItem::Fixture(i)) | (1, SelItem::Geometry(i)) | (2, SelItem::Screen(i)) => {
-                    Some(*i)
-                }
+                (0, SelItem::Fixture(i))
+                | (1, SelItem::Geometry(i))
+                | (2, SelItem::Screen(i))
+                | (3, SelItem::Pyro(i)) => Some(*i),
                 _ => None,
             })
             .collect()
@@ -623,15 +687,17 @@ pub fn apply_select(current: &Selection, hits: &[SelItem], op: SelectOp) -> Sele
     match op {
         SelectOp::Replace => {
             // Hits define the whole new selection (empty → cleared). Multi-kind
-            // hit sets collapse to the dominant kind (fixtures > geometry > screens).
-            for k in [0u8, 1, 2] {
+            // hit sets collapse to the dominant kind (fixtures > geometry > screens
+            // > pyro).
+            for k in [0u8, 1, 2, 3] {
                 let v = hit_kind(k);
                 if !v.is_empty() {
                     let mut s = Selection::default();
                     match k {
                         0 => s.fixtures = v,
                         1 => s.geometry = v,
-                        _ => s.screens = v,
+                        2 => s.screens = v,
+                        _ => s.pyro = v,
                     }
                     return s;
                 }
@@ -649,6 +715,7 @@ pub fn apply_select(current: &Selection, hits: &[SelItem], op: SelectOp) -> Sele
                     SelItem::Fixture(_) => Some(0u8),
                     SelItem::Geometry(_) => Some(1),
                     SelItem::Screen(_) => Some(2),
+                    SelItem::Pyro(_) => Some(3),
                     _ => None,
                 };
                 if hk.is_some() && hk != active_kind {
@@ -658,13 +725,14 @@ pub fn apply_select(current: &Selection, hits: &[SelItem], op: SelectOp) -> Sele
             // Operate within the active kind (extend the existing set) or, if
             // nothing is selected yet, the hits' dominant kind.
             let kind = active_kind.or_else(|| {
-                [0u8, 1, 2].into_iter().find(|&k| !hit_kind(k).is_empty())
+                [0u8, 1, 2, 3].into_iter().find(|&k| !hit_kind(k).is_empty())
             });
             let Some(kind) = kind else { return current.clone() };
             let mut set: Vec<usize> = match kind {
                 0 => current.fixtures.clone(),
                 1 => current.geometry.clone(),
-                _ => current.screens.clone(),
+                2 => current.screens.clone(),
+                _ => current.pyro.clone(),
             };
             for i in hit_kind(kind) {
                 let pos = set.iter().position(|&x| x == i);
@@ -686,7 +754,8 @@ pub fn apply_select(current: &Selection, hits: &[SelItem], op: SelectOp) -> Sele
             match kind {
                 0 => s.fixtures = set,
                 1 => s.geometry = set,
-                _ => s.screens = set,
+                2 => s.screens = set,
+                _ => s.pyro = set,
             }
             s
         }
@@ -778,6 +847,11 @@ pub struct Scene {
     /// (`.archie` FORMAT 7) so a saved project keeps its render setup — the look is
     /// shared with the live viewport, so only render-specific knobs live here.
     pub render: RenderConfig,
+    /// Placed pyro devices (CO2 cannons + cold-spark machines) — drawn as a
+    /// billboard particle / fog pass, patched inline to DMX. Persisted with the
+    /// show (`.archie` FORMAT 9); the live particle simulation is runtime-only in
+    /// the renderer. Appended LAST in the serialized stream (after `render`).
+    pub pyro: Vec<PyroDevice>,
     /// Monotonic [`EntityId`] allocator. serde-skip → reset to 0 on load;
     /// [`ensure_ids`](Self::ensure_ids) reseeds it past the max live id after
     /// every load/import/undo-restore.
@@ -812,6 +886,7 @@ impl Scene {
             screens: Vec::new(),
             mvr: None,
             render: RenderConfig::default(),
+            pyro: Vec::new(),
             next_id: 0,
         };
         scene.ensure_ids(); // hand the demo entities their stable ids
@@ -907,6 +982,7 @@ impl Scene {
             }),
             ObjectRef::Geometry(i) => self.geometry.get(i).and_then(|g| g.world_bounds()),
             ObjectRef::Screen(i) => self.screens.get(i).map(|s| s.world_bounds()),
+            ObjectRef::Pyro(i) => self.pyro.get(i).map(|p| p.world_bounds()),
             ObjectRef::Environment(i) => self.environments.get(i).map(|e| (e.min(), e.max())),
         }
     }
@@ -921,6 +997,7 @@ impl Scene {
                 g.world_bounds().map(|(lo, hi)| (lo + hi) * 0.5).unwrap_or_else(|| g.transform.w_axis.truncate())
             }),
             ObjectRef::Screen(i) => self.screens.get(i).map(|s| s.world_center()),
+            ObjectRef::Pyro(i) => self.pyro.get(i).map(|p| p.world_nozzle()),
             ObjectRef::Environment(i) => self.environments.get(i).map(|e| e.center),
         }
     }
@@ -953,6 +1030,13 @@ impl Scene {
                 s.id = self.alloc_id();
                 self.screens.push(s);
                 Some(ObjectRef::Screen(self.screens.len() - 1))
+            }
+            ObjectRef::Pyro(i) => {
+                let mut p = self.pyro.get(i)?.clone();
+                p.name = dup_name(&p.name);
+                p.id = self.alloc_id();
+                self.pyro.push(p);
+                Some(ObjectRef::Pyro(self.pyro.len() - 1))
             }
             ObjectRef::Environment(i) => {
                 let mut e = self.environments.get(i)?.clone();
@@ -993,6 +1077,11 @@ impl Scene {
                     s.transform.w_axis += delta.extend(0.0);
                 }
             }
+            ObjectRef::Pyro(i) => {
+                if let Some(p) = self.pyro.get_mut(i) {
+                    p.transform.w_axis += delta.extend(0.0);
+                }
+            }
             ObjectRef::Environment(i) => {
                 if let Some(e) = self.environments.get_mut(i) {
                     e.center += delta;
@@ -1008,6 +1097,9 @@ impl Scene {
         self.fixtures.clear();
         self.geometry.clear();
         self.screens.clear();
+        // Pyro devices are app-native (off the fixture patch table / MVR), so an
+        // MVR import replaces the scene's pyro with nothing — see RESEARCH-pyro §6.
+        self.pyro.clear();
         for f in import.fixtures {
             self.fixtures.push(Fixture::from_mvr(f));
         }
@@ -1053,6 +1145,7 @@ impl Scene {
         let mut pts = self.fixtures.iter().map(|f| f.position).collect::<Vec<_>>();
         pts.extend(self.geometry.iter().map(|g| g.transform.w_axis.truncate()));
         pts.extend(self.screens.iter().map(|s| s.world_center()));
+        pts.extend(self.pyro.iter().map(|p| p.world_nozzle()));
         let first = *pts.first()?;
         let (mut lo, mut hi) = (first, first);
         for p in &pts {
@@ -1100,6 +1193,20 @@ impl Scene {
         screen.id = self.alloc_id();
         self.screens.push(screen);
         self.screens.len() - 1
+    }
+
+    /// Add a pyro device from a library profile, standing on the floor over the
+    /// `ground` point with its nozzle a touch above the deck, aiming +Y; returns
+    /// its new index. `ground.y` is ignored — the device rests on the floor.
+    pub fn add_pyro_at(&mut self, profile: &PyroProfile, ground: Vec3) -> usize {
+        let n = self.pyro.iter().filter(|p| p.kind == profile.kind).count() + 1;
+        let name = format!("{} {}", profile.name, n);
+        // The nozzle sits ~0.3 m above the deck (on top of the device body).
+        let transform = Mat4::from_translation(Vec3::new(ground.x, 0.3, ground.z));
+        let mut device = PyroDevice::from_profile(profile, name, transform);
+        device.id = self.alloc_id();
+        self.pyro.push(device);
+        self.pyro.len() - 1
     }
 
     /// Add an environment from a library profile at the origin; returns its new
@@ -1151,6 +1258,9 @@ impl Scene {
         for s in &self.screens {
             n = n.max(s.id);
         }
+        for p in &self.pyro {
+            n = n.max(p.id);
+        }
         for e in &self.environments {
             n = n.max(e.id);
         }
@@ -1171,6 +1281,12 @@ impl Scene {
             if s.id == 0 {
                 n += 1;
                 s.id = n;
+            }
+        }
+        for p in &mut self.pyro {
+            if p.id == 0 {
+                n += 1;
+                p.id = n;
             }
         }
         for e in &mut self.environments {
@@ -1196,6 +1312,10 @@ impl Scene {
     /// Resolve an [`EntityId`] to its current `screens` index.
     pub fn screen_index_of(&self, id: EntityId) -> Option<usize> {
         self.screens.iter().position(|e| e.id == id)
+    }
+    /// Resolve an [`EntityId`] to its current `pyro` index.
+    pub fn pyro_index_of(&self, id: EntityId) -> Option<usize> {
+        self.pyro.iter().position(|e| e.id == id)
     }
     /// Resolve an [`EntityId`] to its current `environments` index.
     pub fn environment_index_of(&self, id: EntityId) -> Option<usize> {
@@ -1292,7 +1412,7 @@ mod tests {
 
     #[test]
     fn select_all_of_fills_one_kind_and_clears_others() {
-        let counts = (3, 2, 4);
+        let counts = (3, 2, 4, 2);
         let mut s = Selection::geometry(0);
         s.select_all_of(SelKind::Fixtures, counts);
         assert_eq!(s.fixtures, vec![0, 1, 2]);
@@ -1306,7 +1426,7 @@ mod tests {
 
     #[test]
     fn invert_within_toggles_membership() {
-        let counts = (4, 0, 0);
+        let counts = (4, 0, 0, 0);
         // {0,2} → {1,3} within fixtures.
         let mut s = fsel(&[0, 2]);
         s.invert_within(SelKind::Fixtures, counts);
@@ -1326,7 +1446,7 @@ mod tests {
 
     #[test]
     fn invert_within_objects_uses_object_count_not_fixtures() {
-        let counts = (1, 3, 0); // 1 fixture, 3 objects
+        let counts = (1, 3, 0, 0); // 1 fixture, 3 objects, 0 screens, 0 pyro
         let mut s = Selection::geometry(1);
         s.invert_within(SelKind::Objects, counts);
         assert_eq!(s.geometry, vec![0, 2], "inverts over the OBJECT domain");

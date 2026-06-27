@@ -49,7 +49,7 @@ use egui_dock::{DockArea, DockState, TabViewer};
 use glam::Vec3;
 
 use crate::renderer::camera::{CameraView, OrbitCamera};
-use crate::scene::{Library, ObjectRef, RenderSettings, Scene, Selection, ViewportMode};
+use crate::scene::{Library, ObjectRef, RenderSettings, Scene, SelKind, Selection, ViewportMode};
 use windows::{Preferences, ProfileEditor};
 
 /// Window within which consecutive arrow-key nudges coalesce into one undo step
@@ -276,6 +276,10 @@ pub struct TransformOp {
     /// move/rotate/scale math — this is what makes screens fully grabbable
     /// (G/R/S) like every other object. Empty unless screens are selected.
     pub screen_start: Vec<(usize, glam::Mat4)>,
+    /// Original (pyro-device index, world transform) snapshot. Pyro devices carry
+    /// the SAME `Mat4` transform as screens/geometry, so they ride the identical
+    /// move/rotate/scale math. Empty unless pyro devices are selected.
+    pub pyro_start: Vec<(usize, glam::Mat4)>,
     /// Original (environment index, center, size) snapshot. Fog volumes are
     /// axis-aligned (center + size, no orientation): Move slides the centre,
     /// Rotate orbits it about the pivot (a no-op for a lone box), and Scale grows
@@ -960,6 +964,7 @@ impl Ui {
         // the chosen start slot; U disables the selected fixtures' patch entries.
         if windows::patch_dialog_window(ctx, &mut self.patch_dialog) {
             let (u, a) = (self.patch_dialog.start_universe, self.patch_dialog.start_address);
+            let kind = self.patch_dialog.kind;
             self.run_op(
                 "fixture.patch",
                 "Patch",
@@ -968,12 +973,21 @@ impl Ui {
                 dmx,
                 true,
                 |cx| {
-                    cx.patch.assign_indices(cx.scene, &cx.selection.fixtures, u, a);
+                    // Fixtures pack through the side PatchTable; pyro (inline patch)
+                    // packs through the Patchable trait. The captured scene snapshot
+                    // covers scene.pyro, so undo works for both.
+                    match kind {
+                        SelKind::Pyro => ops::patch_pyro_inline(cx.scene, &cx.selection.pyro, u, a),
+                        _ => {
+                            cx.patch.assign_indices(cx.scene, &cx.selection.fixtures, u, a);
+                        }
+                    }
                     op::OpStatus::Finished
                 },
             );
         }
         if windows::unpatch_dialog_window(ctx, &mut self.unpatch_dialog) {
+            let kind = self.unpatch_dialog.kind;
             self.run_op(
                 "fixture.unpatch",
                 "Unpatch",
@@ -982,9 +996,7 @@ impl Ui {
                 dmx,
                 true,
                 |cx| {
-                    for &fi in &cx.selection.fixtures {
-                        cx.patch.unpatch(fi);
-                    }
+                    ops::unpatch_selection(cx, kind);
                     op::OpStatus::Finished
                 },
             );
@@ -1084,6 +1096,7 @@ impl Ui {
                 AddAction::Fixture(i) => lib_prefs::LibItem::Fixture(i),
                 AddAction::Gdtf(i) => lib_prefs::LibItem::Gdtf(i),
                 AddAction::Screen(i) => lib_prefs::LibItem::Screen(i),
+                AddAction::Pyro(i) => lib_prefs::LibItem::Pyro(i),
                 AddAction::Environment(i) => lib_prefs::LibItem::Env(i),
             };
             let key = lib_prefs::entry_key(&self.library, item);
@@ -1114,6 +1127,12 @@ impl Ui {
                             .get(i)
                             .cloned()
                             .map(|p| Selection::screen(cx.scene.add_screen_at(&p, place))),
+                        AddAction::Pyro(i) => cx
+                            .library
+                            .pyro
+                            .get(i)
+                            .cloned()
+                            .map(|p| Selection::pyro(cx.scene.add_pyro_at(&p, place))),
                         AddAction::Environment(i) => cx
                             .library
                             .environments

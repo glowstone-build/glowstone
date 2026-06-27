@@ -76,11 +76,18 @@ pub(super) fn compute_pivot(scene: &Scene, objs: &[ObjectRef], mode: PivotMode, 
 /// (fixtures, then geometry, screens, environment) — the order the pivot's
 /// "active" element and the gizmo read. The single place selection → object list
 /// happens for the transform path.
-pub(super) fn obj_refs(fids: &[usize], gids: &[usize], sids: &[usize], eids: &[usize]) -> Vec<ObjectRef> {
+pub(super) fn obj_refs(
+    fids: &[usize],
+    gids: &[usize],
+    sids: &[usize],
+    pids: &[usize],
+    eids: &[usize],
+) -> Vec<ObjectRef> {
     fids.iter()
         .map(|&i| ObjectRef::Fixture(i))
         .chain(gids.iter().map(|&i| ObjectRef::Geometry(i)))
         .chain(sids.iter().map(|&i| ObjectRef::Screen(i)))
+        .chain(pids.iter().map(|&i| ObjectRef::Pyro(i)))
         .chain(eids.iter().map(|&i| ObjectRef::Environment(i)))
         .collect()
 }
@@ -96,17 +103,25 @@ pub(super) fn snapshot_starts(
     fids: &[usize],
     gids: &[usize],
     sids: &[usize],
+    pids: &[usize],
     eids: &[usize],
-) -> (Vec<(usize, Vec3, Quat)>, Vec<(usize, Mat4)>, Vec<(usize, Mat4)>, Vec<(usize, Vec3, Vec3)>) {
+) -> (
+    Vec<(usize, Vec3, Quat)>,
+    Vec<(usize, Mat4)>,
+    Vec<(usize, Mat4)>,
+    Vec<(usize, Mat4)>,
+    Vec<(usize, Vec3, Vec3)>,
+) {
     let start = fids
         .iter()
         .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
         .collect();
     let geo_start = gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
     let screen_start = sids.iter().map(|&i| (i, scene.screens[i].transform)).collect();
+    let pyro_start = pids.iter().map(|&i| (i, scene.pyro[i].transform)).collect();
     let env_start =
         eids.iter().map(|&i| (i, scene.environments[i].center, scene.environments[i].size)).collect();
-    (start, geo_start, screen_start, env_start)
+    (start, geo_start, screen_start, pyro_start, env_start)
 }
 
 /// Resolve the transform-orientation (#37) to a 3×3 whose COLUMNS are the X/Y/Z
@@ -241,6 +256,11 @@ pub(super) fn nearest_origin_screen(
             consider(s.transform.w_axis.truncate());
         }
     }
+    for d in &scene.pyro {
+        if !d.hidden {
+            consider(d.world_nozzle());
+        }
+    }
     best.map(|(_, w)| w)
 }
 
@@ -305,7 +325,7 @@ mod tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, gizmo_view: false, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), dup_extra: Vec::new(), orientation }
+        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, gizmo_view: false, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), dup_extra: Vec::new(), orientation }
     }
 
     #[test]
@@ -378,7 +398,7 @@ mod tests {
             viewport: rect,
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
-            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: Some(Axis::Z),
             gizmo_view: false,
@@ -416,6 +436,7 @@ mod tests {
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
             screen_start: Vec::new(),
+            pyro_start: Vec::new(),
             env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
@@ -455,6 +476,7 @@ mod tests {
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
             screen_start: Vec::new(),
+            pyro_start: Vec::new(),
             env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
@@ -509,6 +531,7 @@ mod tests {
             start: vec![(0, p0, scene.fixtures[0].orientation)],
             geo_start: Vec::new(),
             screen_start: Vec::new(),
+            pyro_start: Vec::new(),
             env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
@@ -707,7 +730,7 @@ mod tests {
             viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
             pivot: median,
             start: vec![(0, p0a, q0a), (1, p0b, scene.fixtures[1].orientation)],
-            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,
@@ -750,7 +773,7 @@ mod tests {
                 (0, p0a, scene.fixtures[0].orientation),
                 (1, p0b, scene.fixtures[1].orientation),
             ],
-            geo_start: Vec::new(), screen_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,

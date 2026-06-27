@@ -4,7 +4,9 @@
 //! **HDR** [`Viewport`] target. The post pipelines (volumetric raymarch, bloom,
 //! tonemap) are fullscreen passes that consume/produce those targets.
 
-use super::mesh::{LensInstance, LineVertex, MeshInstance, MeshVertex, WallInstance};
+use super::mesh::{
+    LensInstance, LineVertex, MeshInstance, MeshVertex, ParticleInstance, WallInstance,
+};
 use super::viewport::Viewport;
 
 fn load(device: &wgpu::Device, label: &str, source: &'static str) -> wgpu::ShaderModule {
@@ -209,6 +211,67 @@ pub fn wall_alpha_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout)
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: Viewport::HDR_FORMAT,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Cold-spark billboard pipeline: **additive** (`One`/`One`) so emissive sparks
+/// accumulate and bloom; depth-TESTS against the scene (occluded by geometry) but
+/// does NOT write depth (so it never clips the volumetric beams behind it, like
+/// the lens discs). Camera-only bind group; the quad is generated in the VS, so
+/// the only vertex buffer is the per-particle [`ParticleInstance`] stream.
+pub fn spark_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    particle_pipeline(device, layout, blend, "fs_spark", "spark-pipeline")
+}
+
+/// CO2 / fog billboard pipeline: **premultiplied alpha** (`One`/`OneMinusSrcAlpha`)
+fn particle_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    blend: wgpu::BlendState,
+    fs_entry: &str,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    let shader = load(device, "particles.wgsl", include_str!("../shaders/particles.wgsl"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[ParticleInstance::layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil_no_write()),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some(fs_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: Viewport::HDR_FORMAT,
@@ -529,6 +592,25 @@ pub fn volumetric_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
             // (tiled light culling — the ray's tile bounds which beams it marches).
             storage_entry(11),
             storage_entry(12),
+            // 13: CO2 volume descriptors (AABB + Z-slab layer) the raymarch loops.
+            storage_entry(13),
+            // 14: the splatted CO2 smoke density grid (3D), 15: its filtering sampler.
+            wgpu::BindGroupLayoutEntry {
+                binding: 14,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 15,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }

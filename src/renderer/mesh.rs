@@ -165,6 +165,40 @@ impl WallInstance {
     }
 }
 
+/// One billboard particle instance (`particles.wgsl`): a camera-facing,
+/// velocity-stretched sprite. The quad is generated in the vertex shader from
+/// `@builtin(vertex_index)` (no mesh vertex buffer) — this is the ONLY vertex
+/// buffer the spark/CO2 pipelines bind. Built each frame by the CPU pyro sim.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct ParticleInstance {
+    /// xyz = world centre (m), w = base half-size radius (m).
+    pub pos_radius: [f32; 4],
+    /// SPARK: rgb = HDR emission (values > 1 bloom), a = coverage alpha.
+    /// CO2:   rgb = the lit base colour (sampled stage light), a = density/alpha.
+    pub color: [f32; 4],
+    /// SPARK: xyz = world velocity (for the velocity-aligned stretch), w = stretch
+    /// multiplier (1 = round). CO2: xyz = dominant world LIGHT DIRECTION (puff→light,
+    /// for the N·L directional shading), w = 1 (no stretch).
+    pub vel_stretch: [f32; 4],
+    /// CO2 aux: x = noise phase/seed, y = self-shadow `0..1` (denser/lower = darker),
+    /// z = ambient floor, w = backlit/translucency term. Unused by sparks.
+    pub aux: [f32; 4],
+}
+
+impl ParticleInstance {
+    const ATTRS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
+
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ParticleInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
 /// A non-indexed vertex buffer plus its vertex count.
 pub struct GpuMesh {
     pub vertex_buffer: wgpu::Buffer,

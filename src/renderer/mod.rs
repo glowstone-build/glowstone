@@ -14,6 +14,7 @@ pub mod fixture_model;
 pub mod gpu_timer;
 pub mod mesh;
 mod noise;
+mod particles;
 mod pipeline;
 mod shadow;
 pub mod viewport;
@@ -34,7 +35,8 @@ use crate::scene::library::FixtureGeometry;
 use crate::scene::screen::{LedScreen, ScreenContent};
 use crate::scene::{Fixture, RenderSettings, Scene, Selection, ViewportMode};
 use camera::{CameraUniform, OrbitCamera};
-use mesh::{GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance, WallInstance};
+use mesh::{GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance, ParticleInstance, WallInstance};
+use particles::PyroSystem;
 use viewport::Viewport;
 
 /// Camera + scene data for the volumetric raymarch (mirrors `Volumetric` in
@@ -55,6 +57,38 @@ struct VolumetricUniform {
     /// w = wide-light count (unused by shader). The ray's screen tile bounds which
     /// beams it marches. Mirrors `tile` in volumetric.wgsl.
     tile: [f32; 4],
+    /// Stage-CO2 ambient: rgb = the room's ambient light colour the white smoke
+    /// reflects (so a cyan-lit stage gives a dim-cyan thick plume), w = strength.
+    /// Mirrors `co2_amb` in volumetric.wgsl.
+    co2_amb: [f32; 4],
+}
+
+/// Build the CO2 density 3D texture (+ view) at `res` voxels/axis: one `res`-tall
+/// Z-slab per emitter stacked along Z, R8, clamp-to-edge + linear. Recreated when
+/// the quality-driven resolution changes (see `Renderer::ensure_co2_res`).
+fn create_co2_density_texture(
+    device: &wgpu::Device,
+    res: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("co2-density-3d"),
+        size: wgpu::Extent3d {
+            width: res,
+            height: res,
+            depth_or_array_layers: res * particles::CO2_LAYERS,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D3),
+        ..Default::default()
+    });
+    (tex, view)
 }
 
 /// Temporal-accumulation uniform (mirrors `TemporalU` in vol_temporal.wgsl). Drives
@@ -328,6 +362,9 @@ pub struct Renderer {
     wall_pipeline: wgpu::RenderPipeline,
     /// Transparent / mesh LED walls (premultiplied alpha, no depth write).
     wall_alpha_pipeline: wgpu::RenderPipeline,
+    /// Cold-spark billboard particles (additive, depth-test no-write → bloom).
+    /// CO2 is NOT a particle pass — it's density injected into the volumetric raymarch.
+    spark_pipeline: wgpu::RenderPipeline,
     /// Selection silhouette: a mask pass marks selected surfaces into a full-res R8
     /// target (depth-tested, occlusion-correct), then an edge-detect composite adds
     /// an amber outline into the HDR before bloom. Two mask pipelines cover the two
@@ -361,6 +398,14 @@ pub struct Renderer {
     lens_instances: GrowBuffer,
     wall_instances: GrowBuffer,
     dynamic_lines: GrowBuffer,
+
+    /// Stage pyro (CO2 + cold spark): the CPU particle simulation (runtime-only,
+    /// keyed by EntityId) plus the per-frame additive-spark / alpha-CO2 instance
+    /// buffers it builds. Advanced once per real frame in [`advance_pyro`].
+    pyro: PyroSystem,
+    spark_instances: GrowBuffer,
+    /// CO2 density columns (storage buffer) the volumetric raymarch reads at binding 13.
+    co2_plumes_storage: GrowBuffer,
 
     // Imported GDTF fixture models: per-fixture-type (Arc ptr) cache of part
     // meshes (keyed by model name), plus a per-frame instance buffer.
@@ -448,6 +493,15 @@ pub struct Renderer {
     noise_texture: wgpu::Texture,
     noise_view: wgpu::TextureView,
     noise_sampler: wgpu::Sampler,
+    /// Stage-CO2 smoke density grid: the particle sim splats per-emitter density
+    /// into this 3D texture (one `co2_res`-tall Z-slab per emitter, stacked), and
+    /// the volumetric raymarch samples it (see particles.rs / volumetric.wgsl).
+    co2_density_tex: wgpu::Texture,
+    co2_density_view: wgpu::TextureView,
+    co2_density_samp: wgpu::Sampler,
+    /// Current CO2 grid resolution (voxels/axis) — driven by the max visible CO2
+    /// device's quality preset; the texture is recreated when it changes.
+    co2_res: u32,
 
     // Screen-space AO (Unlit mode only): multiply-blended onto the HDR.
     ssao_pipeline: wgpu::RenderPipeline,
@@ -472,6 +526,11 @@ pub struct Renderer {
     /// render never disturbs the interactive preview's size or content. `None` when
     /// no render has run this session.
     render_view: Option<Viewport>,
+    /// True while recording a high-quality RENDER (still capture / render-view) vs
+    /// the live preview: the CO2 raymarch uses full beam-blocking + multi-tap
+    /// self-shadow when set, and the cheaper preview path when not (the preview-vs-
+    /// render quality split). Routed to `VolumetricUniform.tile.w`.
+    hq_co2: bool,
     /// The GPU backend this renderer is running on (Metal / Vulkan / DX12 / GL).
     active_backend: wgpu::Backend,
     /// Every backend that has a usable adapter on this machine — the options the
@@ -724,6 +783,9 @@ impl Renderer {
         });
         let wall_pipeline = pipeline::wall_pipeline(&device, &wall_layout);
         let wall_alpha_pipeline = pipeline::wall_alpha_pipeline(&device, &wall_layout);
+        // Cold-spark billboard particles: the quad is built in the VS, so they need
+        // only the camera (group 0). (CO2 is volumetric — no particle pipeline.)
+        let spark_pipeline = pipeline::spark_pipeline(&device, &line_layout);
         // Selection-mask pipelines: camera-only layout (the mask shader reads only
         // group 0); the same instance buffers as the forward pass feed them.
         let sel_mask_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -808,6 +870,10 @@ impl Renderer {
         let lens_instances = GrowBuffer::new(&device, "lens-instances", vertex, inst * 64);
         let wall_inst = std::mem::size_of::<WallInstance>() as u64;
         let wall_instances = GrowBuffer::new(&device, "wall-instances", vertex, wall_inst * 8);
+        let part_inst = std::mem::size_of::<ParticleInstance>() as u64;
+        let spark_instances = GrowBuffer::new(&device, "spark-instances", vertex, part_inst * 4096);
+        let co2_plumes_storage =
+            GrowBuffer::new(&device, "co2-plumes", wgpu::BufferUsages::STORAGE, 64 * 16);
         let dynamic_lines = GrowBuffer::new(&device, "dynamic-lines", vertex, 8192);
         let gdtf_instances = GrowBuffer::new(&device, "gdtf-instances", vertex, inst * 32);
         let scene_geom_instances =
@@ -907,6 +973,21 @@ impl Renderer {
             ..Default::default()
         });
 
+        // --- stage CO2 density grid: per-emitter splatted smoke density, stacked
+        // one `res`-tall Z-slab per emitter. Resolution is dynamic (device quality);
+        // recreated by `ensure_co2_res`. Clamp-to-edge + linear, R8 (256 levels). ---
+        let co2_res = particles::CO2_RES_INIT;
+        let (co2_density_tex, co2_density_view) = create_co2_density_texture(&device, co2_res);
+        let co2_density_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("co2-density-samp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         // --- screen-space AO (Unlit mode) ---
         let ssao_layout = pipeline::ssao_bind_group_layout(&device);
         let ssao_pipeline = pipeline::ssao_pipeline(&device, &ssao_layout);
@@ -979,6 +1060,7 @@ impl Renderer {
             lens_pipeline,
             wall_pipeline,
             wall_alpha_pipeline,
+            spark_pipeline,
             sel_mask_mesh_pipeline,
             sel_mask_wall_pipeline,
             sel_outline_pipeline,
@@ -998,6 +1080,9 @@ impl Renderer {
             fixture_instances,
             lens_instances,
             wall_instances,
+            pyro: PyroSystem::new(),
+            spark_instances,
+            co2_plumes_storage,
             dynamic_lines,
             gdtf_cache: HashMap::new(),
             gdtf_instances,
@@ -1041,6 +1126,10 @@ impl Renderer {
             noise_texture,
             noise_view,
             noise_sampler,
+            co2_density_tex,
+            co2_density_view,
+            co2_density_samp,
+            co2_res,
             bloom_bright,
             bloom_blur_h,
             bloom_blur_v,
@@ -1052,6 +1141,7 @@ impl Renderer {
             egui_renderer,
             viewport,
             render_view: None,
+            hq_co2: false,
             active_backend,
             available_backends,
         }
@@ -1117,6 +1207,37 @@ impl Renderer {
     /// the fog/beams don't drift across the accumulation frames.
     pub fn set_anim_time(&mut self, t: f32) {
         self.anim_time = t;
+    }
+
+    /// Advance the stage-pyro particle simulation by `dt` (once per real frame,
+    /// from the app update tick — NEVER from `record_scene`, which also runs for
+    /// headless capture: the double-advance trap, same rule as wheel motion). The
+    /// camera position drives the distance LOD. Reads the per-device control state
+    /// `dmx::decode::apply_pyro` wrote into the scene this frame.
+    pub fn advance_pyro(&mut self, scene: &Scene, cam_pos: Vec3, dt: f32) {
+        // CO2 grid resolution = the crispest (max quality) visible CO2 device wants;
+        // recreate the density texture when it changes, then splat at that res.
+        let res = scene
+            .pyro
+            .iter()
+            .filter(|d| !d.hidden && d.kind == crate::scene::pyro::PyroKind::Co2Jet)
+            .map(|d| particles::quality_res(d.quality))
+            .max()
+            .unwrap_or(particles::CO2_RES_INIT);
+        self.ensure_co2_res(res);
+        self.pyro.advance(scene, cam_pos, self.anim_time, dt, self.co2_res);
+    }
+
+    /// Recreate the CO2 density texture at `res` voxels/axis if it differs from the
+    /// current resolution (the per-frame bind group picks up the new view).
+    fn ensure_co2_res(&mut self, res: u32) {
+        if res == self.co2_res {
+            return;
+        }
+        let (tex, view) = create_co2_density_texture(&self.device, res);
+        self.co2_density_tex = tex;
+        self.co2_density_view = view;
+        self.co2_res = res;
     }
 
     /// Resize the offscreen 3D target to match the viewport panel.
@@ -1277,7 +1398,13 @@ impl Renderer {
             screen_descriptor,
         );
 
-        // The 3D scene + volumetrics + post resolve into the LDR target.
+        // The 3D scene + volumetrics + post resolve into the LDR target. The live
+        // viewport uses the cheaper CO2 raymarch UNLESS a visible CO2 device opts into
+        // full-quality preview (`viewport_hq`); renders are always full quality.
+        self.hq_co2 = scene
+            .pyro
+            .iter()
+            .any(|d| !d.hidden && d.kind == crate::scene::pyro::PyroKind::Co2Jet && d.viewport_hq);
         self.record_scene(&mut encoder, scene, camera, selection, settings);
 
         // egui (panels + the viewport image, which samples the LDR target) -> surface.
@@ -1351,6 +1478,9 @@ impl Renderer {
         settings: &RenderSettings,
     ) -> (u32, u32, Vec<u8>) {
         let (width, height) = self.viewport.size;
+        // Headless screenshot = a RENDER → full-quality CO2 (PREVIZ_CO2_PREVIEW forces
+        // the cheaper preview path so the split can be A/B'd from the same harness).
+        self.hq_co2 = std::env::var("PREVIZ_CO2_PREVIEW").is_err();
 
         // Warm up the temporal accumulation: a single headless frame would show the raw
         // jittered (dithered) raymarch, so render several static frames first to let the
@@ -1359,7 +1489,15 @@ impl Renderer {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(28);
+        // Advance the animation clock + pyro sim each warmup frame so the temporal EMA
+        // converges to the SAME moving-content result the live render shows. A frozen
+        // clock converges to a crisp static pattern the real (time-advancing) render
+        // never sees — the verification trap that made smoke look crisper here than live.
+        let dt = 1.0 / 60.0;
+        let eye = camera.eye();
         for _ in 0..warmup {
+            self.anim_time += dt;
+            self.advance_pyro(scene, eye, dt);
             let mut warm = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("warm") });
@@ -1474,6 +1612,7 @@ impl Renderer {
             return false;
         };
         std::mem::swap(&mut self.viewport, &mut rv); // self.viewport := render target; rv := live
+        self.hq_co2 = true; // deliberate render → full-quality CO2 (preview/render split)
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render-view-encoder") });
@@ -2210,6 +2349,84 @@ impl Renderer {
         // moving smoke clusters, so we hold less history (let them live) instead of
         // smearing them into a smooth average.
         let fog_uniformity = fog.map(|f| f.uniformity).unwrap_or(1.0);
+
+        // --- stage CO2 plumes: density injected into the raymarch (see particles.rs) ---
+        // Build/upload the density columns; their union AABB EXTENDS the march bounds,
+        // so a tall plume isn't clipped by a small (or absent) fog box. CO2 makes the
+        // volumetric pass run even with no haze box — it's its own participating media,
+        // lit by every beam that scatters through it (the proven volumetric look).
+        // Each active emitter's splatted density grid is written into its own
+        // Z-slab of co2_density_tex; the descriptor (AABB + layer) goes to the
+        // storage buffer the raymarch loops.
+        let res = self.co2_res;
+        let grid_voxels = (res * res * res) as usize;
+        let mut scratch = vec![0u8; grid_voxels];
+        let mut co2_upload: Vec<particles::Co2Volume> = Vec::new();
+        for (layer, &id) in self
+            .pyro
+            .co2_ids
+            .iter()
+            .enumerate()
+            .take(particles::CO2_LAYERS as usize)
+        {
+            let Some(grid) = self.pyro.co2_grid(id) else {
+                continue;
+            };
+            if grid.len() != grid_voxels {
+                continue; // sim hasn't re-splatted at the new res yet (next frame will)
+            }
+            for (o, d) in grid.iter().enumerate() {
+                scratch[o] = (d.clamp(0.0, 1.0) * 255.0) as u8;
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.co2_density_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer as u32 * res,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &scratch,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(res),
+                    rows_per_image: Some(res),
+                },
+                wgpu::Extent3d {
+                    width: res,
+                    height: res,
+                    depth_or_array_layers: res,
+                },
+            );
+            let mut v = self.pyro.co2_vol[layer];
+            v.box_size[3] = layer as f32; // texture Z-slab layer index for the shader
+            co2_upload.push(v);
+        }
+        let has_co2 = !co2_upload.is_empty() && settings.mode == ViewportMode::Beauty;
+        // Media (raymarch) bounds + look = the fog box, UNIONed with the plume AABBs.
+        let mut media_min = fog.map(|f| f.min()).unwrap_or(Vec3::splat(f32::INFINITY));
+        let mut media_max = fog.map(|f| f.max()).unwrap_or(Vec3::splat(f32::NEG_INFINITY));
+        for v in &co2_upload {
+            let lo = Vec3::from_slice(&v.box_min[..3]);
+            media_min = media_min.min(lo);
+            media_max = media_max.max(lo + Vec3::from_slice(&v.box_size[..3]));
+        }
+        if co2_upload.is_empty() {
+            co2_upload.push(particles::Co2Volume::zeroed()); // keep the storage binding non-empty
+        }
+        let co2_n = self
+            .co2_plumes_storage
+            .upload(&self.device, &self.queue, &co2_upload);
+        let media_density = fog.map(|f| f.density).unwrap_or(0.0);
+        let media_color = fog.map(|f| f.color).unwrap_or([1.0, 1.0, 1.0]);
+        let media_g = fog.map(|f| f.anisotropy).unwrap_or(0.4);
+        let media_contrast = fog.map(|f| f.cluster_contrast).unwrap_or(0.0);
+        // Run the volumetric pass when there's haze OR active CO2.
+        let has_media = has_fog || has_co2;
+
         // Hybrid froxel volumetric — opt-in (off by default; the per-pixel raymarch
         // is the default renderer). Enabled only when the adapter supports it and the
         // user turns it on (settings toggle), or PREVIZ_NOFROXEL is unset.
@@ -2634,7 +2851,7 @@ impl Renderer {
             .lens_instances
             .upload(&self.device, &self.queue, &lens_instances);
 
-        if let Some(fog) = fog {
+        if has_media {
             let inv_vp = camera.view_proj(aspect).inverse();
             let eye = camera.eye();
             // Constant-dt target for the raymarch: a full-diagonal ray spends the
@@ -2671,16 +2888,43 @@ impl Renderer {
             // Stays well under the pre-tiling per-ray cost. Scale with the `steps` quality knob.
             let beam_sample_budget = settings.steps.max(40) as f32 * 40.0;
             let step_cap = (beam_sample_budget / march_beams as f32).clamp(64.0, 176.0);
-            let target_dt = (fog.max() - fog.min()).length() / step_cap;
+            let target_dt = (media_max - media_min).length() / step_cap;
+            // Ambient stage colour the white CO2 reflects: the intensity-weighted
+            // average HUE of the beams (a cyan rig → a dim-cyan plume), neutral-cool
+            // fallback when dark. Thick white smoke reads DIM in this, with bright
+            // beam highlights layered on by the scatter loop.
+            let mut amb_col = Vec3::ZERO;
+            let mut amb_w = 0.0_f32;
+            for fxg in &gpu_fixtures {
+                let c = Vec3::new(fxg.color[0], fxg.color[1], fxg.color[2]);
+                let m = c.max_element();
+                if m > 1e-3 {
+                    let wgt = m.min(50.0);
+                    amb_col += (c / m) * wgt;
+                    amb_w += wgt;
+                }
+            }
+            let amb_hue = if amb_w > 1e-3 {
+                amb_col / amb_w
+            } else {
+                Vec3::new(0.70, 0.78, 0.92)
+            };
+            // Ambient STRENGTH from the scene's actual ambient light (world IBL + how
+            // lit the room is by beams) — a dark stage gives dark smoke, a bright one
+            // brighter (not a fixed value). Kept modest: thick white smoke reads DIM
+            // in ambient, with the beams doing the bright lighting.
+            let world_amb = (scene.world.ambient * scene.world.brightness).clamp(0.0, 4.0);
+            let beam_level = (amb_w / 300.0).min(1.0);
+            let co2_amb_strength = (0.10 + 0.12 * world_amb + 0.26 * beam_level).clamp(0.08, 0.5);
             let vol = VolumetricUniform {
                 inv_view_proj: inv_vp.to_cols_array_2d(),
                 eye_time: [eye.x, eye.y, eye.z, time],
-                fog_min_density: [fog.min().x, fog.min().y, fog.min().z, fog.density],
-                fog_max_g: [fog.max().x, fog.max().y, fog.max().z, fog.anisotropy],
+                fog_min_density: [media_min.x, media_min.y, media_min.z, media_density],
+                fog_max_g: [media_max.x, media_max.y, media_max.z, media_g],
                 albedo_beam: [
-                    fog.color[0],
-                    fog.color[1],
-                    fog.color[2],
+                    media_color[0],
+                    media_color[1],
+                    media_color[2],
                     settings.beam_intensity,
                 ],
                 counts: [
@@ -2702,19 +2946,29 @@ impl Renderer {
                 chroma: [
                     settings.chroma_haze,
                     (self.frame_index % 64) as f32,
-                    fog.uniformity, // z = haze uniformity (1 smooth … 0 clustered)
-                    fog.cluster_contrast, // w = cluster vs haze density contrast
+                    fog_uniformity, // z = haze uniformity (1 smooth … 0 clustered)
+                    media_contrast, // w = cluster vs haze density contrast
                 ],
                 // Tiled light culling: same full-res grid the mesh pass uses (render_mode.zw),
-                // so the ray scans exactly the beams its tile holds.
-                tile: [tiles_x as f32, tiles_y as f32, LIGHT_TILE_PX as f32, 0.0],
+                // so the ray scans exactly the beams its tile holds. w = CO2 quality flag
+                // (1 = full-quality render: beam-blocking + multi-tap self-shadow; 0 =
+                // cheaper live preview — the preview-vs-render split).
+                tile: [
+                    tiles_x as f32,
+                    tiles_y as f32,
+                    LIGHT_TILE_PX as f32,
+                    if self.hq_co2 { 1.0 } else { 0.0 },
+                ],
+                // rgb = ambient room hue the CO2 reflects; w = scene-driven strength
+                // (dim — the smoke is thick white, so it reads dim-coloured + beam highlights).
+                co2_amb: [amb_hue.x, amb_hue.y, amb_hue.z, co2_amb_strength],
             };
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
 
             if use_froxel {
                 if let Some(fx) = &self.froxel {
-                    let (lo, hi) = (fog.min(), fog.max());
+                    let (lo, hi) = (media_min, media_max);
                     let near = 0.3_f32;
                     // Far = distance to the farthest fog-box corner, so the grid
                     // spans the whole box along every ray.
@@ -2729,9 +2983,9 @@ impl Renderer {
                     let fu = FroxelUniform {
                         inv_view_proj: inv_vp.to_cols_array_2d(),
                         eye_time: [eye.x, eye.y, eye.z, time],
-                        fog_min_density: [lo.x, lo.y, lo.z, fog.density],
-                        fog_max_g: [hi.x, hi.y, hi.z, fog.anisotropy],
-                        albedo_beam: [fog.color[0], fog.color[1], fog.color[2], settings.beam_intensity],
+                        fog_min_density: [lo.x, lo.y, lo.z, media_density],
+                        fog_max_g: [hi.x, hi.y, hi.z, media_g],
+                        albedo_beam: [media_color[0], media_color[1], media_color[2], settings.beam_intensity],
                         dims: [
                             fx.dims.0 as f32,
                             fx.dims.1 as f32,
@@ -2873,6 +3127,28 @@ impl Renderer {
                     binding: 12,
                     resource: self.tile_lights.buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    // 13: stage CO2 volume descriptors (AABB + Z-slab layer) — bind
+                    // only the used portion so `arrayLength` returns the real emitter
+                    // count (>= 1; a zero dummy when none, contributing no density).
+                    binding: 13,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.co2_plumes_storage.buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            co2_n as u64 * std::mem::size_of::<particles::Co2Volume>() as u64,
+                        ),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    // 14/15: the splatted CO2 smoke density grid + its sampler.
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(&self.co2_density_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::Sampler(&self.co2_density_samp),
+                },
             ],
         });
         // Froxel compute + composite bind groups (only when the froxel path runs).
@@ -2923,7 +3199,7 @@ impl Renderer {
         // blends it in, converging the jitter into a smooth beam. History weight ramps
         // up while STATIC and drops when the camera or any beam moves (so moving beams
         // don't ghost). Runs whenever the raymarch path renders fog.
-        let temporal_on = has_fog && settings.mode == ViewportMode::Beauty;
+        let temporal_on = has_media && settings.mode == ViewportMode::Beauty;
         // The raymarch (and thus the temporal pass) actually runs unless we're in
         // froxel-only mode with no hero beams (mirrors the pass gate below).
         let raymarch_ran = temporal_on && (!use_froxel || n_shadows > 0);
@@ -2956,7 +3232,14 @@ impl Renderer {
             // History cap scales with uniformity: smooth fog accumulates hard (0.92) for
             // glass-smooth beams; clustered fog holds little (down to ~0.55) so the moving
             // smoke pockets stay crisp and alive instead of averaging into a smear.
-            let hist_cap = 0.55 + 0.37 * fog_uniformity;
+            let mut hist_cap = 0.55 + 0.37 * fog_uniformity;
+            // Active CO2 is fine, fast-MOVING cauliflower detail — same as clustered
+            // smoke, it must NOT be hard-accumulated or the temporal EMA averages the
+            // lumps into a smooth blob (the "crisp in a frozen still, smooth when it
+            // actually animates" trap). Hold little history so the pockets stay crisp.
+            if has_co2 {
+                hist_cap = hist_cap.min(0.42);
+            }
             let opacity = if !history_valid {
                 0.0 // first frame / resize / froxel-skip → trust this frame fully
             } else if moving {
@@ -3474,7 +3757,7 @@ impl Renderer {
 
         // Pass 2a: volumetric raymarch -> half-res vol target (scatter, transmit).
         // Pass 2b: upsample + composite into the HDR scene.
-        if has_fog && settings.mode == ViewportMode::Beauty {
+        if has_media && settings.mode == ViewportMode::Beauty {
             // HYBRID stage 1 — the froxel volume carries the wide/dim "masses"
             // (all non-hero beams) at a cost decoupled from beam count, with no
             // dither/banding and full mid-air occlusion. inject → integrate →
@@ -3583,6 +3866,42 @@ impl Renderer {
             }
         }
 
+        // Pass 2.8: COLD-SPARK billboard particles — additive emissive embers drawn
+        // into the HDR AFTER the volumetric composite (beams read behind them) and
+        // BEFORE bloom (so they glow). Depth-TESTED against the forward depth
+        // (occluded by geometry), NO depth write. The quad is built in the VS, so the
+        // only vertex buffer is the per-particle instance stream (group 0 = camera).
+        // (CO2 is participating media, injected into the volumetric raymarch above —
+        // not drawn here.)
+        let spark_count = self
+            .spark_instances
+            .upload(&self.device, &self.queue, &self.pyro.spark);
+        if spark_count > 0 && settings.mode != ViewportMode::Wireframe {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("spark-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.viewport.hdr_view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.viewport.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                ..Default::default()
+            });
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_pipeline(&self.spark_pipeline);
+            pass.set_vertex_buffer(0, self.spark_instances.buffer.slice(..));
+            pass.draw(0..6, 0..spark_count);
+        }
+
         // Pass 2.9: SELECTION OUTLINE — edge-detect the sel_mask and ADD a bright
         // amber silhouette ring into the HDR (blend One/One), BEFORE bloom so the
         // outline glows slightly. Only when something selectable is selected.
@@ -3613,6 +3932,7 @@ impl Renderer {
         // Pass 4: separable blur (bloom[0] -> bloom[1] -> bloom[0]).
         self.fullscreen(encoder, "bloom-blur-h", &self.bloom_blur_h, self.viewport.bloom_view(1), &blur_h_bg, self.ts_rp(gpu_timer::P_BLOOM_H));
         self.fullscreen(encoder, "bloom-blur-v", &self.bloom_blur_v, self.viewport.bloom_view(0), &blur_v_bg, self.ts_rp(gpu_timer::P_BLOOM_V));
+
         // Pass 5: tonemap/resolve (HDR + bloom -> LDR, sRGB-encoded).
         self.fullscreen(encoder, "tonemap", &self.tonemap_pipeline, self.viewport.ldr_view(), &tonemap_bg, self.ts_rp(gpu_timer::P_TONEMAP));
 

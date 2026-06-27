@@ -37,6 +37,8 @@ pub mod icon {
     pub const IMAGE: &str = p::IMAGE;
     pub const GEOMETRY: &str = p::CUBE;
     pub const SCREEN: &str = p::MONITOR;
+    /// Stage pyro devices (CO2 cannon + cold-spark machine).
+    pub const PYRO: &str = p::FLAME;
     pub const CATEGORY: &str = p::TAG;
     // Actions
     pub const ADD: &str = p::PLUS;

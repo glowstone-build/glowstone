@@ -677,6 +677,81 @@ pub fn apply_screens(screens: &mut [crate::scene::LedScreen], snap: &UniverseSna
     }
 }
 
+/// Decode the inline-patched stage-pyro devices (CO2 cannons + cold-spark
+/// machines), mirroring [`apply_screens`] — they are patched directly on the
+/// device (a [`PyroPatch`](crate::scene::pyro::PyroPatch)), NOT through the
+/// fixture `PatchTable`. Per the verified DMX footprints (see
+/// `docs/RESEARCH-pyro.md` §2): Arm/Safety windows, a high-window Blast/Spark
+/// trigger, height + macros. Writes the runtime control fields (`driven`,
+/// `armed`, `fire`, live `height_m`/`pan`/`tilt`/`spin_rpm`) the renderer's sim
+/// reads. A device whose universe is NOT present in the snapshot stays
+/// **un-driven** so it free-runs at its `density` (the previz-preview default).
+pub fn apply_pyro(pyro: &mut [crate::scene::PyroDevice], snap: &UniverseSnapshot) {
+    use crate::scene::pyro::{PyroKind, PyroMode};
+    for d in pyro.iter_mut() {
+        let Some(patch) = d.patch else {
+            d.driven = false;
+            continue;
+        };
+        // Only obey DMX when the patched universe is actually being received;
+        // otherwise free-run so a freshly-patched device still previews.
+        if snap.get(patch.universe).is_none() {
+            d.driven = false;
+            continue;
+        }
+        d.driven = true;
+        let read = |off: u16| -> u8 { snap.level(patch.universe, patch.address + off).unwrap_or(0) };
+        let unit = |v: u8| v as f32 / 255.0;
+
+        match d.kind {
+            PyroKind::Co2Jet => {
+                if d.mode == PyroMode::Minimal {
+                    // 1ch: Blast (200–255 fires); no separate arm.
+                    d.armed = true;
+                    d.fire = if read(0) >= 200 { 1.0 } else { 0.0 };
+                } else {
+                    // 7ch: Arm, Blast, Intensity, Duration, Pan, Tilt, Speed.
+                    let arm = read(0);
+                    let blast = read(1);
+                    let intensity = read(2);
+                    d.armed = (100..=199).contains(&arm);
+                    let amt = unit(intensity).max(0.4); // intensity scales plume output
+                    d.fire = if d.armed && blast >= 200 { amt } else { 0.0 };
+                    d.pan = (unit(read(4)) - 0.5) * 180.0; // ±90°
+                    d.tilt = (unit(read(5)) - 0.5) * 120.0; // ±60°
+                }
+            }
+            PyroKind::ColdSpark => {
+                // 3ch/5ch share Safety, Spark, Height; 5ch adds Function + Oscillation.
+                let safety = read(0);
+                let spark = read(1);
+                let height = read(2);
+                d.armed = (50..=200).contains(&safety);
+                d.fire = if d.armed && spark >= 10 { unit(spark) } else { 0.0 };
+                // Height channel → 1.5..6 m (the device's working apex).
+                d.height_m = 1.5 + unit(height) * (6.0 - 1.5);
+                if d.mode == PyroMode::Rich {
+                    let func = read(3);
+                    let osc = read(4);
+                    if (20..=40).contains(&func) {
+                        d.armed = false; // EMERGENCY STOP
+                        d.fire = 0.0;
+                    } else if (60..=80).contains(&func) {
+                        d.fire = 0.0; // Clear Material (suppress spray)
+                    }
+                    d.spin_rpm = if (16..=135).contains(&osc) {
+                        (osc - 16) as f32 / 119.0 * 100.0 // CW
+                    } else if osc >= 136 {
+                        -((osc - 136) as f32 / 119.0 * 100.0) // CCW
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

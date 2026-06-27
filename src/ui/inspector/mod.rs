@@ -19,6 +19,7 @@ mod environment;
 mod fixture;
 mod optics;
 mod props;
+mod pyro;
 mod screen;
 mod world;
 pub use props::{Inspect, Props};
@@ -710,6 +711,13 @@ fn inspector_body(
         return;
     }
 
+    // Pyro devices (CO2 cannons + cold-spark machines) take the Inspector.
+    let pyro: Vec<usize> = selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
+    if let Some(&primary) = pyro.first() {
+        pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state);
+        return;
+    }
+
     // Keep only still-valid fixture indices.
     let ids: Vec<usize> = selection
         .fixtures
@@ -827,6 +835,48 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
         // Pure move: rewrite only the translation column, keeping the original
         // (possibly non-uniform) basis intact.
         g.transform.w_axis = pos.extend(1.0);
+    }
+}
+
+/// Inspector for a selected stage **pyro device** (CO2 cannon or cold-spark
+/// machine): the heading/Visible chrome + the decomposed transform here, then the
+/// kind-aware Effect/Movement/Quality/DMX grid via `impl Inspect for PyroDevice`.
+/// Mirrors [`geometry_inspector`] (the device stores a `Mat4`, decomposed/recomposed
+/// on edit) — when patched + receiving live DMX the Effect values are console-driven,
+/// otherwise they are the free-run preview values.
+fn pyro_inspector(ui: &mut egui::Ui, d: &mut crate::scene::PyroDevice, count: usize, state: &mut InspectorState) {
+    ui.heading(d.name.as_str());
+    ui.label(RichText::new(format!("{} · {}", d.kind.label(), d.profile_name)).weak().small());
+    if count > 1 {
+        ui.label(RichText::new(format!("{count} devices — editing the active one")).weak().small());
+    }
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        let mut visible = !d.hidden;
+        if ui.checkbox(&mut visible, "Visible").changed() {
+            d.hidden = !visible;
+        }
+    });
+
+    // Transform (position + rotation; nozzle at origin, fires +Y). Position is
+    // lossless (translation column only); Rotation recomposes to a clean basis only
+    // when the user edits it (no scale — the device transform is rigid).
+    let mut pos = d.transform.w_axis.truncate();
+    let mut rot = glam::Quat::from_mat4(&d.transform);
+    let mut pos_changed = false;
+    let mut rot_changed = false;
+    props::with(ui, state, |p| {
+        p.group("Transform", theme::icon::INSPECTOR, true, |p| {
+            pos_changed |= p.vec3("Position", &mut pos).speed(0.05).show();
+            rot_changed |= p.rotation("Rotation", &mut rot);
+        });
+        d.inspect(p);
+    });
+    if rot_changed {
+        d.transform = Mat4::from_rotation_translation(rot, pos);
+    } else if pos_changed {
+        d.transform.w_axis = pos.extend(1.0);
     }
 }
 

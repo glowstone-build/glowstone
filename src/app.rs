@@ -369,6 +369,63 @@ impl ApplicationHandler for App {
             state.ui.selection = crate::scene::Selection::screen(idx);
         }
 
+        // Optional stage-pyro demo: PREVIZ_PYRO=spark|co2|both builds a stage of
+        // cold-spark fountains and/or CO2 jets (with a coloured back-wash so the
+        // white plumes catch stage colour) to verify the billboard particle pass
+        // headlessly. The sim is primed in the PREVIZ_SCREENSHOT path before capture.
+        if std::env::var("PREVIZ_PYRO").is_ok() {
+            use crate::scene::pyro::PyroKind;
+            let state = self.state.as_mut().unwrap();
+            let lib = crate::scene::Library::standard();
+            let mode = std::env::var("PREVIZ_PYRO").unwrap_or_default().to_lowercase();
+            let sparks = mode != "co2";
+            let co2 = mode != "spark";
+            // Rebuild the stage: drop the single demo PAR.
+            state.scene.fixtures.clear();
+            if sparks {
+                let prof = lib.pyro.iter().find(|p| p.kind == PyroKind::ColdSpark).unwrap();
+                for k in 0..6 {
+                    let x = -5.0 + k as f32 * 2.0;
+                    state.scene.add_pyro_at(prof, glam::Vec3::new(x, 0.0, 1.5));
+                }
+            }
+            if co2 {
+                let prof = lib.pyro.iter().find(|p| p.kind == PyroKind::Co2Jet).unwrap();
+                for &x in &[-3.5f32, 0.0, 3.5] {
+                    let i = state.scene.add_pyro_at(prof, glam::Vec3::new(x, 0.0, -3.0));
+                    state.scene.pyro[i].density = 1.0; // free-run blast for the still
+                }
+                // Coloured back-wash so the white CO2 plumes read in stage colour.
+                if let Some(par) = lib.fixtures.first() {
+                    let mut add = |pos: glam::Vec3, color: [f32; 3], tilt: f32| {
+                        let idx = state.scene.add_fixture_at(par, pos);
+                        let f = &mut state.scene.fixtures[idx];
+                        f.color = color;
+                        f.intensity = 1.0;
+                        f.tilt = tilt;
+                        f.snap_movement();
+                    };
+                    add(glam::Vec3::new(-4.0, 5.0, -7.0), [0.12, 0.85, 1.0], 60.0); // cyan
+                    add(glam::Vec3::new(4.0, 5.0, -7.0), [1.0, 0.12, 0.55], 60.0); // magenta
+                    add(glam::Vec3::new(0.0, 6.0, -8.0), [0.25, 0.55, 1.0], 72.0); // blue
+                }
+                // PREVIZ_PYRO_NOHAZE removes the fog box so there are NO volumetric
+                // beams — only the CO2 smoke is visible (isolate the smoke look).
+                if std::env::var("PREVIZ_PYRO_NOHAZE").is_ok() {
+                    state.scene.environments.clear();
+                }
+            }
+            // A front, slightly-low stage camera looking into the rig.
+            state.camera.target = glam::Vec3::new(0.0, 2.2, -1.0);
+            state.camera.distance = 17.0;
+            state.camera.yaw = 0.0;
+            state.camera.pitch = -0.12;
+            // Select the first device so a PREVIZ_UI shot shows the pyro inspector.
+            if !state.scene.pyro.is_empty() && std::env::var("PREVIZ_PYRO_SELECT").is_ok() {
+                state.ui.selection = crate::scene::Selection::pyro(0);
+            }
+        }
+
         // Optional MVR scene import for testing: PREVIZ_MVR=scene.mvr loads a full
         // scene (fixtures + static stage/truss geometry), replacing the demo
         // fixtures, and frames the camera on the rig.
@@ -611,6 +668,15 @@ impl ApplicationHandler for App {
             // Headless render skips the per-frame motion integrator; settle the
             // posed heads so the screenshot shows the commanded pan/tilt.
             state.scene.snap_movement();
+            // Prime the stage-pyro particle sim: capture() doesn't advance it (that's
+            // the live update tick), so step it to a steady state with the FINAL
+            // camera so the fountains/plumes are fully developed in the still.
+            if !state.scene.pyro.is_empty() {
+                let eye = state.camera.eye();
+                for _ in 0..150 {
+                    state.renderer.advance_pyro(&state.scene, eye, 1.0 / 60.0);
+                }
+            }
             let (w, h, pixels) =
                 state
                     .renderer
@@ -1449,6 +1515,12 @@ impl State {
             // Advance time-based wheel motion once per real frame (not in the
             // renderer, which also runs for headless capture).
             self.scene.advance(dt);
+
+            // Advance the stage-pyro particle simulation once per real frame too
+            // (same rule — never in the renderer's record_scene). Reads the
+            // per-device trigger state DMX decode wrote above; the camera position
+            // drives the distance LOD.
+            self.renderer.advance_pyro(&self.scene, self.camera.eye(), dt);
 
             // Advance the renderer's animation clock by the SAME dt, so fog drift +
             // beam animation track the logical scene time (not wall-clock). Frozen

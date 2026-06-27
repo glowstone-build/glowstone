@@ -302,6 +302,7 @@ impl<'a> Props<'a> {
             decimals: None,
             default: None,
             slider: false,
+            no_clamp: false,
             enabled: true,
             tip: None,
             text_value: None,
@@ -512,6 +513,10 @@ pub struct NumField<'p, 'a> {
     decimals: Option<usize>,
     default: Option<f32>,
     slider: bool,
+    /// When set, a `.slider()` never CLAMPS to its range — the range only suggests a
+    /// span for the bar; the user can type/drag any value past it
+    /// ([`egui::SliderClamping::Never`]). Used by the pyro Effect/Movement sliders.
+    no_clamp: bool,
     enabled: bool,
     tip: Option<String>,
     /// Slider readout override (e.g. zoom shown as "58°" instead of the raw 0–1).
@@ -549,6 +554,13 @@ impl<'p, 'a> NumField<'p, 'a> {
     }
     pub fn slider(mut self) -> Self {
         self.slider = true;
+        self
+    }
+    /// Make this slider's range a SUGGESTION, not a clamp — the user can type or drag
+    /// any value past the bar's ends ([`egui::SliderClamping::Never`]). No effect on a
+    /// non-slider field. Used by the pyro Effect/Movement sliders.
+    pub fn no_clamp(mut self) -> Self {
+        self.no_clamp = true;
         self
     }
     pub fn enabled(mut self, e: bool) -> Self {
@@ -596,12 +608,16 @@ impl<'p, 'a> NumField<'p, 'a> {
                 let range = self.range.clone();
                 let tip = self.tip.clone();
                 let text_value = self.text_value.clone();
-                let (speed, suffix, decimals, slider, enabled) =
-                    (self.speed, self.suffix, self.decimals, self.slider, self.enabled);
+                let (speed, suffix, decimals, slider, enabled, no_clamp) =
+                    (self.speed, self.suffix, self.decimals, self.slider, self.enabled, self.no_clamp);
                 let mut changed = false;
                 let build = |ui: &mut egui::Ui| {
                     let resp = if slider {
                         let mut s = Slider::new(value, range.unwrap_or(0.0..=1.0));
+                        if no_clamp {
+                            // The range only suggests a span — typing/dragging past it is allowed.
+                            s = s.clamping(egui::SliderClamping::Never);
+                        }
                         if let Some(n) = decimals {
                             s = s.max_decimals(n);
                         }

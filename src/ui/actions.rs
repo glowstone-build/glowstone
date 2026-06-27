@@ -1,5 +1,5 @@
 use super::*;
-use super::ops::next_free_slot;
+use super::ops::{next_free_slot, patchable_count};
 
 impl Ui {
     /// AABB of the current selection (or whole scene if nothing selected),
@@ -36,6 +36,9 @@ impl Ui {
             for i in 0..scene.screens.len() {
                 grow(scene.object_world_bounds(ObjectRef::Screen(i)));
             }
+            for i in 0..scene.pyro.len() {
+                grow(scene.object_world_bounds(ObjectRef::Pyro(i)));
+            }
         }
 
         if !any {
@@ -67,6 +70,12 @@ impl Ui {
         for &i in &self.selection.screens {
             if let Some(s) = scene.screens.get(i) {
                 sum += s.transform.w_axis.truncate();
+                n += 1.0;
+            }
+        }
+        for &i in &self.selection.pyro {
+            if let Some(p) = scene.pyro.get(i) {
+                sum += p.transform.w_axis.truncate();
                 n += 1.0;
             }
         }
@@ -136,8 +145,9 @@ impl Ui {
         use shortcuts::{Action, Dir};
         // Arrow nudges only act when the viewport has focus and no transform is in
         // progress (so they don't fight panel scrolling or the live G/R/S op).
-        let nudge_ok =
-            self.viewport_focused && self.transform.is_none() && !self.selection.fixtures.is_empty();
+        let nudge_ok = self.viewport_focused
+            && self.transform.is_none()
+            && (!self.selection.fixtures.is_empty() || !self.selection.pyro.is_empty());
         match action {
             // --- View / framing -------------------------------------------------
             Action::FrameSelection => {
@@ -207,7 +217,7 @@ impl Ui {
             // objects/screens when one of those is the current selection). Mirrors
             // Blender's `A` acting on the active mode's collection.
             Action::SelectAll => {
-                let counts = (scene.fixtures.len(), scene.geometry.len(), scene.screens.len());
+                let counts = (scene.fixtures.len(), scene.geometry.len(), scene.screens.len(), scene.pyro.len());
                 let kind = self.selection.active_kind();
                 self.selection.select_all_of(kind, counts);
                 self.scene_anchor = None;
@@ -223,7 +233,7 @@ impl Ui {
             // Invert (#88): flip membership within the active kind. Defaults to
             // fixtures when nothing is selected, so a bare Ctrl+I selects everything.
             Action::SelectInvert => {
-                let counts = (scene.fixtures.len(), scene.geometry.len(), scene.screens.len());
+                let counts = (scene.fixtures.len(), scene.geometry.len(), scene.screens.len(), scene.pyro.len());
                 let kind = self.selection.active_kind();
                 self.selection.invert_within(kind, counts);
                 self.scene_anchor = None;
@@ -238,6 +248,7 @@ impl Ui {
                 if !self.selection.fixtures.is_empty()
                     || !self.selection.geometry.is_empty()
                     || !self.selection.screens.is_empty()
+                    || !self.selection.pyro.is_empty()
                 {
                     // committed after the dock (remaps patch/groups/cues)
                     self.pending_delete = true;
@@ -265,26 +276,29 @@ impl Ui {
                 let anchor = ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
                 self.add_menu.show_at(anchor);
             }
-            // Patch / Unpatch (P/U) — only meaningful with fixtures selected. Open
-            // the dialog now (the patch is reachable here); its confirm commits the
-            // mutation after the dock, like the old `do_patch` / `do_unpatch` path.
+            // Patch / Unpatch (P/U) — works for whichever patchable kind is active
+            // (fixtures via the PatchTable, pyro via its inline patch). Open the
+            // dialog now (the patch is reachable here); its confirm commits after
+            // the dock, like the old `do_patch` / `do_unpatch` path.
             Action::Patch => {
-                if !self.selection.fixtures.is_empty() {
+                let kind = self.selection.active_kind();
+                let count = patchable_count(&self.selection, kind);
+                if count > 0 {
                     let (u, a) = next_free_slot(dmx.patch_mut(), scene);
                     self.patch_dialog = windows::PatchDialog {
                         open: true,
-                        count: self.selection.fixtures.len(),
+                        count,
+                        kind,
                         start_universe: u,
                         start_address: a,
                     };
                 }
             }
             Action::Unpatch => {
-                if !self.selection.fixtures.is_empty() {
-                    self.unpatch_dialog = windows::UnpatchDialog {
-                        open: true,
-                        count: self.selection.fixtures.len(),
-                    };
+                let kind = self.selection.active_kind();
+                let count = patchable_count(&self.selection, kind);
+                if count > 0 {
+                    self.unpatch_dialog = windows::UnpatchDialog { open: true, count, kind };
                 }
             }
             // --- 3D cursor (S1-3d-cursor) --------------------------------------
@@ -454,6 +468,19 @@ mod tests {
         assert!(h && ui.patch_dialog.open, "Patch opens its dialog with a selection");
         let (ui, _, _, h) = run(Action::Unpatch, &sel);
         assert!(h && ui.unpatch_dialog.open, "Unpatch opens its dialog with a selection");
+        // Patch/Unpatch are kind-aware: a pyro selection opens the dialog tagged Pyro
+        // (so the confirm packs the inline PyroPatch instead of the fixture PatchTable).
+        let pyro_sel: &dyn Fn(&mut Ui) = &|ui: &mut Ui| ui.selection = Selection::pyro(0);
+        let (ui, _, _, h) = run(Action::Patch, pyro_sel);
+        assert!(
+            h && ui.patch_dialog.open && ui.patch_dialog.kind == SelKind::Pyro,
+            "Patch opens tagged Pyro for a pyro selection"
+        );
+        let (ui, _, _, h) = run(Action::Unpatch, pyro_sel);
+        assert!(
+            h && ui.unpatch_dialog.open && ui.unpatch_dialog.kind == SelKind::Pyro,
+            "Unpatch opens tagged Pyro for a pyro selection"
+        );
         // Empty selection: P/U are guarded no-ops (still reported handled).
         let clear = &|ui: &mut Ui| ui.selection = Selection::default();
         let (ui, _, _, h) = run(Action::Patch, clear);

@@ -49,6 +49,7 @@ impl Ui {
                 s.insert(NodeKey::Group(GroupKind::Fixtures));
                 s.insert(NodeKey::Group(GroupKind::Objects));
                 s.insert(NodeKey::Group(GroupKind::Screens));
+                s.insert(NodeKey::Group(GroupKind::Pyro));
                 s
             },
             scene_rename: None,

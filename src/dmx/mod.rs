@@ -233,6 +233,7 @@ impl DmxIo {
             self.stale,
         );
         decode::apply_screens(&mut scene.screens, &self.snapshot);
+        decode::apply_pyro(&mut scene.pyro, &self.snapshot);
     }
 
     /// Auto-assign addresses to every unpatched fixture (the "Auto-patch" action).
