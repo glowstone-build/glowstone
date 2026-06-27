@@ -27,15 +27,19 @@ pub enum LabelMode {
     Name,
     FixtureId,
     Address,
+    /// The user-facing fixture SEQUENCE (channel) number. (Appended LAST — bincode
+    /// keys enum variants by index, so the Name/FixtureId/Address ordinals stay valid.)
+    Sequence,
 }
 
 impl LabelMode {
-    pub const ALL: [LabelMode; 3] = [Self::Name, Self::FixtureId, Self::Address];
+    pub const ALL: [LabelMode; 4] = [Self::Name, Self::FixtureId, Self::Address, Self::Sequence];
     pub fn label(self) -> &'static str {
         match self {
             Self::Name => "Name",
             Self::FixtureId => "Fixture ID",
             Self::Address => "DMX address",
+            Self::Sequence => "Sequence",
         }
     }
 }

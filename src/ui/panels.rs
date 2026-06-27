@@ -1925,6 +1925,7 @@ pub fn viewport(
                     .and_then(|m| m.addresses.first())
                     .map(|a| format!("{}.{:03}", a.universe(), a.channel()))
                     .unwrap_or_else(|| "—".into()),
+                LabelMode::Sequence => f.sequence.to_string(),
             };
             // Selected label takes the accent; others sit quiet over the canvas.
             let col = if selected {
