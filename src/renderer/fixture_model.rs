@@ -147,6 +147,50 @@ fn emit_3ds_trimesh(body: &[u8], out: &mut Vec<MeshVertex>) {
     }
 }
 
+/// Rescale a baked part to fit its GDTF `<Model>`'s declared bounding box when the
+/// mesh was exported at the wrong scale. Some GDTFs ship parts 100–1700× oversized
+/// (the Clay Paky Zonda's effect disc bakes at 685 m for a declared 0.41 m, and its
+/// pixel meshes likewise) while the rest of the fixture is correct. The GDTF
+/// `Width`/`Height`/`Length` is the authoritative physical size, so a part whose
+/// baked extent GROSSLY exceeds the declared box is uniformly scaled (about the
+/// origin, preserving the mesh's proportions and pivot) to fit. Well-authored parts
+/// (within 4× of declared) are left untouched, so this never nudges a good model.
+pub fn fit_to_declared(verts: &mut [MeshVertex], declared: [f32; 3]) {
+    let decl_max = declared[0].max(declared[1]).max(declared[2]);
+    if decl_max < 1e-4 || verts.is_empty() {
+        return;
+    }
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for v in verts.iter() {
+        for k in 0..3 {
+            lo[k] = lo[k].min(v.position[k]);
+            hi[k] = hi[k].max(v.position[k]);
+        }
+    }
+    let baked_max = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2]);
+    if baked_max < 1e-6 {
+        return;
+    }
+    // Only correct a gross oversize (a bad export) — not a mesh that merely sticks
+    // a little past its declared box.
+    if baked_max <= decl_max * 4.0 {
+        return;
+    }
+    let s = decl_max / baked_max;
+    for v in verts.iter_mut() {
+        for k in 0..3 {
+            v.position[k] *= s;
+        }
+    }
+    log::warn!(
+        "GDTF part baked {:.1}× oversized ({:.1} m vs declared {:.3} m) — rescaled to fit",
+        1.0 / s,
+        baked_max,
+        decl_max
+    );
+}
+
 /// Bake a GLB into non-indexed triangles (positions + normals), applying the
 /// glTF node hierarchy. Returns vertices in the GLB's own space.
 ///
@@ -439,6 +483,24 @@ mod tests_3ds {
         assert!(out[0].normal[2].abs() > 0.9, "flat normal should point along +/-Z");
         // Vertices are scaled mm → m (×0.001).
         assert!((out[1].position[0] - 0.001).abs() < 1e-6);
+    }
+
+    /// A grossly oversized part (a bad GLB export) is rescaled to its declared
+    /// box; a well-authored part is left untouched.
+    #[test]
+    fn fit_to_declared_rescales_only_bad_exports() {
+        let v = |x: f32, y: f32, z: f32| MeshVertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], emissive: 0.0 };
+        // Oversized: a 685 m disc declared at 0.41 m (the Zonda effect bug).
+        let mut bad = vec![v(-342.0, -5.0, -342.0), v(342.0, 5.0, 342.0)];
+        super::fit_to_declared(&mut bad, [0.41, 0.005, 0.41]);
+        let span = bad[1].position[0] - bad[0].position[0];
+        assert!((span - 0.41).abs() < 0.02, "rescaled to declared box, span {span}");
+        // Well-authored: baked ≈ declared → unchanged.
+        let mut good = vec![v(-0.2, -0.05, -0.2), v(0.2, 0.05, 0.2)];
+        let before = good.clone();
+        super::fit_to_declared(&mut good, [0.44, 0.21, 0.44]);
+        assert_eq!(good[0].position, before[0].position, "good mesh untouched");
+        assert_eq!(good[1].position, before[1].position);
     }
 
     #[test]

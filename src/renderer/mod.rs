@@ -1281,8 +1281,11 @@ impl Renderer {
         let mut meshes = HashMap::new();
         for model in &gdtf.models {
             if let Some(glb) = &model.glb {
-                let verts = fixture_model::load_glb(glb);
+                let mut verts = fixture_model::load_glb(glb);
                 if !verts.is_empty() {
+                    // Guard against bad-scale GLB exports (e.g. the Zonda's effect
+                    // disc baked at 685 m) using the declared Model size.
+                    fixture_model::fit_to_declared(&mut verts, model.size);
                     meshes.insert(model.name.clone(), GpuMesh::new(&self.device, &model.name, &verts));
                 }
             }
