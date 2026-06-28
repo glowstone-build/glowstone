@@ -355,17 +355,36 @@ fn decode_gdtf(
             }
         }
     }
-    // Subset dimmer-only groups (zone masters) multiply their cells.
+    // Subset dimmer/shutter-only groups. Two cases per covered cell:
+    //  • the cell is already lit by a COLOUR layer → this group is a ZONE master
+    //    (or a section strobe gate) that SCALES it — multiply;
+    //  • the cell has NO colour layer → it's a MONOCHROME emitter (an LED tube /
+    //    strobe pixel whose own Dimmer IS its level), so SET it to the source
+    //    white at that level and mark it covered.
+    // Without the monochrome case, per-pixel single-colour dimmers were multiplied
+    // into a zeroed, never-"covered" accumulator and discarded — e.g. the 60
+    // warm-white pixels of a ROXX Cluster (and any mono LED strip/blinder/bar in a
+    // per-pixel mode) could not be individually controlled at all.
+    let white = emitters.white;
     for g in groups.iter().filter(|g| !all(g) && !has_color(g)) {
         if g.dimmer.is_none() && g.shutter.is_none() {
             continue;
         }
         let scale = g.dimmer.unwrap_or(1.0) * gate(g);
         for &c in &g.cells {
-            if (c as usize) < n_cells {
+            let c = c as usize;
+            if c >= n_cells {
+                continue;
+            }
+            if covered[c] {
                 for k in 0..3 {
-                    cells[c as usize][k] *= scale;
+                    cells[c][k] *= scale;
                 }
+            } else {
+                for k in 0..3 {
+                    cells[c][k] = white[k] * scale;
+                }
+                covered[c] = true;
             }
         }
     }
@@ -1330,4 +1349,108 @@ mod tests {
         assert!((f.optics.dimmer - 1.0).abs() < 1e-3, "dimmer raised, got {}", f.optics.dimmer);
     }
 
+    /// A synthetic monochrome pixel fixture — two colourless emitters, each with
+    /// its OWN per-cell `Dimmer` plus a fixture-wide master `Dimmer` (the ROXX
+    /// Cluster tube structure). Driving the per-cell dimmers must light each cell
+    /// to the source white at ITS OWN level. (Regression: a colourless per-cell
+    /// dimmer was multiplied into a zeroed, never-"covered" accumulator and
+    /// discarded, so the cells stayed stuck at rest-white and ignored the dimmer.)
+    #[test]
+    fn per_cell_mono_dimmer_lights_each_cell() {
+        use crate::gdtf::{Aperture, EmitterDef, ResolvedChannel};
+        let dim = |geom: &str, off: u32| DmxChannel {
+            geometry: geom.into(),
+            offsets: vec![off],
+            dmx_break: Some(1),
+            default: 0.0,
+            attribute: "Dimmer".into(),
+            function: "Dimmer".into(),
+            sets: Vec::new(),
+            resolution: 1,
+            functions: vec![cf("Dimmer", "Dimmer", 0.0, 0.0, 100.0)],
+        };
+        let rc = |ch: usize, off: u32, cells: Vec<u16>, group: u16| ResolvedChannel {
+            channel: ch,
+            offsets: vec![off],
+            instance: None,
+            cells,
+            group,
+        };
+        let geometry = Geometry {
+            name: "Root".into(),
+            kind: GeometryKind::Geometry,
+            model: None,
+            matrix: Mat4::IDENTITY,
+            children: Vec::new(),
+            beam: None,
+            reference: None,
+        };
+        let emitter = |n: &str| EmitterDef {
+            name: n.into(),
+            beam: BeamData::default(),
+            aperture: Aperture::default(),
+            pos: [0.0, 0.0],
+            merged_into: None,
+        };
+        let gdtf = Arc::new(GdtfFixture {
+            source: crate::gdtf::FixtureSource::Import,
+            name: "Mono".into(),
+            manufacturer: "T".into(),
+            long_name: "Mono".into(),
+            short_name: "M".into(),
+            description: String::new(),
+            thumbnail: None,
+            wheels: Vec::new(),
+            models: Vec::new(),
+            geometry: geometry.clone(),
+            roots: vec![geometry],
+            modes: vec![DmxMode {
+                name: "Std".into(),
+                geometry: "Root".into(),
+                channels: vec![dim("Root", 1), dim("Px0", 2), dim("Px1", 3)],
+                emitters: vec![emitter("Px0"), emitter("Px1")],
+                resolved: vec![
+                    rc(0, 1, vec![0, 1], 0), // master (all cells)
+                    rc(1, 2, vec![0], 1),    // per-cell dimmer, cell 0
+                    rc(2, 3, vec![1], 2),    // per-cell dimmer, cell 1
+                ],
+                components: Vec::new(),
+                footprint: 3,
+            }],
+            beam_angle: 15.0,
+            beam: BeamData::default(),
+            spec: String::new(),
+            raw: None,
+        });
+
+        let run = |master: u8, d0: u8, d1: u8| -> Fixture {
+            let mut fixture = Fixture::from_gdtf(gdtf.clone(), "M", Vec3::ZERO);
+            fixture.sync_mode();
+            fixture.optics.dimmer = 0.0;
+            let mut levels = [0u8; 512];
+            levels[0] = master;
+            levels[1] = d0;
+            levels[2] = d1;
+            let snap = snapshot_with(1, levels);
+            let patch = one_patch(1, 1, 3, 0);
+            let mut fx = vec![fixture];
+            let mut live = Vec::new();
+            apply(&mut fx, &patch, &snap, &mut live, Duration::from_secs(2));
+            fx.pop().unwrap()
+        };
+
+        // Master full; cell 0 at ~half, cell 1 at full. The master drives the
+        // fixture dimmer; each cell carries its OWN per-pixel level as white.
+        let f = run(255, 128, 255);
+        assert!((f.optics.dimmer - 1.0).abs() < 1e-3, "master → dimmer: {}", f.optics.dimmer);
+        let (c0, c1) = (f.cells[0], f.cells[1]);
+        assert!(c1.iter().all(|&v| v > 0.6), "cell 1 lit white at full: {c1:?}");
+        for k in 0..3 {
+            assert!((c0[k] - 0.5 * c1[k]).abs() < 0.06, "cell 0 ≈ half cell 1 (k{k}): {c0:?} vs {c1:?}");
+        }
+        // Per-cell dimmer 0 darkens ONLY that cell.
+        let f = run(255, 0, 255);
+        assert!(f.cells[0].iter().all(|&v| v < 1e-3), "cell 0 dark at its dimmer 0: {:?}", f.cells[0]);
+        assert!(f.cells[1].iter().any(|&v| v > 0.6), "cell 1 still lit: {:?}", f.cells[1]);
+    }
 }

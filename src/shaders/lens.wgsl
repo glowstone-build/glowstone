@@ -71,11 +71,22 @@ const LN2: f32 = 0.6931472;
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let r = length(in.local);
-    if (r > 1.0) {
-        discard;
+    // Aperture mask: a disc for round lenses, a rounded rectangle for LED
+    // strips/panels (shutter.w = 1). The billboard already carries the real W×H
+    // scale, so `local` is normalised to the face. Crisp edge — the soft glow is
+    // bloom, not a soft alpha (a soft edge reads as cotton).
+    var edge: f32;
+    if (in.shutter.w > 0.5) {
+        // Rounded-rect signed distance in normalised [-1,1] face space.
+        let cr = 0.12;
+        let q = abs(in.local) - vec2<f32>(1.0 - cr, 1.0 - cr);
+        let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - cr;
+        if (d > 0.0) { discard; }
+        edge = clamp(-d / max(fwidth(d), 1e-4), 0.0, 1.0);
+    } else {
+        if (r > 1.0) { discard; }
+        edge = clamp((1.0 - r) / max(fwidth(r), 1e-4), 0.0, 1.0);
     }
-    // Crisp aperture: anti-alias only over the last screen pixel.
-    let edge = clamp((1.0 - r) / max(fwidth(r), 1e-4), 0.0, 1.0);
 
     let view = normalize(camera.eye.xyz - in.world_pos);
     let cosv = dot(in.axis, view); // >0 = camera on the emitting side

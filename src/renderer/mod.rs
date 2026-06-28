@@ -867,7 +867,7 @@ impl Renderer {
             "fixture-cone",
             &mesh::cone(0.45, 0.45 * 12.0_f32.to_radians().tan(), 28),
         );
-        let disc_mesh = GpuMesh::new(&device, "lens-disc", &mesh::disc(48));
+        let disc_mesh = GpuMesh::new(&device, "lens-face", &mesh::lens_quad());
         let quad_mesh = GpuMesh::new(&device, "led-wall-quad", &mesh::unit_quad(64, 24));
 
         let vertex = wgpu::BufferUsages::VERTEX;
@@ -4061,9 +4061,49 @@ struct BeamBuild {
     lenses: Vec<LensInstance>,
 }
 
-/// Build a lens-disc instance facing `dir` at `origin`, radius `r`.
+/// Build a lens-face instance facing `dir` at `origin`. The face spans `half_w`
+/// along `right` and `half_h` along `up` (the GDTF emitter aperture); `round`
+/// masks it to a disc (lens) vs a rectangle (LED strip / panel).
 #[allow(clippy::too_many_arguments)]
 fn lens_instance(
+    origin: Vec3,
+    dir: Vec3,
+    right: Vec3,
+    up: Vec3,
+    half_w: f32,
+    half_h: f32,
+    round: bool,
+    color: [f32; 3],
+    level: f32,
+    tan_half: f32,
+    n_order: f32,
+    candela: f32,
+    shutter: [f32; 4],
+) -> LensInstance {
+    // Non-uniform scale bakes the real aperture W×H into the billboard; the Z
+    // column only needs a non-zero length (the shader renormalises the axis).
+    let depth = half_w.max(half_h).max(1e-3);
+    let model = Mat4::from_cols(
+        (right * half_w).extend(0.0),
+        (up * half_h).extend(0.0),
+        (dir * depth).extend(0.0),
+        origin.extend(1.0),
+    );
+    let aspect = (half_w / half_h.max(1e-4)).clamp(0.05, 20.0);
+    let mut shutter = shutter;
+    shutter[3] = if round { 0.0 } else { 1.0 };
+    LensInstance {
+        model: model.to_cols_array_2d(),
+        color: [color[0], color[1], color[2], level],
+        params: [tan_half, n_order, candela, aspect],
+        shutter,
+    }
+}
+
+/// A round lens-face instance of radius `r` — the common case (spots, washes,
+/// lasers, and any emitter without a rectangular model).
+#[allow(clippy::too_many_arguments)]
+fn lens_disc(
     origin: Vec3,
     dir: Vec3,
     right: Vec3,
@@ -4076,18 +4116,7 @@ fn lens_instance(
     candela: f32,
     shutter: [f32; 4],
 ) -> LensInstance {
-    let model = Mat4::from_cols(
-        (right * r).extend(0.0),
-        (up * r).extend(0.0),
-        (dir * r).extend(0.0),
-        origin.extend(1.0),
-    );
-    LensInstance {
-        model: model.to_cols_array_2d(),
-        color: [color[0], color[1], color[2], level],
-        params: [tan_half, n_order, candela, r],
-        shutter,
-    }
+    lens_instance(origin, dir, right, up, r, r, true, color, level, tan_half, n_order, candela, shutter)
 }
 
 /// Build the GPU beam + lens for a laser engine: a thin, near-collimated streak.
@@ -4122,7 +4151,7 @@ fn build_laser(
                 cmyf: [0.0, 0.0, 0.0, 0.0],
             }]
         },
-        lenses: vec![lens_instance(
+        lenses: vec![lens_disc(
             f.origin + f.dir * 0.02,
             f.dir,
             f.right,
@@ -4198,7 +4227,7 @@ fn build_beam_gpus(
                     cmyf: [0.0, 0.0, 0.0, 0.0],
                 }]
             },
-            lenses: vec![lens_instance(
+            lenses: vec![lens_disc(
                 f.origin + f.dir * 0.02,
                 f.dir,
                 f.right,
@@ -4357,7 +4386,7 @@ fn build_beam_gpus(
         // into its colour here (otherwise the glass would read un-tinted).
         let cmy_t = optics::color::cmy_transmittance(o.cmy);
         let lens_tint = [tint[0] * cmy_t[0], tint[1] * cmy_t[1], tint[2] * cmy_t[2]];
-        let lenses = vec![lens_instance(
+        let lenses = vec![lens_disc(
             frame.origin + frame.dir * 0.04,
             frame.dir,
             frame.right,
@@ -4391,6 +4420,7 @@ fn build_beam_gpus(
         lit: f32,
         cone: optics::EmitterCone,
         lens_r: f32,
+        ap: crate::gdtf::Aperture,
     }
     // Fixture-total flux cap: GDTF pixel files often duplicate group flux onto
     // every cell — normalise so the whole array sums to a plausible fixture.
@@ -4433,18 +4463,25 @@ fn build_beam_gpus(
             white: cell_white,
             lit: cell_max * effective,
             cone,
-            lens_r: em.beam.beam_radius.max(0.01),
+            // The beam shaft/pool stays round; its radius is the aperture's
+            // larger half-extent (a strip throws a wider sheet than a 5 cm disc).
+            lens_r: em.aperture.half_w.max(em.aperture.half_h).max(0.01),
+            ap: em.aperture,
         });
     }
 
-    // Lens faces: every visible cell, lit or dark (dark = glass).
+    // Lens faces: every visible cell, lit or dark (dark = glass). Each is sized
+    // and shaped from the emitter's real GDTF aperture (a strip renders as a thin
+    // line, a panel as a rectangle) instead of a generic disc.
     for c in &cells {
         lenses.push(lens_instance(
             c.frame.origin + c.frame.dir * 0.006,
             c.frame.dir,
             c.frame.right,
             c.frame.up,
-            c.lens_r,
+            c.ap.half_w,
+            c.ap.half_h,
+            c.ap.round,
             c.tint,
             (effective * c.cell_max).min(1.0), // no blade here → uniform dim
             c.cone.tan_half,

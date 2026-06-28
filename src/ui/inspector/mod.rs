@@ -1002,29 +1002,7 @@ fn gdtf_inspector(
             .weak()
             .small(),
         );
-        ui.horizontal_wrapped(|ui| {
-            for (i, em) in emitters.iter().enumerate() {
-                if em.merged_into.is_some() {
-                    continue;
-                }
-                let c = fixture.cells.get(i).copied().unwrap_or([1.0, 1.0, 1.0]);
-                let level = (fixture.intensity * fixture.optics.dimmer).clamp(0.0, 1.0);
-                let col = egui::Color32::from_rgb(
-                    ((c[0].min(1.0) * level).powf(1.0 / 2.2) * 255.0) as u8,
-                    ((c[1].min(1.0) * level).powf(1.0 / 2.2) * 255.0) as u8,
-                    ((c[2].min(1.0) * level).powf(1.0 / 2.2) * 255.0) as u8,
-                );
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
-                ui.painter().rect_filled(rect, 7.0, col);
-                ui.painter().rect_stroke(
-                    rect,
-                    7.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
-                    egui::StrokeKind::Inside,
-                );
-                resp.on_hover_text(&em.name);
-            }
-        });
+        emitter_layout_preview(ui, fixture, emitters);
     }
 
     // MVR patch identity (FixtureID, DMX address, mode) when imported from a scene.

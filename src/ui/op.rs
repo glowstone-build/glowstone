@@ -668,6 +668,8 @@ mod tests {
         let emitter = |n: &str| EmitterDef {
             name: n.into(),
             beam: BeamData::default(),
+            aperture: crate::gdtf::Aperture::default(),
+            pos: [0.0, 0.0],
             merged_into: None,
         };
         GdtfFixture {
