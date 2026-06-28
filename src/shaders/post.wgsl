@@ -86,12 +86,14 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     // pixel an alternating outlier → it collapses to the local mean. A smooth broad beam or
     // gradual haze cluster has center ≈ mean → left UNCHANGED (the "nearly perfect" look is
     // preserved); only speckle and hard edges soften — the thin-beam case asked to approximate.
-    // 5×5 depth-weighted neighbourhood mean (a single 3×3 only cuts grain ~3× — the
-    // half-res FBM speckle needs a wider support to collapse).
+    // 3×3 depth-weighted neighbourhood mean. The old 5×5 filter was useful when
+    // hundreds of independent cell shafts produced high-frequency speckle, but after
+    // multi-emitter beam clustering it spends too much full-res bandwidth for little
+    // visible gain.
     var m = c;
     var wsum = 1.0;
-    for (var dy = -2; dy <= 2; dy = dy + 1) {
-        for (var dx = -2; dx <= 2; dx = dx + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
             if (dx == 0 && dy == 0) { continue; }
             let uv = in.uv + vec2<f32>(f32(dx) * t.x, f32(dy) * t.y);
             let dt = textureLoad(comp_depth, clamp(vec2<i32>(uv * dd), vec2<i32>(0), hi), 0);

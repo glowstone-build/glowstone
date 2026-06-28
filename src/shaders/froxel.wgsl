@@ -52,8 +52,8 @@ const PI: f32 = 3.14159265359;
 
 fn hg(cos_theta: f32, g: f32) -> f32 {
     let g2 = g * g;
-    let denom = 1.0 + g2 - 2.0 * g * cos_theta;
-    return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-4), 1.5));
+    let denom = max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4);
+    return (1.0 - g2) / (4.0 * PI * denom * sqrt(denom));
 }
 
 fn density_at(p: vec3<f32>, t: f32) -> f32 {

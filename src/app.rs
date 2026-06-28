@@ -750,7 +750,12 @@ impl ApplicationHandler for App {
             // GLOWSTONE_BENCH_READBACK=1 keeps the full capture (incl. GPU→CPU copy);
             // default times render-only (what the live presenting app actually pays).
             let readback = std::env::var("GLOWSTONE_BENCH_READBACK").is_ok();
-            for _ in 0..10 {
+            let color_chase = std::env::var("GLOWSTONE_BENCH_COLORCHASE").ok();
+            if let Some(mode) = color_chase.as_deref() {
+                log::info!("BENCH color chase: {mode}");
+            }
+            for i in 0..10 {
+                apply_bench_color_chase(&mut state.scene, color_chase.as_deref(), i);
                 if readback {
                     let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
                 } else {
@@ -758,7 +763,8 @@ impl ApplicationHandler for App {
                 }
             }
             let t0 = Instant::now();
-            for _ in 0..n {
+            for i in 0..n {
+                apply_bench_color_chase(&mut state.scene, color_chase.as_deref(), i + 10);
                 if readback {
                     let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
                 } else {
@@ -773,6 +779,36 @@ impl ApplicationHandler for App {
                 1.0 / per,
                 if readback { "incl. readback" } else { "render-only" }
             );
+            let timings = state.renderer.last_timings;
+            let frame_ms = per * 1000.0;
+            let max_pass = timings.passes.iter().copied().fold(0.0_f32, f32::max);
+            if timings.gpu_valid && max_pass <= frame_ms * 1.25 + 1.0 {
+                let passes = crate::renderer::gpu_timer::BAR_LABELS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, _))| format!("{name}={:.2}", timings.passes[i]))
+                    .collect::<Vec<_>>()
+                    .join("ms, ");
+                log::info!(
+                    "BENCH scene: fixtures={} beams={} shadows={} geom_draws={} render_px={}x{} passes: {passes}ms",
+                    timings.fixtures,
+                    timings.beams,
+                    timings.shadow_maps,
+                    timings.geom_draws,
+                    timings.render_px.0,
+                    timings.render_px.1,
+                );
+            } else {
+                log::info!(
+                    "BENCH scene: fixtures={} beams={} shadows={} geom_draws={} render_px={}x{} (GPU pass timestamps unavailable or inconsistent)",
+                    timings.fixtures,
+                    timings.beams,
+                    timings.shadow_maps,
+                    timings.geom_draws,
+                    timings.render_px.0,
+                    timings.render_px.1,
+                );
+            }
             event_loop.exit();
             return;
         }
@@ -1249,6 +1285,56 @@ fn apply_cam_env(camera: &mut OrbitCamera) {
     }
     // Headless one-shot: land on the final pose, never mid-transition.
     camera.skip_anim();
+}
+
+/// Headless-only benchmark stimulus for fast live colour changes. `uniform`
+/// drives every emitter in a fixture through the CMY chain so the volumetric
+/// renderer exercises the non-plain multi-emitter path; `cells` drives a
+/// pixel-map style per-emitter chase while keeping the cheap plain-beam path.
+fn apply_bench_color_chase(scene: &mut Scene, mode: Option<&str>, frame: u32) {
+    let Some(mode) = mode else {
+        return;
+    };
+    let mode = mode.trim().to_ascii_lowercase();
+    if mode.is_empty() || mode == "0" || mode == "off" {
+        return;
+    }
+    let palette: [[f32; 3]; 6] = [
+        [1.0, 0.0, 0.04],
+        [0.0, 0.1, 1.0],
+        [0.0, 1.0, 0.1],
+        [1.0, 0.0, 0.9],
+        [0.0, 0.9, 1.0],
+        [1.0, 0.55, 0.0],
+    ];
+
+    for (fixture_index, f) in scene.fixtures.iter_mut().enumerate() {
+        if f.hidden {
+            continue;
+        }
+        let n_cells = f.emitters().len();
+        if n_cells > 0 && f.cells.len() != n_cells {
+            f.cells.resize(n_cells, [1.0, 1.0, 1.0]);
+        }
+
+        match mode.as_str() {
+            "cells" | "pixel" | "pixels" | "pixmap" => {
+                f.color = [1.0, 1.0, 1.0];
+                f.optics.cmy = [0.0, 0.0, 0.0];
+                for (i, cell) in f.cells.iter_mut().enumerate() {
+                    *cell = palette[(frame as usize + fixture_index * 3 + i) % palette.len()];
+                }
+            }
+            _ => {
+                let col = palette[(frame as usize + fixture_index * 2) % palette.len()];
+                f.color = [1.0, 1.0, 1.0];
+                f.optics.cmy = [1.0 - col[0], 1.0 - col[1], 1.0 - col[2]];
+                for cell in &mut f.cells {
+                    *cell = [1.0, 1.0, 1.0];
+                }
+            }
+        }
+    }
 }
 
 fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {

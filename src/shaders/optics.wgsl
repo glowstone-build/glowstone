@@ -28,7 +28,16 @@ fn opt_rot(uv: vec2<f32>, a: f32) -> vec2<f32> {
 // believable glow just outside the cone.
 fn opt_radial(axis_dist: f32, beam_r: f32, n: f32) -> f32 {
     let x = axis_dist / max(beam_r, 1e-4);
-    let core = exp(-0.6931472 * pow(x, 2.0 * n));
+    let x2 = x * x;
+    var xn = x2;
+    if (abs(n - 2.0) <= 0.001) {
+        xn = x2 * x2;
+    } else if (abs(n - 3.0) <= 0.001) {
+        xn = x2 * x2 * x2;
+    } else if (abs(n - 1.0) > 0.001) {
+        xn = pow(x, 2.0 * n);
+    }
+    let core = exp(-0.6931472 * xn);
     let spill = 0.02 * exp(-x * x * 0.5);
     return max(core, spill);
 }

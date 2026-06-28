@@ -18,7 +18,7 @@ struct Volumetric {
     albedo_beam: vec4<f32>,     // rgb = scattering tint, w = beam intensity
     counts: vec4<f32>,          // y = max step count, z = constant-dt target (world m)
     chroma: vec4<f32>,          // x = Helmholtz–Kohlrausch chroma read-up strength; yzw reserved
-    tile: vec4<f32>,            // x = tiles_x, y = tiles_y, z = tile size (full-res px), w unused
+    tile: vec4<f32>,            // x = tiles_x, y = tiles_y, z = tile size (full-res px), w = CO2 quality (<0 no CO2)
     co2_amb: vec4<f32>,         // rgb = ambient room colour the white CO2 reflects, w = strength
 };
 
@@ -90,16 +90,15 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> VsOut {
 }
 
 // Exact Henyey–Greenstein phase (forward peak at cosθ=+1 with the −2g·cosθ
-// convention, cosθ = dot(bdir, −rd)). We tried the Schlick pow-free approximation
+// convention, cosθ = dot(bdir, −rd)). We tried the Schlick approximation
 // k=1.55g−0.55g³, but k crosses 1 at |g|≳0.93 (the anisotropy slider reaches
 // ±0.95), where (1−k²) flips negative and the forward lobe inverts to backscatter
-// — a visible blow-up at exactly the sharp-beam setting users crank toward. The
-// exact form has no such edge, and its one pow() is no longer hot: the per-fixture
-// radial pre-cull already skips the phase for samples outside the beam.
+// — a visible blow-up at exactly the sharp-beam setting users crank toward. Keep
+// the exact form, but compute denom^1.5 as denom*sqrt(denom) instead of generic pow.
 fn hg(cos_theta: f32, g: f32) -> f32 {
     let g2 = g * g;
-    let denom = 1.0 + g2 - 2.0 * g * cos_theta;
-    return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-4), 1.5));
+    let denom = max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4);
+    return (1.0 - g2) / (4.0 * PI * denom * sqrt(denom));
 }
 
 // Interleaved gradient noise — per-pixel ray-start jitter (kills banding).
@@ -111,6 +110,9 @@ fn ign(p: vec2<f32>) -> f32 {
 // scrolling scales for structure across the whole size range, high-contrast
 // remap so the beam reveals clear pockets and dense wisps.
 fn density_at(p: vec3<f32>, t: f32) -> f32 {
+    if (u.chroma.z >= 0.999) {
+        return 1.0;
+    }
     let wind1 = vec3<f32>(0.10, 0.020, 0.06) * t;
     let wind2 = vec3<f32>(-0.06, 0.015, 0.05) * t;
     let wind3 = vec3<f32>(0.04, -0.03, 0.08) * t;
@@ -315,6 +317,9 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
     // detail at a few-beam cost. In raymarch-only mode counts.x is the shared
     // occluder layer (>= 0) or -1, so this stays false and every beam is marched.
     let hero_only = u.counts.x < -1.5;
+    let clump_s = 1.0 - clamp(u.chroma.z, 0.0, 1.0);
+    let co2_on = u.tile.w >= -0.5;
+    let co2_hq = u.tile.w > 0.5;
 
     var transmittance = 1.0;
     var scatter = vec3<f32>(0.0);
@@ -324,8 +329,14 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
         let p = ro + rd * t;
         // Haze density + any stage-CO2 plume density at this sample (the beams
         // scatter through both identically → the CO2 is lit like real volumetric smoke).
-        let haze_d = base * density_at(p, time);
-        let co2v = co2_density_at(p, time);
+        var haze_d = 0.0;
+        if (base > 1e-5) {
+            haze_d = base * density_at(p, time);
+        }
+        var co2v = vec2<f32>(0.0, 0.0);
+        if (co2_on) {
+            co2v = co2_density_at(p, time);
+        }
         let co2_d = co2v.x;     // extinction σₜ from the splatted sim grid
         let co2_core = co2v.y;  // raw grid density 0..1 (densest voxels → darker)
         let dens = haze_d + co2_d;
@@ -340,8 +351,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
         // under bright beams (a uniformly-lit plume reads as a smooth blob no matter how
         // much noise detail the density has). Floored so cores are deep grey, not black;
         // scales with density (faint plumes barely darken → stay visible).
-        // tile.w = CO2 quality (1 = render, 0 = preview — fewer shadow taps live).
-        let co2_hq = u.tile.w > 0.5;
+        // tile.w = CO2 quality (1 = render, 0 = preview, <0 = no CO2).
         var co2_shadow = 1.0;
         if (co2_d > 1e-4) {
             let up = vec3<f32>(0.0, 1.0, 0.0);
@@ -461,14 +471,12 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             // BETWEEN the lens and this sample dims the beam here, so a dense pocket casts a
             // soft shadow into the fog behind it (god-ray / cloud-shaft structure). Density
             // modulation alone washes out in the airlight integral; structured OCCLUSION
-            // does not. Crude 2-tap proxy of the optical depth from lens→sample along the
-            // light ray. Gated by clumpiness so SMOOTH fog (uniform → uniform → no structure)
-            // is left exactly as-is.
-            let clump_s = 1.0 - clamp(u.chroma.z, 0.0, 1.0);
+            // does not. Crude one-tap proxy of the optical depth from lens→sample along
+            // the light ray. Gated by clumpiness so SMOOTH fog (uniform → uniform → no
+            // structure) is left exactly as-is.
             if (clump_s > 0.001 && !laser) {
-                let s1 = density_at(mix(lpos, p, 0.34), time);
-                let s2 = density_at(mix(lpos, p, 0.7), time);
-                let self_od = (s1 + s2) * 0.5 * base * depth;
+                let s1 = density_at(mix(lpos, p, 0.52), time);
+                let self_od = s1 * base * depth;
                 vis = vis * exp(-self_od * 0.07 * clump_s);
             }
             // THICK CO2 BLOCKS THE BEAM: the optical depth of CO2 between the lens

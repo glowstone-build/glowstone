@@ -1448,14 +1448,7 @@ impl Renderer {
 
         // Pump the async per-pass GPU-timing readback (reads data 2 frames stale; never
         // blocks — the submit above services the pending map callbacks).
-        let period = self.queue.get_timestamp_period();
-        let bars = self.gpu_timers.as_mut().map(|t| {
-            t.pump(period);
-            t.bars
-        });
-        if let Some(b) = bars {
-            self.last_timings.passes = b;
-        }
+        self.pump_gpu_timers();
 
         true
     }
@@ -1476,6 +1469,7 @@ impl Renderer {
         self.record_scene(&mut encoder, scene, camera, &Selection::default(), settings);
         self.queue.submit(std::iter::once(encoder.finish()));
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.pump_gpu_timers();
     }
 
     pub fn capture(
@@ -2003,6 +1997,15 @@ impl Renderer {
     }
     fn ts_cp(&self, pair: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
         self.gpu_timers.as_ref().and_then(|t| t.cp(pair))
+    }
+
+    fn pump_gpu_timers(&mut self) {
+        let period = self.queue.get_timestamp_period();
+        if let Some(t) = self.gpu_timers.as_mut() {
+            if t.pump(period) {
+                self.last_timings.passes = t.bars;
+            }
+        }
     }
 
     fn record_scene(
@@ -2724,9 +2727,8 @@ impl Renderer {
         // of the screen) go in a global prefix every tile scans, keeping spot lists tight.
         // GLOWSTONE_NOCULL forces the all-lights fallback (the pixel-identity test harness).
         // `avg_tile_beams` (set in the block) = the beams an average ray actually marches;
-        // the volumetric step budget divides by THIS, not the full count, so culling's freed
-        // per-ray budget is spent on more march steps (the banding fix) — see the fog block.
-        let mut avg_tile_beams = gpu_fixtures.len().max(1);
+        // the volumetric step budget divides by THIS, not the full count.
+        let avg_tile_beams: usize;
         {
             let n_tiles = (tiles_x * tiles_y) as usize;
             let view_proj = camera.view_proj(aspect);
@@ -2877,24 +2879,36 @@ impl Renderer {
             // Step budget divides by the beams a ray ACTUALLY marches. Pre-tiling that
             // was all N (so a 168-beam rig floored at 40 steps → bad longitudinal banding
             // in a big fog box, worst during camera motion when temporal can't accumulate).
-            // Tiled culling means a ray now marches only its tile's beams (avg_tile_beams),
-            // so the SAME per-ray beam cost buys far more steps — spend that on step count
-            // (the ghost-free banding fix; raising temporal history instead would smear,
-            // since the volumetric reprojects against scene depth, not the mid-air haze).
-            // Isolated beams (sparse tiles → where banding reads most) get the most steps.
+            // Tiled culling means a ray now marches only its tile's beams
+            // (`avg_tile_beams`). Keep a sparse-beam quality bonus, but do not let busy
+            // high-resolution wash rigs spend all saved work on extra samples; the user's
+            // step setting should remain a practical preview budget.
             let march_beams = if use_froxel {
                 n_shadows.max(1)
             } else {
                 avg_tile_beams
             };
-            // Per-ray work budget in beam-samples (steps × beams-marched). Pre-tiling a ray
-            // marched all N beams, so this budget floored the step count (40) and the big
-            // fog box banded; now a ray marches only `avg_tile_beams`, so the same budget
-            // buys ~N/avg× more steps — spent on killing the banding (and the motion flicker,
-            // since a denser per-frame march bands far less when temporal can't accumulate).
-            // Stays well under the pre-tiling per-ray cost. Scale with the `steps` quality knob.
+            // Per-ray work budget in beam-samples (steps × beams-marched). Scale with
+            // the `steps` quality knob, then clamp by a resolution-aware cap: at high
+            // pixel counts a half-res volumetric still has hundreds of thousands of rays.
             let beam_sample_budget = settings.steps.max(40) as f32 * 40.0;
-            let step_cap = (beam_sample_budget / march_beams as f32).clamp(64.0, 176.0);
+            let px = (vw as f32) * (vh as f32);
+            let pressure = ((px / (1280.0 * 800.0)) - 1.0).clamp(0.0, 1.0);
+            let sparse_bonus = if march_beams <= 4 {
+                1.8
+            } else if march_beams <= 8 {
+                1.35
+            } else {
+                1.0
+            };
+            let step_max = (settings.steps as f32 * sparse_bonus * (1.0 - 0.25 * pressure))
+                .clamp(48.0, 176.0);
+            let step_min = if pressure > 0.5 && march_beams >= 16 {
+                48.0
+            } else {
+                64.0_f32.min(step_max)
+            };
+            let step_cap = (beam_sample_budget / march_beams as f32).clamp(step_min, step_max);
             let target_dt = (media_max - media_min).length() / step_cap;
             // Ambient stage colour the white CO2 reflects: the intensity-weighted
             // average HUE of the beams (a cyan rig → a dim-cyan plume), neutral-cool
@@ -2964,7 +2978,11 @@ impl Renderer {
                     tiles_x as f32,
                     tiles_y as f32,
                     LIGHT_TILE_PX as f32,
-                    if self.hq_co2 { 1.0 } else { 0.0 },
+                    if has_co2 {
+                        if self.hq_co2 { 1.0 } else { 0.0 }
+                    } else {
+                        -1.0
+                    },
                 ],
                 // rgb = ambient room hue the CO2 reflects; w = scene-driven strength
                 // (dim — the smoke is thick white, so it reads dim-coloured + beam highlights).
@@ -4455,13 +4473,10 @@ fn build_beam_gpus(
     }
 
     // Beams: skip dark cells, then cluster the rest by direction (a Spiider is
-    // one parallel cluster; a multi-tube blinder is several). A uniform cluster
-    // of ≥4 collapses to ONE wide disc beam (sum of cell outputs — exact in the
-    // far field where the cell cones overlap; dense-array areas match near the
-    // face). Non-uniform (pixel-mapped) clusters stay per-cell — until the
-    // fixture would exceed its beam budget, where a lossy direction-cone LOD
-    // bounds the volumetric cost (the raymarch is O(px·steps·beams); one 72-px
-    // omnidirectional blinder must not cost 72 wide cones).
+    // one parallel cluster; a multi-tube blinder is several). Uniform clusters
+    // collapse to one disc beam. Non-uniform broad washes also collapse when
+    // their cells physically overlap into one haze mass; narrow/steered pixel
+    // emitters stay separate so real pixel shafts remain visible.
     let lit: Vec<&Cell> = cells.iter().filter(|c| c.lit > 1e-4 && c.cone.shaft).collect();
     if lit.is_empty() {
         return BeamBuild { beams, lenses };
@@ -4504,6 +4519,48 @@ fn build_beam_gpus(
             }
         }
         out.into_iter().map(|(_, v)| v).collect()
+    };
+    let color_clusters = |cells: &[&Cell], idxs: &[usize], limit: usize| -> Vec<Vec<usize>> {
+        let mut out: Vec<([f32; 3], f32, Vec<usize>)> = Vec::new();
+        for &idx in idxs {
+            let c = cells[idx];
+            let peak = c.color.iter().copied().fold(0.0_f32, f32::max);
+            let hue = if peak > 1e-5 {
+                [c.color[0] / peak, c.color[1] / peak, c.color[2] / peak]
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            let mut best: Option<(usize, f32)> = None;
+            for (gi, (gh, gp, _)) in out.iter().enumerate() {
+                let hue_d =
+                    (hue[0] - gh[0]).powi(2) + (hue[1] - gh[1]).powi(2) + (hue[2] - gh[2]).powi(2);
+                let level_d = if peak > 1e-5 && *gp > 1e-5 {
+                    (peak / *gp).ln().abs() * 0.18
+                } else {
+                    0.0
+                };
+                let d = hue_d + level_d * level_d;
+                if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                    best = Some((gi, d));
+                }
+            }
+            let assign = match best {
+                Some((gi, d)) if d < 0.035 || out.len() >= limit => Some(gi),
+                _ => None,
+            };
+            if let Some(gi) = assign {
+                let (gh, gp, members) = &mut out[gi];
+                let n = members.len() as f32;
+                gh[0] = (gh[0] * n + hue[0]) / (n + 1.0);
+                gh[1] = (gh[1] * n + hue[1]) / (n + 1.0);
+                gh[2] = (gh[2] * n + hue[2]) / (n + 1.0);
+                *gp = (*gp * n + peak) / (n + 1.0);
+                members.push(idx);
+            } else {
+                out.push((hue, peak, vec![idx]));
+            }
+        }
+        out.into_iter().map(|(_, _, v)| v).collect()
     };
     // One merged beam covering a cluster: centroid origin, mean direction
     // widened by the member spread, summed output.
@@ -4559,37 +4616,165 @@ fn build_beam_gpus(
         (c.cone.tan_half * SHAFT_NARROW, c.cone.n_order.max(SHAFT_N_ORDER))
     };
 
+    let cluster_shape_compatible = |cl: &[&Cell]| -> bool {
+        if cl.len() < 4 {
+            return false;
+        }
+        let ref_cell = cl[0];
+        for c in cl.iter().copied().skip(1) {
+            let tan_tol = ref_cell.cone.tan_half.max(c.cone.tan_half) * 0.08 + 1e-4;
+            if (c.cone.tan_half - ref_cell.cone.tan_half).abs() > tan_tol {
+                return false;
+            }
+            let order_tol = ref_cell.cone.n_order.max(c.cone.n_order) * 0.12 + 1e-3;
+            if (c.cone.n_order - ref_cell.cone.n_order).abs() > order_tol {
+                return false;
+            }
+            let radius_tol = ref_cell.lens_r.max(c.lens_r) * 0.15 + 1e-4;
+            if (c.lens_r - ref_cell.lens_r).abs() > radius_tol {
+                return false;
+            }
+        }
+        true
+    };
+
+    let cluster_uniform = |cl: &[&Cell]| -> bool {
+        if !cluster_shape_compatible(cl) {
+            return false;
+        }
+        let ref_cell = cl[0];
+        let ref_peak = ref_cell.color.iter().copied().fold(0.0_f32, f32::max);
+        for c in cl.iter().copied().skip(1) {
+            let peak = c.color.iter().copied().fold(0.0_f32, f32::max);
+            let color_tol = (ref_peak.max(peak) * 0.035).max(0.004);
+            for k in 0..3 {
+                if (c.color[k] - ref_cell.color[k]).abs() > color_tol {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+
+    let cluster_overlapped_wash = |cl: &[&Cell]| -> bool {
+        if !cluster_shape_compatible(cl) {
+            return false;
+        }
+        let mean_dir = cl
+            .iter()
+            .fold(Vec3::ZERO, |a, c| a + c.frame.dir)
+            .normalize_or_zero();
+        let centroid = cl.iter().fold(Vec3::ZERO, |a, c| a + c.frame.origin) / cl.len() as f32;
+        let mut source_r = 0.0_f32;
+        let mut lens_r = 0.0_f32;
+        let mut tan_half = 0.0_f32;
+        for c in cl {
+            let rel = c.frame.origin - centroid;
+            source_r = source_r.max((rel - mean_dir * rel.dot(mean_dir)).length());
+            lens_r = lens_r.max(c.lens_r);
+            tan_half = tan_half.max(shaft_cone(c).0);
+        }
+
+        // At this width the cells are wash lobes, not resolvable aerial pixels.
+        // Once their source-ring radius fits inside the widened cone after roughly
+        // the first metre, separate raymarched shafts are redundant work; the lens
+        // instances above still show the exact pixel map on the fixture face.
+        let wide_wash = tan_half >= 0.12;
+        let near_overlap_r = lens_r + tan_half * 1.25;
+        wide_wash && source_r <= near_overlap_r * 0.85
+    };
+
+    let cell_beam = |c: &Cell| -> FixtureGpu {
+        let (tan_half, n_order) = shaft_cone(c);
+        let b = make(
+            &c.frame,
+            c.frame.dir,
+            c.frame.right,
+            c.frame.up,
+            c.color,
+            tan_half,
+            n_order,
+            c.lens_r,
+            0.0,
+            0.0,
+        );
+        finish(b, c.white)
+    };
+
     const MAX_FIXTURE_BEAMS: usize = 24;
-    if lit.len() > MAX_FIXTURE_BEAMS {
+    const MAX_PLAIN_FIXTURE_BEAMS: usize = 8;
+    let tight = cluster_by(&lit, 0.996);
+    let mut active_lit: Vec<&Cell> = Vec::new();
+    let mut aggregated = false;
+    for cl in &tight {
+        let cs: Vec<&Cell> = cl.iter().map(|&i| lit[i]).collect();
+        let overlap_merge_ok = plain || !has_pattern;
+        if cluster_uniform(&cs) || (overlap_merge_ok && cluster_overlapped_wash(&cs)) {
+            beams.push(finish(aggregate(&cs), cluster_white(&cs)));
+            aggregated = true;
+        } else {
+            active_lit.extend(cs);
+        }
+    }
+    if aggregated && active_lit.is_empty() {
+        return BeamBuild { beams, lenses };
+    }
+    if !aggregated {
+        active_lit = lit.clone();
+    }
+
+    if plain {
+        let tight = cluster_by(&active_lit, 0.996);
+        let mut remainder: Vec<&Cell> = Vec::new();
+        let mut plain_aggregated = false;
+        for cl in &tight {
+            let cs: Vec<&Cell> = cl.iter().map(|&i| active_lit[i]).collect();
+            if cs.len() > MAX_PLAIN_FIXTURE_BEAMS {
+                for cg in color_clusters(&active_lit, cl, MAX_PLAIN_FIXTURE_BEAMS) {
+                    let gs: Vec<&Cell> = cg.iter().map(|&i| active_lit[i]).collect();
+                    if gs.len() > 1 {
+                        beams.push(finish(aggregate(&gs), cluster_white(&gs)));
+                        plain_aggregated = true;
+                    } else {
+                        remainder.extend(gs);
+                    }
+                }
+            } else {
+                remainder.extend(cs);
+            }
+        }
+        if plain_aggregated || aggregated {
+            if beams.len() + remainder.len() > MAX_FIXTURE_BEAMS {
+                let coarse = cluster_by(&remainder, 0.906);
+                for cl in &coarse {
+                    let cs: Vec<&Cell> = cl.iter().map(|&i| remainder[i]).collect();
+                    beams.push(finish(aggregate(&cs), cluster_white(&cs)));
+                }
+            } else {
+                for c in remainder {
+                    beams.push(cell_beam(c));
+                }
+            }
+            return BeamBuild { beams, lenses };
+        }
+    }
+
+    if beams.len() + active_lit.len() > MAX_FIXTURE_BEAMS {
         // Bounded-cost LOD for a huge array (e.g. a 72-cell blinder / LED wall):
         // coarse direction-cone merge so the raymarch can't pay for hundreds of
         // beams. Loses per-cell colour in the shaft, but the per-cell lens faces
         // above still carry the pixel-mapped detail on the source.
-        let coarse = cluster_by(&lit, 0.906);
+        let coarse = cluster_by(&active_lit, 0.906);
         for cl in &coarse {
-            let cs: Vec<&Cell> = cl.iter().map(|&i| lit[i]).collect();
+            let cs: Vec<&Cell> = cl.iter().map(|&i| active_lit[i]).collect();
             beams.push(finish(aggregate(&cs), cluster_white(&cs)));
         }
     } else {
-        // The common case (bars, washes, clusters ≤ 24 lit cells): every lit cell
-        // is its OWN crisp shaft, so the pixel map is faithful and each beam culls
-        // tightly. No merging — merging co-located cells into one wide cone was
-        // both the blob look AND a perf trap (the wide cone never culls).
-        for c in &lit {
-            let (tan_half, n_order) = shaft_cone(c);
-            let b = make(
-                &c.frame,
-                c.frame.dir,
-                c.frame.right,
-                c.frame.up,
-                c.color,
-                tan_half,
-                n_order,
-                c.lens_r,
-                0.0,
-                0.0,
-            );
-            beams.push(finish(b, c.white));
+        // Small non-uniform arrays that survived the plain-beam clustering above:
+        // keep every lit cell as its own crisp shaft so low-count pixel effects stay
+        // faithful and each beam still culls tightly.
+        for c in &active_lit {
+            beams.push(cell_beam(c));
         }
     }
     BeamBuild { beams, lenses }
