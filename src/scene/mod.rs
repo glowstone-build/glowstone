@@ -19,7 +19,7 @@ pub use screen::LedScreen;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 use crate::mvr::{GeometryModel, MvrHeader, MvrImport, MvrObjectMeta};
 
@@ -109,6 +109,10 @@ fn model_local_bounds(models: &[GeometryModel]) -> Option<(Vec3, Vec3)> {
 /// avoids parsing/renumbering — repeated duplicates simply stack "copy".)
 fn dup_name(name: &str) -> String {
     format!("{name} copy")
+}
+
+fn uniform_scale_from_vec(scale: Vec3) -> f32 {
+    ((scale.x + scale.y + scale.z) / 3.0).abs().max(1e-3)
 }
 
 /// Document-level MVR data retained from an import so the scene can be written
@@ -272,9 +276,9 @@ impl Default for RenderSettings {
     }
 }
 
-/// The active multi-select KIND — whichever of the three mutually-exclusive
+/// The active multi-select KIND — whichever of the mutually-exclusive
 /// multi-select collections currently holds the selection (fixtures > objects >
-/// screens, mirroring `apply_select`'s precedence). Fixtures is the default
+/// screens > pyro, mirroring `apply_select`'s precedence). Fixtures is the default
 /// when nothing is selected, so a bare Select-All / Invert acts on fixtures
 /// (the catalog #88 "within the active kind" target).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -287,8 +291,8 @@ pub enum SelKind {
 }
 
 /// What the UI currently has selected. Drives the Inspector and the
-/// highlight/wireframe emphasis in the viewport. Supports multi-select of
-/// fixtures (for bulk editing); the environment selection is single.
+/// highlight/wireframe emphasis in the viewport. Supports one active multi-select
+/// kind at a time for bulk editing; the environment selection is single.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Selection {
     /// Selected fixture indices; the first is the "primary" (drives single-edit).
@@ -608,6 +612,16 @@ pub enum ObjectRef {
     Environment(usize),
 }
 
+/// Editable world-transform properties for any placed object that can appear in
+/// the inspector's transform section.
+#[derive(Clone, Copy, Debug)]
+pub struct ObjectTransformProps {
+    pub position: Vec3,
+    pub rotation: Quat,
+    /// `None` for rigid objects whose authored size is edited elsewhere.
+    pub uniform_scale: Option<f32>,
+}
+
 /// How a set of freshly-picked [`SelItem`]s combines with the current
 /// [`Selection`] — Blender's `eSelectOp` indirection, so click / box / (later)
 /// lasso share ONE truth table instead of duplicating per-Hit modifier arms.
@@ -636,7 +650,7 @@ pub enum SelectOp {
 /// NEW selection (no mutation, no undo — selection changes are undo-free). This
 /// is the single source the viewport click + box-select both call.
 ///
-/// Heterogeneous rule: fixtures, geometry and screens are the three multi-select
+/// Heterogeneous rule: fixtures, geometry, screens and pyro are the multi-select
 /// kinds and stay mutually exclusive (the existing `toggle_*` invariant — a
 /// scene has at most one *kind* of selection at a time so the Inspector/gizmo
 /// have one unambiguous target). For [`Add`]/[`Toggle`]/[`Subtract`] we operate
@@ -1006,6 +1020,178 @@ impl Scene {
             ObjectRef::Screen(i) => self.screens.get(i).map(|s| s.world_center()),
             ObjectRef::Pyro(i) => self.pyro.get(i).map(|p| p.world_nozzle()),
             ObjectRef::Environment(i) => self.environments.get(i).map(|e| e.center),
+        }
+    }
+
+    /// Inspector-facing transform state for any placed object. This is separate
+    /// from [`object_anchor`](Self::object_anchor): anchors can be bounding-box
+    /// centres for pivot math, while property editing must expose the authored
+    /// placement origin/translation.
+    pub fn object_transform_props(&self, obj: ObjectRef) -> Option<ObjectTransformProps> {
+        match obj {
+            ObjectRef::Fixture(i) => self.fixtures.get(i).map(|f| ObjectTransformProps {
+                position: f.position,
+                rotation: f.orientation,
+                uniform_scale: None,
+            }),
+            ObjectRef::Geometry(i) => self.geometry.get(i).map(|g| {
+                let (scale, rotation, _) = g.transform.to_scale_rotation_translation();
+                ObjectTransformProps {
+                    position: g.transform.w_axis.truncate(),
+                    rotation,
+                    uniform_scale: Some(uniform_scale_from_vec(scale)),
+                }
+            }),
+            ObjectRef::Screen(i) => self.screens.get(i).map(|s| {
+                let (scale, rotation, _) = s.transform.to_scale_rotation_translation();
+                ObjectTransformProps {
+                    position: s.transform.w_axis.truncate(),
+                    rotation,
+                    uniform_scale: Some(uniform_scale_from_vec(scale)),
+                }
+            }),
+            ObjectRef::Pyro(i) => self.pyro.get(i).map(|p| ObjectTransformProps {
+                position: p.transform.w_axis.truncate(),
+                rotation: Quat::from_mat4(&p.transform),
+                uniform_scale: None,
+            }),
+            ObjectRef::Environment(i) => self.environments.get(i).map(|e| ObjectTransformProps {
+                position: e.center,
+                rotation: Quat::IDENTITY,
+                uniform_scale: None,
+            }),
+        }
+    }
+
+    /// Set one world-position component on any placed object. Other transform
+    /// components are preserved exactly.
+    pub fn set_object_position_axis(&mut self, obj: ObjectRef, axis: usize, value: f32) {
+        if axis >= 3 {
+            return;
+        }
+        match obj {
+            ObjectRef::Fixture(i) => {
+                if let Some(f) = self.fixtures.get_mut(i) {
+                    f.position[axis] = value;
+                }
+            }
+            ObjectRef::Geometry(i) => {
+                if let Some(g) = self.geometry.get_mut(i) {
+                    let mut p = g.transform.w_axis.truncate();
+                    p[axis] = value;
+                    g.transform.w_axis = p.extend(1.0);
+                }
+            }
+            ObjectRef::Screen(i) => {
+                if let Some(s) = self.screens.get_mut(i) {
+                    let mut p = s.transform.w_axis.truncate();
+                    p[axis] = value;
+                    s.transform.w_axis = p.extend(1.0);
+                }
+            }
+            ObjectRef::Pyro(i) => {
+                if let Some(p) = self.pyro.get_mut(i) {
+                    let mut t = p.transform.w_axis.truncate();
+                    t[axis] = value;
+                    p.transform.w_axis = t.extend(1.0);
+                }
+            }
+            ObjectRef::Environment(i) => {
+                if let Some(e) = self.environments.get_mut(i) {
+                    e.center[axis] = value;
+                }
+            }
+        }
+    }
+
+    /// Set the object's world rotation. Matrix-backed objects are recomposed with
+    /// their current uniform scale and placement origin, matching the single-object
+    /// inspector's behavior when a rotation field is edited.
+    pub fn set_object_rotation(&mut self, obj: ObjectRef, rotation: Quat) {
+        let rotation = rotation.normalize();
+        match obj {
+            ObjectRef::Fixture(i) => {
+                if let Some(f) = self.fixtures.get_mut(i) {
+                    f.orientation = rotation;
+                }
+            }
+            ObjectRef::Geometry(i) => {
+                if let Some(g) = self.geometry.get_mut(i) {
+                    let (scale, _, _) = g.transform.to_scale_rotation_translation();
+                    let position = g.transform.w_axis.truncate();
+                    g.transform = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(uniform_scale_from_vec(scale)),
+                        rotation,
+                        position,
+                    );
+                }
+            }
+            ObjectRef::Screen(i) => {
+                if let Some(s) = self.screens.get_mut(i) {
+                    let (scale, _, _) = s.transform.to_scale_rotation_translation();
+                    let position = s.transform.w_axis.truncate();
+                    s.transform = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(uniform_scale_from_vec(scale)),
+                        rotation,
+                        position,
+                    );
+                }
+            }
+            ObjectRef::Pyro(i) => {
+                if let Some(p) = self.pyro.get_mut(i) {
+                    let position = p.transform.w_axis.truncate();
+                    p.transform = Mat4::from_rotation_translation(rotation, position);
+                }
+            }
+            ObjectRef::Environment(_) => {}
+        }
+    }
+
+    /// Set one displayed Euler component (X/Y/Z degrees) while preserving the
+    /// other two displayed components for that same object.
+    pub fn set_object_rotation_axis_deg(&mut self, obj: ObjectRef, axis: usize, value: f32) {
+        if axis >= 3 {
+            return;
+        }
+        let Some(props) = self.object_transform_props(obj) else { return };
+        let (ry, rx, rz) = props.rotation.to_euler(glam::EulerRot::YXZ);
+        let mut euler = Vec3::new(rx.to_degrees(), ry.to_degrees(), rz.to_degrees());
+        euler[axis] = value;
+        let rotation = Quat::from_euler(
+            glam::EulerRot::YXZ,
+            euler.y.to_radians(),
+            euler.x.to_radians(),
+            euler.z.to_radians(),
+        );
+        self.set_object_rotation(obj, rotation);
+    }
+
+    /// Set a uniform scale on objects that expose scale in the transform
+    /// inspector. Rigid objects return `false` and are left untouched.
+    pub fn set_object_uniform_scale(&mut self, obj: ObjectRef, value: f32) -> bool {
+        let value = value.max(0.001);
+        match obj {
+            ObjectRef::Geometry(i) => {
+                if let Some(g) = self.geometry.get_mut(i) {
+                    let (_, rotation, _) = g.transform.to_scale_rotation_translation();
+                    let position = g.transform.w_axis.truncate();
+                    g.transform = Mat4::from_scale_rotation_translation(Vec3::splat(value), rotation, position);
+                    true
+                } else {
+                    false
+                }
+            }
+            ObjectRef::Screen(i) => {
+                if let Some(s) = self.screens.get_mut(i) {
+                    let (_, rotation, _) = s.transform.to_scale_rotation_translation();
+                    let position = s.transform.w_axis.truncate();
+                    s.transform = Mat4::from_scale_rotation_translation(Vec3::splat(value), rotation, position);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
         }
     }
 
@@ -1527,6 +1713,39 @@ mod tests {
         let new_id = scene.fixtures[new_idx].id;
         assert!(!ids.contains(&new_id), "fresh id is never a previously-used id");
         assert_ne!(new_id, removed_id);
+    }
+
+    #[test]
+    fn object_transform_component_setters_cover_device_kinds() {
+        let library = Library::standard();
+        let mut scene = Scene::demo();
+        let screen = scene.add_screen(&library.screens[0]);
+        let pyro = scene.add_pyro_at(&library.pyro[0], Vec3::ZERO);
+
+        scene.fixtures[0].position = Vec3::new(1.0, 2.0, 3.0);
+        scene.screens[screen].transform =
+            Mat4::from_scale_rotation_translation(Vec3::splat(2.0), Quat::IDENTITY, Vec3::new(4.0, 5.0, 6.0));
+        scene.pyro[pyro].transform = Mat4::from_rotation_translation(Quat::IDENTITY, Vec3::new(7.0, 8.0, 9.0));
+
+        scene.set_object_position_axis(ObjectRef::Fixture(0), 0, 10.0);
+        scene.set_object_position_axis(ObjectRef::Screen(screen), 1, 20.0);
+        scene.set_object_position_axis(ObjectRef::Pyro(pyro), 2, 30.0);
+        assert_eq!(scene.fixtures[0].position, Vec3::new(10.0, 2.0, 3.0));
+        assert_eq!(scene.screens[screen].transform.w_axis.truncate(), Vec3::new(4.0, 20.0, 6.0));
+        assert_eq!(scene.pyro[pyro].transform.w_axis.truncate(), Vec3::new(7.0, 8.0, 30.0));
+
+        scene.set_object_rotation_axis_deg(ObjectRef::Fixture(0), 1, 45.0);
+        scene.set_object_rotation_axis_deg(ObjectRef::Pyro(pyro), 0, 30.0);
+        let (fy, _, _) = scene.fixtures[0].orientation.to_euler(glam::EulerRot::YXZ);
+        let (_, px, _) = Quat::from_mat4(&scene.pyro[pyro].transform).to_euler(glam::EulerRot::YXZ);
+        assert!((fy.to_degrees() - 45.0).abs() < 1e-3);
+        assert!((px.to_degrees() - 30.0).abs() < 1e-3);
+
+        assert!(scene.set_object_uniform_scale(ObjectRef::Screen(screen), 3.0));
+        assert!(!scene.set_object_uniform_scale(ObjectRef::Pyro(pyro), 3.0));
+        let (scale, _, _) = scene.screens[screen].transform.to_scale_rotation_translation();
+        assert!((scale.x - 3.0).abs() < 1e-3);
+        assert_eq!(scene.screens[screen].transform.w_axis.truncate(), Vec3::new(4.0, 20.0, 6.0));
     }
 
     // --- SelectOp truth table (#24) ---------------------------------------

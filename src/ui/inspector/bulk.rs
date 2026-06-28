@@ -6,7 +6,7 @@ use super::{bulk_f32_row, category, common_f32, common_rgb, InspectorState};
 use crate::dmx::PatchTable;
 use crate::gdtf::WheelKind;
 use crate::optics::OpticField;
-use crate::scene::Scene;
+use crate::scene::{ObjectRef, Scene};
 use egui::{DragValue, Grid, RichText, Slider};
 
 /// Bulk editor shown when several fixtures are selected: edits a shared property
@@ -63,16 +63,19 @@ pub(super) fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut P
         ui.separator();
     }
 
-    // --- TRANSFORM ---
+    let transform_refs = ids.iter().map(|&i| ObjectRef::Fixture(i)).collect::<Vec<_>>();
+    super::object_transform_bulk(ui, scene, &transform_refs, state);
+
+    // --- FIXTURE ---
     category(
         ui,
         state,
-        "Transform",
-        format!("{}  Transform", theme::icon::INSPECTOR),
+        "Fixture",
+        format!("{}  Fixture", theme::icon::COLOR),
         true,
-        &["Pan", "Tilt", "Nudge position", "Nudge rotation"],
+        &["Pan", "Tilt", "Dimmer", "Beam", "Color"],
         |ui, fs| {
-            Grid::new("bulk-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+            Grid::new("bulk-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 let pan = common_f32(ids.iter().map(|&i| scene.fixtures[i].pan));
                 bulk_f32_row(
                     ui,
@@ -93,70 +96,6 @@ pub(super) fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut P
                     |ui, v| ui.add(DragValue::new(v).speed(0.5).range(-180.0..=180.0).suffix("°")),
                     |v| ids.iter().for_each(|&i| scene.fixtures[i].tilt = v),
                 );
-            });
-            if fs.row_visible("Nudge position") {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Nudge position (all)").small().strong());
-                ui.horizontal(|ui| {
-                    let mut delta = glam::Vec3::ZERO;
-                    // Drag from zero applies a delta; the field snaps back each frame.
-                    for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
-                        let mut v = 0.0f32;
-                        if ui.add(DragValue::new(&mut v).speed(0.05).prefix(format!("{label} "))).changed() {
-                            delta[axis] += v;
-                        }
-                    }
-                    if delta != glam::Vec3::ZERO {
-                        for &i in ids {
-                            scene.fixtures[i].position += delta;
-                        }
-                    }
-                });
-            }
-            if fs.row_visible("Nudge rotation") {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Nudge rotation (all · individual origins)").small().strong());
-                ui.horizontal(|ui| {
-                    // Drag from zero applies a delta rotation about each fixture's OWN
-                    // origin (orientation only), so the rig keeps its arrangement and
-                    // each head tilts in place — never collapsed onto one pivot.
-                    let mut d = glam::Vec3::ZERO; // euler degrees (x, y, z)
-                    for (axis, label) in [(0usize, "x"), (1, "y"), (2, "z")] {
-                        let mut v = 0.0f32;
-                        if ui
-                            .add(DragValue::new(&mut v).speed(0.5).suffix("°").prefix(format!("{label} ")))
-                            .changed()
-                        {
-                            d[axis] += v;
-                        }
-                    }
-                    if d != glam::Vec3::ZERO {
-                        let delta = glam::Quat::from_euler(
-                            glam::EulerRot::YXZ,
-                            d.y.to_radians(),
-                            d.x.to_radians(),
-                            d.z.to_radians(),
-                        );
-                        for &i in ids {
-                            scene.fixtures[i].orientation =
-                                (delta * scene.fixtures[i].orientation).normalize();
-                        }
-                    }
-                });
-            }
-        },
-    );
-
-    // --- FIXTURE ---
-    category(
-        ui,
-        state,
-        "Fixture",
-        format!("{}  Fixture", theme::icon::COLOR),
-        true,
-        &["Dimmer", "Beam", "Color"],
-        |ui, fs| {
-            Grid::new("bulk-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 let dimmer = common_f32(ids.iter().map(|&i| scene.fixtures[i].optics.dimmer));
                 bulk_f32_row(
                     ui,

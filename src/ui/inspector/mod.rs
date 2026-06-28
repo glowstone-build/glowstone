@@ -28,12 +28,12 @@ use super::panels::InspectorEdit;
 use super::render_panel::RenderUiState;
 use super::theme;
 use super::windows::ProfileEditor;
-use super::{GdtfTextures, ScreenSources};
+use super::{EmitterPreviewCell, GdtfTextures, ScreenSources};
 use crate::dmx::PatchTable;
 use crate::gdtf::GdtfFixture;
 use crate::optics::OpticalControls;
 use crate::scene::environment::Environment;
-use crate::scene::{Fixture, Scene, Selection};
+use crate::scene::{Fixture, ObjectRef, Scene, Selection};
 
 /// Persistent + transient Inspector UI state (S1): the property **filter** box and
 /// each category's remembered **open/closed** state.
@@ -249,6 +249,239 @@ fn bulk_f32_row(
         }
     }
     ui.end_row();
+}
+
+#[derive(Clone, Copy)]
+struct ObjectTransformValues {
+    position: Vec3,
+    rotation_deg: Vec3,
+    uniform_scale: Option<f32>,
+}
+
+fn object_transform_values(scene: &Scene, obj: ObjectRef) -> Option<ObjectTransformValues> {
+    let props = scene.object_transform_props(obj)?;
+    let (ry, rx, rz) = props.rotation.to_euler(glam::EulerRot::YXZ);
+    Some(ObjectTransformValues {
+        position: props.position,
+        rotation_deg: Vec3::new(rx.to_degrees(), ry.to_degrees(), rz.to_degrees()),
+        uniform_scale: props.uniform_scale,
+    })
+}
+
+fn common_transform_axis(
+    scene: &Scene,
+    refs: &[ObjectRef],
+    value: impl Fn(ObjectTransformValues) -> f32 + Copy,
+) -> Option<f32> {
+    common_f32(refs.iter().filter_map(|&obj| object_transform_values(scene, obj).map(value)))
+}
+
+fn any_rotation_modified(scene: &Scene, refs: &[ObjectRef]) -> bool {
+    refs.iter().filter_map(|&obj| object_transform_values(scene, obj)).any(|v| {
+        !approx(v.rotation_deg.x, 0.0) || !approx(v.rotation_deg.y, 0.0) || !approx(v.rotation_deg.z, 0.0)
+    })
+}
+
+pub(super) fn object_transform_bulk(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    refs: &[ObjectRef],
+    state: &mut InspectorState,
+) {
+    let refs: Vec<ObjectRef> = refs
+        .iter()
+        .copied()
+        .filter(|&obj| scene.object_transform_props(obj).is_some())
+        .collect();
+    if refs.is_empty() {
+        return;
+    }
+    let Some(primary) = object_transform_values(scene, refs[0]) else { return };
+    let scale_common = common_f32(
+        refs.iter()
+            .filter_map(|&obj| object_transform_values(scene, obj).and_then(|v| v.uniform_scale)),
+    );
+    let scale_seed = primary.uniform_scale;
+    let scale_supported = scale_seed.is_some()
+        && refs
+            .iter()
+            .all(|&obj| object_transform_values(scene, obj).is_some_and(|v| v.uniform_scale.is_some()));
+    let row_labels: &[&str] = if scale_supported {
+        &["Position", "Rotation", "Scale"]
+    } else {
+        &["Position", "Rotation"]
+    };
+
+    category(
+        ui,
+        state,
+        "Transform",
+        format!("{}  Transform", theme::icon::INSPECTOR),
+        true,
+        row_labels,
+        |ui, fs| {
+            Grid::new("bulk-object-transform")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    let position_common = [
+                        common_transform_axis(scene, &refs, |v| v.position.x),
+                        common_transform_axis(scene, &refs, |v| v.position.y),
+                        common_transform_axis(scene, &refs, |v| v.position.z),
+                    ];
+                    bulk_transform_vec3_rows(
+                        ui,
+                        fs,
+                        "Position",
+                        primary.position,
+                        position_common,
+                        0.05,
+                        "",
+                        false,
+                        scene,
+                        &refs,
+                        |scene, obj, axis, value| scene.set_object_position_axis(obj, axis, value),
+                    );
+
+                    let rotation_common = [
+                        common_transform_axis(scene, &refs, |v| v.rotation_deg.x),
+                        common_transform_axis(scene, &refs, |v| v.rotation_deg.y),
+                        common_transform_axis(scene, &refs, |v| v.rotation_deg.z),
+                    ];
+                    bulk_transform_vec3_rows(
+                        ui,
+                        fs,
+                        "Rotation",
+                        primary.rotation_deg,
+                        rotation_common,
+                        0.5,
+                        "°",
+                        any_rotation_modified(scene, &refs),
+                        scene,
+                        &refs,
+                        |scene, obj, axis, value| scene.set_object_rotation_axis_deg(obj, axis, value),
+                    );
+
+                    if scale_supported {
+                        bulk_transform_scale_row(
+                            ui,
+                            fs,
+                            scene,
+                            &refs,
+                            scale_common,
+                            scale_seed.unwrap_or(1.0),
+                        );
+                    }
+                });
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bulk_transform_vec3_rows(
+    ui: &mut egui::Ui,
+    state: &InspectorState,
+    label: &str,
+    seed: Vec3,
+    common: [Option<f32>; 3],
+    speed: f64,
+    suffix: &'static str,
+    reset_to_zero: bool,
+    scene: &mut Scene,
+    refs: &[ObjectRef],
+    mut write_axis: impl FnMut(&mut Scene, ObjectRef, usize, f32),
+) {
+    if !state.row_shown(label, true) {
+        return;
+    }
+    let axes = [("X", seed.x), ("Y", seed.y), ("Z", seed.z)];
+    let mut reset = false;
+    for (axis, (prefix, seed_value)) in axes.into_iter().enumerate() {
+        let mixed = common[axis].is_none();
+        let mut value = common[axis].unwrap_or(seed_value);
+        field_row(
+            ui,
+            state.panel_w,
+            |ui| {
+                if axis == 0 {
+                    reset = reset_arrow(ui, reset_to_zero);
+                    ui.add(egui::Label::new(label).truncate());
+                }
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    let mut drag = DragValue::new(&mut value).speed(speed).prefix(format!("{prefix} "));
+                    if !suffix.is_empty() {
+                        drag = drag.suffix(suffix);
+                    }
+                    if ui.add(drag).changed() {
+                        for &obj in refs {
+                            write_axis(scene, obj, axis, value);
+                        }
+                    }
+                    if mixed {
+                        ui.label(RichText::new("mixed").weak().small());
+                    }
+                });
+            },
+        );
+    }
+    if reset {
+        for &obj in refs {
+            for axis in 0..3 {
+                write_axis(scene, obj, axis, 0.0);
+            }
+        }
+    }
+}
+
+fn bulk_transform_scale_row(
+    ui: &mut egui::Ui,
+    state: &InspectorState,
+    scene: &mut Scene,
+    refs: &[ObjectRef],
+    common: Option<f32>,
+    seed: f32,
+) {
+    let differs = refs
+        .iter()
+        .filter_map(|&obj| object_transform_values(scene, obj).and_then(|v| v.uniform_scale))
+        .any(|v| !approx(v, 1.0));
+    if !state.row_shown("Scale", differs) {
+        return;
+    }
+    let mixed = common.is_none();
+    let mut value = common.unwrap_or(seed).max(0.001);
+    let mut reset = false;
+    field_row(
+        ui,
+        state.panel_w,
+        |ui| {
+            reset = reset_arrow(ui, differs);
+            ui.add(egui::Label::new("Scale").truncate());
+        },
+        |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add(DragValue::new(&mut value).speed(0.005).range(0.001..=1000.0))
+                    .changed()
+                {
+                    for &obj in refs {
+                        scene.set_object_uniform_scale(obj, value);
+                    }
+                }
+                if mixed {
+                    ui.label(RichText::new("mixed").weak().small());
+                }
+            });
+        },
+    );
+    if reset {
+        for &obj in refs {
+            scene.set_object_uniform_scale(obj, 1.0);
+        }
+    }
 }
 
 /// The "revert to default" gutter button (#6). Drawn ONLY when `differs` — a
@@ -700,14 +933,22 @@ fn inspector_body(
     // Static geometry (Objects) takes the Inspector when selected.
     let geo: Vec<usize> = selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
     if !geo.is_empty() {
-        geometry_inspector(ui, scene, &geo, state);
+        if geo.len() > 1 {
+            let refs = geo.iter().map(|&i| ObjectRef::Geometry(i)).collect::<Vec<_>>();
+            object_transform_bulk(ui, scene, &refs, state);
+        }
+        geometry_inspector(ui, scene, &geo, state, geo.len() == 1);
         return;
     }
 
     // LED screens take the Inspector when selected.
     let scr: Vec<usize> = selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
     if let Some(&primary) = scr.first() {
-        screen::led_screen_inspector(ui, &mut scene.screens[primary], scr.len(), sources, state);
+        if scr.len() > 1 {
+            let refs = scr.iter().map(|&i| ObjectRef::Screen(i)).collect::<Vec<_>>();
+            object_transform_bulk(ui, scene, &refs, state);
+        }
+        screen::led_screen_inspector(ui, &mut scene.screens[primary], scr.len(), sources, state, scr.len() == 1);
         return;
     }
 
@@ -715,17 +956,19 @@ fn inspector_body(
     let pyro: Vec<usize> = selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
     if let Some(&primary) = pyro.first() {
         if pyro.len() > 1 {
+            let refs = pyro.iter().map(|&i| ObjectRef::Pyro(i)).collect::<Vec<_>>();
+            object_transform_bulk(ui, scene, &refs, state);
             // Bulk: edit the active device, then propagate every effect/look field the
             // user just changed to the rest of the selection (snapshot → inspect → diff
-            // → apply). Identity, placement and the DMX patch stay per-device.
+            // → apply). Identity and the DMX patch stay per-device.
             let before = scene.pyro[primary].clone();
-            pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state);
+            pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state, false);
             let after = scene.pyro[primary].clone();
             for &i in pyro.iter().skip(1) {
                 apply_pyro_bulk_delta(&before, &after, &mut scene.pyro[i]);
             }
         } else {
-            pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state);
+            pyro_inspector(ui, &mut scene.pyro[primary], pyro.len(), state, true);
         }
         return;
     }
@@ -817,7 +1060,13 @@ fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut I
 /// truss, or set piece): identity, visibility, and an editable world transform
 /// (position / rotation / uniform scale), decomposed from its 4×4 and recomposed
 /// only when a field changes (so a one-off non-uniform import isn't flattened).
-fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state: &mut InspectorState) {
+fn geometry_inspector(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    ids: &[usize],
+    state: &mut InspectorState,
+    show_transform: bool,
+) {
     let primary = ids[0];
     let Some(g) = scene.geometry.get_mut(primary) else {
         ui.label("Selection is no longer valid.");
@@ -831,7 +1080,11 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
             .small(),
     );
     if ids.len() > 1 {
-        ui.label(RichText::new(format!("{} objects — editing the active one", ids.len())).weak().small());
+        ui.label(
+            RichText::new(format!("{} objects — transform applies to all; other edits affect the active object", ids.len()))
+                .weak()
+                .small(),
+        );
     }
     ui.separator();
 
@@ -842,43 +1095,45 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
         }
     });
 
-    // Position is read/written via the translation column directly (lossless), so
-    // a pure move never disturbs a non-uniform/sheared import. Rotation + scale
-    // are decomposed for display and only re-composed (to a clean uniform basis)
-    // when the user actually edits one of them.
-    let (scale0, rot0, _trans0) = g.transform.to_scale_rotation_translation();
-    let mut pos = g.transform.w_axis.truncate();
-    let mut uscale = ((scale0.x + scale0.y + scale0.z) / 3.0).max(1e-3);
-    let mut rot = rot0;
-    let bounds = g.world_bounds();
-    let mut pos_changed = false;
-    let mut rs_changed = false;
+    if show_transform {
+        // Position is read/written via the translation column directly (lossless), so
+        // a pure move never disturbs a non-uniform/sheared import. Rotation + scale
+        // are decomposed for display and only re-composed (to a clean uniform basis)
+        // when the user actually edits one of them.
+        let (scale0, rot0, _trans0) = g.transform.to_scale_rotation_translation();
+        let mut pos = g.transform.w_axis.truncate();
+        let mut uscale = ((scale0.x + scale0.y + scale0.z) / 3.0).max(1e-3);
+        let mut rot = rot0;
+        let bounds = g.world_bounds();
+        let mut pos_changed = false;
+        let mut rs_changed = false;
 
-    // Position is lossless (translation column only); Rotation (→identity) + Scale
-    // (→unit) recompose to a clean uniform basis only when the user edits one.
-    props::with(ui, state, |p| {
-        p.group("Transform", theme::icon::INSPECTOR, true, |p| {
-            pos_changed |= p.vec3("Position", &mut pos).speed(0.05).show();
-            rs_changed |= p.rotation("Rotation", &mut rot);
-            rs_changed |= p
-                .f32("Scale", &mut uscale)
-                .speed(0.005)
-                .range(0.001..=1000.0)
-                .default(1.0)
-                .show();
-            if let Some((lo, hi)) = bounds {
-                let s = hi - lo;
-                p.note(format!("size  {:.2} × {:.2} × {:.2} m", s.x, s.y, s.z));
-            }
+        // Position is lossless (translation column only); Rotation (→identity) + Scale
+        // (→unit) recompose to a clean uniform basis only when the user edits one.
+        props::with(ui, state, |p| {
+            p.group("Transform", theme::icon::INSPECTOR, true, |p| {
+                pos_changed |= p.vec3("Position", &mut pos).speed(0.05).show();
+                rs_changed |= p.rotation("Rotation", &mut rot);
+                rs_changed |= p
+                    .f32("Scale", &mut uscale)
+                    .speed(0.005)
+                    .range(0.001..=1000.0)
+                    .default(1.0)
+                    .show();
+                if let Some((lo, hi)) = bounds {
+                    let s = hi - lo;
+                    p.note(format!("size  {:.2} × {:.2} × {:.2} m", s.x, s.y, s.z));
+                }
+            });
         });
-    });
 
-    if rs_changed {
-        g.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
-    } else if pos_changed {
-        // Pure move: rewrite only the translation column, keeping the original
-        // (possibly non-uniform) basis intact.
-        g.transform.w_axis = pos.extend(1.0);
+        if rs_changed {
+            g.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
+        } else if pos_changed {
+            // Pure move: rewrite only the translation column, keeping the original
+            // (possibly non-uniform) basis intact.
+            g.transform.w_axis = pos.extend(1.0);
+        }
     }
 }
 
@@ -888,7 +1143,13 @@ fn geometry_inspector(ui: &mut egui::Ui, scene: &mut Scene, ids: &[usize], state
 /// Mirrors [`geometry_inspector`] (the device stores a `Mat4`, decomposed/recomposed
 /// on edit) — when patched + receiving live DMX the Effect values are console-driven,
 /// otherwise they are the free-run preview values.
-fn pyro_inspector(ui: &mut egui::Ui, d: &mut crate::scene::PyroDevice, count: usize, state: &mut InspectorState) {
+fn pyro_inspector(
+    ui: &mut egui::Ui,
+    d: &mut crate::scene::PyroDevice,
+    count: usize,
+    state: &mut InspectorState,
+    show_transform: bool,
+) {
     ui.heading(d.name.as_str());
     ui.label(RichText::new(format!("{} · {}", d.kind.label(), d.profile_name)).weak().small());
     if count > 1 {
@@ -915,10 +1176,12 @@ fn pyro_inspector(ui: &mut egui::Ui, d: &mut crate::scene::PyroDevice, count: us
     let mut pos_changed = false;
     let mut rot_changed = false;
     props::with(ui, state, |p| {
-        p.group("Transform", theme::icon::INSPECTOR, true, |p| {
-            pos_changed |= p.vec3("Position", &mut pos).speed(0.05).show();
-            rot_changed |= p.rotation("Rotation", &mut rot);
-        });
+        if show_transform {
+            p.group("Transform", theme::icon::INSPECTOR, true, |p| {
+                pos_changed |= p.vec3("Position", &mut pos).speed(0.05).show();
+                rot_changed |= p.rotation("Rotation", &mut rot);
+            });
+        }
         d.inspect(p);
     });
     if rot_changed {
@@ -931,8 +1194,8 @@ fn pyro_inspector(ui: &mut egui::Ui, d: &mut crate::scene::PyroDevice, count: us
 /// Bulk-edit propagation for pyro: copy to `target` every effect/look/quality field the
 /// user just changed on the active device (`before` → `after`). Only fields that ACTUALLY
 /// changed are copied, so editing one knob in a multi-selection nudges only that knob on
-/// the rest. Per-device data is deliberately left alone: name, kind, the world transform,
-/// and the inline DMX patch (each device keeps its own address).
+/// the rest. Transform is handled by [`object_transform_bulk`]; per-device identity,
+/// kind, and the inline DMX patch stay local to each device.
 #[allow(clippy::float_cmp)] // exact change-detection — propagate only what the user touched
 fn apply_pyro_bulk_delta(
     before: &crate::scene::PyroDevice,
@@ -1073,7 +1336,12 @@ fn gdtf_inspector(
             meta_sep(ui, muted);
             meta_value(ui, "per-cell DMX", pal.accent, true);
         });
-        emitter_layout_preview(ui, fixture, emitters);
+        let emitter_mode_index = fixture.mode_index;
+        let emitter_shapes = tex
+            .emitter_shapes
+            .entry(emitter_mode_index)
+            .or_insert_with(|| build_emitter_preview_shapes(&gdtf, emitter_mode_index));
+        emitter_layout_preview(ui, fixture, emitters, emitter_shapes);
     }
 
     // MVR patch identity (FixtureID, DMX address, mode) when imported from a scene.
@@ -1203,27 +1471,35 @@ fn gdtf_inspector(
     );
 }
 
-/// Draw the fixture's emitters at their TRUE 2D positions on the face (from each
-/// `EmitterDef::pos`), as squares/rectangles sized by the real aperture and
-/// coloured by the live per-cell value — a faithful mini-map of the head (the
-/// ROXX Cluster's stacked tube/RGB bands, a Spiider's lens flower, a bar's row),
-/// not a generic wrapped grid of dots. Unlit cells read as dark grey so the
-/// layout is always visible; the master level fades them up to their cell colour.
+/// Draw the fixture's emitters at their TRUE 2D positions on the face. When the
+/// renderer has a real beam-node lens mesh, the preview uses that mesh's 2D
+/// silhouette; otherwise it falls back to the same disc / rounded-rect aperture
+/// mask the renderer uses for synthetic lens billboards.
 fn emitter_layout_preview(
     ui: &mut egui::Ui,
     fixture: &crate::scene::Fixture,
     emitters: &[crate::gdtf::EmitterDef],
+    mesh_shapes: &[Option<EmitterPreviewCell>],
 ) {
-    // Face bounds (positions ± apertures), skipping coaxial overlays.
+    // Face bounds, skipping coaxial overlays.
     let mut lo = [f32::MAX, f32::MAX];
     let mut hi = [f32::MIN, f32::MIN];
     let mut any = false;
-    for e in emitters.iter().filter(|e| e.merged_into.is_none()) {
+    for (i, e) in emitters.iter().enumerate().filter(|(_, e)| e.merged_into.is_none()) {
         any = true;
-        lo[0] = lo[0].min(e.pos[0] - e.aperture.half_w);
-        lo[1] = lo[1].min(e.pos[1] - e.aperture.half_h);
-        hi[0] = hi[0].max(e.pos[0] + e.aperture.half_w);
-        hi[1] = hi[1].max(e.pos[1] + e.aperture.half_h);
+        if let Some(cell) = mesh_shapes.get(i).and_then(|s| s.as_ref()) {
+            for &[x, y] in &cell.outline {
+                lo[0] = lo[0].min(x);
+                lo[1] = lo[1].min(y);
+                hi[0] = hi[0].max(x);
+                hi[1] = hi[1].max(y);
+            }
+        } else {
+            lo[0] = lo[0].min(e.pos[0] - e.aperture.half_w);
+            lo[1] = lo[1].min(e.pos[1] - e.aperture.half_h);
+            hi[0] = hi[0].max(e.pos[0] + e.aperture.half_w);
+            hi[1] = hi[1].max(e.pos[1] + e.aperture.half_h);
+        }
     }
     if !any {
         return;
@@ -1250,6 +1526,8 @@ fn emitter_layout_preview(
             face.top() + (hi[1] - y) * scale,
         )
     };
+    let stroke = egui::Stroke::new(1.0, pal.border);
+    let mut cells: Vec<(EmitterPreviewPaintShape, Color32)> = Vec::new();
     for (i, e) in emitters.iter().enumerate() {
         if e.merged_into.is_some() {
             continue;
@@ -1262,18 +1540,256 @@ fn emitter_layout_preview(
             (egui::lerp(0.27_f32..=on.max(0.0), level) * 255.0).clamp(0.0, 255.0) as u8
         };
         let col = Color32::from_rgb(lit(c[0]), lit(c[1]), lit(c[2]));
+        if let Some(cell) = mesh_shapes.get(i).and_then(|s| s.as_ref()) {
+            let outline = cell.outline.iter().map(|&[x, y]| map(x, y)).collect::<Vec<_>>();
+            if outline.len() >= 3 {
+                cells.push((
+                    EmitterPreviewPaintShape::Polygon { outline, depth: cell.depth, area: cell.area },
+                    col,
+                ));
+                continue;
+            }
+        }
+
         let a = map(e.pos[0] - e.aperture.half_w, e.pos[1] + e.aperture.half_h);
         let b = map(e.pos[0] + e.aperture.half_w, e.pos[1] - e.aperture.half_h);
         let rect = egui::Rect::from_two_pos(a, b);
-        // A hair of inset so neighbouring cells stay visually distinct as squares.
         let cell = rect.shrink((rect.width().min(rect.height()) * 0.08).clamp(0.2, 1.2));
-        let round = if e.aperture.round {
-            cell.width().min(cell.height()) * 0.5
+        if e.aperture.round {
+            cells.push((
+                EmitterPreviewPaintShape::Circle {
+                    center: cell.center(),
+                    radius: cell.width().min(cell.height()) * 0.5,
+                    depth: 0.0,
+                },
+                col,
+            ));
         } else {
-            1.0
-        };
-        painter.rect_filled(cell, round, col);
+            let round = (cell.width().min(cell.height()) * 0.06).clamp(1.0, 3.0);
+            cells.push((EmitterPreviewPaintShape::Rect { rect: cell, round, depth: 0.0 }, col));
+        }
     }
+    cells.sort_by(|a, b| {
+        a.0.depth()
+            .total_cmp(&b.0.depth())
+            .then_with(|| b.0.area().total_cmp(&a.0.area()))
+    });
+    for (shape, col) in &cells {
+        shape.fill(&painter, *col);
+    }
+    for (shape, _) in &cells {
+        shape.stroke(&painter, stroke);
+    }
+}
+
+enum EmitterPreviewPaintShape {
+    Polygon { outline: Vec<egui::Pos2>, depth: f32, area: f32 },
+    Circle { center: egui::Pos2, radius: f32, depth: f32 },
+    Rect { rect: egui::Rect, round: f32, depth: f32 },
+}
+
+impl EmitterPreviewPaintShape {
+    fn depth(&self) -> f32 {
+        match self {
+            Self::Polygon { depth, .. } | Self::Circle { depth, .. } | Self::Rect { depth, .. } => *depth,
+        }
+    }
+
+    fn area(&self) -> f32 {
+        match self {
+            Self::Polygon { area, .. } => *area,
+            Self::Circle { radius, .. } => std::f32::consts::PI * radius * radius,
+            Self::Rect { rect, .. } => rect.width() * rect.height(),
+        }
+    }
+
+    fn fill(&self, painter: &egui::Painter, color: Color32) {
+        match self {
+            Self::Polygon { outline, .. } => {
+                painter.add(egui::Shape::convex_polygon(outline.clone(), color, egui::Stroke::NONE));
+            }
+            Self::Circle { center, radius, .. } => {
+                painter.circle_filled(*center, *radius, color);
+            }
+            Self::Rect { rect, round, .. } => {
+                painter.rect_filled(*rect, *round, color);
+            }
+        }
+    }
+
+    fn stroke(&self, painter: &egui::Painter, stroke: egui::Stroke) {
+        match self {
+            Self::Polygon { outline, .. } => {
+                if outline.len() >= 3 {
+                    painter.add(egui::Shape::closed_line(outline.clone(), stroke));
+                }
+            }
+            Self::Circle { center, radius, .. } => {
+                painter.circle_stroke(*center, *radius, stroke);
+            }
+            Self::Rect { rect, round, .. } => {
+                painter.rect_stroke(*rect, *round, stroke, egui::StrokeKind::Inside);
+            }
+        }
+    }
+}
+
+fn build_emitter_preview_shapes(gdtf: &GdtfFixture, mode_index: usize) -> Vec<Option<EmitterPreviewCell>> {
+    let emitters = gdtf.emitters(mode_index);
+    if emitters.is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(Clone)]
+    struct PolarEmitter {
+        idx: usize,
+        r: f32,
+        theta: f32,
+    }
+
+    #[derive(Clone)]
+    struct Ring {
+        r: f32,
+        items: Vec<PolarEmitter>,
+    }
+
+    let mut polar = Vec::new();
+    for (idx, e) in emitters.iter().enumerate() {
+        if e.merged_into.is_some() {
+            continue;
+        }
+        let x = e.pos[0];
+        let y = e.pos[1];
+        if !(x.is_finite() && y.is_finite()) {
+            continue;
+        }
+        let r = (x * x + y * y).sqrt();
+        let theta = y.atan2(x).rem_euclid(std::f32::consts::TAU);
+        polar.push(PolarEmitter { idx, r, theta });
+    }
+    if polar.len() < 8 {
+        return vec![None; emitters.len()];
+    }
+    let max_r = polar.iter().map(|p| p.r).fold(0.0_f32, f32::max);
+    if max_r < 1e-4 {
+        return vec![None; emitters.len()];
+    }
+
+    polar.sort_by(|a, b| a.r.total_cmp(&b.r));
+    let ring_tol = (max_r * 0.08).max(1e-4);
+    let mut rings: Vec<Ring> = Vec::new();
+    for p in polar {
+        match rings.last_mut() {
+            Some(ring) if (p.r - ring.r).abs() <= ring_tol => {
+                let n = ring.items.len() as f32;
+                ring.r = (ring.r * n + p.r) / (n + 1.0);
+                ring.items.push(p);
+            }
+            _ => rings.push(Ring { r: p.r, items: vec![p] }),
+        }
+    }
+    if !rings.iter().any(|r| r.items.len() >= 6) {
+        return vec![None; emitters.len()];
+    }
+
+    rings.sort_by(|a, b| a.r.total_cmp(&b.r));
+    let mut out = vec![None; emitters.len()];
+    for ri in 0..rings.len() {
+        let ring = &rings[ri];
+        let inner = if ri == 0 {
+            0.0
+        } else {
+            (rings[ri - 1].r + ring.r) * 0.5
+        };
+        let outer = if ri + 1 < rings.len() {
+            (ring.r + rings[ri + 1].r) * 0.5
+        } else {
+            (ring.r + (ring.r - inner).max(max_r * 0.08)).max(max_r * 0.1)
+        };
+
+        let mut items = ring.items.clone();
+        items.sort_by(|a, b| a.theta.total_cmp(&b.theta));
+        if items.len() == 1 && inner <= max_r * 0.08 {
+            let outline = circle_polygon(outer, 40);
+            let area = polygon_area_2d(&outline);
+            out[items[0].idx] = Some(EmitterPreviewCell { outline, depth: 0.0, area });
+            continue;
+        }
+        if items.len() < 2 {
+            let e = &emitters[items[0].idx];
+            let outline = ellipse_polygon(e.pos[0], e.pos[1], e.aperture.half_w, e.aperture.half_h, 28);
+            let area = polygon_area_2d(&outline);
+            out[items[0].idx] = Some(EmitterPreviewCell { outline, depth: 0.0, area });
+            continue;
+        }
+
+        for i in 0..items.len() {
+            let theta = items[i].theta;
+            let prev = if i == 0 {
+                items[items.len() - 1].theta - std::f32::consts::TAU
+            } else {
+                items[i - 1].theta
+            };
+            let next = if i + 1 == items.len() {
+                items[0].theta + std::f32::consts::TAU
+            } else {
+                items[i + 1].theta
+            };
+            let start = (prev + theta) * 0.5;
+            let end = (theta + next) * 0.5;
+            let outline = annular_sector_polygon(inner, outer, start, end);
+            let area = polygon_area_2d(&outline);
+            out[items[i].idx] = Some(EmitterPreviewCell { outline, depth: 0.0, area });
+        }
+    }
+    out
+}
+
+fn circle_polygon(radius: f32, steps: usize) -> Vec<[f32; 2]> {
+    (0..steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32 * std::f32::consts::TAU;
+            [t.cos() * radius, t.sin() * radius]
+        })
+        .collect()
+}
+
+fn ellipse_polygon(cx: f32, cy: f32, rx: f32, ry: f32, steps: usize) -> Vec<[f32; 2]> {
+    (0..steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32 * std::f32::consts::TAU;
+            [cx + t.cos() * rx, cy + t.sin() * ry]
+        })
+        .collect()
+}
+
+fn annular_sector_polygon(inner: f32, outer: f32, start: f32, end: f32) -> Vec<[f32; 2]> {
+    let span = (end - start).abs().max(1e-4);
+    let steps = ((span / std::f32::consts::TAU) * 48.0).ceil().clamp(2.0, 10.0) as usize;
+    let mut pts = Vec::with_capacity((steps + 1) * 2);
+    for s in 0..=steps {
+        let t = start + (end - start) * (s as f32 / steps as f32);
+        pts.push([t.cos() * outer, t.sin() * outer]);
+    }
+    if inner > 1e-4 {
+        for s in (0..=steps).rev() {
+            let t = start + (end - start) * (s as f32 / steps as f32);
+            pts.push([t.cos() * inner, t.sin() * inner]);
+        }
+    } else {
+        pts.push([0.0, 0.0]);
+    }
+    pts
+}
+
+fn polygon_area_2d(points: &[[f32; 2]]) -> f32 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .map(|(a, b)| a[0] * b[1] - a[1] * b[0])
+        .sum::<f32>()
+        .abs()
+        * 0.5
 }
 
 pub(crate) fn load_gdtf_textures(ctx: &egui::Context, gdtf: &GdtfFixture) -> GdtfTextures {
@@ -1295,7 +1811,7 @@ pub(crate) fn load_gdtf_textures(ctx: &egui::Context, gdtf: &GdtfFixture) -> Gdt
                 .collect()
         })
         .collect();
-    GdtfTextures { thumbnail, wheels }
+    GdtfTextures { thumbnail, wheels, emitter_shapes: HashMap::new() }
 }
 
 fn decode_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {

@@ -576,6 +576,50 @@ impl AimState {
     }
 }
 
+/// Keep the Move/origin gizmo visible while a modal Move owns the viewport. This
+/// is draw-only: hit-testing stays disabled until the current transform commits
+/// or cancels, so the live drag state cannot be stolen by another handle.
+fn draw_passive_move_origin_gizmo(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    scene: &Scene,
+    selection: &Selection,
+    camera: &OrbitCamera,
+    xform: &TransformPrefs,
+    cursor_3d: Vec3,
+    aspect: f32,
+) -> Option<egui::Pos2> {
+    let fids: Vec<usize> =
+        selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+    let gids: Vec<usize> =
+        selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
+    let sids: Vec<usize> =
+        selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+    let pids: Vec<usize> =
+        selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
+    let eids: Vec<usize> =
+        selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+    let objs = obj_refs(&fids, &gids, &sids, &pids, &eids);
+    if objs.is_empty() {
+        return None;
+    }
+
+    let vp = camera.view_proj(aspect);
+    let pivot = compute_pivot(scene, &objs, xform.pivot, cursor_3d);
+    let screen = OrbitCamera::project_to_screen(pivot, vp, rect);
+    if let Some(group) = gizmo::for_tool(ActiveTool::Move) {
+        let cx = GizmoCtx {
+            pivot,
+            vp,
+            rect,
+            arm: (camera.distance * 0.18).clamp(0.4, 4.0),
+            forward: camera.view_basis().2,
+        };
+        group.draw(&ui.painter_at(rect), &cx, None);
+    }
+    screen
+}
+
 /// Where a viewport ray lands in the world, for the Measure tool: the nearest hit on
 /// real surfaces (fixtures' bodies, screens, geometry AABBs, environment volumes),
 /// falling back to the **ground plane y=0** when the ray misses everything (so you can
@@ -1239,6 +1283,20 @@ pub fn viewport(
             // `before` undo snapshot is taken before any extras exist.
             if op.from_duplicate && !*transform_started {
                 update_dup_array(op, scene);
+            }
+            if op.kind == TransformKind::Move
+                && let Some(sc) = draw_passive_move_origin_gizmo(
+                    ui,
+                    rect,
+                    scene,
+                    selection,
+                    camera,
+                    &xform,
+                    *cursor_3d,
+                    aspect,
+                )
+            {
+                gizmo_screen = Some(sc);
             }
             // The key cluster (X/Y/Z · type number · Enter/Esc) is read LIVE from
             // the keymap so the pill can never drift from the binds (#23). When an

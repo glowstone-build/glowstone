@@ -12,7 +12,14 @@ use glam::{Mat4, Vec3};
 /// cabinet grid (with a live derived-resolution readout), surface photometry,
 /// and the content source. Phase 1 covers Test Pattern + Solid Colour content;
 /// the cabinet is editable directly (the panel TYPE is set from the Library).
-pub(super) fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: usize, sources: &ScreenSources, state: &mut InspectorState) {
+pub(super) fn led_screen_inspector(
+    ui: &mut egui::Ui,
+    s: &mut LedScreen,
+    count: usize,
+    sources: &ScreenSources,
+    state: &mut InspectorState,
+    show_transform: bool,
+) {
     ui.heading(s.name.as_str());
     let [rx, ry] = s.resolution();
     let [mw, mh] = s.size_m();
@@ -22,7 +29,11 @@ pub(super) fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: 
             .small(),
     );
     if count > 1 {
-        ui.label(RichText::new(format!("{count} screens — editing the active one")).weak().small());
+        ui.label(
+            RichText::new(format!("{count} screens — transform applies to all; other edits affect the active screen"))
+                .weak()
+                .small(),
+        );
     }
     ui.separator();
 
@@ -36,40 +47,42 @@ pub(super) fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: 
         ui.add(DragValue::new(&mut s.sequence).range(1..=u32::MAX).speed(0.2));
     });
 
-    // --- Transform (position / rotation / uniform scale, lossless like geometry) ---
-    let (scale0, rot0, _t0) = s.transform.to_scale_rotation_translation();
-    let mut pos = s.transform.w_axis.truncate();
-    let mut uscale = ((scale0.x + scale0.y + scale0.z) / 3.0).max(1e-3);
-    let (ryr, rxr, rzr) = rot0.to_euler(glam::EulerRot::YXZ);
-    let (mut ey, mut ex, mut ez) = (ryr.to_degrees(), rxr.to_degrees(), rzr.to_degrees());
-    let mut pos_changed = false;
-    let mut rs_changed = false;
-    category(
-        ui,
-        state,
-        "Transform",
-        format!("{}  Transform", theme::icon::INSPECTOR),
-        true,
-        &["Position", "Rotation", "Scale"],
-        |ui, fs| {
-            Grid::new("led-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
-                pos_changed |= vec3_rows(
-                    ui, fs, "Position", false, 0.05, "",
-                    &mut pos.x, &mut pos.y, &mut pos.z,
-                );
-                rs_changed |= vec3_rows(ui, fs, "Rotation", false, 0.5, "°", &mut ex, &mut ey, &mut ez);
-                row(ui, fs, "Scale", false, |ui| {
-                    rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
+    if show_transform {
+        // --- Transform (position / rotation / uniform scale, lossless like geometry) ---
+        let (scale0, rot0, _t0) = s.transform.to_scale_rotation_translation();
+        let mut pos = s.transform.w_axis.truncate();
+        let mut uscale = ((scale0.x + scale0.y + scale0.z) / 3.0).max(1e-3);
+        let (ryr, rxr, rzr) = rot0.to_euler(glam::EulerRot::YXZ);
+        let (mut ey, mut ex, mut ez) = (ryr.to_degrees(), rxr.to_degrees(), rzr.to_degrees());
+        let mut pos_changed = false;
+        let mut rs_changed = false;
+        category(
+            ui,
+            state,
+            "Transform",
+            format!("{}  Transform", theme::icon::INSPECTOR),
+            true,
+            &["Position", "Rotation", "Scale"],
+            |ui, fs| {
+                Grid::new("led-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                    // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
+                    pos_changed |= vec3_rows(
+                        ui, fs, "Position", false, 0.05, "",
+                        &mut pos.x, &mut pos.y, &mut pos.z,
+                    );
+                    rs_changed |= vec3_rows(ui, fs, "Rotation", false, 0.5, "°", &mut ex, &mut ey, &mut ez);
+                    row(ui, fs, "Scale", false, |ui| {
+                        rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
+                    });
                 });
-            });
-        },
-    );
-    if rs_changed {
-        let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
-        s.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
-    } else if pos_changed {
-        s.transform.w_axis = pos.extend(1.0);
+            },
+        );
+        if rs_changed {
+            let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
+            s.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
+        } else if pos_changed {
+            s.transform.w_axis = pos.extend(1.0);
+        }
     }
 
     // --- Panel: one cabinet's size + native pixels (pitch is derived) ---

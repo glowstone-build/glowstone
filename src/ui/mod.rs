@@ -136,6 +136,15 @@ pub struct GdtfTextures {
     pub thumbnail: Option<egui::TextureHandle>,
     /// `wheels[wheel_index][slot_index]`.
     pub wheels: Vec<Vec<Option<egui::TextureHandle>>>,
+    /// Inspector emitter-preview silhouettes, keyed by GDTF mode index.
+    pub(crate) emitter_shapes: HashMap<usize, Vec<Option<EmitterPreviewCell>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EmitterPreviewCell {
+    pub outline: Vec<[f32; 2]>,
+    pub depth: f32,
+    pub area: f32,
 }
 
 /// The set of dockable panels. Plain enum — each variant is one tab.

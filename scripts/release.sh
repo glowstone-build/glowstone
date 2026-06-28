@@ -45,7 +45,7 @@ NOTES="## glowstone ${VERSION}
 Downloads
 - macOS (Apple Silicon): the .dmg. It's ad-hoc signed, so the first launch needs a
   right-click → Open (or \`xattr -dr com.apple.quarantine /Applications/Glowstone.app\`).
-- Windows (x64): the portable `.zip`"
+- Windows (x64): the portable \`.zip\`"
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   echo "==> release $TAG exists — uploading artifacts (clobber)"
