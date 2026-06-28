@@ -1128,6 +1128,73 @@ fn gdtf_inspector(
     );
 }
 
+/// Draw the fixture's emitters at their TRUE 2D positions on the face (from each
+/// `EmitterDef::pos`), as squares/rectangles sized by the real aperture and
+/// coloured by the live per-cell value — a faithful mini-map of the head (the
+/// ROXX Cluster's stacked tube/RGB bands, a Spiider's lens flower, a bar's row),
+/// not a generic wrapped grid of dots. Unlit cells read as dark grey so the
+/// layout is always visible; the master level fades them up to their cell colour.
+fn emitter_layout_preview(
+    ui: &mut egui::Ui,
+    fixture: &crate::scene::Fixture,
+    emitters: &[crate::gdtf::EmitterDef],
+) {
+    // Face bounds (positions ± apertures), skipping coaxial overlays.
+    let mut lo = [f32::MAX, f32::MAX];
+    let mut hi = [f32::MIN, f32::MIN];
+    let mut any = false;
+    for e in emitters.iter().filter(|e| e.merged_into.is_none()) {
+        any = true;
+        lo[0] = lo[0].min(e.pos[0] - e.aperture.half_w);
+        lo[1] = lo[1].min(e.pos[1] - e.aperture.half_h);
+        hi[0] = hi[0].max(e.pos[0] + e.aperture.half_w);
+        hi[1] = hi[1].max(e.pos[1] + e.aperture.half_h);
+    }
+    if !any {
+        return;
+    }
+    let span_x = (hi[0] - lo[0]).max(1e-3);
+    let span_y = (hi[1] - lo[1]).max(1e-3);
+    let w = ui.available_width().clamp(80.0, 360.0);
+    let h = (w * span_y / span_x).clamp(10.0, 150.0);
+    ui.add_space(2.0);
+    let (canvas, _) = ui.allocate_exact_size(egui::vec2(w, h), Sense::hover());
+    let painter = ui.painter_at(canvas);
+    painter.rect_filled(canvas, 2.0, Color32::from_gray(20));
+    let level = (fixture.intensity * fixture.optics.dimmer).clamp(0.0, 1.0);
+    // World (right, up) → canvas pixel. `up` is +y, screen y is down, so flip.
+    let map = |x: f32, y: f32| -> egui::Pos2 {
+        egui::pos2(
+            canvas.left() + (x - lo[0]) / span_x * canvas.width(),
+            canvas.top() + (hi[1] - y) / span_y * canvas.height(),
+        )
+    };
+    for (i, e) in emitters.iter().enumerate() {
+        if e.merged_into.is_some() {
+            continue;
+        }
+        let c = fixture.cells.get(i).copied().unwrap_or([1.0, 1.0, 1.0]);
+        // Off → dark grey (shows the cell exists); fades to the emitted colour
+        // with the master level so the preview tracks the live look.
+        let lit = |ch: f32| -> u8 {
+            let on = (ch.min(1.0) * level).powf(1.0 / 2.2);
+            (egui::lerp(0.27_f32..=on.max(0.0), level) * 255.0).clamp(0.0, 255.0) as u8
+        };
+        let col = Color32::from_rgb(lit(c[0]), lit(c[1]), lit(c[2]));
+        let a = map(e.pos[0] - e.aperture.half_w, e.pos[1] + e.aperture.half_h);
+        let b = map(e.pos[0] + e.aperture.half_w, e.pos[1] - e.aperture.half_h);
+        let rect = egui::Rect::from_two_pos(a, b);
+        // A hair of inset so neighbouring cells stay visually distinct as squares.
+        let cell = rect.shrink((rect.width().min(rect.height()) * 0.08).clamp(0.2, 1.2));
+        let round = if e.aperture.round {
+            cell.width().min(cell.height()) * 0.5
+        } else {
+            1.0
+        };
+        painter.rect_filled(cell, round, col);
+    }
+}
+
 pub(crate) fn load_gdtf_textures(ctx: &egui::Context, gdtf: &GdtfFixture) -> GdtfTextures {
     let thumbnail = gdtf
         .thumbnail
