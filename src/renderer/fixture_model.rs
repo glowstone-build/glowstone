@@ -218,6 +218,12 @@ fn collect_node(node: &gltf::Node, parent: Mat4, blob: Option<&[u8]>, out: &mut 
 pub struct PartDraw {
     pub model: String,
     pub world: Mat4,
+    /// When this part is an emitter's own lens geometry (the model on a `<Beam>`
+    /// node), the emitter index — index-aligned with the mode's emitters / cells.
+    /// The renderer draws these polygons EMISSIVE in the cell colour (the real
+    /// lens shape — a Spiider's hexagons), so the synthetic lens billboard is
+    /// skipped for them. `None` for body parts (base / yoke / head).
+    pub emitter: Option<usize>,
 }
 
 /// The beam's world-space frame: where it exits, the direction it points, and a
@@ -326,6 +332,7 @@ pub fn assemble(
 
     let mut parts = Vec::new();
     let mut beams = Vec::new();
+    let mut beam_idx = 0usize;
     walk(
         fixture.root_for_mode(mode_index),
         root,
@@ -336,6 +343,7 @@ pub fn assemble(
         &axes,
         &mut parts,
         &mut beams,
+        &mut beam_idx,
     );
     Assembly { parts, beams }
 }
@@ -351,6 +359,7 @@ fn walk(
     axes: &std::collections::HashMap<&str, AxisDrive>,
     parts: &mut Vec<PartDraw>,
     beams: &mut Vec<BeamFrame>,
+    beam_idx: &mut usize,
 ) {
     let mut local = node.matrix;
     // GDTF axes rotate about their local axis: pan about +Z (up), tilt about +X.
@@ -365,6 +374,9 @@ fn walk(
     }
     let world = parent * local;
 
+    // A model on a `<Beam>` node is that emitter's own lens geometry → tag it with
+    // the emitter index (same depth-first order as `collect_emitters` / the cells).
+    let is_beam = node.kind == GeometryKind::Beam;
     if let Some(model) = &node.model {
         // The glTF meshes are authored +Y-up; the GDTF geometry frame is +Z-up.
         // Rotate each part's mesh from Y-up into the geometry's Z-up frame
@@ -372,9 +384,10 @@ fn walk(
         parts.push(PartDraw {
             model: model.clone(),
             world: world * Mat4::from_rotation_x(FRAC_PI_2),
+            emitter: is_beam.then_some(*beam_idx),
         });
     }
-    if node.kind == GeometryKind::Beam {
+    if is_beam {
         let origin = world.transform_point3(Vec3::ZERO);
         // The beam emits along the geometry's local -Z (GDTF "down"); local X/Y
         // are the stable cookie basis (carried through pan/tilt by `world`).
@@ -382,10 +395,11 @@ fn walk(
         let right = world.transform_vector3(Vec3::X).normalize_or_zero();
         let up = world.transform_vector3(Vec3::Y).normalize_or_zero();
         beams.push(BeamFrame { origin, dir, right, up });
+        *beam_idx += 1;
     }
 
     for child in &node.children {
-        walk(child, world, pan, tilt, cell_pan, cell_tilt, axes, parts, beams);
+        walk(child, world, pan, tilt, cell_pan, cell_tilt, axes, parts, beams, beam_idx);
     }
 }
 

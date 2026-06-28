@@ -65,10 +65,14 @@ pub struct MeshInstance {
     pub color: [f32; 3],
     pub intensity: f32,
     pub selected: f32,
+    /// Per-instance emissive amount `0..1` — an emitter's real lens geometry glows
+    /// the instance colour (HDR bloom) instead of being shaded, exactly like the
+    /// baked-`emissive` lens billboard but for the GLB lens mesh. 0 for body parts.
+    pub emissive: f32,
 }
 
 impl MeshInstance {
-    const ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
+    const ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
         5 => Float32x4,
         6 => Float32x4,
         7 => Float32x4,
@@ -76,6 +80,7 @@ impl MeshInstance {
         9 => Float32x3,
         10 => Float32,
         11 => Float32,
+        12 => Float32,
     ];
 
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
