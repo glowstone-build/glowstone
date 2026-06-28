@@ -40,15 +40,12 @@ if [ ${#ARTIFACTS[@]} -eq 0 ]; then
 fi
 echo "==> artifacts:"; printf '    %s\n' "${ARTIFACTS[@]}"
 
-NOTES="glowstone ${VERSION} — first public alpha.
-
-Real-time lighting previsualization for live events: GDTF/DMX fixtures, volumetric
-\"Spectre\" beams, MVR scenes and pyro. This is an early alpha — expect rough edges.
+NOTES="## glowstone ${VERSION}
 
 Downloads
 - macOS (Apple Silicon): the .dmg. It's ad-hoc signed, so the first launch needs a
   right-click → Open (or \`xattr -dr com.apple.quarantine /Applications/Glowstone.app\`).
-- Windows (x64): the portable .zip (or setup.exe if present)."
+- Windows (x64): the portable `.zip`"
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   echo "==> release $TAG exists — uploading artifacts (clobber)"
