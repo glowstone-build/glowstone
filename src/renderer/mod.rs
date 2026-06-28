@@ -2047,6 +2047,7 @@ impl Renderer {
             color: [0.16, 0.16, 0.19],
             intensity: 1.0,
             selected: 0.0,
+            emissive: 0.0,
         }];
         self.floor_instances
             .upload(&self.device, &self.queue, &floor_instance);
@@ -2065,6 +2066,7 @@ impl Renderer {
                     color: fixture.color,
                     intensity: fixture.intensity,
                     selected: if selection.contains_fixture(i) { 1.0 } else { 0.0 },
+                    emissive: 0.0,
                 });
             }
             let count = fixture_instances.len() as u32 - start;
@@ -2087,6 +2089,10 @@ impl Renderer {
         let mut gdtf_placeholders: Vec<MeshInstance> = Vec::new();
         let mut beam_frames: Vec<Vec<fixture_model::BeamFrame>> =
             vec![Vec::new(); scene.fixtures.len()];
+        // Per fixture, per emitter: does the emitter have REAL lens geometry (a
+        // baked GLB on its `<Beam>`)? Those are drawn emissive as the actual mesh,
+        // so `build_beam_gpus` skips their synthetic lens billboard.
+        let mut emitter_lens_mesh: Vec<Vec<bool>> = vec![Vec::new(); scene.fixtures.len()];
         for (i, fixture) in scene.fixtures.iter().enumerate() {
             let Some(gdtf) = fixture.gdtf.clone() else {
                 continue;
@@ -2129,6 +2135,13 @@ impl Renderer {
             };
             let selected = if selection.contains_fixture(i) { 1.0 } else { 0.0 };
             let drawn_before = gdtf_draws.len();
+            // Emitter lens parts glow in their cell colour — but only on the
+            // fixture's OWN model (a BORROWED body model's beams aren't this
+            // fixture's emitters/cells, so its parts stay plain body geometry).
+            let own_model = fixture.model_src.is_none();
+            let emitters = fixture.emitters();
+            let level = (fixture.intensity.max(0.0) * fixture.optics.dimmer.max(0.0)).clamp(0.0, 1.0);
+            let mut has_mesh = vec![false; emitters.len()];
             for part in &asm.parts {
                 if self
                     .gdtf_cache
@@ -2136,16 +2149,39 @@ impl Renderer {
                     .map(|m| m.contains_key(&part.model))
                     .unwrap_or(false)
                 {
+                    // Default: a dark-grey lit body part.
+                    let (mut color, mut intensity, mut emissive) = ([0.09, 0.09, 0.10], 1.0, 0.0);
+                    if let (true, Some(e)) = (own_model, part.emitter) {
+                        if e < emitters.len() {
+                            has_mesh[e] = true;
+                            if emitters[e].merged_into.is_none() {
+                                // The real lens mesh, emissive in the live cell colour
+                                // (× the manual master tint), HDR so it blooms.
+                                let c = fixture.cells.get(e).copied().unwrap_or([1.0, 1.0, 1.0]);
+                                color = [
+                                    c[0] * fixture.color[0],
+                                    c[1] * fixture.color[1],
+                                    c[2] * fixture.color[2],
+                                ];
+                                intensity = level * 2.5;
+                                emissive = 1.0;
+                            } else {
+                                color = [0.02, 0.02, 0.025]; // occluded overlay (Spiider flower)
+                            }
+                        }
+                    }
                     let idx = gdtf_parts.len() as u32;
                     gdtf_parts.push(MeshInstance {
                         model: part.world.to_cols_array_2d(),
-                        color: [0.09, 0.09, 0.10],
-                        intensity: 1.0,
+                        color,
+                        intensity,
                         selected,
+                        emissive,
                     });
                     gdtf_draws.push((key, part.model.clone(), idx));
                 }
             }
+            emitter_lens_mesh[i] = has_mesh;
             // No model parts baked for this fixture type — show a placeholder cone
             // at the fixture (placed + aimed by its model matrix) so it's visible.
             if gdtf_draws.len() == drawn_before {
@@ -2154,6 +2190,7 @@ impl Renderer {
                     color: [0.16, 0.16, 0.19],
                     intensity: 1.0,
                     selected,
+                    emissive: 0.0,
                 });
             }
         }
@@ -2221,6 +2258,7 @@ impl Renderer {
                         color: [0.13, 0.13, 0.15],
                         intensity: 1.0,
                         selected,
+                        emissive: 0.0,
                     });
                     // World AABB = local mesh bounds transformed by the full instance
                     // matrix (exact, so it accounts for model.matrix + flip too).
@@ -2499,7 +2537,7 @@ impl Renderer {
                 continue;
             }
             let key = f.gdtf.as_ref().map(|g| Arc::as_ptr(g) as usize).unwrap_or(0);
-            let built = build_beam_gpus(f, &beam_frames[i], key, &self.gobo_atlas, time, &mut gpu_wheels);
+            let built = build_beam_gpus(f, &beam_frames[i], &emitter_lens_mesh[i], key, &self.gobo_atlas, time, &mut gpu_wheels);
             if beam_dump && !built.beams.is_empty() {
                 let cmax = built
                     .beams
@@ -4176,6 +4214,7 @@ fn build_laser(
 fn build_beam_gpus(
     fixture: &Fixture,
     frames: &[fixture_model::BeamFrame],
+    lens_mesh: &[bool],
     key: usize,
     atlas: &atlas::GoboAtlas,
     time: f32,
@@ -4386,19 +4425,25 @@ fn build_beam_gpus(
         // into its colour here (otherwise the glass would read un-tinted).
         let cmy_t = optics::color::cmy_transmittance(o.cmy);
         let lens_tint = [tint[0] * cmy_t[0], tint[1] * cmy_t[1], tint[2] * cmy_t[2]];
-        let lenses = vec![lens_disc(
-            frame.origin + frame.dir * 0.04,
-            frame.dir,
-            frame.right,
-            frame.up,
-            lens_radius * 1.25,
-            lens_tint,
-            lens_level * cell_lit.min(1.0),
-            cone.tan_half,
-            cone.n_order,
-            cone.face_gain,
-            lens_shutter,
-        )];
+        // Skip the synthetic disc when this emitter has REAL lens geometry (drawn
+        // emissive as the actual mesh).
+        let lenses = if lens_mesh.first().copied().unwrap_or(false) {
+            Vec::new()
+        } else {
+            vec![lens_disc(
+                frame.origin + frame.dir * 0.04,
+                frame.dir,
+                frame.right,
+                frame.up,
+                lens_radius * 1.25,
+                lens_tint,
+                lens_level * cell_lit.min(1.0),
+                cone.tan_half,
+                cone.n_order,
+                cone.face_gain,
+                lens_shutter,
+            )]
+        };
         return BeamBuild { beams, lenses };
     }
 
@@ -4421,6 +4466,9 @@ fn build_beam_gpus(
         cone: optics::EmitterCone,
         lens_r: f32,
         ap: crate::gdtf::Aperture,
+        /// This emitter has real GLB lens geometry (drawn emissive elsewhere) →
+        /// skip its synthetic lens-face billboard, but still emit its beam shaft.
+        mesh: bool,
     }
     // Fixture-total flux cap: GDTF pixel files often duplicate group flux onto
     // every cell — normalise so the whole array sums to a plausible fixture.
@@ -4467,13 +4515,18 @@ fn build_beam_gpus(
             // larger half-extent (a strip throws a wider sheet than a 5 cm disc).
             lens_r: em.aperture.half_w.max(em.aperture.half_h).max(0.01),
             ap: em.aperture,
+            mesh: lens_mesh.get(i).copied().unwrap_or(false),
         });
     }
 
     // Lens faces: every visible cell, lit or dark (dark = glass). Each is sized
     // and shaped from the emitter's real GDTF aperture (a strip renders as a thin
-    // line, a panel as a rectangle) instead of a generic disc.
+    // line, a panel as a rectangle) instead of a generic disc — UNLESS the emitter
+    // has real lens geometry, which is drawn emissive as the actual mesh instead.
     for c in &cells {
+        if c.mesh {
+            continue;
+        }
         lenses.push(lens_instance(
             c.frame.origin + c.frame.dir * 0.006,
             c.frame.dir,

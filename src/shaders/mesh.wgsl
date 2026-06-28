@@ -88,6 +88,7 @@ struct VsIn {
     @location(9) color: vec3<f32>,
     @location(10) intensity: f32,
     @location(11) selected: f32,
+    @location(12) inst_emissive: f32,
 };
 
 struct VsOut {
@@ -114,7 +115,9 @@ fn vs_main(in: VsIn) -> VsOut {
     out.color = in.color;
     out.intensity = in.intensity;
     out.selected = in.selected;
-    out.emissive = in.emissive;
+    // Emissive is either baked per-vertex (the synthetic lens billboards) or set
+    // per-instance (an emitter's real GLB lens mesh) — take whichever is set.
+    out.emissive = max(in.emissive, in.inst_emissive);
     out.world_pos = world_position.xyz;
     return out;
 }
