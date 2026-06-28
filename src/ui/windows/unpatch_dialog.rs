@@ -1,5 +1,5 @@
 //! The Unpatch confirm dialog (the viewport / Scene `U` key). On confirm the
-//! caller disables the patch entries for the selected fixtures (committed after
+//! caller disables the patch entries for the selected devices (committed after
 //! the dock, where the patch table is reachable — mirrors `commit_delete`).
 //! Esc / Cancel close without confirming; Enter confirms. State lives on `Ui`.
 
@@ -17,7 +17,7 @@ pub struct UnpatchDialog {
 }
 
 /// Render the modeless Unpatch confirm. Returns `true` exactly once on confirm;
-/// the caller then disables the selected fixtures' patch entries and the window
+/// the caller then disables the selected devices' patch entries and the window
 /// auto-closes. Esc / Cancel close without confirming.
 pub fn unpatch_dialog_window(ctx: &egui::Context, dlg: &mut UnpatchDialog) -> bool {
     if !dlg.open {

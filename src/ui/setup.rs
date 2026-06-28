@@ -46,10 +46,8 @@ impl Ui {
                 s.insert(NodeKey::Root);
                 s.insert(NodeKey::World);
                 s.insert(NodeKey::EnvGroup);
-                s.insert(NodeKey::Group(GroupKind::Fixtures));
+                s.insert(NodeKey::Group(GroupKind::Devices));
                 s.insert(NodeKey::Group(GroupKind::Objects));
-                s.insert(NodeKey::Group(GroupKind::Screens));
-                s.insert(NodeKey::Group(GroupKind::Pyro));
                 s
             },
             scene_rename: None,

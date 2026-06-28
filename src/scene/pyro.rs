@@ -15,8 +15,8 @@
 //!   velocity-stretched sprites whose colour cools gold→orange→red (blackbody).
 //!
 //! DMX footprints (verified against MagicFX / Showven Sparkular / Club Cannon /
-//! CryoFX manuals) are decoded inline in `dmx::decode::apply_pyro`, NOT through
-//! the fixture `PatchTable` — same as the LED pixel-map path.
+//! CryoFX manuals) are decoded inline in `dmx::decode::apply_pyro`, through the
+//! shared patchable-device interface — same as the LED pixel-map path.
 
 use glam::{Mat4, Quat, Vec3};
 
@@ -73,9 +73,8 @@ impl PyroMode {
 }
 
 /// An inline DMX patch for a pyro device (universe + 1-based start address).
-/// Patched directly on the device like [`PixelMap`](super::screen::PixelMap),
-/// NOT through the fixture `PatchTable` — so it never churns fixture
-/// fingerprints and persists with the show.
+/// Patched directly on the device like [`PixelMap`](super::screen::PixelMap), so
+/// it never churns fixture fingerprints and persists with the show.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PyroPatch {
@@ -98,6 +97,10 @@ impl Default for PyroPatch {
 #[serde(default)]
 pub struct PyroDevice {
     pub name: String,
+    /// Console/device sequence number shared with fixtures and DMX-driven screens.
+    /// `0` = unassigned; [`Scene::ensure_sequences`](super::Scene::ensure_sequences)
+    /// fills it on load/add.
+    pub sequence: u32,
     pub kind: PyroKind,
     /// Library component this was built from (display / info only).
     pub profile_name: String,
@@ -196,12 +199,23 @@ pub(crate) fn default_thickness() -> f32 {
 }
 
 impl crate::dmx::patch::Patchable for PyroDevice {
+    fn sequence(&self) -> u32 {
+        self.sequence
+    }
+
     fn footprint(&self) -> u16 {
         self.mode.footprint(self.kind)
     }
     fn patch_slot(&self) -> Option<(u16, u16)> {
         self.patch.as_ref().map(|p| (p.universe, p.address))
     }
+}
+
+impl crate::dmx::patch::PatchableMut for PyroDevice {
+    fn set_sequence(&mut self, sequence: u32) {
+        self.sequence = sequence;
+    }
+
     fn set_patch(&mut self, universe: u16, address: u16) {
         self.patch = Some(PyroPatch { universe, address });
     }
@@ -223,6 +237,7 @@ impl PyroDevice {
         let spark = kind == PyroKind::ColdSpark;
         Self {
             name: name.into(),
+            sequence: 0,
             kind,
             profile_name: profile.name.to_string(),
             transform,

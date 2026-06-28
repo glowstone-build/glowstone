@@ -672,7 +672,7 @@ fn inspector_body(
         if let Some(idx) = scene.fixture_index_of(pin) {
             let fixture = &mut scene.fixtures[idx];
             if fixture.is_gdtf() {
-                gdtf_inspector(ui, fixture, gdtf_textures, idx, profile, state);
+                gdtf_inspector(ui, fixture, patch, gdtf_textures, idx, profile, state);
             } else {
                 fixture_inspector(ui, fixture, state);
             }
@@ -745,7 +745,7 @@ fn inspector_body(
             let id = *id;
             let fixture = &mut scene.fixtures[id];
             if fixture.is_gdtf() {
-                gdtf_inspector(ui, fixture, gdtf_textures, id, profile, state);
+                gdtf_inspector(ui, fixture, patch, gdtf_textures, id, profile, state);
             } else {
                 fixture_inspector(ui, fixture, state);
             }
@@ -768,6 +768,38 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
     // The editable property grid (Transform + Fixture) is declared by `impl Inspect
     // for Fixture` and rendered uniformly by the property builder.
     props::show(ui, state, fixture);
+}
+
+fn meta_label(ui: &mut egui::Ui, text: impl Into<String>, color: Color32) {
+    ui.label(RichText::new(text).size(12.0).color(color));
+}
+
+fn meta_value(ui: &mut egui::Ui, text: impl Into<String>, color: Color32, strong: bool) {
+    let mut text = RichText::new(text).size(12.0).color(color);
+    if strong {
+        text = text.strong();
+    }
+    ui.label(text);
+}
+
+fn meta_sep(ui: &mut egui::Ui, color: Color32) {
+    ui.label(RichText::new("·").size(12.0).color(color));
+}
+
+fn centered_thumbnail(ui: &mut egui::Ui, thumb: &egui::TextureHandle) {
+    let source = thumb.size_vec2();
+    if source.x <= 0.0 || source.y <= 0.0 {
+        return;
+    }
+    let max_w = ui.available_width().min(230.0);
+    let max_h = 220.0;
+    let scale = (max_w / source.x).min(max_h / source.y).max(0.1);
+    let size = source * scale;
+    ui.add_space(6.0);
+    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+        ui.image((thumb.id(), size));
+    });
+    ui.add_space(4.0);
 }
 
 fn environment_inspector(ui: &mut egui::Ui, env: &mut Environment, state: &mut InspectorState) {
@@ -926,6 +958,7 @@ fn apply_pyro_bulk_delta(
 fn gdtf_inspector(
     ui: &mut egui::Ui,
     fixture: &mut Fixture,
+    patch: &PatchTable,
     gdtf_textures: &mut HashMap<usize, GdtfTextures>,
     fixture_id: usize,
     profile: &mut Option<ProfileEditor>,
@@ -937,8 +970,21 @@ fn gdtf_inspector(
         .entry(key)
         .or_insert_with(|| load_gdtf_textures(ui.ctx(), &gdtf));
 
+    let pal = theme::Palette::get(ui);
+    let ink = pal.ink;
+    let secondary = pal.ink_secondary;
+    let tertiary = pal.ink_tertiary;
+    let muted = pal.ink_muted;
+    let patch_entry = patch.get(fixture_id);
+    let mode_index = patch_entry.map(|p| p.mode_index).unwrap_or(fixture.mode_index);
+    let mode_name = gdtf.modes.get(mode_index).map(|m| m.name.as_str()).unwrap_or("unknown mode");
+    let patch_conflict = patch
+        .conflicts()
+        .iter()
+        .any(|c| c.a == fixture_id || c.b == fixture_id);
+
     ui.horizontal(|ui| {
-        ui.heading(gdtf.name.as_str());
+        ui.heading(RichText::new(gdtf.name.as_str()).color(ink));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button(format!("{}  Profile…", theme::icon::PROFILE))
@@ -947,61 +993,86 @@ fn gdtf_inspector(
             {
                 *profile = Some(ProfileEditor::new(fixture_id));
             }
-            // Provenance chip (GDTF / MVR) — left of the Profile button.
-            source_chip(ui, fixture.source);
         });
     });
-    ui.label(
-        RichText::new(format!("{} · {}", gdtf.manufacturer, gdtf.long_name))
-            .weak()
-            .small(),
-    );
+    let [sr, sg, sb] = fixture.source.color_rgb();
+    ui.horizontal_wrapped(|ui| {
+        meta_value(ui, gdtf.manufacturer.as_str(), secondary, false);
+        meta_sep(ui, muted);
+        meta_value(ui, gdtf.long_name.as_str(), secondary, false);
+        meta_sep(ui, muted);
+        meta_value(ui, fixture.source.label(), Color32::from_rgb(sr, sg, sb), false);
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        meta_label(ui, "Patch", tertiary);
+        match patch_entry {
+            Some(p) if p.enabled => {
+                let end = p.address.saturating_add(p.footprint.saturating_sub(1)).min(512);
+                let patch_color = if patch_conflict { pal.conflict } else { pal.accent };
+                meta_value(ui, format!("U{} {:03}-{:03}", p.universe, p.address, end), patch_color, true);
+                meta_sep(ui, muted);
+                meta_value(ui, format!("{} ch", p.footprint), secondary, false);
+                meta_sep(ui, muted);
+                meta_value(ui, p.source.label(), muted, false);
+                if patch_conflict {
+                    meta_sep(ui, muted);
+                    meta_value(ui, "address conflict", pal.conflict, true);
+                }
+            }
+            Some(p) => {
+                meta_value(ui, format!("unpatched · {} ch reserved", p.footprint), pal.warn, true);
+            }
+            None => {
+                meta_value(ui, "no patch entry", pal.warn, true);
+            }
+        }
+        meta_sep(ui, muted);
+        meta_label(ui, "DMX", tertiary);
+        meta_value(ui, mode_name, secondary, false);
+    });
 
     if let Some(thumb) = &tex.thumbnail {
-        let s = thumb.size_vec2();
-        let w = 200.0_f32.min(ui.available_width());
-        let h = w * s.y / s.x.max(1.0);
-        ui.add_space(4.0);
-        ui.image((thumb.id(), egui::vec2(w, h)));
+        centered_thumbnail(ui, thumb);
     }
 
     // Physical source / beam spec from the GDTF Beam geometry.
     let b = &gdtf.beam;
-    ui.label(
-        RichText::new(format!(
-            "{} engine · {:.0} K · CRI {:.0} · {:.0} lm · {:.0} W",
-            b.lamp_type, b.color_temp, b.cri, b.luminous_flux, b.power
-        ))
-        .weak()
-        .small(),
-    );
-    ui.label(
-        RichText::new(format!(
-            "{} · beam {:.0}° / field {:.0}° · throw {:.2}",
-            b.beam_type, b.beam_angle, b.field_angle, b.throw_ratio
-        ))
-        .weak()
-        .small(),
-    );
+    ui.horizontal_wrapped(|ui| {
+        meta_value(ui, format!("{} engine", b.lamp_type), secondary, false);
+        meta_sep(ui, muted);
+        meta_value(ui, format!("{:.0} K", b.color_temp), secondary, false);
+        meta_sep(ui, muted);
+        meta_value(ui, format!("CRI {:.0}", b.cri), secondary, false);
+        meta_sep(ui, muted);
+        meta_value(ui, format!("{:.0} lm", b.luminous_flux), secondary, false);
+        meta_sep(ui, muted);
+        meta_value(ui, format!("{:.0} W", b.power), secondary, false);
+    });
+    ui.horizontal_wrapped(|ui| {
+        meta_value(ui, b.beam_type.as_str(), secondary, false);
+        meta_sep(ui, muted);
+        meta_value(ui, format!("beam {:.0}° / field {:.0}°", b.beam_angle, b.field_angle), secondary, false);
+        meta_sep(ui, muted);
+        meta_value(ui, format!("throw {:.2}", b.throw_ratio), secondary, false);
+    });
     // Multi-emitter summary: cell count + the live per-cell colors (driven by
     // per-pixel DMX; the Color picker below multiplies all of them manually).
     let emitters = fixture.emitters();
     if emitters.len() > 1 {
         let visible = emitters.iter().filter(|e| e.merged_into.is_none()).count();
-        ui.label(
-            RichText::new(format!(
-                "{} emitters · {} {} · per-cell DMX in mode \"{}\"",
-                visible,
-                emitters[0].beam.beam_type,
-                if emitters.len() > visible { "(+1 overlay)" } else { "" },
-                gdtf.modes
-                    .get(fixture.mode_index)
-                    .map(|m| m.name.as_str())
-                    .unwrap_or("?"),
-            ))
-            .weak()
-            .small(),
-        );
+        ui.horizontal_wrapped(|ui| {
+            meta_value(ui, format!("{visible} emitters"), secondary, false);
+            if emitters.len() > visible {
+                meta_sep(ui, muted);
+                let overlays = emitters.len() - visible;
+                meta_value(ui, format!("{overlays} overlay{}", if overlays == 1 { "" } else { "s" }), muted, false);
+            }
+            meta_sep(ui, muted);
+            meta_value(ui, emitters[0].beam.beam_type.as_str(), secondary, false);
+            meta_sep(ui, muted);
+            meta_value(ui, "per-cell DMX", pal.accent, true);
+        });
         emitter_layout_preview(ui, fixture, emitters);
     }
 
@@ -1014,11 +1085,15 @@ fn gdtf_inspector(
             .map(|a| format!("{}.{:03}", a.universe(), a.channel()))
             .unwrap_or_else(|| "—".into());
         let mode = if m.gdtf_mode.is_empty() { "—" } else { m.gdtf_mode.as_str() };
-        ui.label(
-            RichText::new(format!("MVR · ID {id} · addr {addr} · {mode}"))
-                .weak()
-                .small(),
-        )
+        ui.horizontal_wrapped(|ui| {
+            meta_label(ui, "MVR", tertiary);
+            meta_value(ui, format!("ID {id}"), muted, false);
+            meta_sep(ui, muted);
+            meta_value(ui, format!("addr {addr}"), muted, false);
+            meta_sep(ui, muted);
+            meta_value(ui, mode, muted, false);
+        })
+        .response
         .on_hover_text("Fixture ID · DMX universe.channel · mode, from the imported MVR patch");
     }
 
@@ -1155,18 +1230,24 @@ fn emitter_layout_preview(
     }
     let span_x = (hi[0] - lo[0]).max(1e-3);
     let span_y = (hi[1] - lo[1]).max(1e-3);
-    let w = ui.available_width().clamp(80.0, 360.0);
-    let h = (w * span_y / span_x).clamp(10.0, 150.0);
+    let outer_w = ui.available_width().max(80.0);
+    let max_face_w = (outer_w - 24.0).max(40.0).min(220.0);
+    let outer_h = (max_face_w * span_y / span_x + 18.0).clamp(76.0, 160.0);
     ui.add_space(2.0);
-    let (canvas, _) = ui.allocate_exact_size(egui::vec2(w, h), Sense::hover());
+    let (canvas, _) = ui.allocate_exact_size(egui::vec2(outer_w, outer_h), Sense::hover());
     let painter = ui.painter_at(canvas);
-    painter.rect_filled(canvas, 2.0, Color32::from_gray(20));
+    let pal = theme::Palette::get(ui);
+    painter.rect_filled(canvas, 3.0, pal.input);
+    painter.rect_stroke(canvas, 3.0, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+    let max_face_h = (canvas.height() - 16.0).max(40.0);
+    let scale = (max_face_w / span_x).min(max_face_h / span_y);
+    let face = egui::Rect::from_center_size(canvas.center(), egui::vec2(span_x * scale, span_y * scale));
     let level = (fixture.intensity * fixture.optics.dimmer).clamp(0.0, 1.0);
     // World (right, up) → canvas pixel. `up` is +y, screen y is down, so flip.
     let map = |x: f32, y: f32| -> egui::Pos2 {
         egui::pos2(
-            canvas.left() + (x - lo[0]) / span_x * canvas.width(),
-            canvas.top() + (hi[1] - y) / span_y * canvas.height(),
+            face.left() + (x - lo[0]) * scale,
+            face.top() + (hi[1] - y) * scale,
         )
     };
     for (i, e) in emitters.iter().enumerate() {
@@ -1429,4 +1510,3 @@ mod property_tests {
         assert!(back.open_state("Wheels", true)); // unknown → falls back to default
     }
 }
-

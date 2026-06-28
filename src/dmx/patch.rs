@@ -1,6 +1,6 @@
-//! The DMX patch: which universe + address each fixture occupies, and the
-//! channel layout used both to decode incoming DMX and to label the universe
-//! grid.
+//! The DMX patch: which universe + address each desk-controlled device occupies,
+//! and the channel layout used both to decode incoming DMX and to label the
+//! universe grid.
 //!
 //! The patch is a **side table** ([`PatchTable`]) owned by `DmxIo`, index-parallel
 //! to `scene.fixtures` — deliberately NOT a field on [`Fixture`]:
@@ -13,23 +13,68 @@ use std::hash::{Hash, Hasher};
 
 use crate::scene::{Fixture, Scene};
 
-/// A DMX-patchable scene entity whose patch (universe + 1-based start address)
-/// lives INLINE on the entity — pyro devices today, LED screens (pixel-maps) next.
-/// Fixtures deliberately do NOT implement this: their patch lives in the side
-/// [`PatchTable`] (see the module note) and is packed in batch by
-/// [`PatchTable::assign_indices`]. The trait lets the patch/unpatch keybinds drive
-/// the inline kinds through one code path instead of per-kind special-casing.
+/// Format a 1-based DMX slot as the compact patch tag used in device rows.
+pub fn format_patch_slot(universe: u16, address: u16) -> String {
+    format!("{}.{:03}", universe, address)
+}
+
+/// A normalized DMX patch view for anything that can be controlled by a desk.
+///
+/// Fixtures keep their patch in [`PatchTable`] for conflict-free duplication and
+/// MVR round-tripping, so they use [`FixturePatchRef`] as an adapter. Inline
+/// devices such as pyro and pixel-map LED screens implement this directly.
 pub trait Patchable {
+    /// User-facing console/device sequence number. `0` means unassigned and is
+    /// filled by [`Scene::ensure_sequences`](crate::scene::Scene::ensure_sequences).
+    fn sequence(&self) -> u32;
     /// DMX channels this entity consumes.
     fn footprint(&self) -> u16;
     /// `(universe, 1-based start address)` when patched, else `None`.
     fn patch_slot(&self) -> Option<(u16, u16)>;
+    /// Compact display tag (`"1.001"` or `"none"`).
+    fn patch_tag(&self) -> String {
+        self.patch_slot()
+            .map(|(u, a)| format_patch_slot(u, a))
+            .unwrap_or_else(|| "none".to_string())
+    }
+    fn is_patched(&self) -> bool {
+        self.patch_slot().is_some()
+    }
+}
+
+/// A patchable entity whose patch lives inline and can therefore be edited
+/// without a side table.
+pub trait PatchableMut: Patchable {
+    /// Set the user-facing console/device sequence number.
+    #[allow(dead_code)]
+    fn set_sequence(&mut self, sequence: u32);
     /// Patch (and enable) at `universe` / 1-based `address`.
     fn set_patch(&mut self, universe: u16, address: u16);
     /// Unpatch — free the channels.
     fn clear_patch(&mut self);
-    fn is_patched(&self) -> bool {
-        self.patch_slot().is_some()
+}
+
+/// Read-only patch adapter for fixtures, whose patch is intentionally stored in
+/// the scene-level side table rather than on [`Fixture`] itself.
+pub struct FixturePatchRef<'a> {
+    pub fixture: &'a Fixture,
+    pub patch: Option<&'a Patch>,
+}
+
+impl Patchable for FixturePatchRef<'_> {
+    fn sequence(&self) -> u32 {
+        self.fixture.sequence
+    }
+
+    fn footprint(&self) -> u16 {
+        self.patch
+            .map(|p| p.footprint)
+            .unwrap_or_else(|| footprint_for(self.fixture, self.fixture.mode_index))
+            .max(1)
+    }
+
+    fn patch_slot(&self) -> Option<(u16, u16)> {
+        self.patch.filter(|p| p.enabled).map(|p| (p.universe, p.address))
     }
 }
 
@@ -318,6 +363,7 @@ impl PatchTable {
     /// already claimed by OTHER enabled entries (so we don't clobber an existing
     /// rig). Each fixture is (re)enabled as it lands, so the next one packs after
     /// it. Indices that don't exist are ignored. Returns the number patched.
+    #[allow(dead_code)]
     pub fn assign_indices(
         &mut self,
         scene: &Scene,

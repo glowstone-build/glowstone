@@ -105,6 +105,17 @@ impl Default for PixelMap {
     }
 }
 
+impl PixelMap {
+    /// RGB channel footprint for this low-res DMX grid. The renderer clamps the
+    /// runtime grid separately; this clamp keeps patch packing in `u16` space.
+    pub fn footprint(self) -> u16 {
+        self.cols
+            .saturating_mul(self.rows)
+            .saturating_mul(3)
+            .clamp(1, u16::MAX as u32) as u16
+    }
+}
+
 /// What the wall surface displays. Only stable, serializable descriptors live
 /// here — decoded frames / GPU textures / the blurred lighting summary are
 /// runtime-only ([`LedScreen::frame`] + the renderer cache, keyed by screen
@@ -171,6 +182,10 @@ pub struct ScreenFrame {
 #[serde(default)]
 pub struct LedScreen {
     pub name: String,
+    /// Console/device sequence number shared with fixtures and pyro devices.
+    /// `0` = unassigned; [`Scene::ensure_sequences`](super::Scene::ensure_sequences)
+    /// fills it on load/add.
+    pub sequence: u32,
     /// Library component this was built from (display / info only).
     pub panel_type: String,
     /// World placement (Y-up, metres). The surface spans the local XY plane,
@@ -231,6 +246,7 @@ impl LedScreen {
     ) -> Self {
         Self {
             name: name.into(),
+            sequence: 0,
             panel_type: profile.name.to_string(),
             transform,
             cabinet_mm: profile.cabinet_mm,
@@ -354,6 +370,56 @@ impl LedScreen {
             },
             // Image / NDI / CITP / pixel-map: the renderer uses the decoded frame.
             _ => [0.4, 0.4, 0.4],
+        }
+    }
+}
+
+impl crate::dmx::patch::Patchable for LedScreen {
+    fn sequence(&self) -> u32 {
+        self.sequence
+    }
+
+    fn footprint(&self) -> u16 {
+        match self.content {
+            ScreenContent::PixelMapDmx(pm) => pm.footprint(),
+            _ => PixelMap::default().footprint(),
+        }
+    }
+
+    fn patch_slot(&self) -> Option<(u16, u16)> {
+        match self.content {
+            ScreenContent::PixelMapDmx(pm) => Some((pm.universe, pm.start_address)),
+            _ => None,
+        }
+    }
+}
+
+impl crate::dmx::patch::PatchableMut for LedScreen {
+    fn set_sequence(&mut self, sequence: u32) {
+        self.sequence = sequence;
+    }
+
+    fn set_patch(&mut self, universe: u16, address: u16) {
+        match &mut self.content {
+            ScreenContent::PixelMapDmx(pm) => {
+                pm.universe = universe;
+                pm.start_address = address;
+            }
+            _ => {
+                self.content = ScreenContent::PixelMapDmx(PixelMap {
+                    universe,
+                    start_address: address,
+                    ..PixelMap::default()
+                });
+                self.frame = None;
+            }
+        }
+    }
+
+    fn clear_patch(&mut self) {
+        if matches!(self.content, ScreenContent::PixelMapDmx(_)) {
+            self.content = ScreenContent::TestPattern(TestPattern::Grid);
+            self.frame = None;
         }
     }
 }

@@ -541,6 +541,7 @@ fn parse_video_screen(node: &roxmltree::Node, mvr_xform: Mat4) -> crate::scene::
 
     LedScreen {
         name: attr(node, "name"),
+        sequence: 0,
         panel_type: node.attribute("glowstonePanelType").unwrap_or("Imported").to_string(),
         transform: mvr_to_world() * mvr_xform,
         cabinet_mm: [a_f32("glowstoneCabinetW", 500.0), a_f32("glowstoneCabinetH", 500.0)],

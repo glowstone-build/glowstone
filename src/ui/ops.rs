@@ -227,12 +227,25 @@ impl Ui {
                             false // stale id (deleted) — no-op
                         }
                     }
-                    NodeKey::Group(GroupKind::Fixtures) => {
-                        let hide = scene.fixtures.iter().any(|f| !f.hidden);
+                    NodeKey::Group(GroupKind::Devices) => {
+                        let hide = scene
+                            .fixtures
+                            .iter()
+                            .any(|f| !f.hidden)
+                            || scene.screens.iter().any(|s| !s.hidden)
+                            || scene.pyro.iter().any(|p| !p.hidden);
                         for f in &mut scene.fixtures {
                             f.hidden = hide;
                         }
+                        for s in &mut scene.screens {
+                            s.hidden = hide;
+                        }
+                        for p in &mut scene.pyro {
+                            p.hidden = hide;
+                        }
                         !scene.fixtures.is_empty()
+                            || !scene.screens.is_empty()
+                            || !scene.pyro.is_empty()
                     }
                     NodeKey::Group(GroupKind::Objects) => {
                         let hide = scene.geometry.iter().any(|g| !g.hidden);
@@ -240,20 +253,6 @@ impl Ui {
                             g.hidden = hide;
                         }
                         !scene.geometry.is_empty()
-                    }
-                    NodeKey::Group(GroupKind::Screens) => {
-                        let hide = scene.screens.iter().any(|s| !s.hidden);
-                        for s in &mut scene.screens {
-                            s.hidden = hide;
-                        }
-                        !scene.screens.is_empty()
-                    }
-                    NodeKey::Group(GroupKind::Pyro) => {
-                        let hide = scene.pyro.iter().any(|d| !d.hidden);
-                        for d in &mut scene.pyro {
-                            d.hidden = hide;
-                        }
-                        !scene.pyro.is_empty()
                     }
                     NodeKey::EnvGroup | NodeKey::World => {
                         // Toggle all environments (World/HDRI has no hidden field).
@@ -314,7 +313,7 @@ impl Ui {
             "object.add" => true,
             // Needs a primary fixture to duplicate.
             "fixture.duplicate" => self.selection.primary_fixture().is_some(),
-            // Patch / unpatch operate on the active patchable kind (fixtures or pyro).
+            // Patch / unpatch operate on the active patchable device kind.
             "fixture.patch" | "fixture.unpatch" => {
                 patchable_count(&self.selection, self.selection.active_kind()) > 0
             }
@@ -574,74 +573,187 @@ fn delete_selection(cx: &mut op::OpCtx) -> op::OpStatus {
 
 /// The modal Duplicate dialog: array the selected fixture by offset + Y angle.
 /// A sensible default start slot for the Patch dialog: the channel just past the
-/// last enabled patch entry (so a new batch packs onto the end of the rig),
-/// wrapping to the next universe at 512. Falls back to universe 1 / address 1 on
-/// an empty patch. `assign_indices` then finds the first non-clashing slot from
-/// here, so this only needs to be a good starting guess.
+/// last enabled device patch (fixtures, pyro, and pixel-map LED screens), falling
+/// back to universe 1 / address 1 on an empty patch.
 pub(super) fn next_free_slot(patch: &mut crate::dmx::PatchTable, scene: &Scene) -> (u16, u16) {
     patch.sync(scene);
-    let mut best: Option<(u16, u16)> = None; // (universe, address-just-past-end)
-    for i in 0..scene.fixtures.len() {
-        if let Some(p) = patch.get(i).filter(|p| p.enabled) {
-            let end = p.address + p.footprint.max(1); // first free channel after it
-            let cand = (p.universe, end);
-            if best.is_none_or(|b| cand > b) {
-                best = Some(cand);
-            }
-        }
-    }
-    match best {
-        Some((u, a)) if a <= 512 => (u, a),
-        Some((u, _)) => (u + 1, 1),
-        None => (1, 1),
-    }
+    let ranges = occupied_ranges(patch, scene, crate::scene::SelKind::Objects, &[]);
+    ranges.iter().map(|r| r.end).max().map(abs_to_slot).unwrap_or((1, 1))
 }
 
 /// How many of the active selection are DMX-patchable via the Patch dialog
-/// (fixtures + pyro; objects/screens are not patchable there → 0, guarding the
-/// dialog off).
+/// (fixtures, pyro, and LED screens; static objects are not patchable there → 0,
+/// guarding the dialog off).
 pub(super) fn patchable_count(sel: &Selection, kind: crate::scene::SelKind) -> usize {
     use crate::scene::SelKind;
     match kind {
         SelKind::Fixtures => sel.fixtures.len(),
         SelKind::Pyro => sel.pyro.len(),
+        SelKind::Screens => sel.screens.len(),
         _ => 0,
     }
 }
 
-/// Sequentially patch pyro devices (inline patch, via the [`Patchable`] trait)
-/// from a start slot, packing onto the next universe at 512 — the inline-kind twin
-/// of [`crate::dmx::PatchTable::assign_indices`]. Pyro lives in its own universes
-/// by convention, so this packs without cross-fixture clash-avoidance.
-///
-/// [`Patchable`]: crate::dmx::patch::Patchable
-pub(super) fn patch_pyro_inline(scene: &mut Scene, ids: &[usize], start_u: u16, start_a: u16) {
-    use crate::dmx::patch::Patchable;
-    let (mut u, mut a) = (start_u.max(1), start_a.max(1));
-    for &i in ids {
-        if let Some(d) = scene.pyro.get_mut(i) {
-            d.set_patch(u, a);
-            a += d.footprint().max(1);
-            if a > 512 {
-                u += 1;
-                a = 1;
+#[derive(Clone, Copy)]
+struct DmxRange {
+    start: u32,
+    end: u32,
+}
+
+fn slot_to_abs(universe: u16, address: u16) -> u32 {
+    (universe.max(1) as u32 - 1) * 512 + address.clamp(1, 512) as u32 - 1
+}
+
+fn abs_to_slot(abs: u32) -> (u16, u16) {
+    let universe = (abs / 512 + 1).min(u16::MAX as u32) as u16;
+    let address = (abs % 512 + 1) as u16;
+    (universe, address)
+}
+
+fn patch_range(universe: u16, address: u16, footprint: u16) -> DmxRange {
+    let start = slot_to_abs(universe, address);
+    DmxRange { start, end: start + footprint.max(1) as u32 }
+}
+
+fn ranges_overlap(a: DmxRange, b: DmxRange) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+fn next_free_from_ranges(ranges: &[DmxRange], universe: u16, address: u16, footprint: u16) -> (u16, u16) {
+    let width = footprint.max(1) as u32;
+    let mut start = slot_to_abs(universe, address);
+    loop {
+        let candidate = DmxRange { start, end: start + width };
+        let mut blocked_to = None;
+        for &range in ranges {
+            if ranges_overlap(candidate, range) {
+                blocked_to = Some(blocked_to.map_or(range.end, |x: u32| x.max(range.end)));
             }
+        }
+        match blocked_to {
+            Some(next) => start = next,
+            None => return abs_to_slot(start),
         }
     }
 }
 
+fn occupied_ranges(
+    patch: &crate::dmx::PatchTable,
+    scene: &Scene,
+    skip_kind: crate::scene::SelKind,
+    skip_ids: &[usize],
+) -> Vec<DmxRange> {
+    use crate::dmx::patch::Patchable;
+    use crate::scene::SelKind;
+
+    let mut ranges = Vec::new();
+    for i in 0..scene.fixtures.len() {
+        if skip_kind == SelKind::Fixtures && skip_ids.contains(&i) {
+            continue;
+        }
+        if let Some(p) = patch.get(i).filter(|p| p.enabled) {
+            ranges.push(patch_range(p.universe, p.address, p.footprint));
+        }
+    }
+    for (i, d) in scene.pyro.iter().enumerate() {
+        if skip_kind == SelKind::Pyro && skip_ids.contains(&i) {
+            continue;
+        }
+        if let Some((u, a)) = d.patch_slot() {
+            ranges.push(patch_range(u, a, d.footprint()));
+        }
+    }
+    for (i, s) in scene.screens.iter().enumerate() {
+        if skip_kind == SelKind::Screens && skip_ids.contains(&i) {
+            continue;
+        }
+        if let Some((u, a)) = s.patch_slot() {
+            ranges.push(patch_range(u, a, s.footprint()));
+        }
+    }
+    ranges
+}
+
+fn advance_slot(universe: u16, address: u16, footprint: u16) -> (u16, u16) {
+    abs_to_slot(slot_to_abs(universe, address) + footprint.max(1) as u32)
+}
+
+/// Sequentially patch the active device selection from a start slot. All
+/// desk-controlled device kinds pack against the same occupied DMX ranges, while
+/// fixtures still store their resulting entries in the side [`PatchTable`].
+pub(super) fn patch_selection(cx: &mut op::OpCtx, kind: crate::scene::SelKind, start_u: u16, start_a: u16) {
+    use crate::dmx::patch::{PatchSource, Patchable, PatchableMut};
+    use crate::scene::SelKind;
+
+    cx.patch.sync(cx.scene);
+    let ids: Vec<usize> = match kind {
+        SelKind::Fixtures => cx.selection.fixtures.clone(),
+        SelKind::Screens => cx.selection.screens.clone(),
+        SelKind::Pyro => cx.selection.pyro.clone(),
+        SelKind::Objects => Vec::new(),
+    };
+    let mut ranges = occupied_ranges(cx.patch, cx.scene, kind, &ids);
+    let (mut u, mut a) = (start_u.max(1), start_a.clamp(1, 512));
+
+    match kind {
+        SelKind::Fixtures => {
+            for i in ids.into_iter().filter(|&i| i < cx.scene.fixtures.len()) {
+                let footprint = cx.patch.get(i).map(|p| p.footprint).unwrap_or(1).max(1);
+                let (fu, fa) = next_free_from_ranges(&ranges, u, a, footprint);
+                if let Some(p) = cx.patch.get_mut(i) {
+                    p.universe = fu;
+                    p.address = fa;
+                    p.enabled = true;
+                    p.source = PatchSource::Manual;
+                }
+                ranges.push(patch_range(fu, fa, footprint));
+                (u, a) = advance_slot(fu, fa, footprint);
+            }
+        }
+        SelKind::Screens => {
+            let screen_len = cx.scene.screens.len();
+            for i in ids.into_iter().filter(|&i| i < screen_len) {
+                let footprint = cx.scene.screens[i].footprint();
+                let (fu, fa) = next_free_from_ranges(&ranges, u, a, footprint);
+                cx.scene.screens[i].set_patch(fu, fa);
+                ranges.push(patch_range(fu, fa, footprint));
+                (u, a) = advance_slot(fu, fa, footprint);
+            }
+        }
+        SelKind::Pyro => {
+            let pyro_len = cx.scene.pyro.len();
+            for i in ids.into_iter().filter(|&i| i < pyro_len) {
+                let footprint = cx.scene.pyro[i].footprint();
+                let (fu, fa) = next_free_from_ranges(&ranges, u, a, footprint);
+                cx.scene.pyro[i].set_patch(fu, fa);
+                ranges.push(patch_range(fu, fa, footprint));
+                (u, a) = advance_slot(fu, fa, footprint);
+            }
+        }
+        SelKind::Objects => {}
+    }
+}
+
 /// Unpatch the active patchable selection (kind-aware): fixtures clear via the
-/// side PatchTable, pyro clears its inline [`PyroPatch`](crate::scene::pyro::PyroPatch)
-/// through the [`Patchable`](crate::dmx::patch::Patchable) trait. The captured scene
-/// snapshot covers `scene.pyro`, so undo works for both.
+/// side PatchTable; pyro and pixel-map screens clear through the inline
+/// [`PatchableMut`](crate::dmx::patch::PatchableMut) trait. The captured scene
+/// snapshot covers inline devices, so undo works for all patchable kinds.
 pub(super) fn unpatch_selection(cx: &mut op::OpCtx, kind: crate::scene::SelKind) {
     use crate::scene::SelKind;
     match kind {
         SelKind::Pyro => {
-            use crate::dmx::patch::Patchable;
+            use crate::dmx::patch::PatchableMut;
             for &i in &cx.selection.pyro {
                 if let Some(d) = cx.scene.pyro.get_mut(i) {
                     d.clear_patch();
+                }
+            }
+        }
+        SelKind::Screens => {
+            use crate::dmx::patch::PatchableMut;
+            for &i in &cx.selection.screens {
+                if let Some(s) = cx.scene.screens.get_mut(i) {
+                    s.clear_patch();
                 }
             }
         }
@@ -684,6 +796,33 @@ mod tests {
         // Undo the single step → no further undo (proves replace, not stack).
         ui.do_undo(&mut scene, &mut dmx);
         assert!(!ui.undo.can_undo(), "adjust-last must replace, not stack a 2nd unpatch");
+    }
+
+    #[test]
+    fn patch_selection_patches_led_screen_as_device() {
+        use crate::dmx::patch::Patchable;
+        use crate::scene::{screen::ScreenContent, SelKind};
+
+        let mut ui = Ui::new();
+        let mut scene = Scene::default();
+        let mut dmx = DmxIo::new();
+        let screen = scene.add_screen(&ui.library.screens[0]);
+        ui.selection = Selection::screen(screen);
+
+        let mut cx = op::OpCtx {
+            scene: &mut scene,
+            patch: dmx.patch_mut(),
+            cues: &mut ui.cues,
+            groups: &mut ui.groups,
+            selection: &mut ui.selection,
+            library: &ui.library,
+        };
+        patch_selection(&mut cx, SelKind::Screens, 2, 10);
+
+        let screen = &cx.scene.screens[screen];
+        assert_eq!(screen.patch_slot(), Some((2, 10)));
+        assert!(matches!(screen.content, ScreenContent::PixelMapDmx(_)));
+        assert_eq!(screen.footprint(), 16 * 9 * 3);
     }
 
     #[test]

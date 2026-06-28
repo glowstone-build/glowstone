@@ -49,7 +49,7 @@ use egui_dock::{DockArea, DockState, TabViewer};
 use glam::Vec3;
 
 use crate::renderer::camera::{CameraView, OrbitCamera};
-use crate::scene::{Library, ObjectRef, RenderSettings, Scene, SelKind, Selection, ViewportMode};
+use crate::scene::{Library, ObjectRef, RenderSettings, Scene, Selection, ViewportMode};
 use windows::{Preferences, ProfileEditor};
 
 /// Window within which consecutive arrow-key nudges coalesce into one undo step
@@ -432,7 +432,7 @@ impl Tab {
             Tab::Inspector => "Inspector",
             Tab::DmxMonitor => "DMX",
             Tab::Connectivity => "Connectivity",
-            Tab::Patch => "Fixtures",
+            Tab::Patch => "Devices",
             Tab::Cues => "Cues",
             Tab::Render => "Render",
         }
@@ -519,7 +519,7 @@ pub struct Ui {
     /// Discovered live video sources (NDI + CITP) for the LED-screen content
     /// pickers; the app refreshes this each frame.
     pub screen_sources: panels::ScreenSources,
-    /// Fixture-manager (Fixtures tab) state: filter / sort / bulk values.
+    /// Fixture-manager (Devices tab) state: filter / sort / bulk values.
     fm: panels::FmState,
     /// The `s` quick-select palette is open.
     quick_select: bool,
@@ -987,8 +987,8 @@ impl Ui {
         replace_window(ctx, &self.library, scene, &mut self.selection, dmx.patch_mut(), &mut self.replace);
 
         // Patch / Unpatch dialogs (committed here, where the patch is reachable).
-        // On confirm, P assigns sequential addresses to the selected fixtures from
-        // the chosen start slot; U disables the selected fixtures' patch entries.
+        // On confirm, P assigns sequential addresses to the selected devices from
+        // the chosen start slot; U disables their patch entries.
         if windows::patch_dialog_window(ctx, &mut self.patch_dialog) {
             let (u, a) = (self.patch_dialog.start_universe, self.patch_dialog.start_address);
             let kind = self.patch_dialog.kind;
@@ -1000,15 +1000,7 @@ impl Ui {
                 dmx,
                 true,
                 |cx| {
-                    // Fixtures pack through the side PatchTable; pyro (inline patch)
-                    // packs through the Patchable trait. The captured scene snapshot
-                    // covers scene.pyro, so undo works for both.
-                    match kind {
-                        SelKind::Pyro => ops::patch_pyro_inline(cx.scene, &cx.selection.pyro, u, a),
-                        _ => {
-                            cx.patch.assign_indices(cx.scene, &cx.selection.fixtures, u, a);
-                        }
-                    }
+                    ops::patch_selection(cx, kind, u, a);
                     op::OpStatus::Finished
                 },
             );
@@ -1734,7 +1726,7 @@ impl TabViewer for PanelViewer<'_> {
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         // `[horizontal, vertical]`. The Inspector / outliner / list panels must FIT
         // their width and never scroll sideways (the inspector horizontal-scroll bug);
-        // only the genuinely WIDE data tables (the 512-channel DMX grid + the Fixtures
+        // only the genuinely WIDE data tables (the 512-channel DMX grid + the Devices
         // schedule) keep horizontal scroll.
         match tab {
             Tab::Viewport | Tab::Render => [false, false], // draw their own image

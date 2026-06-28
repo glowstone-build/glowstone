@@ -317,10 +317,9 @@ impl Ui {
                 let anchor = ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
                 self.add_menu.show_at(anchor);
             }
-            // Patch / Unpatch (P/U) — works for whichever patchable kind is active
-            // (fixtures via the PatchTable, pyro via its inline patch). Open the
-            // dialog now (the patch is reachable here); its confirm commits after
-            // the dock, like the old `do_patch` / `do_unpatch` path.
+            // Patch / Unpatch (P/U) — works for whichever patchable device kind is
+            // active. Open the dialog now; its confirm commits after the dock where
+            // scene + patch are both reachable.
             Action::Patch => {
                 let kind = self.selection.active_kind();
                 let count = patchable_count(&self.selection, kind);
@@ -427,7 +426,7 @@ impl Ui {
 mod tests {
     use super::*;
     use crate::dmx::DmxIo;
-    use crate::scene::Scene;
+    use crate::scene::{Scene, SelKind};
 
     /// S1 parity: `dispatch_action` is the SINGLE source of truth for every
     /// non-viewport-modal Action. This pins that each Action previously handled in

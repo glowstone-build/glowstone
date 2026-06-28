@@ -112,8 +112,11 @@ impl Inspect for PyroDevice {
             });
         });
 
-        // --- DMX patch (inline; NOT through the fixture patch table) ---
+        // --- DMX patch (inline; same PatchableMut path as other inline devices) ---
         p.group("DMX", icon::PATCH, true, |p| {
+            p.custom("Sequence", true, |ui| {
+                ui.add(egui::DragValue::new(&mut self.sequence).range(1..=u32::MAX).speed(0.2));
+            });
             let mut patched = self.patch.is_some();
             p.custom("Patched", true, |ui| {
                 if ui.checkbox(&mut patched, "").changed() {

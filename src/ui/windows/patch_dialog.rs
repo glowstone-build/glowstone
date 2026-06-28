@@ -1,6 +1,6 @@
 //! The Patch dialog (the viewport / Scene `P` key). Picks a starting universe +
 //! address; on confirm the caller assigns sequential addresses to the selected
-//! fixtures (committed after the dock, where the patch table is reachable —
+//! devices (committed after the dock, where the patch table is reachable —
 //! mirrors `commit_delete`). Esc cancels, Enter confirms. State lives on `Ui`.
 
 use crate::scene::SelKind;
@@ -25,7 +25,7 @@ pub struct PatchDialog {
 pub fn patch_noun(kind: SelKind) -> &'static str {
     match kind {
         SelKind::Pyro => "pyro device",
-        SelKind::Screens => "screen",
+        SelKind::Screens => "LED screen",
         _ => "fixture",
     }
 }

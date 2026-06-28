@@ -34,6 +34,9 @@ impl Inspect for Fixture {
         // FIXTURE = the head's own properties: aim (Pan/Tilt), level, colour, beam.
         let (pan_now, tilt_now) = (self.pan_actual, self.tilt_actual);
         p.group("Fixture", icon::COLOR, true, |p| {
+            p.custom("Sequence", true, |ui| {
+                ui.add(egui::DragValue::new(&mut self.sequence).range(1..=u32::MAX).speed(0.2));
+            });
             p.f32("Pan", &mut self.pan)
                 .speed(0.5)
                 .range(-270.0..=270.0)

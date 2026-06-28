@@ -31,6 +31,9 @@ pub(super) fn led_screen_inspector(ui: &mut egui::Ui, s: &mut LedScreen, count: 
         if ui.checkbox(&mut visible, "Visible").changed() {
             s.hidden = !visible;
         }
+        ui.separator();
+        ui.label(RichText::new("Seq").weak().small());
+        ui.add(DragValue::new(&mut s.sequence).range(1..=u32::MAX).speed(0.2));
     });
 
     // --- Transform (position / rotation / uniform scale, lossless like geometry) ---

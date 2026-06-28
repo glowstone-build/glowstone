@@ -475,14 +475,14 @@ pub static COMMANDS: &[Command] = &[
     command_row("cursor.reset", "Reset cursor to origin", Category::Transform, Action::ResetCursor),
     // --- Object / history ---
     op_row("fixture.duplicate", "Duplicate / Array…", Category::Object, Action::Duplicate, OpInvoke::Dialog),
-    op_row("fixture.patch", "Patch Fixtures…", Category::Object, Action::Patch, OpInvoke::Dialog),
-    op_row("fixture.unpatch", "Unpatch Fixtures", Category::Object, Action::Unpatch, OpInvoke::Direct),
+    op_row("fixture.patch", "Patch Devices…", Category::Object, Action::Patch, OpInvoke::Dialog),
+    op_row("fixture.unpatch", "Unpatch Devices", Category::Object, Action::Unpatch, OpInvoke::Direct),
     op_row("fixture.renumber", "Renumber Sequence by Position", Category::Object, Action::RenumberSequence, OpInvoke::Direct),
     op_row("object.delete", "Delete Selected", Category::Object, Action::Delete, OpInvoke::Direct),
     // The bare Patch/Unpatch keymap labels differ from the catalog labels above, so
     // they get their own keymap-only commands (the P/U binds point here).
-    command_row("kmi.patch", "Patch selected fixtures", Category::Object, Action::Patch),
-    command_row("kmi.unpatch", "Unpatch selected fixtures", Category::Object, Action::Unpatch),
+    command_row("kmi.patch", "Patch selected devices", Category::Object, Action::Patch),
+    command_row("kmi.unpatch", "Unpatch selected devices", Category::Object, Action::Unpatch),
     command_row("kmi.renumber", "Renumber sequence by position", Category::Object, Action::RenumberSequence),
     command_row("kmi.duplicate", "Duplicate / array", Category::Object, Action::Duplicate),
     command_row("kmi.duplicate_grab", "Duplicate & grab", Category::Object, Action::DuplicateGrab),

@@ -946,6 +946,7 @@ impl Scene {
         fixture.snap_movement(); // appear at the placed pose, not slewing from 0
         fixture.id = self.alloc_id();
         self.fixtures.push(fixture);
+        self.ensure_sequences();
         self.fixtures.len() - 1
     }
 
@@ -967,10 +968,12 @@ impl Scene {
             f.position = base.position + offset * i as f32;
             f.pan = base.pan + y_angle_deg * i as f32;
             f.name = format!("{} ({i})", base.name);
+            f.sequence = 0;
             f.snap_movement(); // each copy starts at its fanned pose
             f.id = self.alloc_id(); // a clone shares base.id → give each a fresh one
             self.fixtures.push(f);
         }
+        self.ensure_sequences();
         (count > 0).then_some(first)
     }
 
@@ -1016,9 +1019,11 @@ impl Scene {
             ObjectRef::Fixture(i) => {
                 let mut f = self.fixtures.get(i)?.clone();
                 f.name = dup_name(&f.name);
+                f.sequence = 0;
                 f.id = self.alloc_id();
                 f.snap_movement();
                 self.fixtures.push(f);
+                self.ensure_sequences();
                 Some(ObjectRef::Fixture(self.fixtures.len() - 1))
             }
             ObjectRef::Geometry(i) => {
@@ -1031,15 +1036,19 @@ impl Scene {
             ObjectRef::Screen(i) => {
                 let mut s = self.screens.get(i)?.clone();
                 s.name = dup_name(&s.name);
+                s.sequence = 0;
                 s.id = self.alloc_id();
                 self.screens.push(s);
+                self.ensure_sequences();
                 Some(ObjectRef::Screen(self.screens.len() - 1))
             }
             ObjectRef::Pyro(i) => {
                 let mut p = self.pyro.get(i)?.clone();
                 p.name = dup_name(&p.name);
+                p.sequence = 0;
                 p.id = self.alloc_id();
                 self.pyro.push(p);
+                self.ensure_sequences();
                 Some(ObjectRef::Pyro(self.pyro.len() - 1))
             }
             ObjectRef::Environment(i) => {
@@ -1196,6 +1205,7 @@ impl Scene {
         let mut screen = LedScreen::from_profile(profile, name, transform);
         screen.id = self.alloc_id();
         self.screens.push(screen);
+        self.ensure_sequences();
         self.screens.len() - 1
     }
 
@@ -1210,6 +1220,7 @@ impl Scene {
         let mut device = PyroDevice::from_profile(profile, name, transform);
         device.id = self.alloc_id();
         self.pyro.push(device);
+        self.ensure_sequences();
         self.pyro.len() - 1
     }
 
@@ -1303,16 +1314,63 @@ impl Scene {
         self.ensure_sequences();
     }
 
-    /// Fill any unassigned fixture SEQUENCE numbers (post-load / import / add). An
-    /// unassigned (`0`) fixture is inferred from its imported MVR identity — the
-    /// UnitNumber, then a numeric FixtureID — and otherwise gets the next free number.
-    /// Existing non-zero sequences are kept; a collision is pushed to the next free
-    /// slot, so every fixture ends with a unique, stable sequence.
+    /// Fill any unassigned console/device SEQUENCE numbers (post-load / import /
+    /// add). Fixtures can infer from imported MVR identity — UnitNumber, then a
+    /// numeric FixtureID — and otherwise every desk-controlled device gets the
+    /// next free number. Existing non-zero sequences are kept; duplicates are
+    /// pushed to the next free slot so fixture, screen, and pyro devices share one
+    /// unique sequence namespace.
     pub fn ensure_sequences(&mut self) {
         use std::collections::HashSet;
-        let mut used: HashSet<u32> =
-            self.fixtures.iter().map(|f| f.sequence).filter(|&s| s != 0).collect();
-        let mut next = self.fixtures.iter().map(|f| f.sequence).max().unwrap_or(0);
+
+        fn assign_next(seq: &mut u32, used: &mut HashSet<u32>, next: &mut u32) {
+            if *seq != 0 {
+                return;
+            }
+            *next += 1;
+            while used.contains(&*next) {
+                *next += 1;
+            }
+            *seq = *next;
+            used.insert(*seq);
+        }
+
+        let mut used = HashSet::new();
+        let mut next = 0;
+        for f in &mut self.fixtures {
+            let seq = f.sequence;
+            if seq == 0 {
+                continue;
+            }
+            if used.insert(seq) {
+                next = next.max(seq);
+            } else {
+                f.sequence = 0;
+            }
+        }
+        for s in &mut self.screens {
+            let seq = s.sequence;
+            if seq == 0 {
+                continue;
+            }
+            if used.insert(seq) {
+                next = next.max(seq);
+            } else {
+                s.sequence = 0;
+            }
+        }
+        for p in &mut self.pyro {
+            let seq = p.sequence;
+            if seq == 0 {
+                continue;
+            }
+            if used.insert(seq) {
+                next = next.max(seq);
+            } else {
+                p.sequence = 0;
+            }
+        }
+
         // Pass 1: infer unassigned sequences from the MVR import where it's free.
         for f in &mut self.fixtures {
             if f.sequence != 0 {
@@ -1331,18 +1389,16 @@ impl Scene {
                 next = next.max(seq);
             }
         }
-        // Pass 2: anything still unassigned (no import, or a taken number) gets the
-        // next free sequence.
+        // Pass 2: anything still unassigned (no import, or a taken number) gets
+        // the next free sequence across all console-controlled device kinds.
         for f in &mut self.fixtures {
-            if f.sequence != 0 {
-                continue;
-            }
-            next += 1;
-            while used.contains(&next) {
-                next += 1;
-            }
-            f.sequence = next;
-            used.insert(next);
+            assign_next(&mut f.sequence, &mut used, &mut next);
+        }
+        for s in &mut self.screens {
+            assign_next(&mut s.sequence, &mut used, &mut next);
+        }
+        for p in &mut self.pyro {
+            assign_next(&mut p.sequence, &mut used, &mut next);
         }
     }
 
@@ -1651,21 +1707,37 @@ mod tests {
         for _ in 0..4 {
             scene.add_fixture(&library.fixtures[0]);
         }
+        scene.add_screen(&library.screens[0]);
+        scene.add_pyro_at(&library.pyro[0], Vec3::ZERO);
         for f in &mut scene.fixtures {
             f.sequence = 0; // simulate a fresh/legacy load (no trailer sequences)
         }
+        for s in &mut scene.screens {
+            s.sequence = 0;
+        }
+        for p in &mut scene.pyro {
+            p.sequence = 0;
+        }
         scene.ensure_sequences();
-        let seqs: Vec<u32> = scene.fixtures.iter().map(|f| f.sequence).collect();
+        let seqs: Vec<u32> = scene
+            .fixtures
+            .iter()
+            .map(|f| f.sequence)
+            .chain(scene.screens.iter().map(|s| s.sequence))
+            .chain(scene.pyro.iter().map(|p| p.sequence))
+            .collect();
         assert!(seqs.iter().all(|&s| s != 0), "all assigned");
         let uniq: std::collections::HashSet<u32> = seqs.iter().copied().collect();
         assert_eq!(uniq.len(), seqs.len(), "sequences unique");
         // A pre-set sequence is preserved (not clobbered).
         scene.fixtures[0].sequence = 42;
+        scene.screens[0].sequence = 42; // duplicate is pushed to the next free slot.
         for f in scene.fixtures.iter_mut().skip(1) {
             f.sequence = 0;
         }
         scene.ensure_sequences();
         assert_eq!(scene.fixtures[0].sequence, 42, "existing sequence kept");
+        assert_ne!(scene.screens[0].sequence, 42, "duplicate sequence reassigned");
     }
 
     #[test]
