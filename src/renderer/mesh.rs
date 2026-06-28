@@ -97,10 +97,12 @@ pub struct LensInstance {
     /// w = level `0..1` (0 = off → dark glass).
     pub color: [f32; 4],
     /// x = tan(half beam angle), y = super-Gaussian edge order, z = candela
-    /// gain (zoom concentration → face luminance), w = lens radius (m).
+    /// gain (zoom concentration → face luminance), w = aperture aspect
+    /// (half_w / half_h) so the die hotspot stays round on a non-square face.
     pub params: [f32; 4],
     /// Mechanical shutter on the lens face: x = close 0..1, y = kind (0 none /
-    /// 1 blade / 2 sawtooth), z = edge softness, w = unused.
+    /// 1 blade / 2 sawtooth), z = edge softness, w = face shape (0 = round disc,
+    /// 1 = rectangle — the model matrix already carries the non-uniform W×H scale).
     pub shutter: [f32; 4],
 }
 
@@ -409,6 +411,7 @@ pub fn cone(length: f32, radius: f32, segments: u32) -> Vec<MeshVertex> {
 /// A unit disc in the local XY plane (radius 1, normal +Z), as a triangle fan of
 /// non-indexed triangles. `position.xy` doubles as a `-1..1` radial coordinate
 /// the lens shader uses for the glass/dust look. Oriented by its instance matrix.
+#[allow(dead_code)] // superseded by `lens_quad` for lens faces; kept as a utility.
 pub fn disc(segments: u32) -> Vec<MeshVertex> {
     let seg = segments.max(8);
     let mut verts = Vec::with_capacity(seg as usize * 3);
@@ -421,6 +424,19 @@ pub fn disc(segments: u32) -> Vec<MeshVertex> {
         verts.push(MeshVertex { position: [a1.cos(), a1.sin(), 0.0], normal: n, emissive: 1.0 });
     }
     verts
+}
+
+/// A unit quad covering local XY `[-1, 1]²` with a +Z normal — the lens-face
+/// billboard. One mesh serves every emitter: the fragment shader masks it to a
+/// disc (round lens) or a rounded rectangle (LED strip / panel) per instance, and
+/// the per-instance model matrix carries the real, possibly non-square, W×H scale.
+pub fn lens_quad() -> Vec<MeshVertex> {
+    let n = [0.0, 0.0, 1.0];
+    let v = |x: f32, y: f32| MeshVertex { position: [x, y, 0.0], normal: n, emissive: 1.0 };
+    vec![
+        v(-1.0, -1.0), v(1.0, -1.0), v(1.0, 1.0),
+        v(-1.0, -1.0), v(1.0, 1.0), v(-1.0, 1.0),
+    ]
 }
 
 /// A tessellated unit quad in the local XY plane (`[-0.5, 0.5]²`, normal +Z), as

@@ -112,6 +112,9 @@ pub struct BeamData {
     pub beam_radius: f32,
     /// "Spot" / "Wash" / "None" / "Rectangle".
     pub beam_type: String,
+    /// GDTF `RectangleRatio` — width/height of a rectangular beam cross-section
+    /// (only meaningful when `beam_type == "Rectangle"`). 1.0 = square.
+    pub rectangle_ratio: f32,
     /// Correlated color temperature of the source, Kelvin.
     pub color_temp: f32,
     /// Color rendering index (0..100).
@@ -133,6 +136,7 @@ impl Default for BeamData {
             field_angle: 15.0,
             beam_radius: 0.08,
             beam_type: "Spot".into(),
+            rectangle_ratio: 1.0,
             color_temp: 6500.0,
             cri: 90.0,
             luminous_flux: 10000.0,
@@ -227,6 +231,29 @@ impl GeometryRef {
     }
 }
 
+/// The physical emitting aperture of one emitter, expressed in its lens plane
+/// (the plane perpendicular to the beam axis), in metres. Derived from the GDTF
+/// geometry `Model` (primitive type + Width/Height/Length) so every fixture
+/// renders its REAL face — a thin tube, a wide strip, a panel, a round lens —
+/// instead of a generic disc. The renderer scales the lens-face billboard by
+/// `half_w` along the frame's right axis and `half_h` along its up axis.
+#[derive(Clone, Copy, Debug)]
+pub struct Aperture {
+    /// Half-extent along the lens-plane RIGHT axis (the GDTF model Width), metres.
+    pub half_w: f32,
+    /// Half-extent along the lens-plane UP axis (the GDTF model Height), metres.
+    pub half_h: f32,
+    /// Rounded outline (round lens / Cylinder / Sphere primitive) vs a hard
+    /// rectangle (Cube / panel / strip primitive).
+    pub round: bool,
+}
+
+impl Default for Aperture {
+    fn default() -> Self {
+        Self { half_w: 0.05, half_h: 0.05, round: true }
+    }
+}
+
 /// One light emitter of a fixture in a given mode: a `<Beam>` node instance in
 /// the expanded geometry tree. Order matches the assembly walk, so emitter `i`
 /// here corresponds to beam frame `i` from `fixture_model::assemble`.
@@ -237,6 +264,11 @@ pub struct EmitterDef {
     pub name: String,
     /// The `<Beam>` optics for this emitter.
     pub beam: BeamData,
+    /// Physical aperture shape/size (from the emitter geometry's `Model`).
+    pub aperture: Aperture,
+    /// 2D position on the fixture face `(right, up)` in metres, centred on the
+    /// array centroid — drives the inspector's true-to-layout emitter preview.
+    pub pos: [f32; 2],
     /// When this emitter sits coaxially *behind* another emitter of the same
     /// fixture (it fires through that emitter's aperture — e.g. the Spiider's
     /// "Flower" overlay behind the centre pixel), the front emitter's index.
@@ -636,7 +668,7 @@ impl GdtfFixture {
                     .iter()
                     .find(|r| r.name == mode_geometry)
                     .unwrap_or(&roots[0]);
-                let emitters = collect_emitters(root);
+                let emitters = collect_emitters(root, &models);
                 let resolved = resolve_channels(&channels, root, &emitters);
                 let components = collect_components(&channels, &wheels);
                 let footprint = resolved
@@ -767,6 +799,7 @@ fn parse_geometry(node: &roxmltree::Node) -> Geometry {
             // "Spot" explicitly — Khamsin does; LED arrays rely on the default).
             beam_radius: f("BeamRadius", 0.05),
             beam_type: s("BeamType", "Wash"),
+            rectangle_ratio: f("RectangleRatio", 1.0),
             color_temp: f("ColorTemperature", 6500.0),
             cri: f("ColorRenderingIndex", 90.0),
             // 0 = unspecified: the renderer splits a nominal fixture flux across
@@ -930,42 +963,116 @@ fn first_beam(node: &Geometry) -> Option<&BeamData> {
     node.children.iter().find_map(first_beam)
 }
 
+/// The model-derived shape of an emitter: round vs rectangular, plus the model's
+/// two largest dimensions (the smallest is the plate thickness / beam-normal,
+/// which the face never shows). The renderer combines this with the inter-pixel
+/// spacing (see [`collect_emitters`]) so a pixel array tiles into SOLID bands
+/// while a thin strip stays thin and a sparse array keeps its physical cell size.
+struct ModelFace {
+    round: bool,
+    /// Largest model dimension (metres) — the in-row tiling extent.
+    largest: f32,
+    /// Second-largest model dimension — the across-row band thickness; the round
+    /// bore diameter for `round`.
+    second: f32,
+}
+
+/// Resolve an emitter's [`ModelFace`] from its geometry `Model` (primitive +
+/// Width/Height/Length), honouring `BeamType="Rectangle"` + `RectangleRatio`, and
+/// falling back to the round `BeamRadius` aperture when there's no usable model.
+fn emitter_model_face(node: &Geometry, beam: &BeamData, models: &[Model]) -> ModelFace {
+    let r = beam.beam_radius.max(0.005);
+    if let Some(m) = node.model.as_deref().and_then(|name| {
+        models
+            .iter()
+            .find(|m| m.name == name || m.name.trim() == name.trim())
+    }) {
+        let prim = m.primitive.to_lowercase();
+        let mut d = m.size;
+        if d[0] > 1e-4 && d[1] > 1e-4 && d[2] > 1e-4 {
+            d.sort_by(|a, b| b.partial_cmp(a).unwrap()); // descending
+            // ONLY an explicit Cube/Box primitive is a rectangular emitter (LED
+            // strip / panel / blinder cell). A round lens is usually modelled as a
+            // Cylinder/Sphere — OR as "Undefined" (the Robe Spiider's flower of
+            // round lenses). Treating Undefined as round keeps every round-lens
+            // fixture a disc (the prior behaviour) and confines rectangles to the
+            // genuinely rectangular Cube emitters. `second` (the smaller of the two
+            // largest) is the bore for a round lens and the band thickness for a
+            // strip — robust whether the author put the length on X, Y or Z.
+            if prim.contains("cube") || prim.contains("box") {
+                return ModelFace { round: false, largest: d[0], second: d[1] };
+            }
+            if prim.contains("cylinder") || prim.contains("sphere") {
+                return ModelFace { round: true, largest: d[1], second: d[1] };
+            }
+            // Undefined / other primitive → fall through to the round beam disc.
+        }
+    }
+    if beam.beam_type.eq_ignore_ascii_case("rectangle") {
+        let ratio = beam.rectangle_ratio.clamp(0.05, 20.0);
+        return ModelFace { round: false, largest: 2.0 * r, second: (2.0 * r / ratio).max(0.008) };
+    }
+    ModelFace { round: true, largest: 2.0 * r, second: 2.0 * r }
+}
+
 /// Collect every emitter (`<Beam>` instance) of an expanded tree, in the same
-/// depth-first order the per-frame assembly walk visits them, and mark
-/// coaxially-occluded emitters (rest pose — relative placement within the head
-/// is rigid, so the merge decision is pose-independent).
-fn collect_emitters(root: &Geometry) -> Vec<EmitterDef> {
-    fn rec(node: &Geometry, world: Mat4, out: &mut Vec<(EmitterDef, glam::Vec3, glam::Vec3)>) {
+/// depth-first order the per-frame assembly walk visits them, mark coaxially-
+/// occluded emitters, and size each emitter's lens aperture.
+///
+/// **Aperture = neighbour-fill, model-capped.** A GDTF pixel array is a coarse
+/// control grid whose per-pixel `Model` boxes don't map cleanly to the visible
+/// face (a ROXX Cluster RGB cell is `28×2×60` mm yet the real band is a dense,
+/// thick strip). So a rectangular cell is sized to fill the gap to its nearest
+/// neighbour along each lens-plane axis (the rows tile into solid bands like the
+/// real fixture), capped by the model: the in-row extent by the largest model
+/// dimension, the across-row thickness by the second-largest — so a thin warm
+/// strip stays thin, a thick RGB/centric band fills its row, and a SPARSE array
+/// (a few lamps far apart) keeps its physical cell size instead of bridging gaps.
+/// Round emitters (lenses) keep their bore and don't fill.
+fn collect_emitters(root: &Geometry, models: &[Model]) -> Vec<EmitterDef> {
+    struct Tag {
+        e: EmitterDef,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+        right: glam::Vec3,
+        up: glam::Vec3,
+        face: ModelFace,
+    }
+    fn rec(node: &Geometry, world: Mat4, models: &[Model], out: &mut Vec<Tag>) {
         let world = world * node.matrix;
         if let Some(beam) = &node.beam {
             let origin = world.transform_point3(glam::Vec3::ZERO);
-            let dir = world
-                .transform_vector3(glam::Vec3::NEG_Z)
-                .normalize_or_zero();
-            out.push((
-                EmitterDef { name: node.name.clone(), beam: beam.clone(), merged_into: None },
+            let dir = world.transform_vector3(glam::Vec3::NEG_Z).normalize_or_zero();
+            let right = world.transform_vector3(glam::Vec3::X).normalize_or_zero();
+            let up = world.transform_vector3(glam::Vec3::Y).normalize_or_zero();
+            let face = emitter_model_face(node, beam, models);
+            out.push(Tag {
+                e: EmitterDef { name: node.name.clone(), beam: beam.clone(), aperture: Aperture::default(), pos: [0.0, 0.0], merged_into: None },
                 origin,
                 dir,
-            ));
+                right,
+                up,
+                face,
+            });
         }
         for c in &node.children {
-            rec(c, world, out);
+            rec(c, world, models, out);
         }
     }
     let mut tagged = Vec::new();
-    rec(root, Mat4::IDENTITY, &mut tagged);
+    rec(root, Mat4::IDENTITY, models, &mut tagged);
 
     // Emitter A merges into B when both point the same way, A's axis passes
     // through B's aperture, and A sits behind B — A's light exits through B's
     // lens, so they are one controllable aperture (HTP at the control layer).
     for a in 0..tagged.len() {
-        let (origin_a, dir_a) = (tagged[a].1, tagged[a].2);
+        let (origin_a, dir_a) = (tagged[a].origin, tagged[a].dir);
         let mut best: Option<(u16, f32)> = None;
         for b in 0..tagged.len() {
-            if a == b || tagged[b].0.merged_into.is_some() {
+            if a == b || tagged[b].e.merged_into.is_some() {
                 continue;
             }
-            let (origin_b, dir_b) = (tagged[b].1, tagged[b].2);
+            let (origin_b, dir_b) = (tagged[b].origin, tagged[b].dir);
             if dir_a.dot(dir_b) < 0.999 {
                 continue;
             }
@@ -975,15 +1082,91 @@ fn collect_emitters(root: &Geometry) -> Vec<EmitterDef> {
                 continue; // A is in front of (or beside) B
             }
             let lateral = (rel - dir_b * behind).length();
-            if lateral < tagged[b].0.beam.beam_radius * 0.9
+            if lateral < tagged[b].e.beam.beam_radius * 0.9
                 && best.map(|(_, d)| -behind < d).unwrap_or(true)
             {
                 best = Some((b as u16, -behind));
             }
         }
-        tagged[a].0.merged_into = best.map(|(b, _)| b);
+        tagged[a].e.merged_into = best.map(|(b, _)| b);
     }
-    tagged.into_iter().map(|(e, _, _)| e).collect()
+
+    // Neighbour-fill aperture sizing (see the doc comment).
+    const MIN_HALF: f32 = 0.004;
+    let n = tagged.len();
+    for i in 0..n {
+        let t = &tagged[i];
+        if t.face.round {
+            let rad = (t.face.second * 0.5).max(MIN_HALF);
+            tagged[i].e.aperture = Aperture { half_w: rad, half_h: rad, round: true };
+            continue;
+        }
+        let (oi, ri, ui) = (t.origin, t.right, t.up);
+        // Nearest-neighbour spacing along this emitter's own right / up axes, in
+        // two passes so the cells tile with NO gaps. The across-row pitch comes
+        // first (nearest predominantly-vertical neighbour); then the in-row pitch
+        // counts ONLY neighbours that are clearly in the same row (|du| well under
+        // that row pitch). Otherwise a diagonal pixel from an adjacent, X-offset
+        // row (e.g. a warm tube next to an RGB panel) reads as the nearest
+        // "horizontal" neighbour and shrinks the in-row pitch, leaving gaps.
+        let mut row = f32::INFINITY; // across-row pitch (along up)
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let rel = tagged[j].origin - oi;
+            let (dr, du) = (rel.dot(ri).abs(), rel.dot(ui).abs());
+            if du > 1e-3 && dr < du {
+                row = row.min(du);
+            }
+        }
+        let row_gate = if row.is_finite() { 0.5 * row } else { f32::INFINITY };
+        let mut col = f32::INFINITY; // in-row pitch (along right)
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let rel = tagged[j].origin - oi;
+            let (dr, du) = (rel.dot(ri).abs(), rel.dot(ui).abs());
+            if dr > 1e-3 && du < row_gate {
+                col = col.min(dr);
+            }
+        }
+        let largest = tagged[i].face.largest;
+        let second = tagged[i].face.second;
+        // Fill to half the pitch, capped by the model dim for that axis.
+        let half_w = if col.is_finite() { (col * 0.5).min(largest * 0.5) } else { largest * 0.5 };
+        let half_h = if row.is_finite() { (row * 0.5).min(second * 0.5) } else { second * 0.5 };
+        tagged[i].e.aperture = Aperture {
+            half_w: half_w.max(MIN_HALF),
+            half_h: half_h.max(MIN_HALF),
+            round: false,
+        };
+    }
+
+    // Per-emitter 2D position on the fixture FACE, for the inspector's layout
+    // preview: project every origin onto a common right/up basis (averaged across
+    // emitters, so a flat panel is exact and a curved array is a sensible
+    // flattening), centred on the array centroid. Units are metres.
+    let count = tagged.len().max(1) as f32;
+    let centroid = tagged.iter().fold(glam::Vec3::ZERO, |a, t| a + t.origin) / count;
+    let mut right_avg = tagged.iter().fold(glam::Vec3::ZERO, |a, t| a + t.right);
+    let mut up_avg = tagged.iter().fold(glam::Vec3::ZERO, |a, t| a + t.up);
+    right_avg = right_avg.normalize_or_zero();
+    // Orthonormalise up against right so the projection isn't skewed.
+    up_avg = (up_avg - right_avg * up_avg.dot(right_avg)).normalize_or_zero();
+    if right_avg == glam::Vec3::ZERO {
+        right_avg = glam::Vec3::X;
+    }
+    if up_avg == glam::Vec3::ZERO {
+        up_avg = glam::Vec3::Y;
+    }
+    for t in &mut tagged {
+        let rel = t.origin - centroid;
+        t.e.pos = [rel.dot(right_avg), rel.dot(up_avg)];
+    }
+
+    tagged.into_iter().map(|t| t.e).collect()
 }
 
 /// Expand a mode's channels per `GeometryReference` instance and resolve each
@@ -1392,5 +1575,58 @@ mod tests {
         let counts: Vec<usize> = (0..g.modes.len()).map(|i| g.emitters(i).len()).collect();
         assert!(counts.contains(&16), "a 16-pixel mode exists: {counts:?}");
         eprintln!("PixelBar OK: roots {}, per-mode emitters {:?}", g.roots.len(), counts);
+    }
+
+    /// The ROXX Cluster S2's 72 emitters must derive RECTANGULAR apertures from
+    /// their `Cube` models (not round discs), neighbour-filled into bands: the
+    /// thin warm `Single Tube` strips end up thinner (smaller half-height) than
+    /// the thick RGB / Centric bands, and every cell fills its in-row pitch. Skips
+    /// when the GDTF (from the user's GDTF Share cache or /tmp) isn't present.
+    #[test]
+    fn roxx_cluster_rectangular_banded_aperture() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let candidates = [
+            format!("{home}/Library/Application Support/build.glowstone.glowstone/gdtf/49866.gdtf"),
+            "/tmp/glow_gdtf/49866.gdtf".to_string(),
+        ];
+        let Some(g) = candidates
+            .iter()
+            .find_map(|p| GdtfFixture::load_path(std::path::Path::new(p)).ok())
+        else {
+            eprintln!("skip: ROXX Cluster S2 gdtf (49866) not found");
+            return;
+        };
+        let mode = g
+            .modes
+            .iter()
+            .find(|m| m.name.trim().starts_with("Full Access Extended"))
+            .expect("Full Access Extended mode");
+        let em = &mode.emitters;
+        assert_eq!(em.len(), 72, "12 centric + 48 single tube + 12 rgb");
+        assert!(em.iter().all(|e| !e.aperture.round), "every Cube emitter is rectangular");
+
+        let by = |needle: &str| -> Vec<&EmitterDef> {
+            em.iter().filter(|e| e.name.contains(needle)).collect()
+        };
+        let (single, rgb, centric) = (by("Single Tube"), by("RGB"), by("Centric"));
+        assert_eq!(single.len(), 48);
+        assert_eq!(rgb.len(), 12);
+        assert_eq!(centric.len(), 12);
+
+        let avg_h = |v: &[&EmitterDef]| v.iter().map(|e| e.aperture.half_h).sum::<f32>() / v.len() as f32;
+        let (hs, hr, hc) = (avg_h(&single), avg_h(&rgb), avg_h(&centric));
+        assert!(hs < hr && hs < hc, "thin warm strips are thinner than the bands: single {hs} rgb {hr} centric {hc}");
+
+        // Cells fill their in-row pitch: centric (12 px over ~330 mm) ≈ 15 mm
+        // half-width, rgb (6 px) wider. Just assert they're a sane band width and
+        // wider than the MIN clamp (i.e. real neighbour-fill happened).
+        let avg_w = |v: &[&EmitterDef]| v.iter().map(|e| e.aperture.half_w).sum::<f32>() / v.len() as f32;
+        assert!(avg_w(&centric) > 0.01, "centric cells fill their pitch: {}", avg_w(&centric));
+        assert!(avg_w(&rgb) > avg_w(&centric), "rgb panels are wider-pitch than centric");
+        eprintln!(
+            "Cluster aperture OK: single h={hs:.3} rgb h={hr:.3} centric h={hc:.3}; centric w={:.3} rgb w={:.3}",
+            avg_w(&centric),
+            avg_w(&rgb)
+        );
     }
 }
