@@ -14,9 +14,11 @@ use super::windows::{LabelMode, Preferences};
 use super::{
     ActiveTool, Axis, DuplicateDialog, NumInput, TransformKind, TransformOp, TransformPrefs,
 };
-use crate::dmx::patch::channel_map;
+use crate::dmx::patch::{channel_map, FixturePatchRef, Patchable};
 use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
 use crate::renderer::camera::OrbitCamera;
+use crate::scene::pyro::{PyroKind, PyroMode};
+use crate::scene::screen::ScreenContent;
 use crate::scene::{apply_fixture_click, apply_select, ObjectRef, Scene, SelItem, SelectOp, Selection};
 
 /// Universe is considered live if it updated within this window.
@@ -2330,6 +2332,275 @@ pub fn connectivity(
 /// Bottom tab: the live 512-channel universe grid with patch occupants (replaces
 /// the old DMX Monitor stub). Each cell shows the channel number, its live level,
 /// and the patched fixture + attribute occupying it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DmxTarget {
+    Fixture(usize),
+    Screen(usize),
+    Pyro(usize),
+}
+
+impl DmxTarget {
+    fn is_selected(self, selection: &Selection) -> bool {
+        match self {
+            DmxTarget::Fixture(i) => selection.contains_fixture(i),
+            DmxTarget::Screen(i) => selection.contains_screen(i),
+            DmxTarget::Pyro(i) => selection.contains_pyro(i),
+        }
+    }
+
+    fn selection(self) -> Selection {
+        match self {
+            DmxTarget::Fixture(i) => Selection::fixture(i),
+            DmxTarget::Screen(i) => Selection::screen(i),
+            DmxTarget::Pyro(i) => Selection::pyro(i),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DmxTarget::Fixture(_) => "Fixture",
+            DmxTarget::Screen(_) => "LED Wall",
+            DmxTarget::Pyro(_) => "Pyro",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DmxOcc {
+    target: DmxTarget,
+    name: String,
+    attr: String,
+    tint: Color32,
+}
+
+fn dmx_slot_abs(universe: u16, address: u16) -> u32 {
+    let u0 = universe.max(1) as u32 - 1;
+    let a0 = address.clamp(1, 512) as u32 - 1;
+    u0.saturating_mul(512).saturating_add(a0)
+}
+
+fn dmx_abs_to_slot(abs: u32) -> (u16, u16) {
+    let universe = (abs / 512 + 1).min(u16::MAX as u32) as u16;
+    let address = (abs % 512 + 1) as u16;
+    (universe, address)
+}
+
+fn push_unique_universe(universes: &mut Vec<u16>, universe: u16) {
+    if !universes.contains(&universe) {
+        universes.push(universe);
+    }
+}
+
+fn push_dmx_span_universes(universes: &mut Vec<u16>, universe: u16, address: u16, footprint: u16) {
+    let start = dmx_slot_abs(universe, address);
+    let end = start.saturating_add(footprint.max(1) as u32 - 1);
+    let first = dmx_abs_to_slot(start).0;
+    let last = dmx_abs_to_slot(end).0;
+    for u in first..=last {
+        push_unique_universe(universes, u);
+    }
+}
+
+fn dmx_span_intersects_universe(universe: u16, address: u16, footprint: u16, selected_universe: u16) -> bool {
+    let start = dmx_slot_abs(universe, address);
+    let end = start.saturating_add(footprint.max(1) as u32);
+    let universe_start = dmx_slot_abs(selected_universe, 1);
+    let universe_end = universe_start.saturating_add(512);
+    start < universe_end && end > universe_start
+}
+
+fn dmx_monitor_universes(
+    scene: &Scene,
+    patch: &PatchTable,
+    snapshot: &UniverseSnapshot,
+    selected_universe: u16,
+) -> Vec<u16> {
+    let mut universes = patch.universes();
+
+    for (i, fixture) in scene.fixtures.iter().enumerate() {
+        let patch_entry = patch.get(i).filter(|p| p.enabled);
+        let device = FixturePatchRef { fixture, patch: patch_entry };
+        if let Some((universe, address)) = device.patch_slot() {
+            push_dmx_span_universes(&mut universes, universe, address, device.footprint());
+        }
+    }
+    for screen in &scene.screens {
+        if let Some((universe, address)) = screen.patch_slot() {
+            push_dmx_span_universes(&mut universes, universe, address, screen.footprint());
+        }
+    }
+    for pyro in &scene.pyro {
+        if let Some((universe, address)) = pyro.patch_slot() {
+            push_dmx_span_universes(&mut universes, universe, address, pyro.footprint());
+        }
+    }
+    for &u in snapshot.frames.keys() {
+        push_unique_universe(&mut universes, u);
+    }
+
+    universes.sort_unstable();
+    universes.dedup();
+    if universes.is_empty() {
+        universes.push(selected_universe);
+    }
+    universes
+}
+
+fn put_dmx_occ(occ: &mut [Option<DmxOcc>], conflict_cells: &mut [bool; 512], slot: usize, item: DmxOcc) {
+    if let Some(existing) = occ.get_mut(slot) {
+        if existing.is_some() {
+            conflict_cells[slot] = true;
+        } else {
+            *existing = Some(item);
+        }
+    }
+}
+
+fn add_dmx_channel_span(
+    occ: &mut [Option<DmxOcc>],
+    conflict_cells: &mut [bool; 512],
+    selected_universe: u16,
+    base_universe: u16,
+    base_address: u16,
+    offset: u32,
+    width: u16,
+    item: DmxOcc,
+) {
+    let start = dmx_slot_abs(base_universe, base_address).saturating_add(offset);
+    let end = start.saturating_add(width.max(1) as u32);
+    for abs in start..end {
+        let (universe, address) = dmx_abs_to_slot(abs);
+        if universe == selected_universe {
+            put_dmx_occ(occ, conflict_cells, (address - 1) as usize, item.clone());
+        }
+    }
+}
+
+fn add_screen_dmx_occupancy(
+    occ: &mut [Option<DmxOcc>],
+    conflict_cells: &mut [bool; 512],
+    selected_universe: u16,
+    screen_index: usize,
+    name: &str,
+    pm: crate::scene::screen::PixelMap,
+) {
+    let cols = pm.cols.clamp(1, 256);
+    let rows = pm.rows.clamp(1, 256);
+    let footprint = cols.saturating_mul(rows).saturating_mul(3).clamp(1, u16::MAX as u32);
+    let base = dmx_slot_abs(pm.universe, pm.start_address);
+    let screen_start = base;
+    let screen_end = base.saturating_add(footprint);
+    let universe_start = dmx_slot_abs(selected_universe, 1);
+    let universe_end = universe_start.saturating_add(512);
+    let start = screen_start.max(universe_start);
+    let end = screen_end.min(universe_end);
+    if start >= end {
+        return;
+    }
+
+    let tint = screen_tint(screen_index);
+    for abs in start..end {
+        let offset = abs - base;
+        let pixel = offset / 3;
+        let component = match offset % 3 {
+            0 => "R",
+            1 => "G",
+            _ => "B",
+        };
+        let x = pixel % cols + 1;
+        let y = pixel / cols + 1;
+        let item = DmxOcc {
+            target: DmxTarget::Screen(screen_index),
+            name: name.to_string(),
+            attr: format!("Pixel {x},{y} {component}"),
+            tint,
+        };
+        put_dmx_occ(occ, conflict_cells, (abs - universe_start) as usize, item);
+    }
+}
+
+fn pyro_channel_names(kind: PyroKind, mode: PyroMode) -> &'static [&'static str] {
+    match (kind, mode) {
+        (PyroKind::Co2Jet, PyroMode::Minimal) => &["Blast"],
+        (PyroKind::Co2Jet, PyroMode::Rich) => &["Arm", "Blast", "Intensity", "Duration", "Pan", "Tilt", "Speed"],
+        (PyroKind::ColdSpark, PyroMode::Minimal) => &["Safety", "Spark", "Height"],
+        (PyroKind::ColdSpark, PyroMode::Rich) => &["Safety", "Spark", "Height", "Function", "Oscillation"],
+    }
+}
+
+fn dmx_occupancy_for_universe(
+    scene: &Scene,
+    patch: &PatchTable,
+    selected_universe: u16,
+) -> (Vec<Option<DmxOcc>>, [bool; 512]) {
+    let mut occ: Vec<Option<DmxOcc>> = vec![None; 512];
+    let mut conflict_cells = [false; 512];
+
+    for (i, fixture) in scene.fixtures.iter().enumerate() {
+        let Some(p) = patch.get(i).filter(|p| p.enabled) else { continue };
+        if !dmx_span_intersects_universe(p.universe, p.address, p.footprint, selected_universe) {
+            continue;
+        }
+        let tint = fixture_tint(i);
+        for mc in channel_map(fixture, p.mode_index).channels {
+            let item = DmxOcc {
+                target: DmxTarget::Fixture(i),
+                name: fixture.name.clone(),
+                attr: mc.attribute,
+                tint,
+            };
+            add_dmx_channel_span(
+                &mut occ,
+                &mut conflict_cells,
+                selected_universe,
+                p.universe,
+                p.address,
+                mc.offset as u32,
+                mc.width.max(1) as u16,
+                item,
+            );
+        }
+    }
+
+    for (i, screen) in scene.screens.iter().enumerate() {
+        let ScreenContent::PixelMapDmx(pm) = &screen.content else { continue };
+        add_screen_dmx_occupancy(&mut occ, &mut conflict_cells, selected_universe, i, &screen.name, *pm);
+    }
+
+    for (i, pyro) in scene.pyro.iter().enumerate() {
+        let Some((universe, address)) = pyro.patch_slot() else { continue };
+        if !dmx_span_intersects_universe(universe, address, pyro.footprint(), selected_universe) {
+            continue;
+        }
+        let tint = pyro_tint(i);
+        for (offset, attr) in pyro_channel_names(pyro.kind, pyro.mode)
+            .iter()
+            .copied()
+            .take(pyro.footprint() as usize)
+            .enumerate()
+        {
+            let item = DmxOcc {
+                target: DmxTarget::Pyro(i),
+                name: pyro.name.clone(),
+                attr: attr.to_string(),
+                tint,
+            };
+            add_dmx_channel_span(
+                &mut occ,
+                &mut conflict_cells,
+                selected_universe,
+                universe,
+                address,
+                offset as u32,
+                1,
+                item,
+            );
+        }
+    }
+
+    (occ, conflict_cells)
+}
+
 #[allow(deprecated)] // egui 0.34 show_tooltip_at_pointer — migrated project-wide later
 pub fn dmx_universe_grid(
     ui: &mut egui::Ui,
@@ -2339,18 +2610,8 @@ pub fn dmx_universe_grid(
     selected_universe: &mut u16,
     selection: &mut Selection,
 ) {
-    // Universes present in the snapshot or referenced by the patch.
-    let mut universes = patch.universes();
-    for &u in snapshot.frames.keys() {
-        if !universes.contains(&u) {
-            universes.push(u);
-        }
-    }
-    universes.sort_unstable();
-    universes.dedup();
-    if universes.is_empty() {
-        universes.push(*selected_universe);
-    }
+    // Universes present in the snapshot or referenced by any patchable device.
+    let universes = dmx_monitor_universes(scene, patch, snapshot, *selected_universe);
     if !universes.contains(selected_universe) {
         *selected_universe = universes[0];
     }
@@ -2359,7 +2620,12 @@ pub fn dmx_universe_grid(
     let accent = ui.visuals().selection.stroke.color;
     let u = *selected_universe;
     let live = snapshot.is_live(u, DMX_STALE);
-    let nconf = patch.conflicts().len();
+
+    // Per-channel occupant for the selected universe, computed once so each of
+    // the 512 cells is a cheap lookup. The target is a patchable scene object,
+    // not a fixture-only index.
+    let (occ, conflict_cells) = dmx_occupancy_for_universe(scene, patch, u);
+    let nconf = conflict_cells.iter().filter(|&&c| c).count();
 
     // --- header: title · universe nav · live / conflict status ---
     ui.horizontal(|ui| {
@@ -2384,7 +2650,7 @@ pub fn dmx_universe_grid(
             if nconf > 0 {
                 ui.colored_label(
                     theme::CONFLICT,
-                    RichText::new(format!("{} {nconf} conflict{}", theme::icon::WARNING, if nconf == 1 { "" } else { "s" })),
+                    RichText::new(format!("{} {nconf} conflict ch{}", theme::icon::WARNING, if nconf == 1 { "" } else { "s" })),
                 );
             }
             if live {
@@ -2395,29 +2661,6 @@ pub fn dmx_universe_grid(
             }
         });
     });
-
-    // Per-channel occupant (fixture index + attribute) for the selected universe,
-    // computed once so each of the 512 cells is a cheap lookup.
-    let mut occ: Vec<Option<(usize, String)>> = vec![None; 512];
-    let mut conflict_cells = [false; 512];
-    for (i, fixture) in scene.fixtures.iter().enumerate() {
-        let Some(p) = patch.get(i).filter(|p| p.enabled) else { continue };
-        if p.universe != u {
-            continue;
-        }
-        for mc in channel_map(fixture, p.mode_index).channels {
-            for k in 0..mc.width as u16 {
-                let ch = p.address.saturating_sub(1) + mc.offset + k;
-                if let Some(slot) = occ.get_mut(ch as usize) {
-                    if slot.is_none() {
-                        *slot = Some((i, mc.attribute.clone()));
-                    } else {
-                        conflict_cells[ch as usize] = true;
-                    }
-                }
-            }
-        }
-    }
     let active = (1..=512u16).filter(|&c| snapshot.level(u, c).unwrap_or(0) > 0).count();
     let patched = occ.iter().filter(|o| o.is_some()).count();
 
@@ -2455,8 +2698,8 @@ pub fn dmx_universe_grid(
                 );
                 let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
                 let occupied = occ[ch].as_ref();
-                let selected = occupied.is_some_and(|(fi, _)| selection.contains_fixture(*fi));
-                let tint = occupied.map(|(fi, _)| fixture_tint(*fi)).unwrap_or(accent);
+                let selected = occupied.is_some_and(|item| item.target.is_selected(selection));
+                let tint = occupied.map(|item| item.tint).unwrap_or(accent);
 
                 // Base + a value-fill bar rising from the bottom (∝ level).
                 painter.rect_filled(cell, 3.0, if occupied.is_some() { base_patched } else { base_empty });
@@ -2468,7 +2711,7 @@ pub fn dmx_universe_grid(
                     );
                     painter.rect_filled(fill, 0.0, tint.gamma_multiply(0.22 + 0.55 * frac));
                 }
-                // Fixture-identity stripe down the left edge.
+                // Device-identity stripe down the left edge.
                 if occupied.is_some() {
                     painter.rect_filled(
                         egui::Rect::from_min_max(cell.left_top(), egui::pos2(cell.left() + 2.5, cell.bottom())),
@@ -2512,9 +2755,11 @@ pub fn dmx_universe_grid(
                 let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
                 let pct = (level as f32 / 255.0 * 100.0).round() as u32;
                 let detail = match &occ[ch] {
-                    Some((fi, attr)) => {
-                        let name = scene.fixtures[*fi].name.clone();
-                        format!("Ch {} · {name} · {attr}\n{level}  ({pct}%)", ch + 1)
+                    Some(item) => {
+                        let kind = item.target.label();
+                        let name = &item.name;
+                        let attr = &item.attr;
+                        format!("Ch {} · {kind} · {name} · {attr}\n{level}  ({pct}%)", ch + 1)
                     }
                     None => format!("Ch {} · unpatched\n{level}  ({pct}%)", ch + 1),
                 };
@@ -2531,9 +2776,9 @@ pub fn dmx_universe_grid(
             // Select from the same occupancy map the grid is painted/hovered from
             // (so a click agrees with the cell's shown identity, including gaps).
             if c < COLS && r < ROWS
-                && let Some((fi, _)) = &occ[r * COLS + c]
+                && let Some(item) = &occ[r * COLS + c]
             {
-                *selection = Selection::fixture(*fi);
+                *selection = item.target.selection();
             }
         }
     });
@@ -2544,6 +2789,16 @@ pub fn dmx_universe_grid(
 fn fixture_tint(i: usize) -> Color32 {
     let h = (i as f32 * 0.618_034).fract();
     hsv_to_color(h, 0.55, 0.95)
+}
+
+fn screen_tint(i: usize) -> Color32 {
+    let h = (0.43 + i as f32 * 0.618_034).fract();
+    hsv_to_color(h, 0.48, 0.94)
+}
+
+fn pyro_tint(i: usize) -> Color32 {
+    let h = (0.06 + i as f32 * 0.618_034).fract();
+    hsv_to_color(h, 0.72, 0.98)
 }
 
 fn hsv_to_color(h: f32, s: f32, v: f32) -> Color32 {
@@ -3054,7 +3309,69 @@ fn ray_aabb(ro: Vec3, rd: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
 #[cfg(test)]
 mod pick_tests {
     use super::*;
+    use crate::dmx::patch::PatchTable;
+    use crate::dmx::UniverseSnapshot;
+    use crate::scene::Library;
     use crate::ui::PivotMode;
+
+    #[test]
+    fn dmx_monitor_includes_pixel_map_screens() {
+        use crate::scene::screen::{PixelMap, ScreenContent};
+
+        let library = Library::standard();
+        let mut scene = Scene::default();
+        scene.fixtures.clear();
+        let screen = scene.add_screen(&library.screens[0]);
+        scene.screens[screen].name = "Wall A".to_string();
+        scene.screens[screen].content = ScreenContent::PixelMapDmx(PixelMap {
+            cols: 2,
+            rows: 1,
+            universe: 3,
+            start_address: 511,
+        });
+
+        let patch = PatchTable::default();
+        let snapshot = UniverseSnapshot::default();
+        let universes = dmx_monitor_universes(&scene, &patch, &snapshot, 1);
+        assert!(universes.contains(&3));
+        assert!(universes.contains(&4));
+
+        let (u3, _) = dmx_occupancy_for_universe(&scene, &patch, 3);
+        let item = u3[510].as_ref().expect("screen R channel shown in universe 3");
+        assert_eq!(item.target, DmxTarget::Screen(screen));
+        assert_eq!(item.name, "Wall A");
+        assert_eq!(item.attr, "Pixel 1,1 R");
+        assert_eq!(u3[511].as_ref().unwrap().attr, "Pixel 1,1 G");
+
+        let (u4, _) = dmx_occupancy_for_universe(&scene, &patch, 4);
+        assert_eq!(u4[0].as_ref().unwrap().attr, "Pixel 1,1 B");
+        assert_eq!(u4[1].as_ref().unwrap().attr, "Pixel 2,1 R");
+    }
+
+    #[test]
+    fn dmx_monitor_includes_inline_pyro_devices() {
+        use crate::scene::pyro::{PyroMode, PyroPatch};
+
+        let library = Library::standard();
+        let mut scene = Scene::default();
+        scene.fixtures.clear();
+        let pyro = scene.add_pyro_at(&library.pyro[0], Vec3::ZERO);
+        scene.pyro[pyro].name = "Spark A".to_string();
+        scene.pyro[pyro].mode = PyroMode::Rich;
+        scene.pyro[pyro].patch = Some(PyroPatch { universe: 5, address: 20 });
+
+        let patch = PatchTable::default();
+        let snapshot = UniverseSnapshot::default();
+        let universes = dmx_monitor_universes(&scene, &patch, &snapshot, 1);
+        assert!(universes.contains(&5));
+
+        let (occ, _) = dmx_occupancy_for_universe(&scene, &patch, 5);
+        let item = occ[19].as_ref().expect("pyro safety channel shown");
+        assert_eq!(item.target, DmxTarget::Pyro(pyro));
+        assert_eq!(item.name, "Spark A");
+        assert_eq!(item.attr, "Safety");
+        assert_eq!(occ[23].as_ref().unwrap().attr, "Oscillation");
+    }
 
     #[test]
     fn ray_sphere_front_and_back() {
