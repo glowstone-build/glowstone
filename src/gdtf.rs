@@ -1629,4 +1629,5 @@ mod tests {
             avg_w(&rgb)
         );
     }
+
 }

@@ -442,6 +442,21 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             // collimated/uniform, so no hotspot for them.
             let narrow = clamp(1.0 - tan_half * 5.0, 0.0, 1.0);
             let hotspot = select(1.0 + narrow * 1.6 * exp(-depth * 0.9), 1.0, laser);
+            // Near-field containment: a WIDE source (a wash / pixel array whose
+            // lens_r is the whole front face) otherwise blasts haze in a broad glow
+            // RIGHT at the lens — the inverse-square atten peaks at depth 0, over a
+            // face-wide radius — so the beam balloons a halo around the head instead
+            // of emerging contained and flaring downstream. Ramp the haze IN over a
+            // distance that scales with the source width, only for wide sources; a
+            // narrow spot lens (small lens_r) keeps its bright near-lens hotspot.
+            // "Wide" = a wide front face (lens_r) OR a wide field angle (a wash /
+            // pixel array, even when its per-cell beams don't aggregate). A narrow
+            // spot lens trips neither, so it keeps its bright near-lens hotspot.
+            let wide_src = max(
+                clamp((lens_r - 0.08) * 8.0, 0.0, 1.0),
+                clamp((tan_half - 0.1) * 8.0, 0.0, 1.0),
+            );
+            let near_fade = mix(1.0, clamp(depth / (lens_r * 3.0 + 0.25), 0.3, 1.0), wide_src);
             let tyndall = select(1.0, 3.0, laser);
             let phase = max(hg(dot(bdir, -rd), g), 0.05);
             // Hero beams cast shadows into the haze: darken the shaft where geometry
@@ -511,7 +526,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
             // `strength` scales DIRECTLY — no asymptote, so it can actually push a deep
             // blue/red to read in haze — capped so it can't blow out to flat neon.
             let hk = clamp(1.0 + hk_strength * hk_sat * hk_sat, 1.0, 3.5);
-            lin += (whitened * hk) * trans * (rad3 * (atten * hotspot * phase * beam * vis * tyndall * boost));
+            lin += (whitened * hk) * trans * (rad3 * (atten * hotspot * near_fade * phase * beam * vis * tyndall * boost));
         }
 
         // Self-shadow the in-scattered light (ambient + beams) in CO2, scaled by the
