@@ -332,10 +332,20 @@ fn decode_gdtf(
         fixture.optics.dimmer = 1.0;
     }
 
-    // Color layers, HTP per channel; each scaled by its own dimmer/shutter.
-    // A color group with no cells under it (authoring quirk) covers everything.
+    // Colour layers compose by COVERAGE-SIZE precedence: for each cell, the
+    // winning colour is the SMALLEST-coverage layer that has content. A per-pixel
+    // colour and a fixture-wide "background"/global colour drive the SAME physical
+    // LED, so the most specific control wins — set a pixel blue over a white global
+    // and the LED is blue, not an HTP white/blue mix. (Ayrton Zonda: a blue
+    // per-pixel chase over a default-white global; the Robe Spiider: a red pixel
+    // over a warm-white master reads red.) Layers of EQUAL coverage HTP (max). A
+    // cell with no per-pixel content keeps the broader background colour. Coverage
+    // SIZE (not exact "all") because a global can cover every pixel yet exclude a
+    // separate effect emitter (the Zonda's liquid blob is a 38th emitter, so its
+    // global covers 37 of 38).
     let mut cells = vec![[0.0_f32; 3]; n_cells];
     let mut covered = vec![false; n_cells];
+    let mut win_cov = vec![usize::MAX; n_cells]; // coverage size of each cell's current winner
     for g in groups.iter().filter(|g| has_color(g)) {
         let scale = g.dimmer.unwrap_or(1.0) * gate(g);
         let lv = |i: usize| g.rgbwal[i].unwrap_or(0.0);
@@ -344,13 +354,26 @@ fn decode_gdtf(
             &emitters,
         );
         let rgb = [folded[0] * scale, folded[1] * scale, folded[2] * scale];
+        let content = rgb.iter().any(|&v| v > 1e-4);
+        let cov = if g.cells.is_empty() { n_cells } else { g.cells.len() };
         let targets = if g.cells.is_empty() { &all_cells } else { &g.cells };
         for &c in targets {
             let c = c as usize;
-            if c < n_cells {
-                covered[c] = true;
+            if c >= n_cells {
+                continue;
+            }
+            covered[c] = true;
+            // A colourless layer (all channels 0) never wins — it just leaves the
+            // broader background showing; only a layer WITH content sets the cell.
+            if !content {
+                continue;
+            }
+            if cov < win_cov[c] {
+                cells[c] = rgb; // a more specific layer overrides the broader one
+                win_cov[c] = cov;
+            } else if cov == win_cov[c] {
                 for k in 0..3 {
-                    cells[c][k] = cells[c][k].max(rgb[k]);
+                    cells[c][k] = cells[c][k].max(rgb[k]); // HTP within a tier
                 }
             }
         }
@@ -1146,7 +1169,10 @@ mod tests {
         let dark = (1..18).all(|i| f.cells[i].iter().all(|&v| v < 0.05));
         assert!(dark, "undriven pixels dark: {:?}", &f.cells[1..18]);
 
-        // Now background full warm white, pixels still driving → HTP wins per channel.
+        // Now background full warm white, pixels still driving. An IDLE pixel
+        // shows the background; a DRIVEN pixel OVERRIDES it (the per-pixel colour
+        // and the global drive the same LED, so the specific one wins — a red pixel
+        // reads red over a warm-white global, not a red+green HTP mix).
         let mut levels2 = levels;
         levels2[7] = 0xFF; // bg R coarse
         levels2[9] = 0x80; // bg G coarse
@@ -1158,7 +1184,7 @@ mod tests {
         let c5 = f.cells[5];
         assert!(c5[0] > 0.95 && (c5[1] - 0.5).abs() < 0.05, "bg layer on idle pixel: {c5:?}");
         let c0 = f.cells[0];
-        assert!(c0[0] > 0.95 && (c0[1] - 0.5).abs() < 0.05, "HTP of bg + red pixel: {c0:?}");
+        assert!(c0[0] > 0.95 && c0[1] < 0.05 && c0[2] < 0.05, "driven red pixel overrides the global: {c0:?}");
 
         eprintln!("Spiider per-cell decode OK: {:?}…", &f.cells[..3]);
     }
@@ -1452,5 +1478,61 @@ mod tests {
         let f = run(255, 0, 255);
         assert!(f.cells[0].iter().all(|&v| v < 1e-3), "cell 0 dark at its dimmer 0: {:?}", f.cells[0]);
         assert!(f.cells[1].iter().any(|&v| v > 0.6), "cell 1 still lit: {:?}", f.cells[1]);
+    }
+
+    /// The Ayrton Zonda 9 FX "Extended Pixel 1" mode layers a fixture-wide global
+    /// colour ("LED P Ext" ColorAdd, covers all pixels) UNDER per-pixel colours
+    /// ("LENS N", one cell each). Driving the global full WHITE and a pixel BLUE
+    /// must show that pixel BLUE (the per-pixel overrides the same-LED global) while
+    /// an undriven pixel shows the white global. (Regression: HTP-max made the white
+    /// global dominate every pixel, so a blue per-pixel chase read all white.)
+    /// Skips when the Zonda gdtf isn't present.
+    #[test]
+    fn zonda_per_pixel_color_overrides_global() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let candidates = [
+            "/tmp/zonda/131796.gdtf".to_string(),
+            format!("{home}/Library/Application Support/build.glowstone.glowstone/gdtf/131796.gdtf"),
+        ];
+        let Some(gdtf) = candidates
+            .iter()
+            .find_map(|p| GdtfFixture::load_path(std::path::Path::new(p)).ok())
+        else {
+            eprintln!("skip: Zonda 9 FX gdtf (131796) not found");
+            return;
+        };
+        let mi = gdtf
+            .modes
+            .iter()
+            .position(|m| m.name.trim() == "Extended Pixel 1")
+            .expect("Extended Pixel 1 mode");
+        let fp = gdtf.modes[mi].footprint as u16;
+        let mut fixture = Fixture::from_gdtf(Arc::new(gdtf), "Zonda", Vec3::ZERO);
+        fixture.mode_index = mi;
+        fixture.sync_mode();
+
+        let mut levels = [0u8; 512];
+        // Global "LED P Ext" ColorAdd full WHITE (16-bit coarse at offsets 8/10/12/14).
+        for off in [8, 10, 12, 14] {
+            levels[off - 1] = 0xFF;
+        }
+        levels[16 - 1] = 96; // global shutter (offset 16) open
+        levels[17 - 1] = 0xFF; // "Led Power Ext" pixel dimmer (offset 17 coarse) full
+        levels[18 - 1] = 0xFF; // ... fine
+        // Per-pixel: LED 2 (cell 1) BLUE — LENS 2 ColorAdd R/G/B/W at offsets 56..59.
+        levels[58 - 1] = 0xFF; // ColorAdd_B
+        // LED 3 (cell 2) left at 0 → shows the white global.
+        let snap = snapshot_with(1, levels);
+        let patch = one_patch(1, 1, fp, mi);
+        let mut fixtures = vec![fixture];
+        let mut live = Vec::new();
+        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        let f = &fixtures[0];
+
+        let blue = f.cells[1];
+        assert!(blue[2] > 0.5 && blue[0] < 0.3 && blue[1] < 0.3, "LED 2 reads BLUE (per-pixel overrides white global): {blue:?}");
+        let bg = f.cells[2];
+        assert!(bg.iter().all(|&v| v > 0.5), "undriven LED 3 shows the white global: {bg:?}");
+        eprintln!("Zonda per-pixel OK: driven {blue:?}  background {bg:?}");
     }
 }

@@ -142,7 +142,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     if (mode > 0.5) {
         // Unlit: flat albedo (lifted for readability); emissive surfaces still glow.
         let flat = in.color * 1.1 + vec3<f32>(0.05, 0.05, 0.06);
-        let emit = in.color * max(in.intensity, 0.2) * 24.0;
+        let emit = in.color * max(in.intensity, 0.0) * 4.0;
         return vec4<f32>(mix(flat, emit, clamp(in.emissive, 0.0, 1.0)), 1.0);
     }
 
@@ -252,7 +252,11 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
 
     // Self-illuminated surface (a fixture lens): a bright bloomy disc (HDR,
     // well above 1 so it blooms strongly like a real lamp face).
-    let emit = in.color * max(in.intensity, 0.2) * 24.0;
+    // Emissive lens face: HDR so it reads as a lit source and blooms, but a MODEST
+    // gain (no 24× / no floor) so a per-pixel colour chase stays DISTINCT — at high
+    // gain every dense cell's bloom overlaps and the whole face sums to white. Off
+    // cells (level 0) stay dark.
+    let emit = in.color * max(in.intensity, 0.0) * 4.0;
     var rgb = mix(lit, emit, clamp(in.emissive, 0.0, 1.0));
 
     // Selection highlight: additive amber rim on shaded surfaces.

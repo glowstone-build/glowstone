@@ -2148,6 +2148,14 @@ impl Renderer {
             let emitters = fixture.emitters();
             let level = (fixture.intensity.max(0.0) * fixture.optics.dimmer.max(0.0)).clamp(0.0, 1.0);
             let mut has_mesh = vec![false; emitters.len()];
+            // The optical-chain tint (CMY / colour-mix / colour wheel / CTO) is a
+            // fixture-wide master that colours the beam AND the lens — so the lens
+            // mesh must apply it too, else a master blue beam keeps a white face.
+            let chain_tint = if own_model {
+                optics::resolve(&gdtf, fixture.mode_index, &fixture.optics, &fixture.motion, time).tint
+            } else {
+                [1.0, 1.0, 1.0]
+            };
             for part in &asm.parts {
                 if self
                     .gdtf_cache
@@ -2165,11 +2173,15 @@ impl Renderer {
                                 // (× the manual master tint), HDR so it blooms.
                                 let c = fixture.cells.get(e).copied().unwrap_or([1.0, 1.0, 1.0]);
                                 color = [
-                                    c[0] * fixture.color[0],
-                                    c[1] * fixture.color[1],
-                                    c[2] * fixture.color[2],
+                                    chain_tint[0] * c[0] * fixture.color[0],
+                                    chain_tint[1] * c[1] * fixture.color[1],
+                                    chain_tint[2] * c[2] * fixture.color[2],
                                 ];
-                                intensity = level * 2.5;
+                                // The mesh-lens HDR scale (× the shader's emissive
+                                // gain). Kept modest so a per-pixel colour chase
+                                // reads as DISTINCT colours — too hot and every
+                                // cell's bloom overlaps and sums to white.
+                                intensity = level;
                                 emissive = 1.0;
                             } else {
                                 color = [0.02, 0.02, 0.025]; // occluded overlay (Spiider flower)
