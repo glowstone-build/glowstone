@@ -466,7 +466,7 @@ fn fs_volumetric(in: VsOut) -> @location(0) vec4<f32> {
                 clamp((lens_r - 0.08) * 8.0, 0.0, 1.0),
                 clamp((tan_half - 0.1) * 8.0, 0.0, 1.0),
             );
-            let near_fade = mix(1.0, clamp(depth / (lens_r * 3.0 + 0.25), 0.3, 1.0), wide_src);
+            let near_fade = mix(1.0, clamp(depth / (lens_r * 4.0 + 0.2), 0.1, 1.0), wide_src);
             let tyndall = select(1.0, 3.0, laser);
             let phase = max(hg(dot(bdir, -rd), g), 0.05);
             // Hero beams cast shadows into the haze: darken the shaft where geometry

@@ -152,6 +152,11 @@ pub struct RenderConfig {
     // --- Performance (render-side) ---
     /// Max hero (per-beam) shadow maps for the render.
     pub shadow_max: u32,
+    /// Multi-emitter WASH beam detail for the RENDER (separate from the viewport's
+    /// [`RenderSettings::wash_beam_lod`]): max volumetric shaft beams per wash/array
+    /// fixture. A still render can afford more than the live preview.
+    #[serde(default = "default_render_wash_beam_lod")]
+    pub wash_beam_lod: u32,
     /// Use the froxel grid for wide/dim beams (perf on huge rigs).
     pub froxel_volumetric: bool,
     /// Draw the origin grid + world axes in the render (off for a clean plate).
@@ -179,12 +184,19 @@ impl Default for RenderConfig {
             max_samples: 48,
             volumetric_steps: 96,
             shadow_max: 8,
+            wash_beam_lod: default_render_wash_beam_lod(),
             froxel_volumetric: false,
             show_overlays: false,
             motion_blur: false,
             caustics: false,
         }
     }
+}
+
+/// A still render can spend more shaft beams per wash than the live preview (no
+/// frame-rate pressure), so the render default is higher than the viewport's.
+fn default_render_wash_beam_lod() -> u32 {
+    32
 }
 
 impl RenderConfig {
@@ -210,6 +222,8 @@ impl RenderConfig {
             beam_intensity: viewport.beam_intensity,
             gobo_sharpness: viewport.gobo_sharpness,
             chroma_haze: viewport.chroma_haze,
+            // Render uses its OWN (typically higher) wash beam budget.
+            wash_beam_lod: self.wash_beam_lod,
             // Render-side quality overrides.
             steps: self.volumetric_steps,
             froxel_volumetric: self.froxel_volumetric,

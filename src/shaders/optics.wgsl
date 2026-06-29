@@ -29,13 +29,22 @@ fn opt_rot(uv: vec2<f32>, a: f32) -> vec2<f32> {
 fn opt_radial(axis_dist: f32, beam_r: f32, n: f32) -> f32 {
     let x = axis_dist / max(beam_r, 1e-4);
     let x2 = x * x;
-    var xn = x2;
-    if (abs(n - 2.0) <= 0.001) {
-        xn = x2 * x2;
-    } else if (abs(n - 3.0) <= 0.001) {
-        xn = x2 * x2 * x2;
-    } else if (abs(n - 1.0) > 0.001) {
+    // Super-Gaussian exponent x^(2n). Instead of a per-sample pow() (and instead
+    // of snapping to integer orders — which makes a zoom-driven shoulder sweep POP
+    // as the shaft sharpens), BLEND the shape continuously across n ∈ [1,3] from a
+    // mix of x², x⁴ and x⁶. Smooth (no snap), cheap (pow only for the rare n>3
+    // spot), and exact at the integer orders (mix endpoints == old x⁴ / x⁶).
+    let x4 = x2 * x2;
+    let x6 = x4 * x2;
+    var xn: f32;
+    if (n > 3.0) {
         xn = pow(x, 2.0 * n);
+    } else if (n >= 2.0) {
+        xn = mix(x4, x6, n - 2.0);
+    } else if (n >= 1.0) {
+        xn = mix(x2, x4, n - 1.0);
+    } else {
+        xn = x2;
     }
     let core = exp(-0.6931472 * xn);
     let spill = 0.02 * exp(-x * x * 0.5);
