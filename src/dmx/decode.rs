@@ -33,7 +33,7 @@ use std::time::Duration;
 use crate::gdtf::{ChannelFunction, DmxChannel, DmxMode, GdtfFixture, WheelRole, component_attr};
 use crate::scene::Fixture;
 
-use super::patch::{PatchTable, SYNTH};
+use super::patch::{Patch, PatchTable, SYNTH};
 use super::universe::UniverseSnapshot;
 
 /// Decode `snap` into `fixtures` according to `patch`. `live_mask` is rewritten:
@@ -45,11 +45,48 @@ pub fn apply(
     live_mask: &mut Vec<bool>,
     stale: Duration,
 ) {
-    live_mask.clear();
-    live_mask.resize(fixtures.len(), false);
+    apply_filtered(fixtures, patch, snap, live_mask, stale, true, |_, _| true);
+}
 
+/// Decode only patched fixtures whose ranges are known to be dirty. Unlike
+/// [`apply`], this preserves `live_mask` entries for untouched fixtures.
+pub fn apply_dirty(
+    fixtures: &mut [Fixture],
+    patch: &PatchTable,
+    snap: &UniverseSnapshot,
+    live_mask: &mut Vec<bool>,
+    stale: Duration,
+    mut should_decode: impl FnMut(&Patch) -> bool,
+) {
+    apply_filtered(
+        fixtures,
+        patch,
+        snap,
+        live_mask,
+        stale,
+        false,
+        |_, patch| should_decode(patch),
+    );
+}
+
+fn apply_filtered(
+    fixtures: &mut [Fixture],
+    patch: &PatchTable,
+    snap: &UniverseSnapshot,
+    live_mask: &mut Vec<bool>,
+    stale: Duration,
+    reset_live_mask: bool,
+    mut should_decode: impl FnMut(usize, &Patch) -> bool,
+) {
+    if reset_live_mask {
+        live_mask.clear();
+    }
+    live_mask.resize(fixtures.len(), false);
     for (i, fixture) in fixtures.iter_mut().enumerate() {
         let Some(p) = patch.get(i) else { continue };
+        if !should_decode(i, p) {
+            continue;
+        }
         // Keep the fixture's per-mode state (emitter cells, wheel controls,
         // motion phases) aligned with the patched mode even when no DMX is
         // flowing — the mode dropdown changes the active geometry root.
@@ -58,9 +95,11 @@ pub fn apply(
             fixture.sync_mode();
         }
         if !p.enabled || !snap.is_live(p.universe, stale) {
+            live_mask[i] = false;
             continue;
         }
         let Some(buf) = snap.get(p.universe) else {
+            live_mask[i] = false;
             continue;
         };
         let (address, mode_index) = (p.address, p.mode_index);

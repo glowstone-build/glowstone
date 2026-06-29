@@ -141,6 +141,7 @@ pub struct DmxIo {
     stale: Duration,
     last_fixture_decode_patch_sig: u64,
     last_fixture_decode_generation: u64,
+    last_fixture_decode_snapshot: Option<Arc<UniverseSnapshot>>,
     last_fixture_decode_at: Instant,
     last_screen_decode_generation: u64,
     last_screen_decode_sig: u64,
@@ -176,6 +177,7 @@ impl DmxIo {
             stale: Duration::from_millis(2500),
             last_fixture_decode_patch_sig: 0,
             last_fixture_decode_generation: u64::MAX,
+            last_fixture_decode_snapshot: None,
             last_fixture_decode_at: Instant::now(),
             last_screen_decode_generation: u64::MAX,
             last_screen_decode_sig: 0,
@@ -207,6 +209,7 @@ impl DmxIo {
         self.status = DmxStatus::default();
         *self.shared.status.lock().unwrap() = DmxStatus::default();
         self.last_fixture_decode_generation = u64::MAX;
+        self.last_fixture_decode_snapshot = None;
         self.last_screen_decode_generation = u64::MAX;
         self.last_pyro_decode_generation = u64::MAX;
     }
@@ -247,20 +250,48 @@ impl DmxIo {
         self.patch.sync(scene);
         let patch_sig = self.patch.signature();
         let snapshot_generation = self.snapshot.generation;
-        let fixture_decode_current = self.last_fixture_decode_patch_sig == patch_sig
-            && self.last_fixture_decode_generation == snapshot_generation
-            && self.last_fixture_decode_at.elapsed() < self.stale;
-        if !fixture_decode_current {
-            decode::apply(
-                &mut scene.fixtures,
-                &self.patch,
-                &self.snapshot,
-                &mut self.live_mask,
-                self.stale,
-            );
+        let fixture_patch_current = self.last_fixture_decode_patch_sig == patch_sig;
+        let fixture_snapshot_current = self.last_fixture_decode_generation == snapshot_generation;
+        let fixture_stale_current = self.last_fixture_decode_at.elapsed() < self.stale;
+        if !(fixture_patch_current && fixture_snapshot_current && fixture_stale_current) {
+            let full_decode = !fixture_patch_current
+                || !fixture_stale_current
+                || self.last_fixture_decode_snapshot.is_none();
+            if full_decode {
+                decode::apply(
+                    &mut scene.fixtures,
+                    &self.patch,
+                    &self.snapshot,
+                    &mut self.live_mask,
+                    self.stale,
+                );
+            } else {
+                if let Some(previous) = &self.last_fixture_decode_snapshot {
+                    decode::apply_dirty(
+                        &mut scene.fixtures,
+                        &self.patch,
+                        &self.snapshot,
+                        &mut self.live_mask,
+                        self.stale,
+                        |patch| {
+                            dmx_range_changed(
+                                previous,
+                                &self.snapshot,
+                                patch.universe,
+                                patch.address,
+                                patch.footprint,
+                                self.stale,
+                            )
+                        },
+                    );
+                }
+            }
+            if full_decode {
+                self.last_fixture_decode_at = Instant::now();
+            }
             self.last_fixture_decode_patch_sig = patch_sig;
             self.last_fixture_decode_generation = snapshot_generation;
-            self.last_fixture_decode_at = Instant::now();
+            self.last_fixture_decode_snapshot = Some(self.snapshot.clone());
         }
         let screen_sig = screen_dmx_signature(&scene.screens);
         if self.last_screen_decode_generation != snapshot_generation
@@ -377,6 +408,37 @@ fn pyro_dmx_signature(pyro: &[crate::scene::PyroDevice]) -> u64 {
         device.patch.hash(&mut h);
     }
     h.finish()
+}
+
+fn dmx_range_changed(
+    previous: &UniverseSnapshot,
+    current: &UniverseSnapshot,
+    universe: u16,
+    address: u16,
+    footprint: u16,
+    stale: Duration,
+) -> bool {
+    let was_live = previous.is_live(universe, stale);
+    let is_live = current.is_live(universe, stale);
+    if was_live != is_live {
+        return true;
+    }
+
+    let previous = previous.frames.get(&universe);
+    let current = current.frames.get(&universe);
+    if previous.is_some() != current.is_some() {
+        return true;
+    }
+    let (Some(previous), Some(current)) = (previous, current) else {
+        return false;
+    };
+
+    let start = address.saturating_sub(1) as usize;
+    if start >= 512 {
+        return false;
+    }
+    let end = (start + footprint.max(1) as usize).min(512);
+    previous.levels[start..end] != current.levels[start..end]
 }
 
 /// A bundle of disjoint borrows of [`DmxIo`] for the UI panels.
@@ -594,11 +656,40 @@ pub fn parse_universe_list(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dmx::universe::UniverseFrame;
 
     #[test]
     fn universe_list_parses_ranges_and_dedups() {
         assert_eq!(parse_universe_list("1, 3, 5-7, 3"), vec![1, 3, 5, 6, 7]);
         assert_eq!(parse_universe_list(""), Vec::<u16>::new());
         assert_eq!(parse_universe_list("2"), vec![2]);
+    }
+
+    #[test]
+    fn dmx_range_change_is_limited_to_requested_slots() {
+        let stale = Duration::from_secs(5);
+        let mut previous = UniverseSnapshot::default();
+        let mut current = UniverseSnapshot::default();
+        previous.frames.insert(1, UniverseFrame::new());
+        current.frames.insert(1, UniverseFrame::new());
+        current.frames.get_mut(&1).unwrap().levels[9] = 255;
+
+        assert!(!dmx_range_changed(&previous, &current, 1, 1, 8, stale));
+        assert!(dmx_range_changed(&previous, &current, 1, 10, 1, stale));
+    }
+
+    #[test]
+    fn dmx_range_change_detects_live_transitions() {
+        let stale = Duration::from_millis(100);
+        let mut previous = UniverseSnapshot::default();
+        let mut current = UniverseSnapshot::default();
+        let mut old = UniverseFrame::new();
+        old.last_update = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        previous.frames.insert(1, old);
+        current.frames.insert(1, UniverseFrame::new());
+
+        assert!(dmx_range_changed(&previous, &current, 1, 1, 1, stale));
     }
 }
