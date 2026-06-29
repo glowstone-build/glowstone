@@ -2412,14 +2412,14 @@ impl Renderer {
         // so `build_beam_gpus` skips their synthetic lens billboard.
         let mut emitter_lens_mesh: Vec<Vec<bool>> = vec![Vec::new(); scene.fixtures.len()];
         for (i, fixture) in scene.fixtures.iter().enumerate() {
-            let Some(gdtf) = fixture.gdtf.clone() else {
+            let Some(gdtf) = fixture.gdtf.as_ref() else {
                 continue;
             };
             if fixture.hidden {
                 continue;
             }
-            let key = Arc::as_ptr(&gdtf) as usize;
-            self.ensure_gdtf_loaded(key, &gdtf);
+            let key = Arc::as_ptr(gdtf) as usize;
+            self.ensure_gdtf_loaded(key, gdtf);
             // Place the fixture: translate, then the MVR hang orientation (identity
             // for app-created fixtures), then GDTF +Z-up → world +Y-up. Pan/tilt
             // are articulated inside `assemble`.
@@ -2432,7 +2432,7 @@ impl Renderer {
             // cache key. With `model_src = None` (every normal fixture) this is the
             // same single assemble + `key` as before — byte-identical, no regression.
             let mut own = fixture_model::assemble(
-                &gdtf,
+                gdtf,
                 fixture.mode_index,
                 root,
                 fixture.pan_actual,
@@ -2481,7 +2481,7 @@ impl Renderer {
             // mesh must apply it too, else a master blue beam keeps a white face.
             let chain_tint = if own_model {
                 optics::resolve(
-                    &gdtf,
+                    gdtf,
                     fixture.mode_index,
                     &fixture.optics,
                     &fixture.motion,
