@@ -145,8 +145,10 @@ pub struct DmxIo {
     last_fixture_decode_at: Instant,
     last_screen_decode_generation: u64,
     last_screen_decode_sig: u64,
+    last_screen_decode_snapshot: Option<Arc<UniverseSnapshot>>,
     last_pyro_decode_generation: u64,
     last_pyro_decode_sig: u64,
+    last_pyro_decode_snapshot: Option<Arc<UniverseSnapshot>>,
 }
 
 impl DmxIo {
@@ -181,8 +183,10 @@ impl DmxIo {
             last_fixture_decode_at: Instant::now(),
             last_screen_decode_generation: u64::MAX,
             last_screen_decode_sig: 0,
+            last_screen_decode_snapshot: None,
             last_pyro_decode_generation: u64::MAX,
             last_pyro_decode_sig: 0,
+            last_pyro_decode_snapshot: None,
         }
     }
 
@@ -211,7 +215,9 @@ impl DmxIo {
         self.last_fixture_decode_generation = u64::MAX;
         self.last_fixture_decode_snapshot = None;
         self.last_screen_decode_generation = u64::MAX;
+        self.last_screen_decode_snapshot = None;
         self.last_pyro_decode_generation = u64::MAX;
+        self.last_pyro_decode_snapshot = None;
     }
 
     /// Apply any deferred UI command and push config edits to the worker. Call
@@ -294,20 +300,57 @@ impl DmxIo {
             self.last_fixture_decode_snapshot = Some(self.snapshot.clone());
         }
         let screen_sig = screen_dmx_signature(&scene.screens);
-        if self.last_screen_decode_generation != snapshot_generation
-            || self.last_screen_decode_sig != screen_sig
-        {
-            decode::apply_screens(&mut scene.screens, &self.snapshot);
+        let screen_signature_current = self.last_screen_decode_sig == screen_sig;
+        let screen_snapshot_current = self.last_screen_decode_generation == snapshot_generation;
+        if !(screen_signature_current && screen_snapshot_current) {
+            if !screen_signature_current || self.last_screen_decode_snapshot.is_none() {
+                decode::apply_screens(&mut scene.screens, &self.snapshot);
+            } else if let Some(previous) = &self.last_screen_decode_snapshot {
+                let previous = previous.clone();
+                let current = self.snapshot.clone();
+                let stale = self.stale;
+                decode::apply_screens_dirty(&mut scene.screens, &self.snapshot, |pixel_map| {
+                    dmx_span_changed(
+                        &previous,
+                        &current,
+                        pixel_map.universe,
+                        pixel_map.start_address,
+                        pixel_map.footprint(),
+                        stale,
+                    )
+                });
+            }
             self.last_screen_decode_generation = snapshot_generation;
             self.last_screen_decode_sig = screen_sig;
+            self.last_screen_decode_snapshot = Some(self.snapshot.clone());
         }
         let pyro_sig = pyro_dmx_signature(&scene.pyro);
-        if self.last_pyro_decode_generation != snapshot_generation
-            || self.last_pyro_decode_sig != pyro_sig
-        {
-            decode::apply_pyro(&mut scene.pyro, &self.snapshot);
+        let pyro_signature_current = self.last_pyro_decode_sig == pyro_sig;
+        let pyro_snapshot_current = self.last_pyro_decode_generation == snapshot_generation;
+        if !(pyro_signature_current && pyro_snapshot_current) {
+            if !pyro_signature_current || self.last_pyro_decode_snapshot.is_none() {
+                decode::apply_pyro(&mut scene.pyro, &self.snapshot);
+            } else if let Some(previous) = &self.last_pyro_decode_snapshot {
+                let previous = previous.clone();
+                let current = self.snapshot.clone();
+                let stale = self.stale;
+                decode::apply_pyro_dirty(&mut scene.pyro, &self.snapshot, |device| {
+                    let Some(patch) = device.patch else {
+                        return false;
+                    };
+                    dmx_span_changed(
+                        &previous,
+                        &current,
+                        patch.universe,
+                        patch.address,
+                        device.mode.footprint(device.kind),
+                        stale,
+                    )
+                });
+            }
             self.last_pyro_decode_generation = snapshot_generation;
             self.last_pyro_decode_sig = pyro_sig;
+            self.last_pyro_decode_snapshot = Some(self.snapshot.clone());
         }
     }
 
@@ -439,6 +482,36 @@ fn dmx_range_changed(
     }
     let end = (start + footprint.max(1) as usize).min(512);
     previous.levels[start..end] != current.levels[start..end]
+}
+
+fn dmx_span_changed(
+    previous: &UniverseSnapshot,
+    current: &UniverseSnapshot,
+    universe: u16,
+    address: u16,
+    footprint: u16,
+    stale: Duration,
+) -> bool {
+    let mut remaining = footprint.max(1) as u32;
+    let mut offset = address.saturating_sub(1) as u32;
+    while remaining > 0 {
+        let chunk_universe = universe.wrapping_add((offset / 512) as u16);
+        let chunk_address = (offset % 512) as u16 + 1;
+        let chunk_len = remaining.min(512 - (offset % 512)) as u16;
+        if dmx_range_changed(
+            previous,
+            current,
+            chunk_universe,
+            chunk_address,
+            chunk_len,
+            stale,
+        ) {
+            return true;
+        }
+        remaining -= chunk_len as u32;
+        offset += chunk_len as u32;
+    }
+    false
 }
 
 /// A bundle of disjoint borrows of [`DmxIo`] for the UI panels.
@@ -691,5 +764,20 @@ mod tests {
         current.frames.insert(1, UniverseFrame::new());
 
         assert!(dmx_range_changed(&previous, &current, 1, 1, 1, stale));
+    }
+
+    #[test]
+    fn dmx_span_change_walks_universe_boundaries() {
+        let stale = Duration::from_secs(5);
+        let mut previous = UniverseSnapshot::default();
+        let mut current = UniverseSnapshot::default();
+        previous.frames.insert(1, UniverseFrame::new());
+        previous.frames.insert(2, UniverseFrame::new());
+        current.frames.insert(1, UniverseFrame::new());
+        current.frames.insert(2, UniverseFrame::new());
+        current.frames.get_mut(&2).unwrap().levels[0] = 99;
+
+        assert!(dmx_span_changed(&previous, &current, 1, 511, 3, stale));
+        assert!(!dmx_span_changed(&previous, &current, 1, 510, 2, stale));
     }
 }

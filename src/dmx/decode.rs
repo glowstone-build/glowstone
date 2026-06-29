@@ -752,10 +752,37 @@ fn is_shake(f: &ChannelFunction) -> bool {
 /// NOT a per-screen-pixel composite, and never touches `Fixture.cells`. Absent /
 /// stale channels read 0 (the wall shows black, like a real wall with no signal).
 pub fn apply_screens(screens: &mut [crate::scene::LedScreen], snap: &UniverseSnapshot) {
+    apply_screens_filtered(screens, snap, true, |_| true);
+}
+
+/// Decode only pixel-map screens whose DMX span changed. Untouched screen frames
+/// are preserved.
+pub fn apply_screens_dirty(
+    screens: &mut [crate::scene::LedScreen],
+    snap: &UniverseSnapshot,
+    should_decode: impl FnMut(crate::scene::screen::PixelMap) -> bool,
+) {
+    apply_screens_filtered(screens, snap, false, should_decode);
+}
+
+fn apply_screens_filtered(
+    screens: &mut [crate::scene::LedScreen],
+    snap: &UniverseSnapshot,
+    clear_non_pixel_map: bool,
+    mut should_decode: impl FnMut(crate::scene::screen::PixelMap) -> bool,
+) {
     use crate::scene::screen::{ScreenContent, ScreenFrame};
     for s in screens.iter_mut() {
-        let ScreenContent::PixelMapDmx(pm) = &s.content else {
-            s.frame = None;
+        let pm = match &s.content {
+            ScreenContent::PixelMapDmx(pm) => *pm,
+            _ => {
+                if clear_non_pixel_map {
+                    s.frame = None;
+                }
+                continue;
+            }
+        };
+        if !should_decode(pm) {
             continue;
         };
         // Clamp the grid so a crafted .glow / MVR file can't force a huge
@@ -812,10 +839,33 @@ pub fn apply_screens(screens: &mut [crate::scene::LedScreen], snap: &UniverseSna
 /// reads. A device whose universe is NOT present in the snapshot stays
 /// **un-driven** so it free-runs at its `density` (the glowstone-preview default).
 pub fn apply_pyro(pyro: &mut [crate::scene::PyroDevice], snap: &UniverseSnapshot) {
+    apply_pyro_filtered(pyro, snap, true, |_| true);
+}
+
+/// Decode only inline-patched pyro devices whose DMX span changed.
+pub fn apply_pyro_dirty(
+    pyro: &mut [crate::scene::PyroDevice],
+    snap: &UniverseSnapshot,
+    mut should_decode: impl FnMut(&crate::scene::PyroDevice) -> bool,
+) {
+    apply_pyro_filtered(pyro, snap, false, |device| should_decode(device));
+}
+
+fn apply_pyro_filtered(
+    pyro: &mut [crate::scene::PyroDevice],
+    snap: &UniverseSnapshot,
+    clear_unpatched: bool,
+    mut should_decode: impl FnMut(&crate::scene::PyroDevice) -> bool,
+) {
     use crate::scene::pyro::{PyroKind, PyroMode};
     for d in pyro.iter_mut() {
+        if !should_decode(d) {
+            continue;
+        }
         let Some(patch) = d.patch else {
-            d.driven = false;
+            if clear_unpatched {
+                d.driven = false;
+            }
             continue;
         };
         // Only obey DMX when the patched universe is actually being received;
