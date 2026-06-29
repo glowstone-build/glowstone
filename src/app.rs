@@ -1706,6 +1706,7 @@ impl State {
         // resetting every frame. The job is cleared on completion/cancel, after
         // which the live preview resumes normally.
         let job_active = self.render_job.is_some();
+        let viewport_was_visible = self.ui.viewport_visible();
 
         // Dynamic resolution: nudge the live render scale toward the fps target
         // (live preview only — a still render always uses its own native scale).
@@ -1758,9 +1759,12 @@ impl State {
             // Advance the stage-pyro particle simulation once per real frame too
             // (same rule — never in the renderer's record_scene). Reads the
             // per-device trigger state DMX decode wrote above; the camera position
-            // drives the distance LOD.
-            self.renderer
-                .advance_pyro(&self.scene, self.camera.eye(), dt);
+            // drives the distance LOD. When the viewport was not painted last frame,
+            // skip the renderer-owned sim alongside the skipped 3D pass below.
+            if viewport_was_visible {
+                self.renderer
+                    .advance_pyro(&self.scene, self.camera.eye(), dt);
+            }
 
             // Advance the renderer's animation clock by the SAME dt, so fog drift +
             // beam animation track the logical scene time (not wall-clock). Frozen
