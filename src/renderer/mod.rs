@@ -5239,16 +5239,12 @@ fn build_beam_gpus(
         ));
     }
 
-    // Beams: skip dark cells, then cluster the rest by direction (a Spiider is
-    // one parallel cluster; a multi-tube blinder is several). Uniform clusters
-    // collapse to one disc beam. Non-uniform broad washes also collapse when
-    // their cells physically overlap into one haze mass; narrow/steered pixel
-    // emitters stay separate so real pixel shafts remain visible.
-    let lit: Vec<&Cell> = cells
-        .iter()
-        .filter(|c| c.lit > 1e-4 && c.cone.shaft)
-        .collect();
-    if lit.is_empty() {
+    // Beams: cluster the stable emitter layout by direction (a Spiider is one
+    // parallel cluster; a multi-tube blinder is several), but only emit bins that
+    // currently carry light. This keeps binned shaft geometry stable during DMX
+    // fades: a cell crossing black must not reshuffle neighbouring bin centroids.
+    let shaft_cells: Vec<&Cell> = cells.iter().filter(|c| c.cone.shaft).collect();
+    if !shaft_cells.iter().any(|c| c.lit > 1e-4) {
         return BeamBuild { beams, lenses };
     }
     let no_cookie = wheel_count < 0.5
@@ -5508,8 +5504,11 @@ fn build_beam_gpus(
     // (one crisp shaft per LED — the most faithful, and each culls tightly); a
     // larger array is binned down to this many spatially-compact beams.
     let max_beams = wash_beam_lod.clamp(1, 64);
-    for cl in &cluster_by(&lit, 0.996) {
-        let cs: Vec<&Cell> = cl.iter().map(|&i| lit[i]).collect();
+    for cl in &cluster_by(&shaft_cells, 0.996) {
+        let cs: Vec<&Cell> = cl.iter().map(|&i| shaft_cells[i]).collect();
+        if !cs.iter().any(|c| c.lit > 1e-4) {
+            continue;
+        }
         // Crossfade between resolvable per-cell/binned shafts and ONE soft merged
         // disc as the cones widen into a single haze mass — smoothly, so a zoom
         // chase doesn't snap at the ~13.7° (tan 0.12) merge point. Brightness is
@@ -5526,6 +5525,9 @@ fn build_beam_gpus(
             let w = 1.0 - merge_t;
             for bin in spatial_bins(&cs, max_beams) {
                 let gs: Vec<&Cell> = bin.iter().map(|&i| cs[i]).collect();
+                if !gs.iter().any(|c| c.lit > 1e-4) {
+                    continue;
+                }
                 let b = if gs.len() == 1 {
                     cell_beam(gs[0])
                 } else {
