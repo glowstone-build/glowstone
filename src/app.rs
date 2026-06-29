@@ -1640,11 +1640,22 @@ fn pump_screen_frame_sources<C>(
 {
     let sources: Vec<String> = screens
         .iter()
-        .filter_map(|s| source_for(&s.content).map(ToOwned::to_owned))
-        .collect();
+        .filter(|s| !s.hidden)
+        .filter_map(|s| source_for(&s.content))
+        .fold(Vec::new(), |mut sources, source| {
+            if !sources.iter().any(|s| s == source) {
+                sources.push(source.to_owned());
+            }
+            sources
+        });
     if sources.is_empty() {
         if let Some(client) = client {
             client.retain(&[]);
+        }
+        for screen in screens {
+            if source_for(&screen.content).is_some() {
+                screen.frame = None;
+            }
         }
         return;
     }
@@ -1652,12 +1663,16 @@ fn pump_screen_frame_sources<C>(
     let client = client.get_or_insert_with(make_client);
     client.retain(&sources);
     for screen in screens {
-        let source = source_for(&screen.content).map(ToOwned::to_owned);
+        let source = source_for(&screen.content);
         if let Some(source) = source {
+            if screen.hidden {
+                screen.frame = None;
+                continue;
+            }
             // Assign unconditionally so switching to a different source name clears
             // the previous source's stale frame. `frame_for` returns the cached
             // latest frame for a live source, so a steady stream does not flicker.
-            screen.frame = client.frame_for(&source);
+            screen.frame = client.frame_for(source);
         }
     }
 }
