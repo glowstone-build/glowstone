@@ -2586,8 +2586,6 @@ impl Renderer {
         if self.scene_geom_sig != scene_geom_sig {
             self.rebuild_scene_geometry_cache(scene, selection, scene_geom_sig);
         }
-        let scene_geom_draws = self.scene_geom_draws_cpu.clone();
-        let scene_geom_groups = self.scene_geom_groups_cpu.clone();
 
         // --- dynamic lines: fog-box wireframes + beam indicators ---
         let mut lines = std::mem::take(&mut self.line_vertices_cpu);
@@ -3836,6 +3834,8 @@ impl Renderer {
         if shared_layer >= 0 {
             render_layers.push(shadow::SHARED);
         }
+        let scene_geom_draws = &self.scene_geom_draws_cpu;
+        let scene_geom_groups = &self.scene_geom_groups_cpu;
         for &layer in &render_layers {
             let mut spass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-pass"),
@@ -3967,7 +3967,7 @@ impl Renderer {
             }
             if !scene_geom_groups.is_empty() {
                 pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
-                for (key, base, count) in &scene_geom_groups {
+                for (key, base, count) in scene_geom_groups {
                     if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         pass.draw(0..mesh.vertex_count, *base..*base + *count);
@@ -4078,7 +4078,7 @@ impl Renderer {
             // GPU compute cull can prune off-screen instances before the draw).
             if !scene_geom_groups.is_empty() {
                 pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
-                for (key, base, count) in &scene_geom_groups {
+                for (key, base, count) in scene_geom_groups {
                     if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         pass.draw(0..mesh.vertex_count, *base..*base + *count);
@@ -4212,7 +4212,7 @@ impl Renderer {
             // Imported MVR static geometry.
             if !scene_geom_groups.is_empty() {
                 pass.set_vertex_buffer(1, self.scene_geom_instances.buffer.slice(..));
-                for (key, base, count) in &scene_geom_groups {
+                for (key, base, count) in scene_geom_groups {
                     if let Some(Some(mesh)) = self.scene_geom_cache.get(key) {
                         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         pass.draw(0..mesh.vertex_count, *base..*base + *count);
