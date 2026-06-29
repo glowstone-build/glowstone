@@ -187,10 +187,8 @@ pub struct RenderSettings {
     /// wash / LED-array fixture spends on the raymarch. Its cells render one crisp
     /// shaft each up to this many, then spatially bin down to it (the lens FACE always
     /// shows the full pixel map regardless). Higher = finer per-cell shaft colour /
-    /// structure but more GPU; lower = faster. `skip`-ped: this is a live-preview
-    /// machine/perf preference, not part of the show. Final render detail is persisted
-    /// separately on [`render::RenderConfig`].
-    #[serde(skip, default = "default_wash_beam_lod")]
+    /// structure but more GPU; lower = faster. Shown in Render Properties ▸ Performance.
+    #[serde(default = "default_wash_beam_lod")]
     pub wash_beam_lod: u32,
     /// Floor-pool gobo edge sharpening amount (0 = off). Drives the contour
     /// steepening in mesh.wgsl via `camera.render_mode.y`.
@@ -258,7 +256,7 @@ fn default_shadow_max() -> u32 {
 }
 
 fn default_wash_beam_lod() -> u32 {
-    2
+    16
 }
 
 impl Default for RenderSettings {
