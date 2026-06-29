@@ -29,7 +29,7 @@ pub use gpu_timer::PassTimings;
 /// glowstone's bespoke wgpu raster + volumetric-raymarch engine.
 pub const ENGINE_NAME: &str = "Spectre";
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::{FRAC_PI_2, TAU};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -457,6 +457,7 @@ pub struct Renderer {
     // Imported GDTF fixture models: per-fixture-type (Arc ptr) cache of part
     // meshes (keyed by model name), plus a per-frame instance buffer.
     gdtf_cache: HashMap<usize, HashMap<String, GpuMesh>>,
+    gdtf_live_keys: HashSet<usize>,
     gdtf_instances: GrowBuffer,
 
     // Imported MVR static geometry (stage/truss/set): cache of baked meshes
@@ -1183,6 +1184,7 @@ impl Renderer {
             co2_plumes_storage,
             dynamic_lines,
             gdtf_cache: HashMap::new(),
+            gdtf_live_keys: HashSet::new(),
             gdtf_instances,
             scene_geom_cache: HashMap::new(),
             scene_geom_bounds: HashMap::new(),
@@ -1417,13 +1419,16 @@ impl Renderer {
         if self.gdtf_cache.is_empty() {
             return;
         }
-        let live: std::collections::HashSet<usize> = scene
-            .fixtures
-            .iter()
-            .flat_map(|f| f.gdtf.iter().chain(f.model_src.iter()))
-            .map(|gdtf| Arc::as_ptr(gdtf) as usize)
-            .collect();
-        if live.len() < self.gdtf_cache.len() {
+        self.gdtf_live_keys.clear();
+        self.gdtf_live_keys.extend(
+            scene
+                .fixtures
+                .iter()
+                .flat_map(|f| f.gdtf.iter().chain(f.model_src.iter()))
+                .map(|gdtf| Arc::as_ptr(gdtf) as usize),
+        );
+        if self.gdtf_live_keys.len() < self.gdtf_cache.len() {
+            let live = &self.gdtf_live_keys;
             self.gdtf_cache.retain(|key, _| live.contains(key));
         }
     }
