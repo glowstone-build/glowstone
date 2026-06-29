@@ -2900,14 +2900,6 @@ impl Renderer {
         // dynamic-offset render buffer (for the depth pass) + the packed sample
         // buffer (for the lighting shaders), and its layer is stamped into
         // misc.w (-1 = unshadowed).
-        let mut shadow_order = std::mem::take(&mut self.shadow_order_cpu);
-        shadow_order.clear();
-        shadow_order.extend((0..gpu_fixtures.len()).filter(|&i| gpu_fixtures[i].dir_cos[3] > 1e-4));
-        shadow_order.sort_by(|&a, &b| {
-            gpu_fixtures[a].dir_cos[3]
-                .partial_cmp(&gpu_fixtures[b].dir_cos[3])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
         // Shadows only matter in the lit Beauty view (unlit/wireframe skip lighting).
         let max_shadows = if settings.mode == ViewportMode::Beauty && !self.debug.disable_shadows {
             // Capped by the user's `shadow_max` lever (each hero map is a depth pass,
@@ -2916,6 +2908,17 @@ impl Renderer {
         } else {
             0
         };
+        let mut shadow_order = std::mem::take(&mut self.shadow_order_cpu);
+        shadow_order.clear();
+        if max_shadows > 0 {
+            shadow_order
+                .extend((0..gpu_fixtures.len()).filter(|&i| gpu_fixtures[i].dir_cos[3] > 1e-4));
+            shadow_order.sort_by(|&a, &b| {
+                gpu_fixtures[a].dir_cos[3]
+                    .partial_cmp(&gpu_fixtures[b].dir_cos[3])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         // sample_mats holds ALL atlas layers (heroes 0..n_shadows + the shared
         // occluder at shadow::SHARED); identity for the unused middle slots.
         let mut sample_mats = std::mem::take(&mut self.sample_mats_cpu);
