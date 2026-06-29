@@ -326,9 +326,7 @@ impl Co2Sim {
         self.box_min = lo;
         self.box_size = (hi - lo).max(Vec3::splat(0.5));
         let n = self.res as usize;
-        for d in self.grid.iter_mut() {
-            *d = 0.0;
-        }
+        self.grid.fill(0.0);
         let cell = self.box_size / self.res as f32;
         let inv_cell = Vec3::ONE / cell;
         for i in 0..self.pos.len() {
@@ -350,19 +348,22 @@ impl Co2Sim {
             let (x0, x1) = span(c.x, rv.x, n);
             let (y0, y1) = span(c.y, rv.y, n);
             let (z0, z1) = span(c.z, rv.z, n);
+            let px = self.pos[i].x;
+            let py = self.pos[i].y;
+            let pz = self.pos[i].z;
             for z in z0..z1 {
+                let dz = self.box_min.z + (z as f32 + 0.5) * cell.z - pz;
+                let z2 = dz * dz;
                 for y in y0..y1 {
+                    let dy = self.box_min.y + (y as f32 + 0.5) * cell.y - py;
+                    let yz2 = dy * dy + z2;
+                    let row = (z * n + y) * n;
                     for x in x0..x1 {
-                        let wc = self.box_min
-                            + Vec3::new(
-                                (x as f32 + 0.5) * cell.x,
-                                (y as f32 + 0.5) * cell.y,
-                                (z as f32 + 0.5) * cell.z,
-                            );
-                        let d2 = (wc - self.pos[i]).length_squared();
+                        let dx = self.box_min.x + (x as f32 + 0.5) * cell.x - px;
+                        let d2 = dx * dx + yz2;
                         let g = (-d2 * inv2sig).exp();
                         if g > 0.004 {
-                            self.grid[(z * n + y) * n + x] += amp * g;
+                            self.grid[row + x] += amp * g;
                         }
                     }
                 }
@@ -552,7 +553,7 @@ impl PyroSystem {
                         .or_insert_with(|| Co2Sim::new(dev.id, co2_res));
                     if sim.res != co2_res {
                         sim.res = co2_res;
-                        sim.grid = vec![0.0; (co2_res * co2_res * co2_res) as usize];
+                        sim.grid.resize((co2_res * co2_res * co2_res) as usize, 0.0);
                     }
                     sim.advance(dev.world_nozzle(), dev.world_dir(), output, time, dt, &tn);
                     if !dev.hidden
