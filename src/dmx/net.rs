@@ -123,7 +123,8 @@ impl UniverseMerge {
     /// whether the set of contributing sources shrank (a release event).
     fn recompute(&mut self, policy: MergePolicy, now: Instant) -> bool {
         let before = self.per_source.len();
-        self.per_source.retain(|_, b| now.duration_since(b.last_seen) < STALE);
+        self.per_source
+            .retain(|_, b| now.duration_since(b.last_seen) < STALE);
         let mut merged = [0u8; 512];
         match policy {
             MergePolicy::Latest => {
@@ -133,16 +134,21 @@ impl UniverseMerge {
             }
             MergePolicy::Htp => {
                 for b in self.per_source.values() {
-                    for i in 0..512 {
-                        merged[i] = merged[i].max(b.data[i]);
+                    for (i, value) in merged.iter_mut().enumerate() {
+                        *value = (*value).max(b.data[i]);
                     }
                 }
             }
             MergePolicy::PriorityHtp => {
-                let top = self.per_source.values().map(|b| b.priority).max().unwrap_or(0);
+                let top = self
+                    .per_source
+                    .values()
+                    .map(|b| b.priority)
+                    .max()
+                    .unwrap_or(0);
                 for b in self.per_source.values().filter(|b| b.priority == top) {
-                    for i in 0..512 {
-                        merged[i] = merged[i].max(b.data[i]);
+                    for (i, value) in merged.iter_mut().enumerate() {
+                        *value = (*value).max(b.data[i]);
                     }
                 }
             }
@@ -166,6 +172,7 @@ pub fn run_loop(shared: Arc<DmxShared>) {
     let mut sources: HashMap<SourceKey, SourceStat> = HashMap::new();
     let mut buf = [0u8; 1500];
     let mut last_publish = Instant::now();
+    let mut generation = 0_u64;
     let mut dirty = false;
 
     loop {
@@ -228,7 +235,8 @@ pub fn run_loop(shared: Arc<DmxShared>) {
         }
 
         if dirty && now.duration_since(last_publish) >= PUBLISH_INTERVAL {
-            publish(&shared, &universes, &sources);
+            generation = generation.wrapping_add(1);
+            publish(&shared, &universes, &sources, generation);
             last_publish = now;
             dirty = false;
         }
@@ -248,7 +256,9 @@ fn handle_artnet(
     sources: &mut HashMap<SourceKey, SourceStat>,
     now: Instant,
 ) -> bool {
-    let Some(d) = artnet::parse_artdmx(pkt) else { return false };
+    let Some(d) = artnet::parse_artdmx(pkt) else {
+        return false;
+    };
     // Art-Net is broadcast — there is no per-universe subscription, so accept
     // every universe and let the grid/patch surface what's relevant. (sACN, which
     // is multicast, is still filtered by the joined groups.)
@@ -257,7 +267,15 @@ fn handle_artnet(
         .entry(key)
         .or_insert_with(|| SourceStat::new(Proto::ArtNet, addr.to_string(), String::new(), now));
     merge(
-        universes, stat, key, d.universe, d.data, cfg.artnet_priority, d.sequence, cfg.merge, now,
+        universes,
+        stat,
+        key,
+        d.universe,
+        d.data,
+        cfg.artnet_priority,
+        d.sequence,
+        cfg.merge,
+        now,
     );
     true
 }
@@ -285,9 +303,9 @@ fn handle_sacn(
         }
         return true;
     }
-    let stat = sources
-        .entry(key)
-        .or_insert_with(|| SourceStat::new(Proto::Sacn, cid_label(&d.cid), d.source_name.clone(), now));
+    let stat = sources.entry(key).or_insert_with(|| {
+        SourceStat::new(Proto::Sacn, cid_label(&d.cid), d.source_name.clone(), now)
+    });
     stat.name = d.source_name.clone();
     merge(
         universes, stat, key, d.universe, d.slots, d.priority, d.sequence, cfg.merge, now,
@@ -312,7 +330,11 @@ fn merge(
     let dt = now.duration_since(stat.last_seen).as_secs_f32();
     if dt > 0.0 && dt < 5.0 {
         let inst = 1.0 / dt;
-        stat.fps = if stat.fps == 0.0 { inst } else { stat.fps * 0.9 + inst * 0.1 };
+        stat.fps = if stat.fps == 0.0 {
+            inst
+        } else {
+            stat.fps * 0.9 + inst * 0.1
+        };
     }
     stat.last_seen = now;
     stat.priority = priority;
@@ -321,7 +343,9 @@ fn merge(
         stat.universes.insert(pos, universe);
     }
 
-    let um = universes.entry(universe).or_insert_with(|| UniverseMerge::new(now));
+    let um = universes
+        .entry(universe)
+        .or_insert_with(|| UniverseMerge::new(now));
     let existed = um.per_source.contains_key(&key);
     let buf = um.per_source.entry(key).or_insert(SourceBuf {
         data: [0; 512],
@@ -353,6 +377,7 @@ fn publish(
     shared: &Arc<DmxShared>,
     universes: &HashMap<u16, UniverseMerge>,
     sources: &HashMap<SourceKey, SourceStat>,
+    generation: u64,
 ) {
     let mut frames = HashMap::new();
     for (&u, um) in universes {
@@ -368,7 +393,7 @@ fn publish(
             },
         );
     }
-    *shared.snapshot.lock().unwrap() = Arc::new(UniverseSnapshot { frames });
+    *shared.snapshot.lock().unwrap() = Arc::new(UniverseSnapshot { generation, frames });
 
     let mut stats: Vec<SourceStat> = sources.values().cloned().collect();
     stats.sort_by(|a, b| a.label.cmp(&b.label));
@@ -389,14 +414,21 @@ fn set_bound(shared: &Arc<DmxShared>, art: bool, sacn: bool) {
 
 /// CID as a short hex label (first 6 bytes).
 fn cid_label(cid: &[u8; 16]) -> String {
-    cid[..6].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+    cid[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Bind the receive sockets per config. Isolated here so the std-vs-socket2
 /// escape hatch (e.g. `SO_REUSEADDR`) stays a one-function change. Bind failures
 /// are logged and yield `None` (the panel surfaces the unbound state).
 fn bind_sockets(cfg: &DmxConfig) -> (Option<UdpSocket>, Option<UdpSocket>) {
-    let art = cfg.artnet.then(|| bind_artnet(cfg)).and_then(report("Art-Net"));
+    let art = cfg
+        .artnet
+        .then(|| bind_artnet(cfg))
+        .and_then(report("Art-Net"));
     let sacn = cfg.sacn.then(bind_sacn).and_then(report("sACN"));
     (art, sacn)
 }
@@ -417,7 +449,10 @@ fn bind_artnet(cfg: &DmxConfig) -> std::io::Result<UdpSocket> {
 
 fn bind_sacn() -> std::io::Result<UdpSocket> {
     // Bind INADDR_ANY for reliable multicast receive across NICs.
-    reuse_bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), SACN_PORT))
+    reuse_bind(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SACN_PORT,
+    ))
 }
 
 /// Bind a UDP receive socket with `SO_REUSEADDR` + `SO_REUSEPORT` set *before*
@@ -425,7 +460,11 @@ fn bind_sacn() -> std::io::Result<UdpSocket> {
 /// host (the std `UdpSocket::bind` can't set these pre-bind). Receive-only.
 fn reuse_bind(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     #[cfg(unix)]
@@ -448,10 +487,10 @@ fn sync_multicast(sock: &UdpSocket, cfg: &DmxConfig, already: &[u16]) -> Vec<u16
         }
     }
     for &u in &cfg.universes {
-        if !already.contains(&u) {
-            if let Err(e) = sock.join_multicast_v4(&sacn::multicast_addr(u), &iface) {
-                log::warn!("DMX: sACN join universe {u} failed: {e}");
-            }
+        if !already.contains(&u)
+            && let Err(e) = sock.join_multicast_v4(&sacn::multicast_addr(u), &iface)
+        {
+            log::warn!("DMX: sACN join universe {u} failed: {e}");
         }
     }
     cfg.universes.clone()
@@ -462,15 +501,22 @@ mod tests {
     use super::*;
 
     fn buf_with(value: u8, priority: u8, now: Instant) -> SourceBuf {
-        SourceBuf { data: [value; 512], last_seen: now, priority, last_seq: 0 }
+        SourceBuf {
+            data: [value; 512],
+            last_seen: now,
+            priority,
+            last_seq: 0,
+        }
     }
 
     #[test]
     fn htp_takes_per_channel_max() {
         let now = Instant::now();
         let mut um = UniverseMerge::new(now);
-        um.per_source.insert(SourceKey::Sacn([1; 16]), buf_with(100, 100, now));
-        um.per_source.insert(SourceKey::Sacn([2; 16]), buf_with(200, 100, now));
+        um.per_source
+            .insert(SourceKey::Sacn([1; 16]), buf_with(100, 100, now));
+        um.per_source
+            .insert(SourceKey::Sacn([2; 16]), buf_with(200, 100, now));
         um.recompute(MergePolicy::Htp, now);
         assert_eq!(um.merged[0], 200);
     }
@@ -479,10 +525,15 @@ mod tests {
     fn priority_htp_drops_lower_priority() {
         let now = Instant::now();
         let mut um = UniverseMerge::new(now);
-        um.per_source.insert(SourceKey::Sacn([1; 16]), buf_with(255, 50, now)); // low prio
-        um.per_source.insert(SourceKey::Sacn([2; 16]), buf_with(80, 200, now)); // high prio
+        um.per_source
+            .insert(SourceKey::Sacn([1; 16]), buf_with(255, 50, now)); // low prio
+        um.per_source
+            .insert(SourceKey::Sacn([2; 16]), buf_with(80, 200, now)); // high prio
         um.recompute(MergePolicy::PriorityHtp, now);
-        assert_eq!(um.merged[0], 80, "only the highest-priority source contributes");
+        assert_eq!(
+            um.merged[0], 80,
+            "only the highest-priority source contributes"
+        );
     }
 
     #[test]
@@ -490,8 +541,10 @@ mod tests {
         let now = Instant::now();
         let older = now.checked_sub(Duration::from_millis(50)).unwrap();
         let mut um = UniverseMerge::new(now);
-        um.per_source.insert(SourceKey::Sacn([1; 16]), buf_with(10, 100, older));
-        um.per_source.insert(SourceKey::Sacn([2; 16]), buf_with(20, 100, now));
+        um.per_source
+            .insert(SourceKey::Sacn([1; 16]), buf_with(10, 100, older));
+        um.per_source
+            .insert(SourceKey::Sacn([2; 16]), buf_with(20, 100, now));
         um.recompute(MergePolicy::Latest, now);
         assert_eq!(um.merged[0], 20);
     }
@@ -501,7 +554,8 @@ mod tests {
         let now = Instant::now();
         let old = now.checked_sub(Duration::from_secs(10)).unwrap();
         let mut um = UniverseMerge::new(now);
-        um.per_source.insert(SourceKey::Sacn([1; 16]), buf_with(150, 100, old));
+        um.per_source
+            .insert(SourceKey::Sacn([1; 16]), buf_with(150, 100, old));
         let shrank = um.recompute(MergePolicy::Htp, now);
         assert!(shrank, "the stale source was evicted");
         assert_eq!(um.merged[0], 0, "its HTP contribution is released");
@@ -516,14 +570,54 @@ mod tests {
         let key = SourceKey::Sacn([9; 16]);
         let data = [0u8; 512];
         // First packet seq=254 (no prior -> no loss).
-        merge(&mut universes, &mut stat, key, 1, &data, 100, 254, MergePolicy::Htp, now);
+        merge(
+            &mut universes,
+            &mut stat,
+            key,
+            1,
+            &data,
+            100,
+            254,
+            MergePolicy::Htp,
+            now,
+        );
         // 254 -> 255 (gap 1, ok).
-        merge(&mut universes, &mut stat, key, 1, &data, 100, 255, MergePolicy::Htp, now);
+        merge(
+            &mut universes,
+            &mut stat,
+            key,
+            1,
+            &data,
+            100,
+            255,
+            MergePolicy::Htp,
+            now,
+        );
         // 255 -> 0 (wrap, gap 1, NOT a loss).
-        merge(&mut universes, &mut stat, key, 1, &data, 100, 0, MergePolicy::Htp, now);
+        merge(
+            &mut universes,
+            &mut stat,
+            key,
+            1,
+            &data,
+            100,
+            0,
+            MergePolicy::Htp,
+            now,
+        );
         assert_eq!(stat.seq_errors, 0, "consecutive + wrap are not losses");
         // 0 -> 4 (gap 4 -> 3 missed).
-        merge(&mut universes, &mut stat, key, 1, &data, 100, 4, MergePolicy::Htp, now);
+        merge(
+            &mut universes,
+            &mut stat,
+            key,
+            1,
+            &data,
+            100,
+            4,
+            MergePolicy::Htp,
+            now,
+        );
         assert_eq!(stat.seq_errors, 3);
     }
 

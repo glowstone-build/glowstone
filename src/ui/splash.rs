@@ -36,8 +36,10 @@ impl Ui {
                 .resize(1600, 1600, image::imageops::FilterType::Lanczos3)
                 .to_rgba8();
             let (w, h) = img.dimensions();
-            let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
-            self.welcome_tex = Some(ctx.load_texture("welcome-hero", color, egui::TextureOptions::LINEAR));
+            let color =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+            self.welcome_tex =
+                Some(ctx.load_texture("welcome-hero", color, egui::TextureOptions::LINEAR));
         }
         self.welcome_tex.clone()
     }
@@ -86,7 +88,12 @@ impl Ui {
                 );
                 // Match the dark strip to the image's bottom edge: round its BOTTOM
                 // corners by the same radius so the scrim hugs the rounded outline.
-                let bottom = egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 };
+                let bottom = egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 6,
+                    se: 6,
+                };
                 painter.add(egui::epaint::RectShape::filled(
                     scrim,
                     bottom,
@@ -126,13 +133,19 @@ impl Ui {
                 cols[0].label(egui::RichText::new("New").strong());
                 cols[0].add_space(6.0);
                 if cols[0]
-                    .add_sized([240.0, 30.0], egui::Button::new(format!("{}  New Project", theme::icon::SCENE)))
+                    .add_sized(
+                        [240.0, 30.0],
+                        egui::Button::new(format!("{}  New Project", theme::icon::SCENE)),
+                    )
                     .clicked()
                 {
                     action = Some(SplashAction::New);
                 }
                 if cols[0]
-                    .add_sized([240.0, 30.0], egui::Button::new(format!("{}  Open…", theme::icon::IMPORT_MVR)))
+                    .add_sized(
+                        [240.0, 30.0],
+                        egui::Button::new(format!("{}  Open…", theme::icon::IMPORT_MVR)),
+                    )
                     .clicked()
                 {
                     action = Some(SplashAction::Open);
@@ -140,7 +153,13 @@ impl Ui {
                 if let Some(ap) = &autosave {
                     cols[0].add_space(10.0);
                     if cols[0]
-                        .add_sized([240.0, 30.0], egui::Button::new(format!("{}  Recover Last Session", theme::icon::FRAME)))
+                        .add_sized(
+                            [240.0, 30.0],
+                            egui::Button::new(format!(
+                                "{}  Recover Last Session",
+                                theme::icon::FRAME
+                            )),
+                        )
                         .on_hover_text("Reopen the auto-saved session from the last run")
                         .clicked()
                     {
@@ -160,7 +179,10 @@ impl Ui {
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
                         if cols[1]
-                            .add(egui::Button::new(format!("{}  {}", theme::icon::PROFILE, name)).frame(false))
+                            .add(
+                                egui::Button::new(format!("{}  {}", theme::icon::PROFILE, name))
+                                    .frame(false),
+                            )
                             .on_hover_text(p.display().to_string())
                             .clicked()
                         {

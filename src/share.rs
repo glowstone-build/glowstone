@@ -1,9 +1,10 @@
 //! GDTF Share online fixture library client.
 //!
 //! Talks to the public GDTF Share API (<https://gdtf-share.com/apis/public/>):
-//!   - `login.php`  POST `{user, password}` → sets a session cookie (2 h TTL)
-//!   - `getList.php` GET (cookie) → the full revision list (thousands of fixtures)
-//!   - `downloadFile.php?rid=N` GET (cookie) → the `.gdtf` archive bytes
+//!
+//! - `login.php`  POST `{user, password}` → sets a session cookie (2 h TTL)
+//! - `getList.php` GET (cookie) → the full revision list (thousands of fixtures)
+//! - `downloadFile.php?rid=N` GET (cookie) → the `.gdtf` archive bytes
 //!
 //! All network I/O runs on a single worker thread (the UI never blocks). The
 //! worker owns a `ureq::Agent`, which keeps the session cookie across requests.
@@ -12,10 +13,11 @@
 //! `egui::Context::request_repaint` so an idle UI wakes when data lands.
 //!
 //! Persistence (via the platform dirs):
-//!   - credentials   → config dir `share-credentials.json` (0600 on unix)
-//!   - the big list  → cache dir  `share-list.json` (shown instantly on launch)
-//!   - downloaded    → data  dir  `gdtf/<rid>.gdtf` (a shared library reused
-//!                     across projects; the `rid` is the unique revision id)
+//!
+//! - credentials   → config dir `share-credentials.json` (0600 on unix)
+//! - the big list  → cache dir  `share-list.json` (shown instantly on launch)
+//! - downloaded    → data  dir  `gdtf/<rid>.gdtf` (a shared library reused
+//!   across projects; the `rid` is the unique revision id)
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -196,7 +198,9 @@ fn load_credentials() -> Option<Credentials> {
 }
 
 fn save_credentials(c: &Credentials) {
-    let Some(path) = credentials_path() else { return };
+    let Some(path) = credentials_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -223,7 +227,9 @@ fn load_cached_list() -> Option<(Vec<ListEntry>, i64)> {
 }
 
 fn save_cached_list(raw: &str) {
-    let Some(path) = list_cache_path() else { return };
+    let Some(path) = list_cache_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -237,7 +243,10 @@ fn scan_downloaded(dir: &Path) -> HashSet<i64> {
         for entry in rd.flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("gdtf")
-                && let Some(rid) = p.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<i64>().ok())
+                && let Some(rid) = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<i64>().ok())
             {
                 out.insert(rid);
             }
@@ -251,7 +260,11 @@ fn scan_downloaded(dir: &Path) -> HashSet<i64> {
 // ---------------------------------------------------------------------------
 
 enum Cmd {
-    Login { user: String, password: String, save: bool },
+    Login {
+        user: String,
+        password: String,
+        save: bool,
+    },
     Logout,
     FetchList,
     Download(i64),
@@ -318,7 +331,11 @@ fn collect_session_cookie(resp: &ureq::Response) -> Option<String> {
 
 /// Returns `(notice, session-cookie)` on success. We read the cookie off the
 /// login response and attach it to later requests ourselves.
-fn do_login(agent: &ureq::Agent, user: &str, password: &str) -> Result<(String, Option<String>), String> {
+fn do_login(
+    agent: &ureq::Agent,
+    user: &str,
+    password: &str,
+) -> Result<(String, Option<String>), String> {
     let resp = match agent
         .post(&format!("{BASE}/login.php"))
         .send_json(serde_json::json!({ "user": user, "password": password }))
@@ -334,9 +351,20 @@ fn do_login(agent: &ureq::Agent, user: &str, password: &str) -> Result<(String, 
         if cookie.is_none() {
             log::warn!("gdtf-share: login succeeded but no session cookie was returned");
         }
-        Ok((if r.notice.is_empty() { "Signed in".into() } else { r.notice }, cookie))
+        Ok((
+            if r.notice.is_empty() {
+                "Signed in".into()
+            } else {
+                r.notice
+            },
+            cookie,
+        ))
     } else {
-        Err(if r.error.is_empty() { "invalid user or password".into() } else { r.error })
+        Err(if r.error.is_empty() {
+            "invalid user or password".into()
+        } else {
+            r.error
+        })
     }
 }
 
@@ -351,19 +379,31 @@ fn with_cookie(req: ureq::Request, cookie: &Option<String>) -> ureq::Request {
 fn parse_list(body: &str) -> Result<(Vec<ListEntry>, i64), String> {
     let r: ListResp = serde_json::from_str(body).map_err(|e| format!("list parse: {e}"))?;
     if !r.result {
-        return Err(if r.error.is_empty() { "could not load the list".into() } else { r.error });
+        return Err(if r.error.is_empty() {
+            "could not load the list".into()
+        } else {
+            r.error
+        });
     }
     Ok((r.list, r.timestamp))
 }
 
 /// Fetch + parse the catalogue (no UI side effects — used by the worker and tests).
-fn fetch_list(agent: &ureq::Agent, cookie: &Option<String>) -> Result<(Vec<ListEntry>, i64, String), String> {
+fn fetch_list(
+    agent: &ureq::Agent,
+    cookie: &Option<String>,
+) -> Result<(Vec<ListEntry>, i64, String), String> {
     let body = body_text(with_cookie(agent.get(&format!("{BASE}/getList.php")), cookie).call())?;
     let (list, ts) = parse_list(&body)?;
     Ok((list, ts, body))
 }
 
-fn do_fetch(agent: &ureq::Agent, shared: &Arc<Mutex<Shared>>, ctx: &egui::Context, cookie: &Option<String>) {
+fn do_fetch(
+    agent: &ureq::Agent,
+    shared: &Arc<Mutex<Shared>>,
+    ctx: &egui::Context,
+    cookie: &Option<String>,
+) {
     update(shared, ctx, |s| {
         s.busy = Some("Loading library…".into());
         s.error = None;
@@ -385,11 +425,23 @@ fn do_fetch(agent: &ureq::Agent, shared: &Arc<Mutex<Shared>>, ctx: &egui::Contex
     }
 }
 
-fn do_download(agent: &ureq::Agent, rid: i64, dir: &Path, cookie: &Option<String>) -> Result<(), String> {
-    let bytes = match with_cookie(agent.get(&format!("{BASE}/downloadFile.php?rid={rid}")), cookie).call() {
+fn do_download(
+    agent: &ureq::Agent,
+    rid: i64,
+    dir: &Path,
+    cookie: &Option<String>,
+) -> Result<(), String> {
+    let bytes = match with_cookie(
+        agent.get(&format!("{BASE}/downloadFile.php?rid={rid}")),
+        cookie,
+    )
+    .call()
+    {
         Ok(resp) => {
             let mut v = Vec::new();
-            resp.into_reader().read_to_end(&mut v).map_err(|e| e.to_string())?;
+            resp.into_reader()
+                .read_to_end(&mut v)
+                .map_err(|e| e.to_string())?;
             v
         }
         Err(ureq::Error::Status(_, resp)) => {
@@ -416,7 +468,11 @@ fn run_worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, dir: PathBuf, ctx: 
     let mut cookie: Option<String> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            Cmd::Login { user, password, save } => {
+            Cmd::Login {
+                user,
+                password,
+                save,
+            } => {
                 update(&shared, &ctx, |s| {
                     s.busy = Some("Signing in…".into());
                     s.error = None;
@@ -430,17 +486,22 @@ fn run_worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, dir: PathBuf, ctx: 
                         } else {
                             delete_credentials();
                         }
-                        let need_fetch = shared.lock().map(|g| g.new_list.is_none()).unwrap_or(true);
+                        let need_fetch =
+                            shared.lock().map(|g| g.new_list.is_none()).unwrap_or(true);
                         update(&shared, &ctx, |s| {
                             s.logged_in = online;
                             s.notice = Some(notice);
                             s.busy = None;
                             if !online {
-                                s.error = Some("signed in but the server sent no session cookie".into());
+                                s.error =
+                                    Some("signed in but the server sent no session cookie".into());
                             }
                         });
                         // First sign-in with no cached list: pull it automatically.
-                        if online && need_fetch && list_cache_path().map(|p| !p.exists()).unwrap_or(true) {
+                        if online
+                            && need_fetch
+                            && list_cache_path().map(|p| !p.exists()).unwrap_or(true)
+                        {
                             do_fetch(&agent, &shared, &ctx, &cookie);
                         }
                     }
@@ -464,7 +525,9 @@ fn run_worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, dir: PathBuf, ctx: 
                 if cookie.is_some() {
                     do_fetch(&agent, &shared, &ctx, &cookie);
                 } else {
-                    update(&shared, &ctx, |s| s.error = Some("sign in to refresh the library".into()));
+                    update(&shared, &ctx, |s| {
+                        s.error = Some("sign in to refresh the library".into())
+                    });
                 }
             }
             Cmd::Download(rid) => {
@@ -559,7 +622,10 @@ impl Share {
         let had_saved_creds = creds.is_some();
         let creds = creds.unwrap_or_default();
         Self {
-            shared: Arc::new(Mutex::new(Shared { downloaded: downloaded.clone(), ..Default::default() })),
+            shared: Arc::new(Mutex::new(Shared {
+                downloaded: downloaded.clone(),
+                ..Default::default()
+            })),
             tx: None,
             _worker: None,
             started: false,
@@ -618,7 +684,7 @@ impl Share {
 
         // manufacturer dropdown
         let mut mfrs: Vec<String> = self.list.iter().map(|e| e.manufacturer.clone()).collect();
-        mfrs.sort_unstable_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        mfrs.sort_unstable_by_key(|a| a.to_lowercase());
         mfrs.dedup();
         mfrs.retain(|m| !m.is_empty());
         self.mfr_list = mfrs;
@@ -684,7 +750,9 @@ impl Share {
             RowStatus::Downloading
         } else if self.downloaded.contains(&e.rid) {
             RowStatus::Cached
-        } else if self.uuid_max_rid.get(&e.uuid) == Some(&e.rid) && self.uuid_dl_max.contains_key(&e.uuid) {
+        } else if self.uuid_max_rid.get(&e.uuid) == Some(&e.rid)
+            && self.uuid_dl_max.contains_key(&e.uuid)
+        {
             RowStatus::Update
         } else {
             RowStatus::Cloud
@@ -693,7 +761,10 @@ impl Share {
 
     /// Per-row status for the entry at list index `i`.
     pub fn status(&self, i: usize) -> RowStatus {
-        self.list.get(i).map(|e| self.status_of(e)).unwrap_or(RowStatus::Cloud)
+        self.list
+            .get(i)
+            .map(|e| self.status_of(e))
+            .unwrap_or(RowStatus::Cloud)
     }
 
     /// Filtered/sorted indices into `list` (built by [`ensure_view`]).
@@ -727,7 +798,9 @@ impl Share {
     /// Pull the latest worker state into the UI-side copies. Cheap; call once a
     /// frame while the window is open.
     pub fn sync(&mut self) {
-        let Ok(mut g) = self.shared.lock() else { return };
+        let Ok(mut g) = self.shared.lock() else {
+            return;
+        };
         if let Some((list, ts)) = g.new_list.take() {
             self.list = list;
             self.list_timestamp = ts;
@@ -784,7 +857,14 @@ impl Share {
     /// real credentials (used only by the GLOWSTONE_UI screenshot path).
     pub fn debug_demo(&mut self) {
         self.logged_in = true;
-        let mk = |rid: i64, mfr: &str, fix: &str, rev: &str, rating: f64, modes: &[(&str, i64)], size: i64, uuid: &str| ListEntry {
+        let mk = |rid: i64,
+                  mfr: &str,
+                  fix: &str,
+                  rev: &str,
+                  rating: f64,
+                  modes: &[(&str, i64)],
+                  size: i64,
+                  uuid: &str| ListEntry {
             rid,
             fixture: fix.into(),
             manufacturer: mfr.into(),
@@ -797,15 +877,75 @@ impl Share {
             creator: "demo".into(),
             uuid: uuid.into(),
             filesize: size,
-            modes: modes.iter().map(|(n, f)| Mode { name: (*n).into(), dmxfootprint: *f }).collect(),
+            modes: modes
+                .iter()
+                .map(|(n, f)| Mode {
+                    name: (*n).into(),
+                    dmxfootprint: *f,
+                })
+                .collect(),
         };
         self.list = vec![
-            mk(1001, "Robe", "Robin MegaPointe", "rev. 3", 4.6, &[("Mode 1", 41), ("Mode 2", 35)], 4_809_117, "u-mega"),
-            mk(1002, "Robe", "Robin Esprite", "rev. 2", 4.4, &[("Standard", 49)], 5_220_410, "u-esprite"),
-            mk(1003, "Martin", "MAC Aura PXL", "rev. 1", 4.2, &[("Basic", 20), ("Extended", 96)], 3_110_002, "u-aura"),
-            mk(1004, "Ayrton", "Khamsin S", "rev. 4", 4.8, &[("Mode A", 44)], 6_004_120, "u-khamsin"),
-            mk(1005, "Chauvet", "Maverick Storm 1", "rev. 1", 3.9, &[("16-bit", 38)], 2_551_900, "u-maverick"),
-            mk(1006, "Clay Paky", "Sharpy X Frame", "rev. 2", 4.5, &[("Standard", 60)], 7_220_004, "u-sharpy"),
+            mk(
+                1001,
+                "Robe",
+                "Robin MegaPointe",
+                "rev. 3",
+                4.6,
+                &[("Mode 1", 41), ("Mode 2", 35)],
+                4_809_117,
+                "u-mega",
+            ),
+            mk(
+                1002,
+                "Robe",
+                "Robin Esprite",
+                "rev. 2",
+                4.4,
+                &[("Standard", 49)],
+                5_220_410,
+                "u-esprite",
+            ),
+            mk(
+                1003,
+                "Martin",
+                "MAC Aura PXL",
+                "rev. 1",
+                4.2,
+                &[("Basic", 20), ("Extended", 96)],
+                3_110_002,
+                "u-aura",
+            ),
+            mk(
+                1004,
+                "Ayrton",
+                "Khamsin S",
+                "rev. 4",
+                4.8,
+                &[("Mode A", 44)],
+                6_004_120,
+                "u-khamsin",
+            ),
+            mk(
+                1005,
+                "Chauvet",
+                "Maverick Storm 1",
+                "rev. 1",
+                3.9,
+                &[("16-bit", 38)],
+                2_551_900,
+                "u-maverick",
+            ),
+            mk(
+                1006,
+                "Clay Paky",
+                "Sharpy X Frame",
+                "rev. 2",
+                4.5,
+                &[("Standard", 60)],
+                7_220_004,
+                "u-sharpy",
+            ),
         ];
         self.list_timestamp = 1_700_000_000;
         self.downloaded.insert(1002); // show a "cached" row
@@ -873,12 +1013,25 @@ mod tests {
             return;
         };
         let agent = build_agent();
-        let (notice, cookie) = do_login(&agent, &creds.user, &creds.password).expect("login should succeed");
+        let (notice, cookie) =
+            do_login(&agent, &creds.user, &creds.password).expect("login should succeed");
         eprintln!("live_login_and_list: {notice}");
         assert!(cookie.is_some(), "login returned no session cookie");
-        let (list, _ts, raw) = fetch_list(&agent, &cookie).expect("getList should succeed and parse");
-        eprintln!("live_login_and_list: parsed {} fixtures from {} bytes", list.len(), raw.len());
-        assert!(list.len() > 50, "expected a large catalogue, got {}", list.len());
-        assert!(list.iter().any(|e| !e.fixture.is_empty()), "fixtures should have names");
+        let (list, _ts, raw) =
+            fetch_list(&agent, &cookie).expect("getList should succeed and parse");
+        eprintln!(
+            "live_login_and_list: parsed {} fixtures from {} bytes",
+            list.len(),
+            raw.len()
+        );
+        assert!(
+            list.len() > 50,
+            "expected a large catalogue, got {}",
+            list.len()
+        );
+        assert!(
+            list.iter().any(|e| !e.fixture.is_empty()),
+            "fixtures should have names"
+        );
     }
 }

@@ -135,7 +135,11 @@ pub fn render_tab(ui: &mut egui::Ui, config: &RenderConfig, state: &mut RenderUi
                 state.request_cancel();
             }
         } else {
-            let label = if complete || has_image { "Re-render" } else { "Render" };
+            let label = if complete || has_image {
+                "Re-render"
+            } else {
+                "Render"
+            };
             if ui
                 .add(egui::Button::new(format!("{}  {label}", icon::RENDER_GO)))
                 .on_hover_text("Render the current view with the World ▸ Render settings")
@@ -164,7 +168,11 @@ pub fn render_tab(ui: &mut egui::Ui, config: &RenderConfig, state: &mut RenderUi
 
         // Right-aligned resolution/format readout.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (w, h) = if status.res != (0, 0) { status.res } else { config.output_size() };
+            let (w, h) = if status.res != (0, 0) {
+                status.res
+            } else {
+                config.output_size()
+            };
             ui.label(
                 RichText::new(format!(
                     "{w}×{h} · {} · {}%",
@@ -188,9 +196,15 @@ pub fn render_tab(ui: &mut egui::Ui, config: &RenderConfig, state: &mut RenderUi
         let mins = (status.elapsed_s as u32) / 60;
         let secs = (status.elapsed_s as u32) % 60;
         let txt = if complete {
-            format!("Done · {}/{} · {:02}:{:02}", status.sample, status.total, mins, secs)
+            format!(
+                "Done · {}/{} · {:02}:{:02}",
+                status.sample, status.total, mins, secs
+            )
         } else {
-            format!("Sample {}/{} · {:02}:{:02}", status.sample, status.total, mins, secs)
+            format!(
+                "Sample {}/{} · {:02}:{:02}",
+                status.sample, status.total, mins, secs
+            )
         };
         ui.horizontal(|ui| {
             let bar_w = (ui.available_width() - 170.0).max(60.0);
@@ -211,18 +225,23 @@ pub fn render_tab(ui: &mut egui::Ui, config: &RenderConfig, state: &mut RenderUi
     ui.painter().rect_filled(rect, 2.0, pal.canvas);
 
     // Output resolution (for the aspect).
-    let (rw, rh) = if status.res != (0, 0) { status.res } else { config.output_size() };
+    let (rw, rh) = if status.res != (0, 0) {
+        status.res
+    } else {
+        config.output_size()
+    };
     let aspect = rw as f32 / rh.max(1) as f32;
 
     // Pick the source: the stable finished texture when not actively rendering,
     // else the LIVE offscreen render target (separate from the viewport).
-    let preview: Option<egui::TextureId> = if let Some(tex) = result_tex.as_ref().filter(|_| !rendering) {
-        Some(tex.id())
-    } else if rendering {
-        state.preview_tex
-    } else {
-        None
-    };
+    let preview: Option<egui::TextureId> =
+        if let Some(tex) = result_tex.as_ref().filter(|_| !rendering) {
+            Some(tex.id())
+        } else if rendering {
+            state.preview_tex
+        } else {
+            None
+        };
 
     match preview {
         Some(tex_id) => {
@@ -262,7 +281,10 @@ pub fn render_tab(ui: &mut egui::Ui, config: &RenderConfig, state: &mut RenderUi
                 egui::Align2::CENTER_CENTER,
                 // The bundled fonts have no "▸" glyph (renders as a tofu box) — use the
                 // Phosphor caret, which IS in the merged icon font.
-                format!("Press Render here or in World {}  Render Properties", icon::NEXT),
+                format!(
+                    "Press Render here or in World {}  Render Properties",
+                    icon::NEXT
+                ),
                 egui::FontId::proportional(12.0),
                 pal.ink_muted,
             );
@@ -302,7 +324,11 @@ pub fn default_filename(config: &RenderConfig) -> String {
 /// alpha support); EXR promotes the tonemapped 8-bit plate to float so the file
 /// is a valid OpenEXR (the data is still LDR — we read back the post-tonemap
 /// target).
-pub fn save_image(img: &image::RgbaImage, path: &Path, fmt: RenderFormat) -> image::ImageResult<()> {
+pub fn save_image(
+    img: &image::RgbaImage,
+    path: &Path,
+    fmt: RenderFormat,
+) -> image::ImageResult<()> {
     match fmt {
         RenderFormat::Png => img.save_with_format(path, image::ImageFormat::Png),
         RenderFormat::Jpeg => image::DynamicImage::ImageRgba8(img.clone())

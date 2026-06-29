@@ -117,7 +117,13 @@ pub struct CueEngine {
 
 impl Default for CueEngine {
     fn default() -> Self {
-        Self { cues: Vec::new(), current: None, fade: None, name_buf: String::new(), fade_buf: 2.0 }
+        Self {
+            cues: Vec::new(),
+            current: None,
+            fade: None,
+            name_buf: String::new(),
+            fade_buf: 2.0,
+        }
     }
 }
 
@@ -130,13 +136,19 @@ impl CueEngine {
         } else {
             self.name_buf.trim().to_string()
         };
-        self.cues.push(Cue { name, looks, fade: self.fade_buf.max(0.0) });
+        self.cues.push(Cue {
+            name,
+            looks,
+            fade: self.fade_buf.max(0.0),
+        });
         self.name_buf.clear();
     }
 
     /// Start recalling cue `idx`: snap the discrete optics now, crossfade the rest.
     fn recall(&mut self, idx: usize, scene: &mut Scene) {
-        let Some(cue) = self.cues.get(idx) else { return };
+        let Some(cue) = self.cues.get(idx) else {
+            return;
+        };
         // Capture the CURRENT look first — the crossfade's starting point — BEFORE
         // we snap the discrete optics, so the dimmer fades from where it actually
         // is (snapping would otherwise overwrite the starting dimmer).
@@ -168,7 +180,12 @@ impl CueEngine {
                 a.apply_lerp(b, 0.0, f);
             }
         }
-        self.fade = Some(Fade { from, to: idx, t: 0.0, dur: cue.fade });
+        self.fade = Some(Fade {
+            from,
+            to: idx,
+            t: 0.0,
+            dur: cue.fade,
+        });
     }
 
     /// Advance to the next cue in the list (Go). Stops at the last cue.
@@ -219,18 +236,19 @@ impl CueEngine {
         };
         self.current = self.current.and_then(fix);
         // If the in-flight fade targeted the removed cue (or shifts), stop it.
-        match self.fade.as_mut() {
-            Some(f) => match fix(f.to) {
+        if let Some(f) = self.fade.as_mut() {
+            match fix(f.to) {
                 Some(t) => f.to = t,
                 None => self.fade = None,
-            },
-            None => {}
+            }
         }
     }
 
     /// Tick an in-progress crossfade. Call once per real frame with `dt` seconds.
     pub fn tick(&mut self, scene: &mut Scene, dt: f32) {
-        let Some(fade) = self.fade.as_mut() else { return };
+        let Some(fade) = self.fade.as_mut() else {
+            return;
+        };
         fade.t += dt;
         let a = (fade.t / fade.dur.max(1e-3)).clamp(0.0, 1.0);
         if let Some(cue) = self.cues.get(fade.to) {
@@ -247,7 +265,9 @@ impl CueEngine {
     }
 
     fn fading_progress(&self) -> Option<(usize, f32)> {
-        self.fade.as_ref().map(|f| (f.to, (f.t / f.dur.max(1e-3)).clamp(0.0, 1.0)))
+        self.fade
+            .as_ref()
+            .map(|f| (f.to, (f.t / f.dur.max(1e-3)).clamp(0.0, 1.0)))
     }
 }
 
@@ -257,7 +277,11 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
 
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(format!("{}", engine.cues.len())).small().weak());
+            ui.label(
+                RichText::new(format!("{}", engine.cues.len()))
+                    .small()
+                    .weak(),
+            );
         });
     });
     ui.separator();
@@ -265,7 +289,11 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
     // --- Record a new cue from the current rig look ---
     ui.horizontal(|ui| {
         let hint = format!("Cue {}", engine.cues.len() + 1);
-        ui.add(egui::TextEdit::singleline(&mut engine.name_buf).desired_width(120.0).hint_text(&hint));
+        ui.add(
+            egui::TextEdit::singleline(&mut engine.name_buf)
+                .desired_width(120.0)
+                .hint_text(&hint),
+        );
         ui.add(
             egui::DragValue::new(&mut engine.fade_buf)
                 .range(0.0..=60.0)
@@ -274,7 +302,10 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
         )
         .on_hover_text("Fade time for the new cue");
         if ui
-            .add_enabled(!scene.fixtures.is_empty(), egui::Button::new(format!("{}  Record", theme::icon::ADD)))
+            .add_enabled(
+                !scene.fixtures.is_empty(),
+                egui::Button::new(format!("{}  Record", theme::icon::ADD)),
+            )
             .on_hover_text("Capture the current look of every fixture as a cue")
             .clicked()
         {
@@ -284,7 +315,13 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
 
     // --- Transport ---
     ui.horizontal(|ui| {
-        if ui.add_enabled(!engine.cues.is_empty(), egui::Button::new(format!("{}  Prev", theme::icon::PREV))).clicked() {
+        if ui
+            .add_enabled(
+                !engine.cues.is_empty(),
+                egui::Button::new(format!("{}  Prev", theme::icon::PREV)),
+            )
+            .clicked()
+        {
             engine.prev(scene);
         }
         let can_go = match engine.current {
@@ -292,58 +329,98 @@ pub fn cue_panel(ui: &mut egui::Ui, engine: &mut CueEngine, scene: &mut Scene) {
             None => !engine.cues.is_empty(),
         };
         if ui
-            .add_enabled(can_go, egui::Button::new(RichText::new(format!("Go  {}", theme::icon::NEXT)).strong().color(accent)))
+            .add_enabled(
+                can_go,
+                egui::Button::new(
+                    RichText::new(format!("Go  {}", theme::icon::NEXT))
+                        .strong()
+                        .color(accent),
+                ),
+            )
             .on_hover_text("Fire the next cue in the list")
             .clicked()
         {
             engine.go(scene);
         }
         match engine.current.and_then(|c| engine.cues.get(c)) {
-            Some(cue) => ui.label(RichText::new(format!("{}  {}", theme::icon::PLAY, cue.name)).small().color(accent)),
+            Some(cue) => ui.label(
+                RichText::new(format!("{}  {}", theme::icon::PLAY, cue.name))
+                    .small()
+                    .color(accent),
+            ),
             None => ui.label(RichText::new("—").small().weak()),
         };
     });
     if let Some((to, p)) = engine.fading_progress() {
         let name = engine.cues.get(to).map(|c| c.name.as_str()).unwrap_or("");
-        ui.add(egui::ProgressBar::new(p).desired_height(6.0).text(RichText::new(format!("{}  {name}", theme::icon::ARROW_RIGHT)).small()));
+        ui.add(
+            egui::ProgressBar::new(p)
+                .desired_height(6.0)
+                .text(RichText::new(format!("{}  {name}", theme::icon::ARROW_RIGHT)).small()),
+        );
     }
     ui.separator();
 
     if engine.cues.is_empty() {
-        ui.label(RichText::new("none — set a look (Inspector / DMX), then Record").weak().small());
+        ui.label(
+            RichText::new("none — set a look (Inspector / DMX), then Record")
+                .weak()
+                .small(),
+        );
         return;
     }
 
     // --- The cue list ---
     let mut recall: Option<usize> = None;
     let mut remove: Option<usize> = None;
-    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-        Grid::new("cue-list").num_columns(4).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
-            for i in 0..engine.cues.len() {
-                let is_current = engine.current == Some(i);
-                let label = format!("{}.  {}", i + 1, engine.cues[i].name);
-                if ui
-                    .selectable_label(is_current, RichText::new(label).color(if is_current { accent } else { ui.visuals().text_color() }))
-                    .on_hover_text("Recall this cue")
-                    .clicked()
-                {
-                    recall = Some(i);
-                }
-                ui.label(RichText::new(format!("{} fx", engine.cues[i].looks.len())).small().weak());
-                ui.add(
-                    egui::DragValue::new(&mut engine.cues[i].fade)
-                        .range(0.0..=60.0)
-                        .speed(0.1)
-                        .suffix(" s"),
-                )
-                .on_hover_text("Fade time");
-                if ui.small_button(theme::icon::TRASH).on_hover_text("Delete cue").clicked() {
-                    remove = Some(i);
-                }
-                ui.end_row();
-            }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            Grid::new("cue-list")
+                .num_columns(4)
+                .spacing([10.0, 6.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for i in 0..engine.cues.len() {
+                        let is_current = engine.current == Some(i);
+                        let label = format!("{}.  {}", i + 1, engine.cues[i].name);
+                        if ui
+                            .selectable_label(
+                                is_current,
+                                RichText::new(label).color(if is_current {
+                                    accent
+                                } else {
+                                    ui.visuals().text_color()
+                                }),
+                            )
+                            .on_hover_text("Recall this cue")
+                            .clicked()
+                        {
+                            recall = Some(i);
+                        }
+                        ui.label(
+                            RichText::new(format!("{} fx", engine.cues[i].looks.len()))
+                                .small()
+                                .weak(),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut engine.cues[i].fade)
+                                .range(0.0..=60.0)
+                                .speed(0.1)
+                                .suffix(" s"),
+                        )
+                        .on_hover_text("Fade time");
+                        if ui
+                            .small_button(theme::icon::TRASH)
+                            .on_hover_text("Delete cue")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                        ui.end_row();
+                    }
+                });
         });
-    });
 
     if let Some(i) = recall {
         engine.recall(i, scene);
@@ -372,7 +449,14 @@ mod tests {
         Cue {
             name: format!("Cue {n}"),
             looks: (0..looks)
-                .map(|_| FixtureLook { pan: 0.0, tilt: 0.0, color: [0.0; 3], intensity: 0.0, beam_angle: 0.0, optics: OpticalControls::default() })
+                .map(|_| FixtureLook {
+                    pan: 0.0,
+                    tilt: 0.0,
+                    color: [0.0; 3],
+                    intensity: 0.0,
+                    beam_angle: 0.0,
+                    optics: OpticalControls::default(),
+                })
                 .collect(),
             fade: 1.0,
         }
@@ -380,7 +464,10 @@ mod tests {
 
     #[test]
     fn remove_fixture_shrinks_every_cue_look_list() {
-        let mut e = CueEngine { cues: vec![cue(1, 3), cue(2, 3)], ..Default::default() };
+        let mut e = CueEngine {
+            cues: vec![cue(1, 3), cue(2, 3)],
+            ..Default::default()
+        };
         e.remove_fixture(1);
         assert_eq!(e.cues[0].looks.len(), 2);
         assert_eq!(e.cues[1].looks.len(), 2);
@@ -388,7 +475,11 @@ mod tests {
 
     #[test]
     fn on_cue_removed_fixes_current_index() {
-        let mut e = CueEngine { cues: vec![cue(1, 0), cue(2, 0), cue(3, 0)], current: Some(2), ..Default::default() };
+        let mut e = CueEngine {
+            cues: vec![cue(1, 0), cue(2, 0), cue(3, 0)],
+            current: Some(2),
+            ..Default::default()
+        };
         e.on_cue_removed(1); // delete the middle cue
         assert_eq!(e.current, Some(1)); // index 2 shifted down to 1
         e.on_cue_removed(1); // delete the cue current now points at

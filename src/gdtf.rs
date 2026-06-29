@@ -17,22 +17,17 @@ use glam::Mat4;
 /// Where a fixture came from — drives the colored provenance chip in the UI
 /// (the inspector / scene panel map each variant to a color). Plain data: no
 /// egui dependency here, so the renderer side owns the palette.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum FixtureSource {
     /// A built-in library profile (PAR can, laser engines).
     Builtin,
     /// A `.gdtf` imported from disk (drag-drop / file picker).
+    #[default]
     Import,
     /// Downloaded from the online GDTF Share catalogue.
     GdtfShare,
     /// Brought in as part of an MVR scene import.
     Mvr,
-}
-
-impl Default for FixtureSource {
-    fn default() -> Self {
-        FixtureSource::Import
-    }
 }
 
 impl FixtureSource {
@@ -50,10 +45,10 @@ impl FixtureSource {
     /// layer maps this to whatever `Color32`/style it wants.
     pub fn color_rgb(self) -> [u8; 3] {
         match self {
-            FixtureSource::Builtin => [120, 144, 156], // slate grey
-            FixtureSource::Import => [79, 195, 247],    // light blue
+            FixtureSource::Builtin => [120, 144, 156],   // slate grey
+            FixtureSource::Import => [79, 195, 247],     // light blue
             FixtureSource::GdtfShare => [129, 199, 132], // green
-            FixtureSource::Mvr => [255, 167, 38],       // amber
+            FixtureSource::Mvr => [255, 167, 38],        // amber
         }
     }
 }
@@ -250,7 +245,11 @@ pub struct Aperture {
 
 impl Default for Aperture {
     fn default() -> Self {
-        Self { half_w: 0.05, half_h: 0.05, round: true }
+        Self {
+            half_w: 0.05,
+            half_h: 0.05,
+            round: true,
+        }
     }
 }
 
@@ -469,8 +468,7 @@ impl GdtfFixture {
             .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
             .collect();
 
-        let xml = read_entry(&mut archive, "description.xml")
-            .ok_or("description.xml missing")?;
+        let xml = read_entry(&mut archive, "description.xml").ok_or("description.xml missing")?;
         let xml = String::from_utf8_lossy(&xml).into_owned();
         let doc = roxmltree::Document::parse(&xml).map_err(|e| format!("parse xml: {e}"))?;
 
@@ -485,8 +483,7 @@ impl GdtfFixture {
         let thumbnail = if thumb_base.is_empty() {
             None
         } else {
-            resolve(&names, &format!("{thumb_base}.png"))
-                .and_then(|n| read_entry(&mut archive, &n))
+            resolve(&names, &format!("{thumb_base}.png")).and_then(|n| read_entry(&mut archive, &n))
         };
 
         // --- wheels ---
@@ -496,9 +493,10 @@ impl GdtfFixture {
                 let mut slots = Vec::new();
                 for s in w.children().filter(|n| n.has_tag_name("Slot")) {
                     let color = s.attribute("Color").and_then(parse_cie_xyy);
-                    let media = s.attribute("MediaFileName").filter(|m| !m.is_empty()).and_then(
-                        |m| resolve(&names, &format!("wheels/{m}.png")),
-                    );
+                    let media = s
+                        .attribute("MediaFileName")
+                        .filter(|m| !m.is_empty())
+                        .and_then(|m| resolve(&names, &format!("wheels/{m}.png")));
                     let media = media.and_then(|n| read_entry(&mut archive, &n));
                     let facets = s
                         .children()
@@ -532,7 +530,11 @@ impl GdtfFixture {
                         .or_else(|| resolve(&names, &format!("models/gltf/{file}.glb")))
                         .and_then(|n| read_entry(&mut archive, &n))
                 };
-                let f = |k| m.attribute(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                let f = |k| {
+                    m.attribute(k)
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(0.0)
+                };
                 models.push(Model {
                     name: attr(&m, "Name"),
                     file,
@@ -616,17 +618,32 @@ impl GdtfFixture {
                                     .children()
                                     .filter(|c| c.has_tag_name("ChannelSet"))
                                     .map(|c| ChannelSet {
-                                        dmx_from: c.attribute("DMXFrom").map(parse_dmx_norm).unwrap_or(0.0),
-                                        slot: c.attribute("WheelSlotIndex").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+                                        dmx_from: c
+                                            .attribute("DMXFrom")
+                                            .map(parse_dmx_norm)
+                                            .unwrap_or(0.0),
+                                        slot: c
+                                            .attribute("WheelSlotIndex")
+                                            .and_then(|v| v.trim().parse().ok())
+                                            .unwrap_or(0),
                                     })
                                     .collect();
                                 functions.push(ChannelFunction {
-                                    attribute: cf.attribute("Attribute").unwrap_or(lc_attr).to_string(),
+                                    attribute: cf
+                                        .attribute("Attribute")
+                                        .unwrap_or(lc_attr)
+                                        .to_string(),
                                     name: cf.attribute("Name").unwrap_or("").to_string(),
-                                    dmx_from: cf.attribute("DMXFrom").map(parse_dmx_norm).unwrap_or(0.0),
+                                    dmx_from: cf
+                                        .attribute("DMXFrom")
+                                        .map(parse_dmx_norm)
+                                        .unwrap_or(0.0),
                                     physical_from: pf.unwrap_or(0.0),
                                     physical_to: pt.unwrap_or(1.0),
-                                    wheel: cf.attribute("Wheel").filter(|w| !w.is_empty()).map(String::from),
+                                    wheel: cf
+                                        .attribute("Wheel")
+                                        .filter(|w| !w.is_empty())
+                                        .map(String::from),
                                     sets: cf_sets,
                                 });
                             }
@@ -637,7 +654,8 @@ impl GdtfFixture {
                             .and_then(|n| n.attribute("Attribute"))
                             .unwrap_or("")
                             .to_string();
-                        let cf = lc.and_then(|n| n.children().find(|c| c.has_tag_name("ChannelFunction")));
+                        let cf = lc
+                            .and_then(|n| n.children().find(|c| c.has_tag_name("ChannelFunction")));
                         let function = cf
                             .and_then(|n| n.attribute("Name"))
                             .unwrap_or("")
@@ -734,9 +752,11 @@ impl GdtfFixture {
     /// The first channel function for `attribute` in the first DMX mode, if the
     /// fixture exposes that attribute. Carries the physical range + wheel link.
     pub fn channel_function(&self, attribute: &str) -> Option<&ChannelFunction> {
-        self.modes.first()?.channels.iter().find_map(|c| {
-            c.functions.iter().find(|f| f.attribute == attribute)
-        })
+        self.modes
+            .first()?
+            .channels
+            .iter()
+            .find_map(|c| c.functions.iter().find(|f| f.attribute == attribute))
     }
 
     /// The physical `(from, to)` range mapped by `attribute`'s first channel
@@ -750,11 +770,19 @@ impl GdtfFixture {
     pub fn has_attribute(&self, attribute: &str) -> bool {
         self.modes
             .first()
-            .map(|m| m.channels.iter().any(|c| c.functions.iter().any(|f| f.attribute == attribute)))
+            .map(|m| {
+                m.channels
+                    .iter()
+                    .any(|c| c.functions.iter().any(|f| f.attribute == attribute))
+            })
             .unwrap_or(false)
     }
 
     /// Geometry name driven by an attribute (e.g. "Pan", "Tilt") in mode 0.
+    #[expect(
+        dead_code,
+        reason = "Kept for GDTF geometry/attribute routing during fixture model cleanup."
+    )]
     pub fn geometry_for_attribute(&self, attribute: &str) -> Option<&str> {
         self.modes.first()?.channels.iter().find_map(|c| {
             if c.attribute == attribute {
@@ -789,7 +817,11 @@ fn parse_geometry(node: &roxmltree::Node) -> Geometry {
         .map(|c| parse_geometry(&c))
         .collect();
     let beam = (kind == GeometryKind::Beam).then(|| {
-        let f = |k: &str, d: f32| node.attribute(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+        let f = |k: &str, d: f32| {
+            node.attribute(k)
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(d)
+        };
         let s = |k: &str, d: &str| node.attribute(k).unwrap_or(d).to_string();
         let beam_angle = f("BeamAngle", 25.0);
         BeamData {
@@ -819,7 +851,9 @@ fn parse_geometry(node: &roxmltree::Node) -> Geometry {
             .filter(|c| c.has_tag_name("Break"))
             .map(|b| {
                 let n = |k: &str, d: u32| {
-                    b.attribute(k).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(d)
+                    b.attribute(k)
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                        .unwrap_or(d)
                 };
                 (n("DMXBreak", 1), n("DMXOffset", 1))
             })
@@ -844,23 +878,23 @@ fn parse_geometry(node: &roxmltree::Node) -> Geometry {
 fn expand_references(node: &Geometry, roots: &[Geometry], indirections: u32) -> Geometry {
     let mut out = node.clone();
     let mut next = indirections;
-    if node.kind == GeometryKind::Reference && indirections < 4 {
-        if let Some(target) = node
+    if node.kind == GeometryKind::Reference
+        && indirections < 4
+        && let Some(target) = node
             .reference
             .as_ref()
             .and_then(|r| roots.iter().find(|g| g.name == r.target))
-        {
-            // The reference's Position places the instance; the target root's
-            // own matrix is identity by authoring convention (verified across
-            // Robe/Astera/Roxx files) and is intentionally ignored.
-            out.kind = target.kind;
-            out.beam = target.beam.clone();
-            out.model = node.model.clone().or_else(|| target.model.clone());
-            out.children = target.children.clone();
-            // Only reference→reference chains count toward the cycle cap —
-            // plain tree depth must not exhaust it (rigs nest 6+ levels).
-            next += 1;
-        }
+    {
+        // The reference's Position places the instance; the target root's own
+        // matrix is identity by authoring convention (verified across
+        // Robe/Astera/Roxx files) and is intentionally ignored.
+        out.kind = target.kind;
+        out.beam = target.beam.clone();
+        out.model = node.model.clone().or_else(|| target.model.clone());
+        out.children = target.children.clone();
+        // Only reference→reference chains count toward the cycle cap — plain
+        // tree depth must not exhaust it (rigs nest 6+ levels).
+        next += 1;
     }
     out.children = out
         .children
@@ -879,7 +913,10 @@ fn collect_components(channels: &[DmxChannel], wheels: &[Wheel]) -> Vec<OpticalC
         let Some((kind, number, role)) = component_attr(attr) else {
             return;
         };
-        let entry = match out.iter_mut().find(|c| c.kind == kind && c.number == number) {
+        let entry = match out
+            .iter_mut()
+            .find(|c| c.kind == kind && c.number == number)
+        {
             Some(e) => e,
             None => {
                 out.push(OpticalComponent {
@@ -951,7 +988,7 @@ fn collect_components(channels: &[DmxChannel], wheels: &[Wheel]) -> Vec<OpticalC
             }
         }
     }
-    out.sort_by(|a, b| (a.kind, a.number).cmp(&(b.kind, b.number)));
+    out.sort_by_key(|a| (a.kind, a.number));
     out
 }
 
@@ -1000,19 +1037,35 @@ fn emitter_model_face(node: &Geometry, beam: &BeamData, models: &[Model]) -> Mod
             // largest) is the bore for a round lens and the band thickness for a
             // strip — robust whether the author put the length on X, Y or Z.
             if prim.contains("cube") || prim.contains("box") {
-                return ModelFace { round: false, largest: d[0], second: d[1] };
+                return ModelFace {
+                    round: false,
+                    largest: d[0],
+                    second: d[1],
+                };
             }
             if prim.contains("cylinder") || prim.contains("sphere") {
-                return ModelFace { round: true, largest: d[1], second: d[1] };
+                return ModelFace {
+                    round: true,
+                    largest: d[1],
+                    second: d[1],
+                };
             }
             // Undefined / other primitive → fall through to the round beam disc.
         }
     }
     if beam.beam_type.eq_ignore_ascii_case("rectangle") {
         let ratio = beam.rectangle_ratio.clamp(0.05, 20.0);
-        return ModelFace { round: false, largest: 2.0 * r, second: (2.0 * r / ratio).max(0.008) };
+        return ModelFace {
+            round: false,
+            largest: 2.0 * r,
+            second: (2.0 * r / ratio).max(0.008),
+        };
     }
-    ModelFace { round: true, largest: 2.0 * r, second: 2.0 * r }
+    ModelFace {
+        round: true,
+        largest: 2.0 * r,
+        second: 2.0 * r,
+    }
 }
 
 /// Collect every emitter (`<Beam>` instance) of an expanded tree, in the same
@@ -1042,12 +1095,20 @@ fn collect_emitters(root: &Geometry, models: &[Model]) -> Vec<EmitterDef> {
         let world = world * node.matrix;
         if let Some(beam) = &node.beam {
             let origin = world.transform_point3(glam::Vec3::ZERO);
-            let dir = world.transform_vector3(glam::Vec3::NEG_Z).normalize_or_zero();
+            let dir = world
+                .transform_vector3(glam::Vec3::NEG_Z)
+                .normalize_or_zero();
             let right = world.transform_vector3(glam::Vec3::X).normalize_or_zero();
             let up = world.transform_vector3(glam::Vec3::Y).normalize_or_zero();
             let face = emitter_model_face(node, beam, models);
             out.push(Tag {
-                e: EmitterDef { name: node.name.clone(), beam: beam.clone(), aperture: Aperture::default(), pos: [0.0, 0.0], merged_into: None },
+                e: EmitterDef {
+                    name: node.name.clone(),
+                    beam: beam.clone(),
+                    aperture: Aperture::default(),
+                    pos: [0.0, 0.0],
+                    merged_into: None,
+                },
                 origin,
                 dir,
                 right,
@@ -1068,11 +1129,11 @@ fn collect_emitters(root: &Geometry, models: &[Model]) -> Vec<EmitterDef> {
     for a in 0..tagged.len() {
         let (origin_a, dir_a) = (tagged[a].origin, tagged[a].dir);
         let mut best: Option<(u16, f32)> = None;
-        for b in 0..tagged.len() {
-            if a == b || tagged[b].e.merged_into.is_some() {
+        for (b, tb) in tagged.iter().enumerate() {
+            if a == b || tb.e.merged_into.is_some() {
                 continue;
             }
-            let (origin_b, dir_b) = (tagged[b].origin, tagged[b].dir);
+            let (origin_b, dir_b) = (tb.origin, tb.dir);
             if dir_a.dot(dir_b) < 0.999 {
                 continue;
             }
@@ -1082,7 +1143,7 @@ fn collect_emitters(root: &Geometry, models: &[Model]) -> Vec<EmitterDef> {
                 continue; // A is in front of (or beside) B
             }
             let lateral = (rel - dir_b * behind).length();
-            if lateral < tagged[b].e.beam.beam_radius * 0.9
+            if lateral < tb.e.beam.beam_radius * 0.9
                 && best.map(|(_, d)| -behind < d).unwrap_or(true)
             {
                 best = Some((b as u16, -behind));
@@ -1098,7 +1159,11 @@ fn collect_emitters(root: &Geometry, models: &[Model]) -> Vec<EmitterDef> {
         let t = &tagged[i];
         if t.face.round {
             let rad = (t.face.second * 0.5).max(MIN_HALF);
-            tagged[i].e.aperture = Aperture { half_w: rad, half_h: rad, round: true };
+            tagged[i].e.aperture = Aperture {
+                half_w: rad,
+                half_h: rad,
+                round: true,
+            };
             continue;
         }
         let (oi, ri, ui) = (t.origin, t.right, t.up);
@@ -1110,23 +1175,27 @@ fn collect_emitters(root: &Geometry, models: &[Model]) -> Vec<EmitterDef> {
         // row (e.g. a warm tube next to an RGB panel) reads as the nearest
         // "horizontal" neighbour and shrinks the in-row pitch, leaving gaps.
         let mut row = f32::INFINITY; // across-row pitch (along up)
-        for j in 0..n {
+        for (j, other) in tagged.iter().enumerate().take(n) {
             if j == i {
                 continue;
             }
-            let rel = tagged[j].origin - oi;
+            let rel = other.origin - oi;
             let (dr, du) = (rel.dot(ri).abs(), rel.dot(ui).abs());
             if du > 1e-3 && dr < du {
                 row = row.min(du);
             }
         }
-        let row_gate = if row.is_finite() { 0.5 * row } else { f32::INFINITY };
+        let row_gate = if row.is_finite() {
+            0.5 * row
+        } else {
+            f32::INFINITY
+        };
         let mut col = f32::INFINITY; // in-row pitch (along right)
-        for j in 0..n {
+        for (j, other) in tagged.iter().enumerate().take(n) {
             if j == i {
                 continue;
             }
-            let rel = tagged[j].origin - oi;
+            let rel = other.origin - oi;
             let (dr, du) = (rel.dot(ri).abs(), rel.dot(ui).abs());
             if dr > 1e-3 && du < row_gate {
                 col = col.min(dr);
@@ -1135,8 +1204,16 @@ fn collect_emitters(root: &Geometry, models: &[Model]) -> Vec<EmitterDef> {
         let largest = tagged[i].face.largest;
         let second = tagged[i].face.second;
         // Fill to half the pitch, capped by the model dim for that axis.
-        let half_w = if col.is_finite() { (col * 0.5).min(largest * 0.5) } else { largest * 0.5 };
-        let half_h = if row.is_finite() { (row * 0.5).min(second * 0.5) } else { second * 0.5 };
+        let half_w = if col.is_finite() {
+            (col * 0.5).min(largest * 0.5)
+        } else {
+            largest * 0.5
+        };
+        let half_h = if row.is_finite() {
+            (row * 0.5).min(second * 0.5)
+        } else {
+            second * 0.5
+        };
         tagged[i].e.aperture = Aperture {
             half_w: half_w.max(MIN_HALF),
             half_h: half_h.max(MIN_HALF),
@@ -1218,7 +1295,11 @@ fn resolve_channels(
                     .is_some_and(|r| r.target == ch.geometry);
             if matches {
                 pending.push(hits.len());
-                hits.push(Hit { channel: i, instance: scope.cloned(), cells: Vec::new() });
+                hits.push(Hit {
+                    channel: i,
+                    instance: scope.cloned(),
+                    cells: Vec::new(),
+                });
             }
         }
         for c in &node.children {
@@ -1238,7 +1319,11 @@ fn resolve_channels(
     // the footprint and decode — keep it as a direct master channel.
     for (i, _) in channels.iter().enumerate() {
         if !hits.iter().any(|h| h.channel == i) {
-            hits.push(Hit { channel: i, instance: None, cells: Vec::new() });
+            hits.push(Hit {
+                channel: i,
+                instance: None,
+                cells: Vec::new(),
+            });
         }
     }
 
@@ -1285,7 +1370,11 @@ fn parse_matrix(s: &str) -> Option<Mat4> {
         .split(['{', '}', ','])
         .filter_map(|t| {
             let t = t.trim();
-            if t.is_empty() { None } else { t.parse::<f32>().ok() }
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<f32>().ok()
+            }
         })
         .collect();
     if nums.len() != 16 {
@@ -1306,7 +1395,11 @@ fn parse_facet_offset(s: &str) -> Option<[f32; 2]> {
         .split(['{', '}', ','])
         .filter_map(|t| {
             let t = t.trim();
-            if t.is_empty() { None } else { t.parse::<f32>().ok() }
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<f32>().ok()
+            }
         })
         .collect();
     if nums.len() < 8 {
@@ -1358,13 +1451,13 @@ fn resolve(names: &[String], want: &str) -> Option<String> {
         return Some(n.clone());
     }
     let want_lc = want.to_lowercase();
-    names
-        .iter()
-        .find(|n| n.to_lowercase() == want_lc)
-        .cloned()
+    names.iter().find(|n| n.to_lowercase() == want_lc).cloned()
 }
 
-fn read_entry(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<Vec<u8>> {
+fn read_entry(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    name: &str,
+) -> Option<Vec<u8>> {
     let mut f = archive.by_name(name).ok()?;
     // Cap the pre-allocation hint: the declared size is untrusted (a crafted
     // archive could claim gigabytes). `read_to_end` still grows to real length.
@@ -1399,9 +1492,15 @@ mod tests {
 
         // Optical attribute ranges.
         let zoom = g.physical_range("Zoom").expect("zoom");
-        assert!((zoom.0 - 7.8).abs() < 0.1 && (zoom.1 - 58.0).abs() < 0.1, "zoom {zoom:?}");
+        assert!(
+            (zoom.0 - 7.8).abs() < 0.1 && (zoom.1 - 58.0).abs() < 0.1,
+            "zoom {zoom:?}"
+        );
         let iris = g.physical_range("Iris").expect("iris");
-        assert!((iris.0 - 1.0).abs() < 0.01 && (iris.1 - 0.15).abs() < 0.01, "iris {iris:?}");
+        assert!(
+            (iris.0 - 1.0).abs() < 0.01 && (iris.1 - 0.15).abs() < 0.01,
+            "iris {iris:?}"
+        );
         assert!(g.has_attribute("Frost1"));
         assert!(g.has_attribute("ColorSub_C"));
         assert!(g.has_attribute("Prism1"));
@@ -1459,13 +1558,25 @@ mod tests {
             .find(|(_, m)| m.name.starts_with("Mode 8"))
             .expect("mode 8");
         assert_eq!(mode.emitters.len(), 20, "19 pixels + flower");
-        let washes = mode.emitters.iter().filter(|e| e.beam.beam_type == "Wash").count();
+        let washes = mode
+            .emitters
+            .iter()
+            .filter(|e| e.beam.beam_type == "Wash")
+            .count();
         assert_eq!(washes, 20, "all Spiider emitters are Wash type");
         // The flower emitter (inside the head, firing through the centre pixel)
         // merges into that front pixel; the 19 visible pixels stand alone.
-        let merged: Vec<&EmitterDef> = mode.emitters.iter().filter(|e| e.merged_into.is_some()).collect();
+        let merged: Vec<&EmitterDef> = mode
+            .emitters
+            .iter()
+            .filter(|e| e.merged_into.is_some())
+            .collect();
         assert_eq!(merged.len(), 1, "exactly the flower merges");
-        assert!(merged[0].name.contains("Flower"), "flower is the merged one: {}", merged[0].name);
+        assert!(
+            merged[0].name.contains("Flower"),
+            "flower is the merged one: {}",
+            merged[0].name
+        );
         assert!((mode.emitters[0].beam.beam_radius - 0.0285).abs() < 1e-4);
         assert!((mode.emitters[0].beam.luminous_flux - 579.0).abs() < 0.5);
 
@@ -1484,7 +1595,10 @@ mod tests {
         assert_eq!(lens3_r.iter().copied().min(), Some(63));
         assert_eq!(lens3_r.iter().copied().max(), Some(107));
         // Footprint covers the last pixel's W channel (66 + 45 − 1 = 110).
-        assert_eq!(mode.footprint, 110, "instanced footprint, not naive max offset");
+        assert_eq!(
+            mode.footprint, 110,
+            "instanced footprint, not naive max offset"
+        );
         // Each per-pixel channel instance covers exactly one cell.
         let one_cell = mode
             .resolved
@@ -1564,7 +1678,11 @@ mod tests {
             eprintln!("skip: Basic Festival MVR not found");
             return;
         };
-        assert!(g.roots.len() > 10, "many top-level roots, got {}", g.roots.len());
+        assert!(
+            g.roots.len() > 10,
+            "many top-level roots, got {}",
+            g.roots.len()
+        );
         // Every mode resolves a root and its pixel count matches the mode name.
         for (i, m) in g.modes.iter().enumerate() {
             let n = g.emitters(i).len();
@@ -1574,7 +1692,11 @@ mod tests {
         }
         let counts: Vec<usize> = (0..g.modes.len()).map(|i| g.emitters(i).len()).collect();
         assert!(counts.contains(&16), "a 16-pixel mode exists: {counts:?}");
-        eprintln!("PixelBar OK: roots {}, per-mode emitters {:?}", g.roots.len(), counts);
+        eprintln!(
+            "PixelBar OK: roots {}, per-mode emitters {:?}",
+            g.roots.len(),
+            counts
+        );
     }
 
     /// The ROXX Cluster S2's 72 emitters must derive RECTANGULAR apertures from
@@ -1603,7 +1725,10 @@ mod tests {
             .expect("Full Access Extended mode");
         let em = &mode.emitters;
         assert_eq!(em.len(), 72, "12 centric + 48 single tube + 12 rgb");
-        assert!(em.iter().all(|e| !e.aperture.round), "every Cube emitter is rectangular");
+        assert!(
+            em.iter().all(|e| !e.aperture.round),
+            "every Cube emitter is rectangular"
+        );
 
         let by = |needle: &str| -> Vec<&EmitterDef> {
             em.iter().filter(|e| e.name.contains(needle)).collect()
@@ -1613,21 +1738,32 @@ mod tests {
         assert_eq!(rgb.len(), 12);
         assert_eq!(centric.len(), 12);
 
-        let avg_h = |v: &[&EmitterDef]| v.iter().map(|e| e.aperture.half_h).sum::<f32>() / v.len() as f32;
+        let avg_h =
+            |v: &[&EmitterDef]| v.iter().map(|e| e.aperture.half_h).sum::<f32>() / v.len() as f32;
         let (hs, hr, hc) = (avg_h(&single), avg_h(&rgb), avg_h(&centric));
-        assert!(hs < hr && hs < hc, "thin warm strips are thinner than the bands: single {hs} rgb {hr} centric {hc}");
+        assert!(
+            hs < hr && hs < hc,
+            "thin warm strips are thinner than the bands: single {hs} rgb {hr} centric {hc}"
+        );
 
         // Cells fill their in-row pitch: centric (12 px over ~330 mm) ≈ 15 mm
         // half-width, rgb (6 px) wider. Just assert they're a sane band width and
         // wider than the MIN clamp (i.e. real neighbour-fill happened).
-        let avg_w = |v: &[&EmitterDef]| v.iter().map(|e| e.aperture.half_w).sum::<f32>() / v.len() as f32;
-        assert!(avg_w(&centric) > 0.01, "centric cells fill their pitch: {}", avg_w(&centric));
-        assert!(avg_w(&rgb) > avg_w(&centric), "rgb panels are wider-pitch than centric");
+        let avg_w =
+            |v: &[&EmitterDef]| v.iter().map(|e| e.aperture.half_w).sum::<f32>() / v.len() as f32;
+        assert!(
+            avg_w(&centric) > 0.01,
+            "centric cells fill their pitch: {}",
+            avg_w(&centric)
+        );
+        assert!(
+            avg_w(&rgb) > avg_w(&centric),
+            "rgb panels are wider-pitch than centric"
+        );
         eprintln!(
             "Cluster aperture OK: single h={hs:.3} rgb h={hr:.3} centric h={hc:.3}; centric w={:.3} rgb w={:.3}",
             avg_w(&centric),
             avg_w(&rgb)
         );
     }
-
 }

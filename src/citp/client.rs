@@ -45,10 +45,16 @@ pub struct CitpClient {
 impl CitpClient {
     /// Start the discovery thread (idempotent for the app to hold one).
     pub fn new() -> Self {
-        let shared = Arc::new(Shared { servers: Mutex::new(Vec::new()) });
+        let shared = Arc::new(Shared {
+            servers: Mutex::new(Vec::new()),
+        });
         let discovery_stop = Arc::new(AtomicBool::new(false));
         spawn_discovery(shared.clone(), discovery_stop.clone());
-        Self { shared, streams: HashMap::new(), discovery_stop }
+        Self {
+            shared,
+            streams: HashMap::new(),
+            discovery_stop,
+        }
     }
 
     /// Discovered media-server names (for the inspector source picker).
@@ -75,7 +81,9 @@ impl CitpClient {
             let stream = spawn_stream(self.shared.clone(), source.to_string());
             self.streams.insert(source.to_string(), stream);
         }
-        self.streams.get(source).and_then(|s| s.frame.lock().unwrap().clone())
+        self.streams
+            .get(source)
+            .and_then(|s| s.frame.lock().unwrap().clone())
     }
 
     /// Stop any streams no longer referenced by `active` sources (called each
@@ -152,10 +160,16 @@ fn spawn_discovery(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
                                 s.addr = addr;
                                 s.last_seen = now;
                             } else {
-                                servers.push(Server { name: p.name, addr, last_seen: now });
+                                servers.push(Server {
+                                    name: p.name,
+                                    addr,
+                                    last_seen: now,
+                                });
                             }
                             // Prune long-stale entries.
-                            servers.retain(|s| now.duration_since(s.last_seen) < Duration::from_secs(30));
+                            servers.retain(|s| {
+                                now.duration_since(s.last_seen) < Duration::from_secs(30)
+                            });
                         }
                     }
                     Err(ref e)
@@ -203,7 +217,8 @@ fn spawn_stream(shared: Arc<Shared>, source: String) -> Stream {
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 };
-                if let Err(e) = stream_session(addr, source_id, &frame_t, &stop_t, &mut generation) {
+                if let Err(e) = stream_session(addr, source_id, &frame_t, &stop_t, &mut generation)
+                {
                     log::debug!("CITP: stream {server_name} ended: {e}");
                 }
                 std::thread::sleep(Duration::from_millis(800)); // reconnect backoff
@@ -270,7 +285,9 @@ fn stream_session(
                     break;
                 }
             }
-            let Some(h) = proto::parse_header(&acc) else { break };
+            let Some(h) = proto::parse_header(&acc) else {
+                break;
+            };
             let msg_size = h.message_size as usize;
             if !(proto::HEADER_LEN..=(8 << 20)).contains(&msg_size) {
                 // Corrupt size — drop one byte and resync.
@@ -280,56 +297,76 @@ fn stream_session(
             if acc.len() < msg_size {
                 break; // wait for the rest
             }
-            let msg: Vec<u8> = acc.drain(0..msg_size).collect();
-            if &h.content_type != proto::MSEX {
-                continue;
-            }
-            let Some(sf) = proto::parse_stfr(&msg) else { continue };
-            if sf.source_id != source_id {
-                continue;
-            }
-            // Reassemble fragments if needed, else decode directly.
-            let decoded = if let Some(fr) = &sf.fragment {
-                let count = fr.count.max(1) as usize;
-                let idx = fr.index as usize;
-                let end = fr.byte_offset as usize + sf.buffer.len();
-                // Reject implausible offsets/indices to avoid OOM from crafted
-                // fragments (byte_offset is unvalidated off the wire).
-                let cap = ((sf.width as usize) * (sf.height as usize) * 4).max(16 << 20);
-                if idx >= count || end > cap {
-                    None
-                } else {
-                    // Bound the number of in-flight partial frames (drop orphans
-                    // from incomplete/abandoned frames so the map can't grow).
-                    if frags.len() > 8 && !frags.contains_key(&fr.frame_index) {
-                        frags.clear();
+            let decoded = if &h.content_type == proto::MSEX {
+                let msg = &acc[..msg_size];
+                proto::parse_stfr(msg).and_then(|sf| {
+                    if sf.source_id != source_id {
+                        return None;
                     }
-                    let entry =
-                        frags.entry(fr.frame_index).or_insert_with(|| (vec![false; count], Vec::new()));
-                    if entry.1.len() < end {
-                        entry.1.resize(end, 0);
-                    }
-                    entry.1[fr.byte_offset as usize..end].copy_from_slice(&sf.buffer);
-                    // Count distinct fragments only (ignore duplicates/retransmits).
-                    let mut complete = false;
-                    if !entry.0.get(idx).copied().unwrap_or(true) {
-                        entry.0[idx] = true;
-                        complete = entry.0.iter().all(|&b| b);
-                    }
-                    if complete {
-                        let (_, full) = frags.remove(&fr.frame_index).unwrap();
-                        proto::image_to_rgba(&sf.format, sf.width, sf.height, &full, sf.msex_minor)
+                    // Reassemble fragments if needed, else decode directly.
+                    if let Some(fr) = &sf.fragment {
+                        let count = fr.count.max(1) as usize;
+                        let idx = fr.index as usize;
+                        let end = fr.byte_offset as usize + sf.buffer.len();
+                        // Reject implausible offsets/indices to avoid OOM from crafted
+                        // fragments (byte_offset is unvalidated off the wire).
+                        let cap = ((sf.width as usize) * (sf.height as usize) * 4).max(16 << 20);
+                        if idx >= count || end > cap {
+                            None
+                        } else {
+                            // Bound the number of in-flight partial frames (drop orphans
+                            // from incomplete/abandoned frames so the map can't grow).
+                            if frags.len() > 8 && !frags.contains_key(&fr.frame_index) {
+                                frags.clear();
+                            }
+                            let entry = frags
+                                .entry(fr.frame_index)
+                                .or_insert_with(|| (vec![false; count], Vec::new()));
+                            if entry.1.len() < end {
+                                entry.1.resize(end, 0);
+                            }
+                            entry.1[fr.byte_offset as usize..end].copy_from_slice(&sf.buffer);
+                            // Count distinct fragments only (ignore duplicates/retransmits).
+                            let mut complete = false;
+                            if !entry.0.get(idx).copied().unwrap_or(true) {
+                                entry.0[idx] = true;
+                                complete = entry.0.iter().all(|&b| b);
+                            }
+                            if complete {
+                                let (_, full) = frags.remove(&fr.frame_index).unwrap();
+                                proto::image_to_rgba(
+                                    &sf.format,
+                                    sf.width,
+                                    sf.height,
+                                    &full,
+                                    sf.msex_minor,
+                                )
+                            } else {
+                                None
+                            }
+                        }
                     } else {
-                        None
+                        proto::image_to_rgba(
+                            &sf.format,
+                            sf.width,
+                            sf.height,
+                            &sf.buffer,
+                            sf.msex_minor,
+                        )
                     }
-                }
+                })
             } else {
-                proto::image_to_rgba(&sf.format, sf.width, sf.height, &sf.buffer, sf.msex_minor)
+                None
             };
+            acc.drain(0..msg_size);
             if let Some((w, hgt, rgba)) = decoded {
                 *generation = generation.wrapping_add(1);
-                *frame.lock().unwrap() =
-                    Some(Arc::new(ScreenFrame { width: w, height: hgt, rgba, generation: *generation }));
+                *frame.lock().unwrap() = Some(Arc::new(ScreenFrame {
+                    width: w,
+                    height: hgt,
+                    rgba,
+                    generation: *generation,
+                }));
             }
         }
     }

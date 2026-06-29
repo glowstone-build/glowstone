@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 use egui_dock::{DockState, NodeIndex};
 
-use super::tools::ActiveTool;
 use super::Tab;
+use super::tools::ActiveTool;
 
 /// How many workspaces get a stable indexed `workspace.activate_N` command (for the
 /// F3 palette / keymap). The tab strip + Window menu can switch ANY workspace; only
@@ -89,7 +89,10 @@ pub struct Workspaces {
 
 impl Default for Workspaces {
     fn default() -> Self {
-        Self { items: builtins(), active: 0 }
+        Self {
+            items: builtins(),
+            active: 0,
+        }
     }
 }
 
@@ -98,8 +101,12 @@ impl Workspaces {
     /// (so the workflow presets are always present). If the file loaded but somehow
     /// holds no built-ins (hand-edited), they're re-prepended so they never vanish.
     pub fn load() -> Self {
-        let Some(p) = workspaces_path() else { return Self::default() };
-        let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
+        let Some(p) = workspaces_path() else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return Self::default();
+        };
         let mut ws: Self = match serde_json::from_str(&text) {
             Ok(ws) => ws,
             Err(_) => return Self::default(),
@@ -107,7 +114,11 @@ impl Workspaces {
         ws.ensure_builtins();
         // Always open in the Design workspace (the default working layout), regardless
         // of which workspace was active when the app last closed.
-        ws.active = ws.items.iter().position(|w| w.name == "Design").unwrap_or(0);
+        ws.active = ws
+            .items
+            .iter()
+            .position(|w| w.name == "Design")
+            .unwrap_or(0);
         ws
     }
 
@@ -160,7 +171,13 @@ impl Workspaces {
         let name = if name.is_empty() { "Workspace" } else { name };
         if let Some(i) = self.items.iter().position(|w| w.name == name) {
             let builtin = self.items[i].builtin;
-            self.items[i] = Workspace { name: name.to_string(), dock, default_tool, overlays, builtin };
+            self.items[i] = Workspace {
+                name: name.to_string(),
+                dock,
+                default_tool,
+                overlays,
+                builtin,
+            };
             self.active = i;
             self.save();
             return i;
@@ -195,7 +212,12 @@ impl Workspaces {
     /// of "save current as workspace"). A free helper so the field mapping lives in
     /// one place.
     pub fn capture_overlays(labels: bool, stats: bool, grid: bool, gizmos: bool) -> Overlays {
-        Overlays { labels, stats, grid, gizmos }
+        Overlays {
+            labels,
+            stats,
+            grid,
+            gizmos,
+        }
     }
 }
 
@@ -211,7 +233,12 @@ pub fn builtins() -> Vec<Workspace> {
             name: "Design".into(),
             dock: design_dock(),
             default_tool: ActiveTool::Move,
-            overlays: Overlays { labels: true, stats: false, grid: true, gizmos: true },
+            overlays: Overlays {
+                labels: true,
+                stats: false,
+                grid: true,
+                gizmos: true,
+            },
             builtin: true,
         },
         // PATCH: the systems tech — the Fixtures sheet + DMX dominate a tall bottom
@@ -220,7 +247,12 @@ pub fn builtins() -> Vec<Workspace> {
             name: "Patch".into(),
             dock: patch_dock(),
             default_tool: ActiveTool::Select,
-            overlays: Overlays { labels: true, stats: false, grid: true, gizmos: true },
+            overlays: Overlays {
+                labels: true,
+                stats: false,
+                grid: true,
+                gizmos: true,
+            },
             builtin: true,
         },
         // FOCUS: aim / select-oriented — the focusing session. Thin Scene + Inspector
@@ -230,7 +262,12 @@ pub fn builtins() -> Vec<Workspace> {
             name: "Focus".into(),
             dock: focus_dock(),
             default_tool: ActiveTool::Aim,
-            overlays: Overlays { labels: true, stats: false, grid: false, gizmos: true },
+            overlays: Overlays {
+                labels: true,
+                stats: false,
+                grid: false,
+                gizmos: true,
+            },
             builtin: true,
         },
         // VISUALISE: the glowstone artist — maximise the viewport, minimal chrome. Select
@@ -239,7 +276,12 @@ pub fn builtins() -> Vec<Workspace> {
             name: "Visualise".into(),
             dock: visualise_dock(),
             default_tool: ActiveTool::Select,
-            overlays: Overlays { labels: false, stats: false, grid: true, gizmos: false },
+            overlays: Overlays {
+                labels: false,
+                stats: false,
+                grid: true,
+                gizmos: false,
+            },
             builtin: true,
         },
     ]
@@ -254,7 +296,11 @@ fn design_dock() -> DockState<Tab> {
     let surface = dock.main_surface_mut();
     let [c, _l] = surface.split_left(NodeIndex::root(), 0.17, vec![Tab::Scene, Tab::Library]);
     let [c, _i] = surface.split_right(c, 0.79, vec![Tab::Inspector]);
-    surface.split_below(c, 0.70, vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity]);
+    surface.split_below(
+        c,
+        0.70,
+        vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity],
+    );
     dock
 }
 
@@ -263,7 +309,11 @@ fn patch_dock() -> DockState<Tab> {
     let surface = dock.main_surface_mut();
     let [c, _l] = surface.split_left(NodeIndex::root(), 0.16, vec![Tab::Scene]);
     let [c, _i] = surface.split_right(c, 0.80, vec![Tab::Inspector]);
-    surface.split_below(c, 0.42, vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity]);
+    surface.split_below(
+        c,
+        0.42,
+        vec![Tab::Patch, Tab::DmxMonitor, Tab::Cues, Tab::Connectivity],
+    );
     dock
 }
 
@@ -347,7 +397,12 @@ mod tests {
     #[test]
     fn round_trips_through_json() {
         let mut ws = Workspaces::default();
-        let overlays = Overlays { labels: false, stats: true, grid: false, gizmos: true };
+        let overlays = Overlays {
+            labels: false,
+            stats: true,
+            grid: false,
+            gizmos: true,
+        };
         let idx = ws.save_current("My Focus", focus_dock(), ActiveTool::Rotate, overlays);
         assert_eq!(idx, 4); // appended after the four built-ins
         assert_eq!(ws.active, 4);
@@ -373,19 +428,32 @@ mod tests {
     fn save_overwrites_same_name() {
         let mut ws = Workspaces::default();
         let n0 = ws.items.len();
-        let ov = Overlays { labels: true, stats: true, grid: true, gizmos: false };
+        let ov = Overlays {
+            labels: true,
+            stats: true,
+            grid: true,
+            gizmos: false,
+        };
         let idx = ws.save_current("Design", visualise_dock(), ActiveTool::Scale, ov);
         assert_eq!(idx, 0, "overwrites the existing Design slot");
         assert_eq!(ws.items.len(), n0, "no new row");
         assert_eq!(ws.items[0].default_tool, ActiveTool::Scale);
-        assert!(ws.items[0].builtin, "overwriting a built-in slot keeps it built-in");
+        assert!(
+            ws.items[0].builtin,
+            "overwriting a built-in slot keeps it built-in"
+        );
     }
 
     /// Built-ins can't be deleted; user workspaces can, and `active` re-clamps.
     #[test]
     fn delete_guards_builtins_and_clamps_active() {
         let mut ws = Workspaces::default();
-        let ov = Overlays { labels: true, stats: false, grid: true, gizmos: true };
+        let ov = Overlays {
+            labels: true,
+            stats: false,
+            grid: true,
+            gizmos: true,
+        };
         ws.save_current("Mine", focus_dock(), ActiveTool::Move, ov);
         assert_eq!(ws.active, 4);
         // A built-in delete is refused.
@@ -402,7 +470,7 @@ mod tests {
     /// workspaces), and they map to the matching 0-based [`ActivateWorkspace`] index.
     #[test]
     fn slot_commands_cover_cap() {
-        use crate::ui::shortcuts::{command, Action};
+        use crate::ui::shortcuts::{Action, command};
         for n in 1..=SLOT_CAP {
             let id = format!("window.workspace_{n}");
             let cmd = command(&id).unwrap_or_else(|| panic!("missing command {id}"));
@@ -422,6 +490,9 @@ mod tests {
         ws.items.retain(|w| w.name != "Focus"); // simulate a file missing Focus
         assert!(!ws.items.iter().any(|w| w.name == "Focus"));
         ws.ensure_builtins();
-        assert!(ws.items.iter().any(|w| w.name == "Focus"), "Focus backfilled");
+        assert!(
+            ws.items.iter().any(|w| w.name == "Focus"),
+            "Focus backfilled"
+        );
     }
 }

@@ -2,7 +2,7 @@
 //! inspector `mod.rs`): the editor shown when several fixtures are selected.
 
 use super::theme;
-use super::{bulk_f32_row, category, common_f32, common_rgb, InspectorState};
+use super::{InspectorState, bulk_f32_row, category, common_f32, common_rgb};
 use crate::dmx::PatchTable;
 use crate::gdtf::WheelKind;
 use crate::optics::OpticField;
@@ -14,12 +14,24 @@ use egui::{DragValue, Grid, RichText, Slider};
 /// Categories are collapsible and the Optics / Wheels rows are **dynamic** — they
 /// show the union of controls the selected fixtures actually expose, not a fixed
 /// hardcoded list.
-pub(super) fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut PatchTable, ids: &[usize], state: &mut InspectorState) {
+pub(super) fn bulk_inspector(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    patch: &mut PatchTable,
+    ids: &[usize],
+    state: &mut InspectorState,
+) {
     let primary = ids[0];
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{}  {} fixtures", theme::icon::FIXTURE, ids.len())).strong());
+        ui.label(
+            RichText::new(format!("{}  {} fixtures", theme::icon::FIXTURE, ids.len())).strong(),
+        );
     });
-    ui.label(RichText::new("Bulk edit — changes apply to all selected.").weak().small());
+    ui.label(
+        RichText::new("Bulk edit — changes apply to all selected.")
+            .weak()
+            .small(),
+    );
     ui.separator();
 
     // --- DMX MODE (only when every selected fixture shares one profile, so a
@@ -63,7 +75,10 @@ pub(super) fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut P
         ui.separator();
     }
 
-    let transform_refs = ids.iter().map(|&i| ObjectRef::Fixture(i)).collect::<Vec<_>>();
+    let transform_refs = ids
+        .iter()
+        .map(|&i| ObjectRef::Fixture(i))
+        .collect::<Vec<_>>();
     super::object_transform_bulk(ui, scene, &transform_refs, state);
 
     // --- FIXTURE ---
@@ -75,86 +90,122 @@ pub(super) fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut P
         true,
         &["Pan", "Tilt", "Dimmer", "Beam", "Color"],
         |ui, fs| {
-            Grid::new("bulk-fixture").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                let pan = common_f32(ids.iter().map(|&i| scene.fixtures[i].pan));
-                bulk_f32_row(
-                    ui,
-                    fs,
-                    "Pan",
-                    pan,
-                    scene.fixtures[primary].pan,
-                    |ui, v| ui.add(DragValue::new(v).speed(0.5).range(-270.0..=270.0).suffix("°")),
-                    |v| ids.iter().for_each(|&i| scene.fixtures[i].pan = v),
-                );
-                let tilt = common_f32(ids.iter().map(|&i| scene.fixtures[i].tilt));
-                bulk_f32_row(
-                    ui,
-                    fs,
-                    "Tilt",
-                    tilt,
-                    scene.fixtures[primary].tilt,
-                    |ui, v| ui.add(DragValue::new(v).speed(0.5).range(-180.0..=180.0).suffix("°")),
-                    |v| ids.iter().for_each(|&i| scene.fixtures[i].tilt = v),
-                );
-                let dimmer = common_f32(ids.iter().map(|&i| scene.fixtures[i].optics.dimmer));
-                bulk_f32_row(
-                    ui,
-                    fs,
-                    "Dimmer",
-                    dimmer,
-                    scene.fixtures[primary].optics.dimmer,
-                    |ui, v| ui.add(Slider::new(v, 0.0..=1.0)),
-                    |v| ids.iter().for_each(|&i| scene.fixtures[i].optics.dimmer = v),
-                );
-                let beam = common_f32(ids.iter().map(|&i| scene.fixtures[i].beam));
-                bulk_f32_row(
-                    ui,
-                    fs,
-                    "Beam",
-                    beam,
-                    scene.fixtures[primary].beam,
-                    |ui, v| {
-                        ui.add(Slider::new(v, 0.0..=4.0).text("vol"))
-                            .on_hover_text("Volumetric beam intensity (0 = off)")
-                    },
-                    |v| ids.iter().for_each(|&i| scene.fixtures[i].beam = v),
-                );
-                // Colour: same mixed/unify pattern, but the widget is a colour well.
-                if fs.row_visible("Color") {
-                    ui.label("Color");
-                    match common_rgb(ids.iter().map(|&i| scene.fixtures[i].color)) {
-                        Some(mut color) => {
-                            if ui.color_edit_button_rgb(&mut color).changed() {
-                                for &i in ids {
-                                    scene.fixtures[i].color = color;
+            Grid::new("bulk-fixture")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    let pan = common_f32(ids.iter().map(|&i| scene.fixtures[i].pan));
+                    bulk_f32_row(
+                        ui,
+                        fs,
+                        "Pan",
+                        pan,
+                        scene.fixtures[primary].pan,
+                        |ui, v| {
+                            ui.add(
+                                DragValue::new(v)
+                                    .speed(0.5)
+                                    .range(-270.0..=270.0)
+                                    .suffix("°"),
+                            )
+                        },
+                        |v| ids.iter().for_each(|&i| scene.fixtures[i].pan = v),
+                    );
+                    let tilt = common_f32(ids.iter().map(|&i| scene.fixtures[i].tilt));
+                    bulk_f32_row(
+                        ui,
+                        fs,
+                        "Tilt",
+                        tilt,
+                        scene.fixtures[primary].tilt,
+                        |ui, v| {
+                            ui.add(
+                                DragValue::new(v)
+                                    .speed(0.5)
+                                    .range(-180.0..=180.0)
+                                    .suffix("°"),
+                            )
+                        },
+                        |v| ids.iter().for_each(|&i| scene.fixtures[i].tilt = v),
+                    );
+                    let dimmer = common_f32(ids.iter().map(|&i| scene.fixtures[i].optics.dimmer));
+                    bulk_f32_row(
+                        ui,
+                        fs,
+                        "Dimmer",
+                        dimmer,
+                        scene.fixtures[primary].optics.dimmer,
+                        |ui, v| ui.add(Slider::new(v, 0.0..=1.0)),
+                        |v| {
+                            ids.iter()
+                                .for_each(|&i| scene.fixtures[i].optics.dimmer = v)
+                        },
+                    );
+                    let beam = common_f32(ids.iter().map(|&i| scene.fixtures[i].beam));
+                    bulk_f32_row(
+                        ui,
+                        fs,
+                        "Beam",
+                        beam,
+                        scene.fixtures[primary].beam,
+                        |ui, v| {
+                            ui.add(Slider::new(v, 0.0..=4.0).text("vol"))
+                                .on_hover_text("Volumetric beam intensity (0 = off)")
+                        },
+                        |v| ids.iter().for_each(|&i| scene.fixtures[i].beam = v),
+                    );
+                    // Colour: same mixed/unify pattern, but the widget is a colour well.
+                    if fs.row_visible("Color") {
+                        ui.label("Color");
+                        match common_rgb(ids.iter().map(|&i| scene.fixtures[i].color)) {
+                            Some(mut color) => {
+                                if ui.color_edit_button_rgb(&mut color).changed() {
+                                    for &i in ids {
+                                        scene.fixtures[i].color = color;
+                                    }
+                                }
+                            }
+                            None => {
+                                let seed = scene.fixtures[primary].color;
+                                if ui
+                                    .add(egui::Button::new(
+                                        RichText::new("— Multiple —").small().weak(),
+                                    ))
+                                    .on_hover_text(
+                                        "Colours differ — click to set all to the active colour",
+                                    )
+                                    .clicked()
+                                {
+                                    for &i in ids {
+                                        scene.fixtures[i].color = seed;
+                                    }
                                 }
                             }
                         }
-                        None => {
-                            let seed = scene.fixtures[primary].color;
-                            if ui
-                                .add(egui::Button::new(RichText::new("— Multiple —").small().weak()))
-                                .on_hover_text("Colours differ — click to set all to the active colour")
-                                .clicked()
-                            {
-                                for &i in ids {
-                                    scene.fixtures[i].color = seed;
-                                }
-                            }
-                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-            });
+                });
         },
     );
 
     // --- OPTICS (dynamic): only fields some selected fixture actually exposes ---
     let supports = |f: OpticField| {
-        ids.iter().any(|&i| scene.fixtures[i].gdtf.as_ref().is_some_and(|g| f.supported(g)))
+        ids.iter().any(|&i| {
+            scene.fixtures[i]
+                .gdtf
+                .as_ref()
+                .is_some_and(|g| f.supported(g))
+        })
     };
-    let beam: Vec<OpticField> = OpticField::BEAM.into_iter().filter(|&f| supports(f)).collect();
-    let color: Vec<OpticField> = OpticField::COLOR.into_iter().filter(|&f| supports(f)).collect();
+    let beam: Vec<OpticField> = OpticField::BEAM
+        .into_iter()
+        .filter(|&f| supports(f))
+        .collect();
+    let color: Vec<OpticField> = OpticField::COLOR
+        .into_iter()
+        .filter(|&f| supports(f))
+        .collect();
     if !beam.is_empty() || !color.is_empty() {
         let optic_labels: Vec<&str> = beam.iter().chain(&color).map(|f| f.label()).collect();
         category(
@@ -165,22 +216,34 @@ pub(super) fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut P
             true,
             &optic_labels,
             |ui, fs| {
-                if !beam.is_empty() && fs.category_visible(&beam.iter().map(|f| f.label()).collect::<Vec<_>>()) {
+                if !beam.is_empty()
+                    && fs.category_visible(&beam.iter().map(|f| f.label()).collect::<Vec<_>>())
+                {
                     ui.label(RichText::new("BEAM SHAPING").small().strong());
-                    Grid::new("bulk-beam").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                        for f in &beam {
-                            bulk_opt_field(ui, fs, scene, ids, *f);
-                        }
-                    });
+                    Grid::new("bulk-beam")
+                        .num_columns(2)
+                        .spacing([10.0, 5.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for f in &beam {
+                                bulk_opt_field(ui, fs, scene, ids, *f);
+                            }
+                        });
                 }
-                if !color.is_empty() && fs.category_visible(&color.iter().map(|f| f.label()).collect::<Vec<_>>()) {
+                if !color.is_empty()
+                    && fs.category_visible(&color.iter().map(|f| f.label()).collect::<Vec<_>>())
+                {
                     ui.add_space(4.0);
                     ui.label(RichText::new("COLOR MIXING").small().strong());
-                    Grid::new("bulk-color").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                        for f in &color {
-                            bulk_opt_field(ui, fs, scene, ids, *f);
-                        }
-                    });
+                    Grid::new("bulk-color")
+                        .num_columns(2)
+                        .spacing([10.0, 5.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for f in &color {
+                                bulk_opt_field(ui, fs, scene, ids, *f);
+                            }
+                        });
                 }
             },
         );
@@ -190,9 +253,17 @@ pub(super) fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut P
     let mut wheels: Vec<(WheelKind, u32, String)> = Vec::new();
     for &i in ids {
         let f = &scene.fixtures[i];
-        if let Some(comps) = f.gdtf.as_ref().and_then(|g| g.modes.get(f.mode_index)).map(|m| &m.components) {
+        if let Some(comps) = f
+            .gdtf
+            .as_ref()
+            .and_then(|g| g.modes.get(f.mode_index))
+            .map(|m| &m.components)
+        {
             for c in comps {
-                if !wheels.iter().any(|(k, n, _)| *k == c.kind && *n == c.number) {
+                if !wheels
+                    .iter()
+                    .any(|(k, n, _)| *k == c.kind && *n == c.number)
+                {
                     wheels.push((c.kind, c.number, c.attribute.clone()));
                 }
             }
@@ -208,11 +279,15 @@ pub(super) fn bulk_inspector(ui: &mut egui::Ui, scene: &mut Scene, patch: &mut P
             true,
             &wheel_labels,
             |ui, fs| {
-                Grid::new("bulk-wheels").num_columns(2).spacing([10.0, 5.0]).striped(true).show(ui, |ui| {
-                    for (kind, number, label) in &wheels {
-                        bulk_wheel(ui, fs, scene, ids, *kind, *number, label);
-                    }
-                });
+                Grid::new("bulk-wheels")
+                    .num_columns(2)
+                    .spacing([10.0, 5.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (kind, number, label) in &wheels {
+                            bulk_wheel(ui, fs, scene, ids, *kind, *number, label);
+                        }
+                    });
             },
         );
     }
@@ -231,26 +306,39 @@ fn bulk_wheel(
 ) {
     // Seed from the first selected fixture that actually has this wheel (the
     // union may include wheels the primary doesn't have).
-    let Some((seed_value, seed_spin)) = ids
-        .iter()
-        .find_map(|&i| scene.fixtures[i].wheel_control_mut(kind, number).map(|w| (w.value, w.spin)))
-    else {
+    let Some((seed_value, seed_spin)) = ids.iter().find_map(|&i| {
+        scene.fixtures[i]
+            .wheel_control_mut(kind, number)
+            .map(|w| (w.value, w.spin))
+    }) else {
         return;
     };
     // Mixed-value detection (#7) over only the fixtures that HAVE this wheel.
-    let value = common_f32(
-        ids.iter().filter_map(|&i| scene.fixtures[i].wheel_control_mut(kind, number).map(|w| w.value)),
-    );
-    bulk_f32_row(ui, state, label, value, seed_value, |ui, v| ui.add(Slider::new(v, 0.0..=1.0)), |v| {
-        for &i in ids {
-            if let Some(w) = scene.fixtures[i].wheel_control_mut(kind, number) {
-                w.value = v;
+    let value = common_f32(ids.iter().filter_map(|&i| {
+        scene.fixtures[i]
+            .wheel_control_mut(kind, number)
+            .map(|w| w.value)
+    }));
+    bulk_f32_row(
+        ui,
+        state,
+        label,
+        value,
+        seed_value,
+        |ui, v| ui.add(Slider::new(v, 0.0..=1.0)),
+        |v| {
+            for &i in ids {
+                if let Some(w) = scene.fixtures[i].wheel_control_mut(kind, number) {
+                    w.value = v;
+                }
             }
-        }
-    });
-    let spin = common_f32(
-        ids.iter().filter_map(|&i| scene.fixtures[i].wheel_control_mut(kind, number).map(|w| w.spin)),
+        },
     );
+    let spin = common_f32(ids.iter().filter_map(|&i| {
+        scene.fixtures[i]
+            .wheel_control_mut(kind, number)
+            .map(|w| w.spin)
+    }));
     bulk_f32_row(
         ui,
         state,
@@ -272,16 +360,32 @@ fn bulk_wheel(
 /// fixture (range-aware: e.g. green tint is bipolar). Seeds from the first
 /// selected fixture that actually exposes the field (the union may include a
 /// control the primary doesn't have), falling back to the primary.
-fn bulk_opt_field(ui: &mut egui::Ui, state: &InspectorState, scene: &mut Scene, ids: &[usize], f: OpticField) {
+fn bulk_opt_field(
+    ui: &mut egui::Ui,
+    state: &InspectorState,
+    scene: &mut Scene,
+    ids: &[usize],
+    f: OpticField,
+) {
     let seed = ids
         .iter()
         .copied()
-        .find(|&i| scene.fixtures[i].gdtf.as_ref().is_some_and(|g| f.supported(g)))
+        .find(|&i| {
+            scene.fixtures[i]
+                .gdtf
+                .as_ref()
+                .is_some_and(|g| f.supported(g))
+        })
         .unwrap_or(ids[0]);
     // Mixed-value detection (#7) over only the fixtures that EXPOSE this field.
     let common = common_f32(
         ids.iter()
-            .filter(|&&i| scene.fixtures[i].gdtf.as_ref().is_some_and(|g| f.supported(g)))
+            .filter(|&&i| {
+                scene.fixtures[i]
+                    .gdtf
+                    .as_ref()
+                    .is_some_and(|g| f.supported(g))
+            })
             .map(|&i| f.get(&scene.fixtures[i].optics)),
     );
     bulk_f32_row(

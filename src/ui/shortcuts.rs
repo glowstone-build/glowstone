@@ -165,7 +165,11 @@ impl Mods {
     /// The default the table uses: every modifier must be RELEASED. `.cmd()` /
     /// `.shift()` / `.alt()` flip individual requirements to "held".
     const fn none() -> Self {
-        Self { command: Some(false), shift: Some(false), alt: Some(false) }
+        Self {
+            command: Some(false),
+            shift: Some(false),
+            alt: Some(false),
+        }
     }
     const fn cmd(mut self) -> Self {
         self.command = Some(true);
@@ -213,7 +217,11 @@ pub struct Trigger {
 
 impl Trigger {
     const fn key(key: egui::Key) -> Self {
-        Self { key, mods: Mods::none(), event: Event::Press }
+        Self {
+            key,
+            mods: Mods::none(),
+            event: Event::Press,
+        }
     }
     const fn shift(mut self) -> Self {
         self.mods = self.mods.shift();
@@ -373,8 +381,19 @@ pub struct Command {
 }
 
 /// Compact constructor for a non-catalog command (keymap action only).
-const fn command_row(id: &'static str, label: &'static str, category: Category, action: Action) -> Command {
-    Command { id, label, category, action, invoke: None }
+const fn command_row(
+    id: &'static str,
+    label: &'static str,
+    category: Category,
+    action: Action,
+) -> Command {
+    Command {
+        id,
+        label,
+        category,
+        action,
+        invoke: None,
+    }
 }
 
 /// Compact constructor for a catalog operator command (listed + dispatched by F3).
@@ -385,7 +404,13 @@ const fn op_row(
     action: Action,
     invoke: OpInvoke,
 ) -> Command {
-    Command { id, label, category, action, invoke: Some(invoke) }
+    Command {
+        id,
+        label,
+        category,
+        action,
+        invoke: Some(invoke),
+    }
 }
 
 /// Every command, keyed by `id` — the single source the keymap, menus, F3 palette
@@ -397,129 +422,610 @@ const fn op_row(
 /// the run sites; pure keymap commands use a `kmi.*` id (never dispatched as ops).
 pub static COMMANDS: &[Command] = &[
     // --- View / framing ---
-    command_row("view.frame_selection", "Frame selection", Category::View, Action::FrameSelection),
-    command_row("view.frame_all", "Frame all", Category::View, Action::FrameAll),
-    command_row("view.toggle_labels", "Toggle fixture labels", Category::View, Action::ToggleLabels),
+    command_row(
+        "view.frame_selection",
+        "Frame selection",
+        Category::View,
+        Action::FrameSelection,
+    ),
+    command_row(
+        "view.frame_all",
+        "Frame all",
+        Category::View,
+        Action::FrameAll,
+    ),
+    command_row(
+        "view.toggle_labels",
+        "Toggle fixture labels",
+        Category::View,
+        Action::ToggleLabels,
+    ),
     // --- Overlays (View > Overlays submenu): quiet, toggleable viewport HUD bits. ---
-    command_row("view.toggle_stats", "Toggle scene statistics", Category::View, Action::ToggleStats),
-    command_row("view.toggle_grid", "Toggle grid + world axes", Category::View, Action::ToggleGrid),
-    command_row("view.toggle_gizmos", "Toggle navigation gizmo", Category::View, Action::ToggleGizmos),
-    command_row("view.toggle_hint", "Toggle transform hint line", Category::View, Action::ToggleHint),
-    command_row("view.front", "Front view", Category::View, Action::View(CameraView::Front)),
-    command_row("view.back", "Back view", Category::View, Action::View(CameraView::Back)),
-    command_row("view.right", "Right view", Category::View, Action::View(CameraView::Right)),
-    command_row("view.left", "Left view", Category::View, Action::View(CameraView::Left)),
-    command_row("view.top", "Top view", Category::View, Action::View(CameraView::Top)),
-    command_row("view.bottom", "Bottom view", Category::View, Action::View(CameraView::Bottom)),
-    command_row("view.toggle_ortho", "Toggle ortho/persp", Category::View, Action::ToggleOrtho),
-    command_row("view.camera", "Camera view", Category::View, Action::ViewCamera),
-    command_row("view.orbit_up", "Orbit up", Category::View, Action::OrbitStep(0.0, 15.0)),
-    command_row("view.orbit_down", "Orbit down", Category::View, Action::OrbitStep(0.0, -15.0)),
-    command_row("view.orbit_left", "Orbit left", Category::View, Action::OrbitStep(-15.0, 0.0)),
-    command_row("view.orbit_right", "Orbit right", Category::View, Action::OrbitStep(15.0, 0.0)),
-    command_row("view.pie", "View pie (radial)", Category::View, Action::ViewPie),
-    command_row("view.shading_pie", "Shading pie (radial)", Category::View, Action::ShadingPie),
+    command_row(
+        "view.toggle_stats",
+        "Toggle scene statistics",
+        Category::View,
+        Action::ToggleStats,
+    ),
+    command_row(
+        "view.toggle_grid",
+        "Toggle grid + world axes",
+        Category::View,
+        Action::ToggleGrid,
+    ),
+    command_row(
+        "view.toggle_gizmos",
+        "Toggle navigation gizmo",
+        Category::View,
+        Action::ToggleGizmos,
+    ),
+    command_row(
+        "view.toggle_hint",
+        "Toggle transform hint line",
+        Category::View,
+        Action::ToggleHint,
+    ),
+    command_row(
+        "view.front",
+        "Front view",
+        Category::View,
+        Action::View(CameraView::Front),
+    ),
+    command_row(
+        "view.back",
+        "Back view",
+        Category::View,
+        Action::View(CameraView::Back),
+    ),
+    command_row(
+        "view.right",
+        "Right view",
+        Category::View,
+        Action::View(CameraView::Right),
+    ),
+    command_row(
+        "view.left",
+        "Left view",
+        Category::View,
+        Action::View(CameraView::Left),
+    ),
+    command_row(
+        "view.top",
+        "Top view",
+        Category::View,
+        Action::View(CameraView::Top),
+    ),
+    command_row(
+        "view.bottom",
+        "Bottom view",
+        Category::View,
+        Action::View(CameraView::Bottom),
+    ),
+    command_row(
+        "view.toggle_ortho",
+        "Toggle ortho/persp",
+        Category::View,
+        Action::ToggleOrtho,
+    ),
+    command_row(
+        "view.camera",
+        "Camera view",
+        Category::View,
+        Action::ViewCamera,
+    ),
+    command_row(
+        "view.orbit_up",
+        "Orbit up",
+        Category::View,
+        Action::OrbitStep(0.0, 15.0),
+    ),
+    command_row(
+        "view.orbit_down",
+        "Orbit down",
+        Category::View,
+        Action::OrbitStep(0.0, -15.0),
+    ),
+    command_row(
+        "view.orbit_left",
+        "Orbit left",
+        Category::View,
+        Action::OrbitStep(-15.0, 0.0),
+    ),
+    command_row(
+        "view.orbit_right",
+        "Orbit right",
+        Category::View,
+        Action::OrbitStep(15.0, 0.0),
+    ),
+    command_row(
+        "view.pie",
+        "View pie (radial)",
+        Category::View,
+        Action::ViewPie,
+    ),
+    command_row(
+        "view.shading_pie",
+        "Shading pie (radial)",
+        Category::View,
+        Action::ShadingPie,
+    ),
     // --- View bookmarks (P1 #34): save the live pose to the next free slot, recall
     // a numbered slot with an eased jump. One recall command per slot so each gets a
     // stable id the F3 palette lists + the keymap can bind. ---
-    command_row("view.bookmark_save", "Save view bookmark", Category::View, Action::SaveBookmark),
-    command_row("view.bookmark_recall_1", "Recall view bookmark 1", Category::View, Action::RecallBookmark(1)),
-    command_row("view.bookmark_recall_2", "Recall view bookmark 2", Category::View, Action::RecallBookmark(2)),
-    command_row("view.bookmark_recall_3", "Recall view bookmark 3", Category::View, Action::RecallBookmark(3)),
-    command_row("view.bookmark_recall_4", "Recall view bookmark 4", Category::View, Action::RecallBookmark(4)),
-    command_row("view.bookmark_recall_5", "Recall view bookmark 5", Category::View, Action::RecallBookmark(5)),
-    command_row("view.bookmark_recall_6", "Recall view bookmark 6", Category::View, Action::RecallBookmark(6)),
-    command_row("view.bookmark_recall_7", "Recall view bookmark 7", Category::View, Action::RecallBookmark(7)),
-    command_row("view.bookmark_recall_8", "Recall view bookmark 8", Category::View, Action::RecallBookmark(8)),
-    command_row("view.bookmark_recall_9", "Recall view bookmark 9", Category::View, Action::RecallBookmark(9)),
-    command_row("view.toggle_n_panel", "Toggle N-panel (sidebar)", Category::View, Action::ToggleNPanel),
-    command_row("view.toggle_t_panel", "Toggle T-panel (tool rail)", Category::View, Action::ToggleTPanel),
+    command_row(
+        "view.bookmark_save",
+        "Save view bookmark",
+        Category::View,
+        Action::SaveBookmark,
+    ),
+    command_row(
+        "view.bookmark_recall_1",
+        "Recall view bookmark 1",
+        Category::View,
+        Action::RecallBookmark(1),
+    ),
+    command_row(
+        "view.bookmark_recall_2",
+        "Recall view bookmark 2",
+        Category::View,
+        Action::RecallBookmark(2),
+    ),
+    command_row(
+        "view.bookmark_recall_3",
+        "Recall view bookmark 3",
+        Category::View,
+        Action::RecallBookmark(3),
+    ),
+    command_row(
+        "view.bookmark_recall_4",
+        "Recall view bookmark 4",
+        Category::View,
+        Action::RecallBookmark(4),
+    ),
+    command_row(
+        "view.bookmark_recall_5",
+        "Recall view bookmark 5",
+        Category::View,
+        Action::RecallBookmark(5),
+    ),
+    command_row(
+        "view.bookmark_recall_6",
+        "Recall view bookmark 6",
+        Category::View,
+        Action::RecallBookmark(6),
+    ),
+    command_row(
+        "view.bookmark_recall_7",
+        "Recall view bookmark 7",
+        Category::View,
+        Action::RecallBookmark(7),
+    ),
+    command_row(
+        "view.bookmark_recall_8",
+        "Recall view bookmark 8",
+        Category::View,
+        Action::RecallBookmark(8),
+    ),
+    command_row(
+        "view.bookmark_recall_9",
+        "Recall view bookmark 9",
+        Category::View,
+        Action::RecallBookmark(9),
+    ),
+    command_row(
+        "view.toggle_n_panel",
+        "Toggle N-panel (sidebar)",
+        Category::View,
+        Action::ToggleNPanel,
+    ),
+    command_row(
+        "view.toggle_t_panel",
+        "Toggle T-panel (tool rail)",
+        Category::View,
+        Action::ToggleTPanel,
+    ),
     // --- Selection (#88: All / None / Invert within the active kind) ---
-    command_row("select.all", "Select all", Category::Selection, Action::SelectAll),
-    command_row("select.invert", "Invert selection", Category::Selection, Action::SelectInvert),
-    command_row("select.quick", "Quick-select menu", Category::Selection, Action::QuickSelect),
-    command_row("select.box", "Box select (marquee)", Category::Selection, Action::BoxSelect),
-    command_row("select.replace", "Replace selected fixtures", Category::Selection, Action::Replace),
+    command_row(
+        "select.all",
+        "Select all",
+        Category::Selection,
+        Action::SelectAll,
+    ),
+    command_row(
+        "select.invert",
+        "Invert selection",
+        Category::Selection,
+        Action::SelectInvert,
+    ),
+    command_row(
+        "select.quick",
+        "Quick-select menu",
+        Category::Selection,
+        Action::QuickSelect,
+    ),
+    command_row(
+        "select.box",
+        "Box select (marquee)",
+        Category::Selection,
+        Action::BoxSelect,
+    ),
+    command_row(
+        "select.replace",
+        "Replace selected fixtures",
+        Category::Selection,
+        Action::Replace,
+    ),
     // "None" (Alt+A) reuses the canonical Deselect command (also bound to Escape).
-    command_row("select.deselect", "Deselect all (none)", Category::Selection, Action::Deselect),
-    command_row("object.hide_toggle", "Hide / reveal selection", Category::Object, Action::ToggleHideSelection),
+    command_row(
+        "select.deselect",
+        "Deselect all (none)",
+        Category::Selection,
+        Action::Deselect,
+    ),
+    command_row(
+        "object.hide_toggle",
+        "Hide / reveal selection",
+        Category::Object,
+        Action::ToggleHideSelection,
+    ),
     // --- Transform: nudge (plain = 0.1 m, Shift = 1.0 m). Each direction has a
     // plain command + a "(1 m)" command; the keymap binds the matching trigger. ---
-    command_row("transform.nudge_x_neg", "Nudge -X (Shift = 1 m)", Category::Transform, Action::Nudge(Dir::XNeg, 0.1)),
-    command_row("transform.nudge_x_pos", "Nudge +X (Shift = 1 m)", Category::Transform, Action::Nudge(Dir::XPos, 0.1)),
-    command_row("transform.nudge_z_neg", "Nudge -Z (Shift = 1 m)", Category::Transform, Action::Nudge(Dir::ZNeg, 0.1)),
-    command_row("transform.nudge_z_pos", "Nudge +Z (Shift = 1 m)", Category::Transform, Action::Nudge(Dir::ZPos, 0.1)),
-    command_row("transform.nudge_y_up", "Nudge +height (Shift = 1 m)", Category::Transform, Action::Nudge(Dir::YUp, 0.1)),
-    command_row("transform.nudge_y_down", "Nudge -height (Shift = 1 m)", Category::Transform, Action::Nudge(Dir::YDown, 0.1)),
-    command_row("transform.nudge_x_neg_1m", "Nudge -X (1 m)", Category::Transform, Action::Nudge(Dir::XNeg, 1.0)),
-    command_row("transform.nudge_x_pos_1m", "Nudge +X (1 m)", Category::Transform, Action::Nudge(Dir::XPos, 1.0)),
-    command_row("transform.nudge_z_neg_1m", "Nudge -Z (1 m)", Category::Transform, Action::Nudge(Dir::ZNeg, 1.0)),
-    command_row("transform.nudge_z_pos_1m", "Nudge +Z (1 m)", Category::Transform, Action::Nudge(Dir::ZPos, 1.0)),
-    command_row("transform.nudge_y_up_1m", "Nudge +height (1 m)", Category::Transform, Action::Nudge(Dir::YUp, 1.0)),
-    command_row("transform.nudge_y_down_1m", "Nudge -height (1 m)", Category::Transform, Action::Nudge(Dir::YDown, 1.0)),
+    command_row(
+        "transform.nudge_x_neg",
+        "Nudge -X (Shift = 1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::XNeg, 0.1),
+    ),
+    command_row(
+        "transform.nudge_x_pos",
+        "Nudge +X (Shift = 1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::XPos, 0.1),
+    ),
+    command_row(
+        "transform.nudge_z_neg",
+        "Nudge -Z (Shift = 1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::ZNeg, 0.1),
+    ),
+    command_row(
+        "transform.nudge_z_pos",
+        "Nudge +Z (Shift = 1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::ZPos, 0.1),
+    ),
+    command_row(
+        "transform.nudge_y_up",
+        "Nudge +height (Shift = 1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::YUp, 0.1),
+    ),
+    command_row(
+        "transform.nudge_y_down",
+        "Nudge -height (Shift = 1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::YDown, 0.1),
+    ),
+    command_row(
+        "transform.nudge_x_neg_1m",
+        "Nudge -X (1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::XNeg, 1.0),
+    ),
+    command_row(
+        "transform.nudge_x_pos_1m",
+        "Nudge +X (1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::XPos, 1.0),
+    ),
+    command_row(
+        "transform.nudge_z_neg_1m",
+        "Nudge -Z (1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::ZNeg, 1.0),
+    ),
+    command_row(
+        "transform.nudge_z_pos_1m",
+        "Nudge +Z (1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::ZPos, 1.0),
+    ),
+    command_row(
+        "transform.nudge_y_up_1m",
+        "Nudge +height (1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::YUp, 1.0),
+    ),
+    command_row(
+        "transform.nudge_y_down_1m",
+        "Nudge -height (1 m)",
+        Category::Transform,
+        Action::Nudge(Dir::YDown, 1.0),
+    ),
     // --- Transform: modal G/R/S (impl in panels::viewport; registered here) ---
-    command_row("transform.move", "Move selection", Category::Transform, Action::Transform(TransformKind::Move)),
-    command_row("transform.rotate", "Rotate selection", Category::Transform, Action::Transform(TransformKind::Rotate)),
-    command_row("transform.scale", "Scale selection", Category::Transform, Action::Transform(TransformKind::Scale)),
+    command_row(
+        "transform.move",
+        "Move selection",
+        Category::Transform,
+        Action::Transform(TransformKind::Move),
+    ),
+    command_row(
+        "transform.rotate",
+        "Rotate selection",
+        Category::Transform,
+        Action::Transform(TransformKind::Rotate),
+    ),
+    command_row(
+        "transform.scale",
+        "Scale selection",
+        Category::Transform,
+        Action::Transform(TransformKind::Scale),
+    ),
     // --- Transform: modal axis lock (impl in panels::viewport; MODAL map) ---
-    command_row("transform.axis_x", "Lock X axis (during transform)", Category::Transform, Action::AxisLock(Axis::X)),
-    command_row("transform.axis_y", "Lock Y axis (during transform)", Category::Transform, Action::AxisLock(Axis::Y)),
-    command_row("transform.axis_z", "Lock Z axis (during transform)", Category::Transform, Action::AxisLock(Axis::Z)),
+    command_row(
+        "transform.axis_x",
+        "Lock X axis (during transform)",
+        Category::Transform,
+        Action::AxisLock(Axis::X),
+    ),
+    command_row(
+        "transform.axis_y",
+        "Lock Y axis (during transform)",
+        Category::Transform,
+        Action::AxisLock(Axis::Y),
+    ),
+    command_row(
+        "transform.axis_z",
+        "Lock Z axis (during transform)",
+        Category::Transform,
+        Action::AxisLock(Axis::Z),
+    ),
     // --- Add ---
-    command_row("kmi.add_menu", "Add menu (at cursor)", Category::Add, Action::AddMenu),
-    op_row("object.add", "Add Object…", Category::Add, Action::AddMenu, OpInvoke::Dialog),
+    command_row(
+        "kmi.add_menu",
+        "Add menu (at cursor)",
+        Category::Add,
+        Action::AddMenu,
+    ),
+    op_row(
+        "object.add",
+        "Add Object…",
+        Category::Add,
+        Action::AddMenu,
+        OpInvoke::Dialog,
+    ),
     // --- 3D cursor (S1-3d-cursor): the Blender Shift-RMB world cursor. The set is
     // wired in `panels::viewport` (Shift+right-click); these two commands snap it to
     // the selection / reset it to the origin (impl in `Ui::dispatch_action`). ---
-    command_row("cursor.snap_to_selection", "Snap cursor to selection", Category::Transform, Action::SnapCursorToSelection),
-    command_row("cursor.reset", "Reset cursor to origin", Category::Transform, Action::ResetCursor),
+    command_row(
+        "cursor.snap_to_selection",
+        "Snap cursor to selection",
+        Category::Transform,
+        Action::SnapCursorToSelection,
+    ),
+    command_row(
+        "cursor.reset",
+        "Reset cursor to origin",
+        Category::Transform,
+        Action::ResetCursor,
+    ),
     // --- Object / history ---
-    op_row("fixture.duplicate", "Duplicate / Array…", Category::Object, Action::Duplicate, OpInvoke::Dialog),
-    op_row("fixture.patch", "Patch Devices…", Category::Object, Action::Patch, OpInvoke::Dialog),
-    op_row("fixture.unpatch", "Unpatch Devices", Category::Object, Action::Unpatch, OpInvoke::Direct),
-    op_row("fixture.renumber", "Renumber Sequence by Position", Category::Object, Action::RenumberSequence, OpInvoke::Direct),
-    op_row("object.delete", "Delete Selected", Category::Object, Action::Delete, OpInvoke::Direct),
+    op_row(
+        "fixture.duplicate",
+        "Duplicate / Array…",
+        Category::Object,
+        Action::Duplicate,
+        OpInvoke::Dialog,
+    ),
+    op_row(
+        "fixture.patch",
+        "Patch Devices…",
+        Category::Object,
+        Action::Patch,
+        OpInvoke::Dialog,
+    ),
+    op_row(
+        "fixture.unpatch",
+        "Unpatch Devices",
+        Category::Object,
+        Action::Unpatch,
+        OpInvoke::Direct,
+    ),
+    op_row(
+        "fixture.renumber",
+        "Renumber Sequence by Position",
+        Category::Object,
+        Action::RenumberSequence,
+        OpInvoke::Direct,
+    ),
+    op_row(
+        "object.delete",
+        "Delete Selected",
+        Category::Object,
+        Action::Delete,
+        OpInvoke::Direct,
+    ),
     // The bare Patch/Unpatch keymap labels differ from the catalog labels above, so
     // they get their own keymap-only commands (the P/U binds point here).
-    command_row("kmi.patch", "Patch selected devices", Category::Object, Action::Patch),
-    command_row("kmi.unpatch", "Unpatch selected devices", Category::Object, Action::Unpatch),
-    command_row("kmi.renumber", "Renumber sequence by position", Category::Object, Action::RenumberSequence),
-    command_row("kmi.duplicate", "Duplicate / array", Category::Object, Action::Duplicate),
-    command_row("kmi.duplicate_grab", "Duplicate & grab", Category::Object, Action::DuplicateGrab),
-    command_row("kmi.delete", "Delete selected", Category::Object, Action::Delete),
-    command_row("kmi.delete_alias", "Delete selected (alias)", Category::Object, Action::Delete),
+    command_row(
+        "kmi.patch",
+        "Patch selected devices",
+        Category::Object,
+        Action::Patch,
+    ),
+    command_row(
+        "kmi.unpatch",
+        "Unpatch selected devices",
+        Category::Object,
+        Action::Unpatch,
+    ),
+    command_row(
+        "kmi.renumber",
+        "Renumber sequence by position",
+        Category::Object,
+        Action::RenumberSequence,
+    ),
+    command_row(
+        "kmi.duplicate",
+        "Duplicate / array",
+        Category::Object,
+        Action::Duplicate,
+    ),
+    command_row(
+        "kmi.duplicate_grab",
+        "Duplicate & grab",
+        Category::Object,
+        Action::DuplicateGrab,
+    ),
+    command_row(
+        "kmi.delete",
+        "Delete selected",
+        Category::Object,
+        Action::Delete,
+    ),
+    command_row(
+        "kmi.delete_alias",
+        "Delete selected (alias)",
+        Category::Object,
+        Action::Delete,
+    ),
     command_row("edit.undo", "Undo", Category::Object, Action::Undo),
     command_row("edit.redo", "Redo", Category::Object, Action::Redo),
-    command_row("edit.redo_alias", "Redo (alias)", Category::Object, Action::Redo),
-    command_row("edit.operator_search", "Operator search", Category::Object, Action::OperatorSearch),
-    command_row("edit.adjust_last", "Adjust last operation", Category::Object, Action::AdjustLast),
+    command_row(
+        "edit.redo_alias",
+        "Redo (alias)",
+        Category::Object,
+        Action::Redo,
+    ),
+    command_row(
+        "edit.operator_search",
+        "Operator search",
+        Category::Object,
+        Action::OperatorSearch,
+    ),
+    command_row(
+        "edit.adjust_last",
+        "Adjust last operation",
+        Category::Object,
+        Action::AdjustLast,
+    ),
     // Aliases for view framing (Period / Home share Action with the primary binds).
-    command_row("view.frame_selection_alias", "Frame selection (alias)", Category::View, Action::FrameSelection),
-    command_row("view.frame_all_alias", "Frame all (alias)", Category::View, Action::FrameAll),
+    command_row(
+        "view.frame_selection_alias",
+        "Frame selection (alias)",
+        Category::View,
+        Action::FrameSelection,
+    ),
+    command_row(
+        "view.frame_all_alias",
+        "Frame all (alias)",
+        Category::View,
+        Action::FrameAll,
+    ),
     // --- File ---
     command_row("file.save", "Save project", Category::File, Action::Save),
-    command_row("file.save_as", "Save project as…", Category::File, Action::SaveAs),
+    command_row(
+        "file.save_as",
+        "Save project as…",
+        Category::File,
+        Action::SaveAs,
+    ),
     command_row("file.open", "Open project", Category::File, Action::Open),
     command_row("file.new", "New project", Category::File, Action::New),
     // --- App ---
-    command_row("app.preferences", "Preferences", Category::App, Action::Preferences),
-    command_row("window.fullscreen", "Toggle fullscreen", Category::App, Action::ToggleFullscreen),
-    command_row("render.image", "Render Image", Category::App, Action::RenderImage),
-    command_row("window.report_log", "Report Log", Category::App, Action::ToggleReportLog),
-    command_row("window.welcome", "Welcome Screen", Category::App, Action::ShowWelcome),
+    command_row(
+        "app.preferences",
+        "Preferences",
+        Category::App,
+        Action::Preferences,
+    ),
+    command_row(
+        "window.fullscreen",
+        "Toggle fullscreen",
+        Category::App,
+        Action::ToggleFullscreen,
+    ),
+    command_row(
+        "render.image",
+        "Render Image",
+        Category::App,
+        Action::RenderImage,
+    ),
+    command_row(
+        "window.report_log",
+        "Report Log",
+        Category::App,
+        Action::ToggleReportLog,
+    ),
+    command_row(
+        "window.welcome",
+        "Welcome Screen",
+        Category::App,
+        Action::ShowWelcome,
+    ),
     // --- Workspaces (S1): switch the soft "mode" — apply a saved layout + default
     // tool + overlay emphasis (no locking). One activate command per slot (so each
     // gets a stable id the palette lists + the keymap can bind) + a save command. ---
-    command_row("window.save_workspace", "Save current as workspace…", Category::App, Action::SaveWorkspace),
-    command_row("window.workspace_1", "Workspace 1", Category::App, Action::ActivateWorkspace(0)),
-    command_row("window.workspace_2", "Workspace 2", Category::App, Action::ActivateWorkspace(1)),
-    command_row("window.workspace_3", "Workspace 3", Category::App, Action::ActivateWorkspace(2)),
-    command_row("window.workspace_4", "Workspace 4", Category::App, Action::ActivateWorkspace(3)),
-    command_row("window.workspace_5", "Workspace 5", Category::App, Action::ActivateWorkspace(4)),
-    command_row("window.workspace_6", "Workspace 6", Category::App, Action::ActivateWorkspace(5)),
-    command_row("window.workspace_7", "Workspace 7", Category::App, Action::ActivateWorkspace(6)),
-    command_row("window.workspace_8", "Workspace 8", Category::App, Action::ActivateWorkspace(7)),
-    command_row("window.workspace_9", "Workspace 9", Category::App, Action::ActivateWorkspace(8)),
+    command_row(
+        "window.save_workspace",
+        "Save current as workspace…",
+        Category::App,
+        Action::SaveWorkspace,
+    ),
+    command_row(
+        "window.workspace_1",
+        "Workspace 1",
+        Category::App,
+        Action::ActivateWorkspace(0),
+    ),
+    command_row(
+        "window.workspace_2",
+        "Workspace 2",
+        Category::App,
+        Action::ActivateWorkspace(1),
+    ),
+    command_row(
+        "window.workspace_3",
+        "Workspace 3",
+        Category::App,
+        Action::ActivateWorkspace(2),
+    ),
+    command_row(
+        "window.workspace_4",
+        "Workspace 4",
+        Category::App,
+        Action::ActivateWorkspace(3),
+    ),
+    command_row(
+        "window.workspace_5",
+        "Workspace 5",
+        Category::App,
+        Action::ActivateWorkspace(4),
+    ),
+    command_row(
+        "window.workspace_6",
+        "Workspace 6",
+        Category::App,
+        Action::ActivateWorkspace(5),
+    ),
+    command_row(
+        "window.workspace_7",
+        "Workspace 7",
+        Category::App,
+        Action::ActivateWorkspace(6),
+    ),
+    command_row(
+        "window.workspace_8",
+        "Workspace 8",
+        Category::App,
+        Action::ActivateWorkspace(7),
+    ),
+    command_row(
+        "window.workspace_9",
+        "Workspace 9",
+        Category::App,
+        Action::ActivateWorkspace(8),
+    ),
 ];
 
 impl Command {
@@ -541,7 +1047,10 @@ impl Command {
         // Viewport-/modal-only actions need live viewport mouse state (G/R/S grab +
         // X/Y/Z axis lock), and `ViewCamera` is a registered no-op placeholder — none
         // can do anything from the palette, so exclude them (no dead picks).
-        if matches!(self.action, Action::Transform(_) | Action::AxisLock(_) | Action::ViewCamera) {
+        if matches!(
+            self.action,
+            Action::Transform(_) | Action::AxisLock(_) | Action::ViewCamera
+        ) {
             return false;
         }
         // Keymap-only twins (`kmi.*`) and aliases (`*_alias`) each DUPLICATE a
@@ -634,12 +1143,27 @@ pub static GLOBAL: &[Kmi] = &[
     kmi(Trigger::key(Key::ArrowDown), "transform.nudge_z_pos"),
     kmi(Trigger::key(Key::PageUp), "transform.nudge_y_up"),
     kmi(Trigger::key(Key::PageDown), "transform.nudge_y_down"),
-    kmi(Trigger::key(Key::ArrowLeft).shift(), "transform.nudge_x_neg_1m"),
-    kmi(Trigger::key(Key::ArrowRight).shift(), "transform.nudge_x_pos_1m"),
-    kmi(Trigger::key(Key::ArrowUp).shift(), "transform.nudge_z_neg_1m"),
-    kmi(Trigger::key(Key::ArrowDown).shift(), "transform.nudge_z_pos_1m"),
+    kmi(
+        Trigger::key(Key::ArrowLeft).shift(),
+        "transform.nudge_x_neg_1m",
+    ),
+    kmi(
+        Trigger::key(Key::ArrowRight).shift(),
+        "transform.nudge_x_pos_1m",
+    ),
+    kmi(
+        Trigger::key(Key::ArrowUp).shift(),
+        "transform.nudge_z_neg_1m",
+    ),
+    kmi(
+        Trigger::key(Key::ArrowDown).shift(),
+        "transform.nudge_z_pos_1m",
+    ),
     kmi(Trigger::key(Key::PageUp).shift(), "transform.nudge_y_up_1m"),
-    kmi(Trigger::key(Key::PageDown).shift(), "transform.nudge_y_down_1m"),
+    kmi(
+        Trigger::key(Key::PageDown).shift(),
+        "transform.nudge_y_down_1m",
+    ),
     // --- Object ---
     kmi(Trigger::key(Key::Delete), "kmi.delete"),
     kmi(Trigger::key(Key::Backspace), "kmi.delete_alias"),
@@ -714,9 +1238,18 @@ pub static MODAL: &[Kmi] = &[
 
 /// All keymaps, used by the cheat sheet to walk every registered bind.
 pub static KEYMAPS: &[KeyMap] = &[
-    KeyMap { id: KeymapId::Global, items: GLOBAL },
-    KeyMap { id: KeymapId::Viewport, items: VIEWPORT },
-    KeyMap { id: KeymapId::Modal, items: MODAL },
+    KeyMap {
+        id: KeymapId::Global,
+        items: GLOBAL,
+    },
+    KeyMap {
+        id: KeymapId::Viewport,
+        items: VIEWPORT,
+    },
+    KeyMap {
+        id: KeymapId::Modal,
+        items: MODAL,
+    },
 ];
 
 // ===========================================================================
@@ -811,7 +1344,11 @@ impl SerTrigger {
             shift: Some(self.shift),
             alt: Some(self.alt),
         };
-        Some(Trigger { key, mods, event: self.event.to_event() })
+        Some(Trigger {
+            key,
+            mods,
+            event: self.event.to_event(),
+        })
     }
 }
 
@@ -885,8 +1422,12 @@ impl KeymapOverrides {
     /// Load from disk (config dir); a missing/garbled file yields empty overrides
     /// (so a fresh install / corrupt file falls back to the static defaults).
     pub fn load() -> Self {
-        let Some(p) = overrides_path() else { return Self::default() };
-        let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
+        let Some(p) = overrides_path() else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return Self::default();
+        };
         serde_json::from_str(&text).unwrap_or_default()
     }
 
@@ -905,7 +1446,8 @@ impl KeymapOverrides {
     /// Rebind `cmd_id`'s default trigger to `trigger`, then persist.
     #[allow(dead_code)]
     pub fn rebind(&mut self, cmd_id: &str, trigger: &Trigger) {
-        self.rebind.insert(cmd_id.to_string(), SerTrigger::from_trigger(trigger));
+        self.rebind
+            .insert(cmd_id.to_string(), SerTrigger::from_trigger(trigger));
         self.save();
     }
 
@@ -995,7 +1537,13 @@ pub fn capture_trigger(ctx: &egui::Context) -> Option<Trigger> {
         // Key event, so we simply report nothing and keep capturing until a real key
         // lands.
         for ev in &i.events {
-            if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = ev
+            {
                 if *key == egui::Key::Escape {
                     return None;
                 }
@@ -1004,7 +1552,11 @@ pub fn capture_trigger(ctx: &egui::Context) -> Option<Trigger> {
                     shift: Some(modifiers.shift),
                     alt: Some(modifiers.alt),
                 };
-                return Some(Trigger { key: *key, mods, event: Event::Press });
+                return Some(Trigger {
+                    key: *key,
+                    mods,
+                    event: Event::Press,
+                });
             }
         }
         None
@@ -1029,7 +1581,10 @@ fn effective_items(id: KeymapId, ov: &KeymapOverrides) -> std::borrow::Cow<'stat
         // so check rebind first.
         if let Some(st) = ov.rebind.get(k.cmd) {
             if let Some(t) = st.to_trigger() {
-                out.push(Kmi { trigger: t, cmd: k.cmd });
+                out.push(Kmi {
+                    trigger: t,
+                    cmd: k.cmd,
+                });
             }
             // Stored key name didn't resolve (stale/garbage entry): drop the row
             // rather than silently keep the old default.
@@ -1070,7 +1625,12 @@ pub fn conflicts(ov: &KeymapOverrides) -> Vec<(KeymapId, String, String, String)
         for (i, a) in items.iter().enumerate() {
             for b in items.iter().skip(i + 1) {
                 if a.trigger.key == b.trigger.key && a.trigger.mods == b.trigger.mods {
-                    out.push((id, key_label(&a.trigger), a.cmd.to_string(), b.cmd.to_string()));
+                    out.push((
+                        id,
+                        key_label(&a.trigger),
+                        a.cmd.to_string(),
+                        b.cmd.to_string(),
+                    ));
                 }
             }
         }
@@ -1093,7 +1653,8 @@ pub fn conflicts(ov: &KeymapOverrides) -> Vec<(KeymapId, String, String, String)
 
 use std::sync::{Arc, RwLock};
 
-static ACTIVE_OVERRIDES: std::sync::OnceLock<RwLock<Arc<KeymapOverrides>>> = std::sync::OnceLock::new();
+static ACTIVE_OVERRIDES: std::sync::OnceLock<RwLock<Arc<KeymapOverrides>>> =
+    std::sync::OnceLock::new();
 
 fn active_cell() -> &'static RwLock<Arc<KeymapOverrides>> {
     ACTIVE_OVERRIDES.get_or_init(|| RwLock::new(Arc::new(KeymapOverrides::default())))
@@ -1150,7 +1711,11 @@ pub struct ActiveContext {
 
 /// The keymap registered under `id` (resolved from [`KEYMAPS`] by its `id` field).
 fn by_id(id: KeymapId) -> &'static [Kmi] {
-    KEYMAPS.iter().find(|km| km.id == id).map(|km| km.items).unwrap_or(&[])
+    KEYMAPS
+        .iter()
+        .find(|km| km.id == id)
+        .map(|km| km.items)
+        .unwrap_or(&[])
 }
 
 // Static context stacks for [`gather`] (most-specific-first), as keymap ids.
@@ -1274,10 +1839,18 @@ pub fn modal_hint_keys() -> String {
 pub fn key_label(t: &Trigger) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if t.mods.command == Some(true) {
-        parts.push(if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" });
+        parts.push(if cfg!(target_os = "macos") {
+            "⌘"
+        } else {
+            "Ctrl"
+        });
     }
     if t.mods.alt == Some(true) {
-        parts.push(if cfg!(target_os = "macos") { "⌥" } else { "Alt" });
+        parts.push(if cfg!(target_os = "macos") {
+            "⌥"
+        } else {
+            "Alt"
+        });
     }
     if t.mods.shift == Some(true) {
         parts.push("Shift");
@@ -1352,7 +1925,11 @@ mod tests {
             for (a_idx, a) in items.iter().enumerate() {
                 for b in items.iter().skip(a_idx + 1) {
                     let same = a.trigger.key == b.trigger.key && a.trigger.mods == b.trigger.mods;
-                    assert!(!same, "duplicate bind on key {:?} within one keymap", a.trigger.key);
+                    assert!(
+                        !same,
+                        "duplicate bind on key {:?} within one keymap",
+                        a.trigger.key
+                    );
                 }
             }
         }
@@ -1363,13 +1940,25 @@ mod tests {
         // The keymap stack must put Viewport before Global so a focused-viewport
         // `S` resolves to Scale, not quick-select. (Pure structural check — no egui
         // input needed: assert the gather order + that both maps bind plain `S`.)
-        let cx = ActiveContext { viewport_focused: true, transform_active: false, box_select_active: false };
+        let cx = ActiveContext {
+            viewport_focused: true,
+            transform_active: false,
+            box_select_active: false,
+        };
         let stack = gather(cx);
-        assert_eq!(stack, &[KeymapId::Viewport, KeymapId::Global], "viewport stacks first");
-        let first_s =
-            by_id(stack[0]).iter().find(|k| k.trigger.key == Key::S && k.trigger.mods == Mods::none());
+        assert_eq!(
+            stack,
+            &[KeymapId::Viewport, KeymapId::Global],
+            "viewport stacks first"
+        );
+        let first_s = by_id(stack[0])
+            .iter()
+            .find(|k| k.trigger.key == Key::S && k.trigger.mods == Mods::none());
         assert!(
-            matches!(first_s.map(|k| k.action()), Some(Action::Transform(TransformKind::Scale))),
+            matches!(
+                first_s.map(|k| k.action()),
+                Some(Action::Transform(TransformKind::Scale))
+            ),
             "most-specific map's plain S must be Scale"
         );
         // And the modal map is never in the plain press stack.
@@ -1380,7 +1969,11 @@ mod tests {
     fn transform_suppresses_press_maps() {
         // While a transform owns the viewport, no press-keymap is active (modal keys
         // route through poll_modal instead).
-        let cx = ActiveContext { viewport_focused: true, transform_active: true, box_select_active: false };
+        let cx = ActiveContext {
+            viewport_focused: true,
+            transform_active: true,
+            box_select_active: false,
+        };
         assert!(gather(cx).is_empty());
     }
 
@@ -1395,15 +1988,31 @@ mod tests {
         // Many more than the old 5-op catalog: representative pure-action commands
         // are now listed + runnable from the palette.
         assert!(ids.contains(&"view.top"), "Top View is palette-runnable");
-        assert!(ids.contains(&"view.frame_selection"), "Frame Selection is palette-runnable");
-        assert!(ids.contains(&"select.all"), "Select All is palette-runnable");
+        assert!(
+            ids.contains(&"view.frame_selection"),
+            "Frame Selection is palette-runnable"
+        );
+        assert!(
+            ids.contains(&"select.all"),
+            "Select All is palette-runnable"
+        );
         assert!(ids.contains(&"file.save"), "Save is palette-runnable");
-        assert!(ids.contains(&"object.add"), "Add Object (catalog op) stays listed");
-        assert!(ids.contains(&"object.delete"), "Delete (catalog op) stays listed");
+        assert!(
+            ids.contains(&"object.add"),
+            "Add Object (catalog op) stays listed"
+        );
+        assert!(
+            ids.contains(&"object.delete"),
+            "Delete (catalog op) stays listed"
+        );
         // The viewport-/modal-only actions are EXCLUDED (no dead picks).
         for id in [
-            "transform.move", "transform.rotate", "transform.scale",
-            "transform.axis_x", "transform.axis_y", "transform.axis_z",
+            "transform.move",
+            "transform.rotate",
+            "transform.scale",
+            "transform.axis_x",
+            "transform.axis_y",
+            "transform.axis_z",
         ] {
             assert!(!ids.contains(&id), "{id} (viewport-modal) excluded");
         }
@@ -1412,22 +2021,41 @@ mod tests {
         // keymap twin was a dead pick — dispatch_action doesn't own Duplicate; the
         // catalog `fixture.duplicate` dialog is the canonical entry.)
         for id in [
-            "view.camera", "kmi.duplicate", "kmi.duplicate_grab", "kmi.delete",
-            "kmi.patch", "kmi.unpatch", "kmi.add_menu", "edit.redo_alias",
+            "view.camera",
+            "kmi.duplicate",
+            "kmi.duplicate_grab",
+            "kmi.delete",
+            "kmi.patch",
+            "kmi.unpatch",
+            "kmi.add_menu",
+            "edit.redo_alias",
             "view.frame_all_alias",
         ] {
-            assert!(!ids.contains(&id), "{id} (twin/alias/no-op) excluded from palette");
+            assert!(
+                !ids.contains(&id),
+                "{id} (twin/alias/no-op) excluded from palette"
+            );
         }
-        assert!(ids.contains(&"fixture.duplicate"), "Duplicate stays via its catalog dialog op");
+        assert!(
+            ids.contains(&"fixture.duplicate"),
+            "Duplicate stays via its catalog dialog op"
+        );
         // No two listed commands share an Action — no duplicate rows.
         let mut seen: Vec<Action> = Vec::new();
         for c in palette_commands() {
-            assert!(!seen.contains(&c.action), "duplicate palette row for the same action via {}", c.id);
+            assert!(
+                !seen.contains(&c.action),
+                "duplicate palette row for the same action via {}",
+                c.id
+            );
             seen.push(c.action);
         }
         // Strictly larger than the old 5-op catalog.
         let ops = COMMANDS.iter().filter(|c| c.invoke.is_some()).count();
-        assert!(palette_commands().len() > ops, "palette lists more than the {ops} catalog ops");
+        assert!(
+            palette_commands().len() > ops,
+            "palette lists more than the {ops} catalog ops"
+        );
     }
 
     #[test]
@@ -1435,9 +2063,18 @@ mod tests {
         // A command with a bind resolves to that key's label (live from KEYMAPS); a
         // command with no bind (a catalog-only op) resolves to None. (Empty overrides.)
         let ov = KeymapOverrides::default();
-        assert_eq!(shortcut_for("view.frame_selection", &ov), Some(key_label(&Trigger::key(Key::F))));
-        assert_eq!(shortcut_for("file.save", &ov), Some(key_label(&Trigger::key(Key::S).cmd())));
-        assert_eq!(shortcut_for("transform.move", &ov), Some(key_label(&Trigger::key(Key::G))));
+        assert_eq!(
+            shortcut_for("view.frame_selection", &ov),
+            Some(key_label(&Trigger::key(Key::F)))
+        );
+        assert_eq!(
+            shortcut_for("file.save", &ov),
+            Some(key_label(&Trigger::key(Key::S).cmd()))
+        );
+        assert_eq!(
+            shortcut_for("transform.move", &ov),
+            Some(key_label(&Trigger::key(Key::G)))
+        );
         // object.add / fixture.duplicate have no keymap bind (palette/menu only).
         assert_eq!(shortcut_for("object.add", &ov), None);
         assert_eq!(shortcut_for("fixture.duplicate", &ov), None);
@@ -1480,7 +2117,11 @@ mod tests {
             for (i, a) in map.items.iter().enumerate() {
                 for b in map.items.iter().skip(i + 1) {
                     let same = a.trigger.key == b.trigger.key && a.trigger.mods == b.trigger.mods;
-                    assert!(!same, "duplicate trigger on {:?} in keymap {:?}", a.trigger.key, map.id);
+                    assert!(
+                        !same,
+                        "duplicate trigger on {:?} in keymap {:?}",
+                        a.trigger.key, map.id
+                    );
                 }
             }
         }
@@ -1495,56 +2136,160 @@ mod tests {
         // every category + both modifier states + the modal map.)
         let want: &[(KeymapId, Trigger, Action)] = &[
             // View / nav
-            (KeymapId::Global, Trigger::key(Key::F), Action::FrameSelection),
-            (KeymapId::Global, Trigger::key(Key::F).shift(), Action::FrameAll),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::F),
+                Action::FrameSelection,
+            ),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::F).shift(),
+                Action::FrameAll,
+            ),
             (KeymapId::Global, Trigger::key(Key::L), Action::ToggleLabels),
-            (KeymapId::Viewport, Trigger::key(Key::Num1), Action::View(CameraView::Front)),
-            (KeymapId::Viewport, Trigger::key(Key::Num1).cmd(), Action::View(CameraView::Back)),
-            (KeymapId::Viewport, Trigger::key(Key::Num5), Action::ToggleOrtho),
-            (KeymapId::Viewport, Trigger::key(Key::Backtick), Action::ViewPie),
-            (KeymapId::Viewport, Trigger::key(Key::N), Action::ToggleNPanel),
-            (KeymapId::Viewport, Trigger::key(Key::T), Action::ToggleTPanel),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::Num1),
+                Action::View(CameraView::Front),
+            ),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::Num1).cmd(),
+                Action::View(CameraView::Back),
+            ),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::Num5),
+                Action::ToggleOrtho,
+            ),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::Backtick),
+                Action::ViewPie,
+            ),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::N),
+                Action::ToggleNPanel,
+            ),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::T),
+                Action::ToggleTPanel,
+            ),
             // Selection
             (KeymapId::Global, Trigger::key(Key::A), Action::SelectAll),
             (KeymapId::Global, Trigger::key(Key::S), Action::QuickSelect),
-            (KeymapId::Global, Trigger::key(Key::R).shift(), Action::Replace),
-            (KeymapId::Global, Trigger::key(Key::Escape), Action::Deselect),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::R).shift(),
+                Action::Replace,
+            ),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::Escape),
+                Action::Deselect,
+            ),
             // Transform: nudge (plain + shift) + modal G/R/S
-            (KeymapId::Global, Trigger::key(Key::ArrowLeft), Action::Nudge(Dir::XNeg, 0.1)),
-            (KeymapId::Global, Trigger::key(Key::ArrowLeft).shift(), Action::Nudge(Dir::XNeg, 1.0)),
-            (KeymapId::Global, Trigger::key(Key::PageUp), Action::Nudge(Dir::YUp, 0.1)),
-            (KeymapId::Viewport, Trigger::key(Key::G), Action::Transform(TransformKind::Move)),
-            (KeymapId::Viewport, Trigger::key(Key::R), Action::Transform(TransformKind::Rotate)),
-            (KeymapId::Viewport, Trigger::key(Key::S), Action::Transform(TransformKind::Scale)),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::ArrowLeft),
+                Action::Nudge(Dir::XNeg, 0.1),
+            ),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::ArrowLeft).shift(),
+                Action::Nudge(Dir::XNeg, 1.0),
+            ),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::PageUp),
+                Action::Nudge(Dir::YUp, 0.1),
+            ),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::G),
+                Action::Transform(TransformKind::Move),
+            ),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::R),
+                Action::Transform(TransformKind::Rotate),
+            ),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::S),
+                Action::Transform(TransformKind::Scale),
+            ),
             // Add / Object / history
-            (KeymapId::Viewport, Trigger::key(Key::A).shift(), Action::AddMenu),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::A).shift(),
+                Action::AddMenu,
+            ),
             (KeymapId::Viewport, Trigger::key(Key::D), Action::Duplicate),
             // Shift+D is now Blender-style duplicate-then-grab (was the dialog alias).
-            (KeymapId::Viewport, Trigger::key(Key::D).shift(), Action::DuplicateGrab),
+            (
+                KeymapId::Viewport,
+                Trigger::key(Key::D).shift(),
+                Action::DuplicateGrab,
+            ),
             (KeymapId::Global, Trigger::key(Key::Delete), Action::Delete),
-            (KeymapId::Global, Trigger::key(Key::Backspace), Action::Delete),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::Backspace),
+                Action::Delete,
+            ),
             (KeymapId::Global, Trigger::key(Key::P), Action::Patch),
             (KeymapId::Global, Trigger::key(Key::U), Action::Unpatch),
             (KeymapId::Global, Trigger::key(Key::Z).cmd(), Action::Undo),
-            (KeymapId::Global, Trigger::key(Key::Z).cmd().shift(), Action::Redo),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::Z).cmd().shift(),
+                Action::Redo,
+            ),
             (KeymapId::Global, Trigger::key(Key::Y).cmd(), Action::Redo),
-            (KeymapId::Global, Trigger::key(Key::F3), Action::OperatorSearch),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::F3),
+                Action::OperatorSearch,
+            ),
             (KeymapId::Global, Trigger::key(Key::F9), Action::AdjustLast),
             // File / App
             (KeymapId::Global, Trigger::key(Key::S).cmd(), Action::Save),
-            (KeymapId::Global, Trigger::key(Key::S).cmd().shift(), Action::SaveAs),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::S).cmd().shift(),
+                Action::SaveAs,
+            ),
             (KeymapId::Global, Trigger::key(Key::O).cmd(), Action::Open),
             (KeymapId::Global, Trigger::key(Key::N).cmd(), Action::New),
-            (KeymapId::Global, Trigger::key(Key::Comma).cmd(), Action::Preferences),
+            (
+                KeymapId::Global,
+                Trigger::key(Key::Comma).cmd(),
+                Action::Preferences,
+            ),
             // Modal axis lock
-            (KeymapId::Modal, Trigger::key(Key::X), Action::AxisLock(Axis::X)),
-            (KeymapId::Modal, Trigger::key(Key::Y), Action::AxisLock(Axis::Y)),
-            (KeymapId::Modal, Trigger::key(Key::Z), Action::AxisLock(Axis::Z)),
+            (
+                KeymapId::Modal,
+                Trigger::key(Key::X),
+                Action::AxisLock(Axis::X),
+            ),
+            (
+                KeymapId::Modal,
+                Trigger::key(Key::Y),
+                Action::AxisLock(Axis::Y),
+            ),
+            (
+                KeymapId::Modal,
+                Trigger::key(Key::Z),
+                Action::AxisLock(Axis::Z),
+            ),
         ];
         for (map_id, trig, action) in want {
-            let found = by_id(*map_id).iter().find(|k| {
-                k.trigger.key == trig.key && k.trigger.mods == trig.mods
-            });
+            let found = by_id(*map_id)
+                .iter()
+                .find(|k| k.trigger.key == trig.key && k.trigger.mods == trig.mods);
             let got = found.map(|k| k.action());
             assert!(
                 got == Some(*action),
@@ -1576,7 +2321,10 @@ mod tests {
         assert!(ov.is_empty());
         for id in [KeymapId::Global, KeymapId::Viewport, KeymapId::Modal] {
             let eff = effective_items(id, &ov);
-            assert!(matches!(eff, std::borrow::Cow::Borrowed(_)), "{id:?} must borrow the static slice");
+            assert!(
+                matches!(eff, std::borrow::Cow::Borrowed(_)),
+                "{id:?} must borrow the static slice"
+            );
             let base = by_id(id);
             assert_eq!(eff.len(), base.len());
             for (a, b) in eff.iter().zip(base.iter()) {
@@ -1591,11 +2339,20 @@ mod tests {
         // Rebind Frame-selection from F to J. The new key fires the command; the old
         // key no longer resolves to it.
         let mut ov = KeymapOverrides::default();
-        ov.rebind.insert("view.frame_selection".into(), SerTrigger::from_trigger(&Trigger::key(Key::J)));
+        ov.rebind.insert(
+            "view.frame_selection".into(),
+            SerTrigger::from_trigger(&Trigger::key(Key::J)),
+        );
         // New key now fires the command.
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &ov), Some("view.frame_selection"));
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &ov),
+            Some("view.frame_selection")
+        );
         // Old key (F) no longer resolves to it (its default row was swapped out).
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::F), &ov), None);
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::F), &ov),
+            None
+        );
     }
 
     #[test]
@@ -1603,9 +2360,19 @@ mod tests {
         // Disabling Select-all means plain `A` resolves to nothing in Global.
         let mut ov = KeymapOverrides::default();
         // Sanity: it fires by default.
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &KeymapOverrides::default()), Some("select.all"));
+        assert_eq!(
+            resolved_cmd(
+                KeymapId::Global,
+                &Trigger::key(Key::A),
+                &KeymapOverrides::default()
+            ),
+            Some("select.all")
+        );
         ov.disabled.insert("select.all".into());
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov), None);
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov),
+            None
+        );
         // shortcut_for also reports no live key for a disabled command.
         assert_eq!(shortcut_for("select.all", &ov), None);
     }
@@ -1615,9 +2382,18 @@ mod tests {
         // A command both disabled AND rebound re-enables on the new key (rebind wins).
         let mut ov = KeymapOverrides::default();
         ov.disabled.insert("select.all".into());
-        ov.rebind.insert("select.all".into(), SerTrigger::from_trigger(&Trigger::key(Key::Q)));
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::Q), &ov), Some("select.all"));
-        assert_eq!(shortcut_for("select.all", &ov), Some(key_label(&Trigger::key(Key::Q))));
+        ov.rebind.insert(
+            "select.all".into(),
+            SerTrigger::from_trigger(&Trigger::key(Key::Q)),
+        );
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::Q), &ov),
+            Some("select.all")
+        );
+        assert_eq!(
+            shortcut_for("select.all", &ov),
+            Some(key_label(&Trigger::key(Key::Q)))
+        );
     }
 
     #[test]
@@ -1629,9 +2405,15 @@ mod tests {
             trigger: SerTrigger::from_trigger(&Trigger::key(Key::J)),
             cmd: "view.frame_all".into(),
         });
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &ov), Some("view.frame_all"));
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &ov),
+            Some("view.frame_all")
+        );
         // The original Shift+F default still fires too (added is purely additive).
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::F).shift(), &ov), Some("view.frame_all"));
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::F).shift(), &ov),
+            Some("view.frame_all")
+        );
         // An added bind referencing an unknown command id is dropped (no panic, no row).
         let mut bad = KeymapOverrides::default();
         bad.added.push(AddedBind {
@@ -1639,7 +2421,10 @@ mod tests {
             trigger: SerTrigger::from_trigger(&Trigger::key(Key::J)),
             cmd: "does.not.exist".into(),
         });
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &bad), None);
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &bad),
+            None
+        );
     }
 
     #[test]
@@ -1659,7 +2444,13 @@ mod tests {
             assert!(rt.mods == t.mods, "modifiers must round-trip");
         }
         // An unknown key name resolves to None (a stale/hand-edited entry is dropped).
-        let bad = SerTrigger { key: "NotAKey".into(), command: false, shift: false, alt: false, event: SerEvent::Press };
+        let bad = SerTrigger {
+            key: "NotAKey".into(),
+            command: false,
+            shift: false,
+            alt: false,
+            event: SerEvent::Press,
+        };
         assert!(bad.to_trigger().is_none());
     }
 
@@ -1668,7 +2459,10 @@ mod tests {
         // A full overrides set (rebind + disable + add) survives a JSON round-trip and
         // resolves identically before/after.
         let mut ov = KeymapOverrides::default();
-        ov.rebind.insert("view.frame_selection".into(), SerTrigger::from_trigger(&Trigger::key(Key::J)));
+        ov.rebind.insert(
+            "view.frame_selection".into(),
+            SerTrigger::from_trigger(&Trigger::key(Key::J)),
+        );
         ov.disabled.insert("select.all".into());
         ov.added.push(AddedBind {
             keymap: SerKeymapId::from_id(KeymapId::Viewport),
@@ -1678,9 +2472,18 @@ mod tests {
         let json = serde_json::to_string_pretty(&ov).unwrap();
         let back: KeymapOverrides = serde_json::from_str(&json).unwrap();
         assert!(!back.is_empty());
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &back), Some("view.frame_selection"));
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &back), None);
-        assert_eq!(resolved_cmd(KeymapId::Viewport, &Trigger::key(Key::K), &back), Some("view.toggle_n_panel"));
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::J), &back),
+            Some("view.frame_selection")
+        );
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &back),
+            None
+        );
+        assert_eq!(
+            resolved_cmd(KeymapId::Viewport, &Trigger::key(Key::K), &back),
+            Some("view.toggle_n_panel")
+        );
         // An empty overrides round-trips to empty (and stays the default fast-path).
         let empty: KeymapOverrides = serde_json::from_str("{}").unwrap();
         assert!(empty.is_empty());
@@ -1693,7 +2496,10 @@ mod tests {
         // Rebind Frame-selection onto plain `A` (already Select-all in Global): a
         // collision the editor can warn on.
         let mut ov = KeymapOverrides::default();
-        ov.rebind.insert("view.frame_selection".into(), SerTrigger::from_trigger(&Trigger::key(Key::A)));
+        ov.rebind.insert(
+            "view.frame_selection".into(),
+            SerTrigger::from_trigger(&Trigger::key(Key::A)),
+        );
         let c = conflicts(&ov);
         assert!(
             c.iter().any(|(id, _, a, b)| *id == KeymapId::Global
@@ -1722,7 +2528,10 @@ mod tests {
         assert!(conflicting_ids(&KeymapOverrides::default()).is_empty());
         // Rebind Frame-selection onto plain `A` (Select-all in Global): both ids flag.
         let mut ov = KeymapOverrides::default();
-        ov.rebind.insert("view.frame_selection".into(), SerTrigger::from_trigger(&Trigger::key(Key::A)));
+        ov.rebind.insert(
+            "view.frame_selection".into(),
+            SerTrigger::from_trigger(&Trigger::key(Key::A)),
+        );
         let ids = conflicting_ids(&ov);
         assert!(ids.contains("select.all"));
         assert!(ids.contains("view.frame_selection"));
@@ -1731,7 +2540,10 @@ mod tests {
     #[test]
     fn reset_all_clears_every_override() {
         let mut ov = KeymapOverrides::default();
-        ov.rebind.insert("select.all".into(), SerTrigger::from_trigger(&Trigger::key(Key::Q)));
+        ov.rebind.insert(
+            "select.all".into(),
+            SerTrigger::from_trigger(&Trigger::key(Key::Q)),
+        );
         ov.disabled.insert("view.frame_all".into());
         ov.added.push(AddedBind {
             keymap: SerKeymapId::from_id(KeymapId::Global),
@@ -1768,21 +2580,33 @@ mod tests {
         let mut ov = KeymapOverrides::default();
         // Mirror set_disabled(true/false) without persisting.
         ov.disabled.insert("select.all".into());
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov), None);
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov),
+            None
+        );
         ov.disabled.remove("select.all");
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov), Some("select.all"));
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov),
+            Some("select.all")
+        );
     }
 
     #[test]
     fn reset_clears_rebind_and_disable() {
         // `reset(id)` un-rebinds + un-disables so the static default resolves again.
         let mut ov = KeymapOverrides::default();
-        ov.rebind.insert("select.all".into(), SerTrigger::from_trigger(&Trigger::key(Key::Q)));
+        ov.rebind.insert(
+            "select.all".into(),
+            SerTrigger::from_trigger(&Trigger::key(Key::Q)),
+        );
         ov.disabled.insert("select.all".into());
         // Manual clear (mirrors `reset`, which also persists — not exercised in tests).
         ov.rebind.remove("select.all");
         ov.disabled.remove("select.all");
         assert!(ov.is_empty());
-        assert_eq!(resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov), Some("select.all"));
+        assert_eq!(
+            resolved_cmd(KeymapId::Global, &Trigger::key(Key::A), &ov),
+            Some("select.all")
+        );
     }
 }

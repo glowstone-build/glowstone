@@ -42,7 +42,9 @@ use crate::scene::library::FixtureGeometry;
 use crate::scene::screen::{LedScreen, ScreenContent};
 use crate::scene::{Fixture, RenderSettings, Scene, Selection, ViewportMode};
 use camera::{CameraUniform, OrbitCamera};
-use mesh::{GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance, ParticleInstance, WallInstance};
+use mesh::{
+    GpuMesh, GrowBuffer, LensInstance, LineVertex, MeshInstance, ParticleInstance, WallInstance,
+};
 use particles::PyroSystem;
 use viewport::Viewport;
 
@@ -157,7 +159,8 @@ impl FroxelState {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D3,
                     format: wgpu::TextureFormat::Rgba16Float,
-                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 })
                 .create_view(&wgpu::TextureViewDescriptor::default())
@@ -205,18 +208,18 @@ impl FroxelState {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct FixtureGpu {
-    pos_range: [f32; 4],   // xyz = lens pos, w = range (m)
-    dir_cos: [f32; 4],     // xyz = beam dir (unit), w = tan(half zoom angle)
-    color: [f32; 4],       // rgb = tint*intensity*candela*shutter, w = lens radius (m)
-    cookie_r: [f32; 4],    // xyz = lens-plane right basis, w = wheel-buffer offset
-    cookie_u: [f32; 4],    // xyz = lens-plane up basis,    w = wheel count (dynamic chain)
+    pos_range: [f32; 4], // xyz = lens pos, w = range (m)
+    dir_cos: [f32; 4],   // xyz = beam dir (unit), w = tan(half zoom angle)
+    color: [f32; 4],     // rgb = tint*intensity*candela*shutter, w = lens radius (m)
+    cookie_r: [f32; 4],  // xyz = lens-plane right basis, w = wheel-buffer offset
+    cookie_u: [f32; 4],  // xyz = lens-plane up basis,    w = wheel count (dynamic chain)
     // x = anim layer (<0 none), y = anim scroll. z/w are shutter (close, kind) on
     // single-emitter beams; on a PLAIN multi-emitter cell they are repurposed:
     // z = -1 plain-beam sentinel (skip the cookie chain), w = per-cell HDR whiteness.
     extra: [f32; 4],
-    shape: [f32; 4],       // x = super-Gaussian order, y = focus dist (m), z = iris frac, w = frost 0..1
-    misc: [f32; 4],        // x = CA strength, y = laser flag, z = atlas layer count, w = shadow layer
-    cmyf: [f32; 4],        // CMY flag insertions: c, m, y, unused (spatial sliding dichroic flags)
+    shape: [f32; 4], // x = super-Gaussian order, y = focus dist (m), z = iris frac, w = frost 0..1
+    misc: [f32; 4],  // x = CA strength, y = laser flag, z = atlas layer count, w = shadow layer
+    cmyf: [f32; 4],  // CMY flag insertions: c, m, y, unused (spatial sliding dichroic flags)
 }
 
 /// One physical wheel in a fixture's chain (a DYNAMIC count per fixture, indexed
@@ -339,6 +342,42 @@ fn screen_light_color(s: &LedScreen, rt: Option<&ScreenRuntime>, u: f32, v: f32)
     s.sample_content(u, v)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RenderDebugFlags {
+    co2_preview: bool,
+    warmup_frames: u32,
+    geom_stats: bool,
+    disable_volumetrics: bool,
+    disable_froxel: bool,
+    beam_dump: bool,
+    disable_shadows: bool,
+    shared_shadow: bool,
+    disable_culling: bool,
+    jitter: bool,
+    disable_temporal: bool,
+}
+
+impl RenderDebugFlags {
+    fn from_env() -> Self {
+        Self {
+            co2_preview: std::env::var("GLOWSTONE_CO2_PREVIEW").is_ok(),
+            warmup_frames: std::env::var("GLOWSTONE_WARMUP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(28),
+            geom_stats: std::env::var("GLOWSTONE_GEOM_STATS").is_ok(),
+            disable_volumetrics: std::env::var("GLOWSTONE_NOVOL").is_ok(),
+            disable_froxel: std::env::var("GLOWSTONE_NOFROXEL").is_ok(),
+            beam_dump: std::env::var("GLOWSTONE_BEAM_DUMP").is_ok(),
+            disable_shadows: std::env::var("GLOWSTONE_NOSHADOW").is_ok(),
+            shared_shadow: std::env::var("GLOWSTONE_SHARED").is_ok(),
+            disable_culling: std::env::var("GLOWSTONE_NOCULL").is_ok(),
+            jitter: std::env::var("GLOWSTONE_JITTER").is_ok(),
+            disable_temporal: std::env::var("GLOWSTONE_NOTEMPORAL").is_ok(),
+        }
+    }
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -459,6 +498,7 @@ pub struct Renderer {
     gpu_timers: Option<gpu_timer::GpuTimers>,
     /// Latest per-pass timings + scene counts, read by the perf overlay each frame.
     pub last_timings: PassTimings,
+    debug: RenderDebugFlags,
 
     // Volumetric raymarch (rendered at half resolution, then upsampled).
     volumetric_pipeline: wgpu::RenderPipeline,
@@ -509,6 +549,26 @@ pub struct Renderer {
     /// Current CO2 grid resolution (voxels/axis) — driven by the max visible CO2
     /// device's quality preset; the texture is recreated when it changes.
     co2_res: u32,
+    co2_scratch: Vec<u8>,
+    tile_wide_cpu: Vec<u32>,
+    tile_per_tile_cpu: Vec<Vec<u32>>,
+    tile_offsets_cpu: Vec<u32>,
+    tile_lights_cpu: Vec<u32>,
+    shadow_order_cpu: Vec<usize>,
+    sample_mats_cpu: Vec<[[f32; 4]; 4]>,
+    shadowed_fixtures_cpu: std::collections::HashSet<usize>,
+    shadow_casters_cpu: Vec<(usize, f32)>,
+    render_layers_cpu: Vec<usize>,
+    fixture_instances_cpu: Vec<MeshInstance>,
+    fixture_ranges_cpu: Vec<(FixtureGeometry, u32, u32)>,
+    line_vertices_cpu: Vec<LineVertex>,
+    co2_upload_cpu: Vec<particles::Co2Volume>,
+    wall_instances_cpu: Vec<WallInstance>,
+    wall_draws_cpu: Vec<(usize, bool)>,
+    gpu_fixtures_cpu: Vec<FixtureGpu>,
+    beam_fixture_cpu: Vec<usize>,
+    lens_instances_cpu: Vec<LensInstance>,
+    gpu_wheels_cpu: Vec<WheelGpu>,
 
     // Screen-space AO (Unlit mode only): multiply-blended onto the HDR.
     ssao_pipeline: wgpu::RenderPipeline,
@@ -671,9 +731,7 @@ impl Renderer {
         // RenderPass/ComputePass `timestamp_writes` + `resolve_query_set` — all we need
         // (NOT the INSIDE_ENCODERS/PASSES variants). Opt-in feature; present on Apple
         // Silicon but absent on some older drivers, so probe + degrade to a CPU-only HUD.
-        let timestamps_supported = adapter
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY);
+        let timestamps_supported = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let mut required_features = wgpu::Features::empty();
         if wireframe_supported {
             required_features |= wgpu::Features::POLYGON_MODE_LINE;
@@ -814,7 +872,11 @@ impl Renderer {
         // 1×1 white placeholder content (procedural walls ignore it in-shader).
         let wall_placeholder_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("wall-placeholder"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -830,16 +892,30 @@ impl Renderer {
                 aspect: wgpu::TextureAspect::All,
             },
             &[255u8, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
         );
         let wall_placeholder_view = wall_placeholder_tex.create_view(&Default::default());
         let wall_placeholder_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wall-placeholder-bg"),
             layout: &wall_content_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&wall_placeholder_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&content_sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&wall_placeholder_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&content_sampler),
+                },
             ],
         });
         let sky_pipeline = pipeline::sky_pipeline(&device, &sky_layout);
@@ -849,8 +925,14 @@ impl Renderer {
             label: Some("world-bg"),
             layout: &world_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&world_tex.view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&world_tex.sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&world_tex.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&world_tex.sampler),
+                },
             ],
         });
 
@@ -920,8 +1002,10 @@ impl Renderer {
             wgpu::BufferUsages::STORAGE,
             std::mem::size_of::<FixtureGpu>() as u64 * 16,
         );
-        let tile_offsets = GrowBuffer::new(&device, "tile-offsets", wgpu::BufferUsages::STORAGE, 4096);
-        let tile_lights = GrowBuffer::new(&device, "tile-lights", wgpu::BufferUsages::STORAGE, 4096);
+        let tile_offsets =
+            GrowBuffer::new(&device, "tile-offsets", wgpu::BufferUsages::STORAGE, 4096);
+        let tile_lights =
+            GrowBuffer::new(&device, "tile-lights", wgpu::BufferUsages::STORAGE, 4096);
         let wheels_storage = GrowBuffer::new(
             &device,
             "wheels-gpu",
@@ -1048,8 +1132,11 @@ impl Renderer {
         let shadow = shadow::ShadowMaps::new(&device);
         let froxel = froxel_supported.then(|| FroxelState::new(&device));
         let gpu_timers = timestamps_supported.then(|| gpu_timer::GpuTimers::new(&device));
-        let mut last_timings = PassTimings::default();
-        last_timings.gpu_valid = timestamps_supported;
+        let last_timings = PassTimings {
+            gpu_valid: timestamps_supported,
+            ..Default::default()
+        };
+        let debug = RenderDebugFlags::from_env();
 
         Self {
             surface,
@@ -1108,6 +1195,7 @@ impl Renderer {
             froxel,
             gpu_timers,
             last_timings,
+            debug,
             volumetric_pipeline,
             volumetric_layout,
             volumetric_uniform,
@@ -1137,6 +1225,26 @@ impl Renderer {
             co2_density_view,
             co2_density_samp,
             co2_res,
+            co2_scratch: Vec::new(),
+            tile_wide_cpu: Vec::new(),
+            tile_per_tile_cpu: Vec::new(),
+            tile_offsets_cpu: Vec::new(),
+            tile_lights_cpu: Vec::new(),
+            shadow_order_cpu: Vec::new(),
+            sample_mats_cpu: Vec::new(),
+            shadowed_fixtures_cpu: std::collections::HashSet::new(),
+            shadow_casters_cpu: Vec::new(),
+            render_layers_cpu: Vec::new(),
+            fixture_instances_cpu: Vec::new(),
+            fixture_ranges_cpu: Vec::new(),
+            line_vertices_cpu: Vec::new(),
+            co2_upload_cpu: Vec::new(),
+            wall_instances_cpu: Vec::new(),
+            wall_draws_cpu: Vec::new(),
+            gpu_fixtures_cpu: Vec::new(),
+            beam_fixture_cpu: Vec::new(),
+            lens_instances_cpu: Vec::new(),
+            gpu_wheels_cpu: Vec::new(),
             bloom_bright,
             bloom_blur_h,
             bloom_blur_v,
@@ -1232,7 +1340,8 @@ impl Renderer {
             .max()
             .unwrap_or(particles::CO2_RES_INIT);
         self.ensure_co2_res(res);
-        self.pyro.advance(scene, cam_pos, self.anim_time, dt, self.co2_res);
+        self.pyro
+            .advance(scene, cam_pos, self.anim_time, dt, self.co2_res);
     }
 
     /// Recreate the CO2 density texture at `res` voxels/axis if it differs from the
@@ -1286,7 +1395,10 @@ impl Renderer {
                     // Guard against bad-scale GLB exports (e.g. the Zonda's effect
                     // disc baked at 685 m) using the declared Model size.
                     fixture_model::fit_to_declared(&mut verts, model.size);
-                    meshes.insert(model.name.clone(), GpuMesh::new(&self.device, &model.name, &verts));
+                    meshes.insert(
+                        model.name.clone(),
+                        GpuMesh::new(&self.device, &model.name, &verts),
+                    );
                 }
             }
         }
@@ -1294,26 +1406,50 @@ impl Renderer {
         self.gdtf_cache.insert(key, meshes);
     }
 
+    fn prune_gdtf_cache(&mut self, scene: &Scene) {
+        if self.gdtf_cache.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<usize> = scene
+            .fixtures
+            .iter()
+            .flat_map(|f| f.gdtf.iter().chain(f.model_src.iter()))
+            .map(|gdtf| Arc::as_ptr(gdtf) as usize)
+            .collect();
+        if live.len() < self.gdtf_cache.len() {
+            self.gdtf_cache.retain(|key, _| live.contains(key));
+        }
+    }
+
     /// (Re)load the world HDRI texture when the scene's map changes (keyed by the
     /// bytes' `Arc` pointer), rebuilding the world bind group. Cheap no-op when
     /// the map is unchanged.
     fn ensure_world(&mut self, world: &crate::scene::World) {
-        let key = world.hdri.as_ref().map(|a| Arc::as_ptr(a) as usize).unwrap_or(0);
+        let key = world
+            .hdri
+            .as_ref()
+            .map(|a| Arc::as_ptr(a) as usize)
+            .unwrap_or(0);
         if key == self.world_key {
             return;
         }
         let tex = match &world.hdri {
-            Some(bytes) => match world::WorldTexture::from_bytes(&self.device, &self.queue, bytes) {
-                Some(t) => {
-                    self.world_loaded = true;
-                    t
+            Some(bytes) => {
+                match world::WorldTexture::from_bytes(&self.device, &self.queue, bytes) {
+                    Some(t) => {
+                        self.world_loaded = true;
+                        t
+                    }
+                    None => {
+                        log::warn!(
+                            "world: could not decode environment map '{}'",
+                            world.hdri_name
+                        );
+                        self.world_loaded = false;
+                        world::WorldTexture::placeholder(&self.device, &self.queue)
+                    }
                 }
-                None => {
-                    log::warn!("world: could not decode environment map '{}'", world.hdri_name);
-                    self.world_loaded = false;
-                    world::WorldTexture::placeholder(&self.device, &self.queue)
-                }
-            },
+            }
             None => {
                 self.world_loaded = false;
                 world::WorldTexture::placeholder(&self.device, &self.queue)
@@ -1323,8 +1459,14 @@ impl Renderer {
             label: Some("world-bg"),
             layout: &self.world_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&tex.sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&tex.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&tex.sampler),
+                },
             ],
         });
         self.world_tex = tex;
@@ -1342,7 +1484,10 @@ impl Renderer {
         if !self.scene_geom_cache.contains_key(&key) {
             let verts = fixture_model::load_model(&model.file, &model.glb);
             let entry = if verts.is_empty() {
-                log::warn!("mvr: model '{}' produced no geometry (unsupported/empty)", model.file);
+                log::warn!(
+                    "mvr: model '{}' produced no geometry (unsupported/empty)",
+                    model.file
+                );
                 None
             } else {
                 // Local-space AABB of the raw vertices (the up-flip + transforms are
@@ -1354,12 +1499,16 @@ impl Renderer {
                     lo = lo.min(p);
                     hi = hi.max(p);
                 }
-                self.scene_geom_bounds.insert(key, (lo.to_array(), hi.to_array()));
+                self.scene_geom_bounds
+                    .insert(key, (lo.to_array(), hi.to_array()));
                 Some(GpuMesh::new(&self.device, &model.file, &verts))
             };
             self.scene_geom_cache.insert(key, entry);
         }
-        self.scene_geom_cache.get(&key).and_then(|m| m.as_ref()).map(|_| key)
+        self.scene_geom_cache
+            .get(&key)
+            .and_then(|m| m.as_ref())
+            .map(|_| key)
     }
 
     /// Render one frame. Returns `true` if a frame was presented (a `false`
@@ -1445,8 +1594,11 @@ impl Renderer {
                 .render(&mut pass, paint_jobs, screen_descriptor);
         }
 
-        self.queue
-            .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+        self.queue.submit(
+            user_buffers
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
         frame.present();
 
         // Pump the async per-pass GPU-timing readback (reads data 2 frames stale; never
@@ -1468,7 +1620,9 @@ impl Renderer {
     pub fn bench_render(&mut self, scene: &Scene, camera: &OrbitCamera, settings: &RenderSettings) {
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench-encoder") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bench-encoder"),
+            });
         self.record_scene(&mut encoder, scene, camera, &Selection::default(), settings);
         self.queue.submit(std::iter::once(encoder.finish()));
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -1484,15 +1638,12 @@ impl Renderer {
         let (width, height) = self.viewport.size;
         // Headless screenshot = a RENDER → full-quality CO2 (GLOWSTONE_CO2_PREVIEW forces
         // the cheaper preview path so the split can be A/B'd from the same harness).
-        self.hq_co2 = std::env::var("GLOWSTONE_CO2_PREVIEW").is_err();
+        self.hq_co2 = !self.debug.co2_preview;
 
         // Warm up the temporal accumulation: a single headless frame would show the raw
         // jittered (dithered) raymarch, so render several static frames first to let the
         // EMA converge to the same smooth result the interactive viewport reaches.
-        let warmup: u32 = std::env::var("GLOWSTONE_WARMUP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(28);
+        let warmup = self.debug.warmup_frames;
         // Advance the animation clock + pyro sim each warmup frame so the temporal EMA
         // converges to the SAME moving-content result the live render shows. A frozen
         // clock converges to a crisp static pattern the real (time-advancing) render
@@ -1504,7 +1655,9 @@ impl Renderer {
             self.advance_pyro(scene, eye, dt);
             let mut warm = self
                 .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("warm") });
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("warm"),
+                });
             self.record_scene(&mut warm, scene, camera, &Selection::default(), settings);
             self.queue.submit(std::iter::once(warm.finish()));
         }
@@ -1555,7 +1708,9 @@ impl Renderer {
             let _ = tx.send(r);
         });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv().expect("map channel").expect("map readback buffer");
+        rx.recv()
+            .expect("map channel")
+            .expect("map readback buffer");
 
         let data = slice.get_mapped_range();
         let mut pixels = Vec::with_capacity(unpadded as usize * height as usize);
@@ -1619,7 +1774,9 @@ impl Renderer {
         self.hq_co2 = true; // deliberate render → full-quality CO2 (preview/render split)
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render-view-encoder") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render-view-encoder"),
+            });
         self.record_scene(&mut encoder, scene, camera, &Selection::default(), settings);
         self.queue.submit(std::iter::once(encoder.finish()));
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -1652,7 +1809,8 @@ impl Renderer {
         screen_descriptor: &egui_wgpu::ScreenDescriptor,
     ) -> bool {
         for (id, delta) in &textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
         }
         for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);
@@ -1661,10 +1819,14 @@ impl Renderer {
             Some(f) => f,
             None => return false,
         };
-        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let surface_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("egui-only-encoder") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("egui-only-encoder"),
+            });
         let user_buffers = self.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -1681,7 +1843,12 @@ impl Renderer {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05,
+                                g: 0.05,
+                                b: 0.06,
+                                a: 1.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -1689,10 +1856,14 @@ impl Renderer {
                     ..Default::default()
                 })
                 .forget_lifetime();
-            self.egui_renderer.render(&mut pass, paint_jobs, screen_descriptor);
+            self.egui_renderer
+                .render(&mut pass, paint_jobs, screen_descriptor);
         }
-        self.queue
-            .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+        self.queue.submit(
+            user_buffers
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
         frame.present();
         true
     }
@@ -1712,7 +1883,9 @@ impl Renderer {
         });
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ldr-readback-encoder") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ldr-readback-encoder"),
+            });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: vp.ldr_texture(),
@@ -1728,7 +1901,11 @@ impl Renderer {
                     rows_per_image: Some(height),
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -1738,7 +1915,9 @@ impl Renderer {
             let _ = tx.send(r);
         });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv().expect("map channel").expect("map readback buffer");
+        rx.recv()
+            .expect("map channel")
+            .expect("map readback buffer");
 
         let data = slice.get_mapped_range();
         let mut pixels = Vec::with_capacity(unpadded as usize * height as usize);
@@ -1756,7 +1935,8 @@ impl Renderer {
     /// frames before the final paint.
     pub fn apply_egui_textures(&mut self, delta: &egui::TexturesDelta) {
         for (id, d) in &delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, d);
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, d);
         }
         for id in &delta.free {
             self.egui_renderer.free_texture(id);
@@ -1782,7 +1962,8 @@ impl Renderer {
     ) -> (u32, u32, Vec<u8>) {
         let (width, height) = size;
         for (id, delta) in &textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
         }
         for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);
@@ -1790,7 +1971,11 @@ impl Renderer {
 
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ui-capture-target"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1800,9 +1985,11 @@ impl Renderer {
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ui-capture-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ui-capture-encoder"),
+            });
         let user_buffers = self.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -1821,7 +2008,12 @@ impl Renderer {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.06, a: 1.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05,
+                                g: 0.05,
+                                b: 0.06,
+                                a: 1.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -1829,7 +2021,8 @@ impl Renderer {
                     ..Default::default()
                 })
                 .forget_lifetime();
-            self.egui_renderer.render(&mut pass, paint_jobs, screen_descriptor);
+            self.egui_renderer
+                .render(&mut pass, paint_jobs, screen_descriptor);
         }
 
         let unpadded = width * 4;
@@ -1856,10 +2049,17 @@ impl Renderer {
                     rows_per_image: Some(height),
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
-        self.queue
-            .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+        self.queue.submit(
+            user_buffers
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
 
         let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1900,8 +2100,8 @@ impl Renderer {
         // A live frame (set by the app for pixel-map / NDI / CITP) wins; else
         // decode an `Image`'s bytes once (cached by the Arc pointer).
         if let Some(f) = &s.frame {
-            let key = (Arc::as_ptr(f) as usize as u64)
-                ^ f.generation.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let key =
+                (Arc::as_ptr(f) as usize as u64) ^ f.generation.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             self.upload_screen_rgba(idx, key, f.width, f.height, &f.rgba);
             return self.screen_runtime.contains_key(&idx);
         }
@@ -1936,11 +2136,19 @@ impl Renderer {
         if rgba.len() < expected {
             return; // malformed frame — keep whatever was there
         }
-        let need_new = self.screen_runtime.get(&idx).map(|r| r.size != (w, h)).unwrap_or(true);
+        let need_new = self
+            .screen_runtime
+            .get(&idx)
+            .map(|r| r.size != (w, h))
+            .unwrap_or(true);
         if need_new {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("screen-content"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -1953,8 +2161,14 @@ impl Renderer {
                 label: Some("screen-content-bg"),
                 layout: &self.wall_content_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.content_sampler) },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.content_sampler),
+                    },
                 ],
             });
             self.screen_runtime.insert(
@@ -1986,7 +2200,11 @@ impl Renderer {
                     bytes_per_row: Some(w * 4),
                     rows_per_image: Some(h),
                 },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
             );
             rt.content_key = key;
         }
@@ -1998,16 +2216,12 @@ impl Renderer {
     fn ts_rp(&self, pair: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
         self.gpu_timers.as_ref().and_then(|t| t.rp(pair))
     }
-    fn ts_cp(&self, pair: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
-        self.gpu_timers.as_ref().and_then(|t| t.cp(pair))
-    }
-
     fn pump_gpu_timers(&mut self) {
         let period = self.queue.get_timestamp_period();
-        if let Some(t) = self.gpu_timers.as_mut() {
-            if t.pump(period) {
-                self.last_timings.passes = t.bars;
-            }
+        if let Some(t) = self.gpu_timers.as_mut()
+            && t.pump(period)
+        {
+            self.last_timings.passes = t.bars;
         }
     }
 
@@ -2059,8 +2273,12 @@ impl Renderer {
             .upload(&self.device, &self.queue, &floor_instance);
 
         // --- fixture instances, grouped by geometry ---
-        let mut fixture_instances: Vec<MeshInstance> = Vec::with_capacity(scene.fixtures.len());
-        let mut ranges: Vec<(FixtureGeometry, u32, u32)> = Vec::new();
+        let mut fixture_instances = std::mem::take(&mut self.fixture_instances_cpu);
+        fixture_instances.clear();
+        fixture_instances.reserve(scene.fixtures.len());
+        let mut ranges = std::mem::take(&mut self.fixture_ranges_cpu);
+        ranges.clear();
+        ranges.reserve(2);
         for geometry in [FixtureGeometry::Cylinder, FixtureGeometry::Cone] {
             let start = fixture_instances.len() as u32;
             for (i, fixture) in scene.fixtures.iter().enumerate() {
@@ -2071,7 +2289,11 @@ impl Renderer {
                     model: fixture.model_matrix().to_cols_array_2d(),
                     color: fixture.color,
                     intensity: fixture.intensity,
-                    selected: if selection.contains_fixture(i) { 1.0 } else { 0.0 },
+                    selected: if selection.contains_fixture(i) {
+                        1.0
+                    } else {
+                        0.0
+                    },
                     emissive: 0.0,
                 });
             }
@@ -2085,6 +2307,7 @@ impl Renderer {
 
         // --- GDTF fixtures: assemble parts (loading GLBs on first use) and the
         // articulated beam (origin/direction) per fixture ---
+        self.prune_gdtf_cache(scene);
         let gdtf_to_world = Mat4::from_rotation_x(-FRAC_PI_2); // GDTF +Z up -> world +Y up
         let mut gdtf_parts: Vec<MeshInstance> = Vec::new();
         let mut gdtf_draws: Vec<(usize, String, u32)> = Vec::new();
@@ -2135,24 +2358,47 @@ impl Renderer {
                     self.ensure_gdtf_loaded(mk, m);
                     // The borrowed BODY model has no per-head data of its own — it's
                     // just geometry; its axes (if any) follow the fixture-wide angles.
-                    (fixture_model::assemble(m, 0, root, fixture.pan_actual, fixture.tilt_actual, &[], &[]), mk)
+                    (
+                        fixture_model::assemble(
+                            m,
+                            0,
+                            root,
+                            fixture.pan_actual,
+                            fixture.tilt_actual,
+                            &[],
+                            &[],
+                        ),
+                        mk,
+                    )
                 }
                 None => (own, key),
             };
-            let selected = if selection.contains_fixture(i) { 1.0 } else { 0.0 };
+            let selected = if selection.contains_fixture(i) {
+                1.0
+            } else {
+                0.0
+            };
             let drawn_before = gdtf_draws.len();
             // Emitter lens parts glow in their cell colour — but only on the
             // fixture's OWN model (a BORROWED body model's beams aren't this
             // fixture's emitters/cells, so its parts stay plain body geometry).
             let own_model = fixture.model_src.is_none();
             let emitters = fixture.emitters();
-            let level = (fixture.intensity.max(0.0) * fixture.optics.dimmer.max(0.0)).clamp(0.0, 1.0);
+            let level =
+                (fixture.intensity.max(0.0) * fixture.optics.dimmer.max(0.0)).clamp(0.0, 1.0);
             let mut has_mesh = vec![false; emitters.len()];
             // The optical-chain tint (CMY / colour-mix / colour wheel / CTO) is a
             // fixture-wide master that colours the beam AND the lens — so the lens
             // mesh must apply it too, else a master blue beam keeps a white face.
             let chain_tint = if own_model {
-                optics::resolve(&gdtf, fixture.mode_index, &fixture.optics, &fixture.motion, time).tint
+                optics::resolve(
+                    &gdtf,
+                    fixture.mode_index,
+                    &fixture.optics,
+                    &fixture.motion,
+                    time,
+                )
+                .tint
             } else {
                 [1.0, 1.0, 1.0]
             };
@@ -2165,27 +2411,27 @@ impl Renderer {
                 {
                     // Default: a dark-grey lit body part.
                     let (mut color, mut intensity, mut emissive) = ([0.09, 0.09, 0.10], 1.0, 0.0);
-                    if let (true, Some(e)) = (own_model, part.emitter) {
-                        if e < emitters.len() {
-                            has_mesh[e] = true;
-                            if emitters[e].merged_into.is_none() {
-                                // The real lens mesh, emissive in the live cell colour
-                                // (× the manual master tint), HDR so it blooms.
-                                let c = fixture.cells.get(e).copied().unwrap_or([1.0, 1.0, 1.0]);
-                                color = [
-                                    chain_tint[0] * c[0] * fixture.color[0],
-                                    chain_tint[1] * c[1] * fixture.color[1],
-                                    chain_tint[2] * c[2] * fixture.color[2],
-                                ];
-                                // The mesh-lens HDR scale (× the shader's emissive
-                                // gain). Kept modest so a per-pixel colour chase
-                                // reads as DISTINCT colours — too hot and every
-                                // cell's bloom overlaps and sums to white.
-                                intensity = level;
-                                emissive = 1.0;
-                            } else {
-                                color = [0.02, 0.02, 0.025]; // occluded overlay (Spiider flower)
-                            }
+                    if let (true, Some(e)) = (own_model, part.emitter)
+                        && e < emitters.len()
+                    {
+                        has_mesh[e] = true;
+                        if emitters[e].merged_into.is_none() {
+                            // The real lens mesh, emissive in the live cell colour
+                            // (× the manual master tint), HDR so it blooms.
+                            let c = fixture.cells.get(e).copied().unwrap_or([1.0, 1.0, 1.0]);
+                            color = [
+                                chain_tint[0] * c[0] * fixture.color[0],
+                                chain_tint[1] * c[1] * fixture.color[1],
+                                chain_tint[2] * c[2] * fixture.color[2],
+                            ];
+                            // The mesh-lens HDR scale (× the shader's emissive
+                            // gain). Kept modest so a per-pixel colour chase
+                            // reads as DISTINCT colours — too hot and every
+                            // cell's bloom overlaps and sums to white.
+                            intensity = level;
+                            emissive = 1.0;
+                        } else {
+                            color = [0.02, 0.02, 0.025]; // occluded overlay (Spiider flower)
                         }
                     }
                     let idx = gdtf_parts.len() as u32;
@@ -2218,7 +2464,10 @@ impl Renderer {
         {
             let mut order: Vec<usize> = (0..gdtf_draws.len()).collect();
             order.sort_by(|&a, &b| {
-                gdtf_draws[a].0.cmp(&gdtf_draws[b].0).then_with(|| gdtf_draws[a].1.cmp(&gdtf_draws[b].1))
+                gdtf_draws[a]
+                    .0
+                    .cmp(&gdtf_draws[b].0)
+                    .then_with(|| gdtf_draws[a].1.cmp(&gdtf_draws[b].1))
             });
             let mut parts = Vec::with_capacity(gdtf_parts.len());
             let mut draws = Vec::with_capacity(gdtf_draws.len());
@@ -2237,9 +2486,9 @@ impl Renderer {
         }
         self.gdtf_instances
             .upload(&self.device, &self.queue, &gdtf_parts);
-        let gdtf_placeholder_count = self
-            .gdtf_placeholder_instances
-            .upload(&self.device, &self.queue, &gdtf_placeholders);
+        let gdtf_placeholder_count =
+            self.gdtf_placeholder_instances
+                .upload(&self.device, &self.queue, &gdtf_placeholders);
 
         // --- imported MVR static geometry (stage decks / truss / set pieces) ---
         // Each model is baked once and drawn as one lit instance; the +Y-up GLB
@@ -2257,7 +2506,11 @@ impl Renderer {
                 total_models += obj.models.len();
                 continue;
             }
-            let selected = if selection.contains_geometry(oi) { 1.0 } else { 0.0 };
+            let selected = if selection.contains_geometry(oi) {
+                1.0
+            } else {
+                0.0
+            };
             for model in &obj.models {
                 total_models += 1;
                 if let Some(key) = self.ensure_scene_geom_loaded(model) {
@@ -2310,15 +2563,18 @@ impl Renderer {
             scene_geom_instances = inst;
             scene_geom_draws = draws;
         }
-        if std::env::var("GLOWSTONE_GEOM_STATS").is_ok() {
-            let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        if self.debug.geom_stats {
+            let mut keys: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
             for (k, _, _, _) in &scene_geom_draws {
                 *keys.entry(*k).or_default() += 1;
             }
             let mut counts: Vec<usize> = keys.values().copied().collect();
             counts.sort_unstable_by(|a, b| b.cmp(a));
-            let mut diags: Vec<f32> =
-                scene_geom_draws.iter().map(|(_, _, lo, hi)| (*hi - *lo).length()).collect();
+            let mut diags: Vec<f32> = scene_geom_draws
+                .iter()
+                .map(|(_, _, lo, hi)| (*hi - *lo).length())
+                .collect();
             diags.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             let n_ge = |t: f32| diags.iter().filter(|&&d| d >= t).count();
             log::info!(
@@ -2350,7 +2606,9 @@ impl Renderer {
         }
 
         // --- dynamic lines: fog-box wireframes + beam indicators ---
-        let mut lines: Vec<LineVertex> = Vec::new();
+        let mut lines = std::mem::take(&mut self.line_vertices_cpu);
+        lines.clear();
+        lines.reserve(scene.environments.len().saturating_mul(24));
         for (i, env) in scene.environments.iter().enumerate() {
             if env.hidden {
                 continue; // outliner eye: a hidden fog box draws no wireframe
@@ -2360,14 +2618,22 @@ impl Renderer {
             } else {
                 [0.30, 0.55, 0.72]
             };
-            mesh::push_box_wireframe(&mut lines, env.min().to_array(), env.max().to_array(), color);
+            mesh::push_box_wireframe(
+                &mut lines,
+                env.min().to_array(),
+                env.max().to_array(),
+                color,
+            );
         }
         if settings.show_beam_wireframes {
             for (i, fixture) in scene.fixtures.iter().enumerate() {
                 if fixture.hidden {
                     continue;
                 }
-                push_beam_indicator(&mut lines, &beam_spec(fixture, beam_frames[i].first().copied()));
+                push_beam_indicator(
+                    &mut lines,
+                    &beam_spec(fixture, beam_frames[i].first().copied()),
+                );
             }
         }
         // Selection gizmo for every selected fixture (RGB axes + marker box) —
@@ -2379,8 +2645,11 @@ impl Renderer {
         }
         // Selection gizmo at the centre of every selected (visible) geometry object.
         for &sel in &selection.geometry {
-            if let Some((lo, hi)) =
-                scene.geometry.get(sel).filter(|g| !g.hidden).and_then(|g| g.world_bounds())
+            if let Some((lo, hi)) = scene
+                .geometry
+                .get(sel)
+                .filter(|g| !g.hidden)
+                .and_then(|g| g.world_bounds())
             {
                 push_selection_gizmo(&mut lines, (lo + hi) * 0.5);
             }
@@ -2393,8 +2662,14 @@ impl Renderer {
             let dir = dir.normalize_or_zero();
             if dir != Vec3::ZERO {
                 let half = camera.zfar * 0.9;
-                lines.push(LineVertex { position: (pivot - dir * half).to_array(), color });
-                lines.push(LineVertex { position: (pivot + dir * half).to_array(), color });
+                lines.push(LineVertex {
+                    position: (pivot - dir * half).to_array(),
+                    color,
+                });
+                lines.push(LineVertex {
+                    position: (pivot + dir * half).to_array(),
+                    color,
+                });
             }
         }
         let line_count = self.dynamic_lines.upload(&self.device, &self.queue, &lines);
@@ -2405,8 +2680,8 @@ impl Renderer {
         let fog = scene.environments.iter().find(|e| !e.hidden);
         // GLOWSTONE_NOVOL disables ALL volumetric work (raymarch + froxel) — a bisection
         // kill-switch for the Windows/Vulkan device-loss hunt.
-        let has_fog = fog.map(|f| f.density > 1e-4).unwrap_or(false)
-            && std::env::var("GLOWSTONE_NOVOL").is_err();
+        let has_fog =
+            fog.map(|f| f.density > 1e-4).unwrap_or(false) && !self.debug.disable_volumetrics;
         // Haze uniformity (1 smooth … 0 clustered). Drives the density-noise contrast
         // AND the temporal history cap below: at low uniformity the user WANTS to see the
         // moving smoke clusters, so we hold less history (let them live) instead of
@@ -2423,8 +2698,10 @@ impl Renderer {
         // storage buffer the raymarch loops.
         let res = self.co2_res;
         let grid_voxels = (res * res * res) as usize;
-        let mut scratch = vec![0u8; grid_voxels];
-        let mut co2_upload: Vec<particles::Co2Volume> = Vec::new();
+        self.co2_scratch.resize(grid_voxels, 0);
+        let mut co2_upload = std::mem::take(&mut self.co2_upload_cpu);
+        co2_upload.clear();
+        co2_upload.reserve(particles::CO2_LAYERS as usize);
         for (layer, &id) in self
             .pyro
             .co2_ids
@@ -2439,7 +2716,7 @@ impl Renderer {
                 continue; // sim hasn't re-splatted at the new res yet (next frame will)
             }
             for (o, d) in grid.iter().enumerate() {
-                scratch[o] = (d.clamp(0.0, 1.0) * 255.0) as u8;
+                self.co2_scratch[o] = (d.clamp(0.0, 1.0) * 255.0) as u8;
             }
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -2452,7 +2729,7 @@ impl Renderer {
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &scratch,
+                &self.co2_scratch,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(res),
@@ -2471,7 +2748,9 @@ impl Renderer {
         let has_co2 = !co2_upload.is_empty() && settings.mode == ViewportMode::Beauty;
         // Media (raymarch) bounds + look = the fog box, UNIONed with the plume AABBs.
         let mut media_min = fog.map(|f| f.min()).unwrap_or(Vec3::splat(f32::INFINITY));
-        let mut media_max = fog.map(|f| f.max()).unwrap_or(Vec3::splat(f32::NEG_INFINITY));
+        let mut media_max = fog
+            .map(|f| f.max())
+            .unwrap_or(Vec3::splat(f32::NEG_INFINITY));
         for v in &co2_upload {
             let lo = Vec3::from_slice(&v.box_min[..3]);
             media_min = media_min.min(lo);
@@ -2496,16 +2775,20 @@ impl Renderer {
         let use_froxel = has_fog
             && self.froxel.is_some()
             && settings.froxel_volumetric
-            && std::env::var("GLOWSTONE_NOFROXEL").is_err();
+            && !self.debug.disable_froxel;
 
         // --- LED-wall surfaces: prepare each wall's content texture (image / live
         // frame), then build ONE emissive quad instance per visible screen (the
         // whole wall, never per-pixel). `wall_draws[j]` = the screen index for
         // instance j, so the forward pass can bind the right content texture. ---
         self.screen_runtime.retain(|&k, _| k < scene.screens.len());
-        let mut wall_instances: Vec<WallInstance> = Vec::with_capacity(scene.screens.len());
+        let mut wall_instances = std::mem::take(&mut self.wall_instances_cpu);
+        wall_instances.clear();
+        wall_instances.reserve(scene.screens.len());
         // (screen index, is_transparent) per drawn wall instance.
-        let mut wall_draws: Vec<(usize, bool)> = Vec::new();
+        let mut wall_draws = std::mem::take(&mut self.wall_draws_cpu);
+        wall_draws.clear();
+        wall_draws.reserve(scene.screens.len());
         for (i, s) in scene.screens.iter().enumerate() {
             if s.hidden {
                 continue;
@@ -2529,33 +2812,72 @@ impl Renderer {
             let seam = if s.gap_mm > 0.0 { 0.06 } else { 0.015 };
             wall_instances.push(WallInstance {
                 model: s.surface_matrix().to_cols_array_2d(),
-                grid: [res[0] as f32, res[1] as f32, s.panels_wide as f32, s.panels_high as f32],
+                grid: [
+                    res[0] as f32,
+                    res[1] as f32,
+                    s.panels_wide as f32,
+                    s.panels_high as f32,
+                ],
                 color: [solid[0], solid[1], solid[2], nits_scale],
-                look: [kind, tp, s.opacity, if selection.contains_screen(i) { 1.0 } else { 0.0 }],
-                extra: [s.gamma, seam, s.curvature_deg.to_radians(), s.pixel_shape.code()],
+                look: [
+                    kind,
+                    tp,
+                    s.opacity,
+                    if selection.contains_screen(i) {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ],
+                extra: [
+                    s.gamma,
+                    seam,
+                    s.curvature_deg.to_radians(),
+                    s.pixel_shape.code(),
+                ],
             });
             wall_draws.push((i, s.opacity < 0.99));
         }
-        self.wall_instances.upload(&self.device, &self.queue, &wall_instances);
+        self.wall_instances
+            .upload(&self.device, &self.queue, &wall_instances);
 
         // Resolve each fixture's optics → its GPU beams (per lit emitter, per
         // prism facet; uniform LED arrays collapse to one aggregate). The
         // shaders loop `arrayLength(&fixtures)`, so the expansion is
         // transparent to them.
-        let mut gpu_fixtures: Vec<FixtureGpu> = Vec::with_capacity(scene.fixtures.len());
+        let mut gpu_fixtures = std::mem::take(&mut self.gpu_fixtures_cpu);
+        gpu_fixtures.clear();
+        gpu_fixtures.reserve(scene.fixtures.len());
         // Which scene fixture each GPU beam came from (shadow dedupe).
-        let mut beam_fixture: Vec<usize> = Vec::with_capacity(scene.fixtures.len());
-        let mut lens_instances: Vec<LensInstance> = Vec::with_capacity(scene.fixtures.len());
+        let mut beam_fixture = std::mem::take(&mut self.beam_fixture_cpu);
+        beam_fixture.clear();
+        beam_fixture.reserve(scene.fixtures.len());
+        let mut lens_instances = std::mem::take(&mut self.lens_instances_cpu);
+        lens_instances.clear();
+        lens_instances.reserve(scene.fixtures.len());
         // Per-fixture wheel chains, flattened into one buffer; each FixtureGpu
         // indexes its slice via cookie_r.w (offset) + cookie_u.w (count).
-        let mut gpu_wheels: Vec<WheelGpu> = Vec::new();
-        let beam_dump = std::env::var("GLOWSTONE_BEAM_DUMP").is_ok();
+        let mut gpu_wheels = std::mem::take(&mut self.gpu_wheels_cpu);
+        gpu_wheels.clear();
+        let beam_dump = self.debug.beam_dump;
         for (i, f) in scene.fixtures.iter().enumerate() {
             if f.hidden {
                 continue;
             }
-            let key = f.gdtf.as_ref().map(|g| Arc::as_ptr(g) as usize).unwrap_or(0);
-            let built = build_beam_gpus(f, &beam_frames[i], &emitter_lens_mesh[i], key, &self.gobo_atlas, time, &mut gpu_wheels);
+            let key = f
+                .gdtf
+                .as_ref()
+                .map(|g| Arc::as_ptr(g) as usize)
+                .unwrap_or(0);
+            let built = build_beam_gpus(
+                f,
+                &beam_frames[i],
+                &emitter_lens_mesh[i],
+                key,
+                &self.gobo_atlas,
+                time,
+                &mut gpu_wheels,
+            );
             if beam_dump && !built.beams.is_empty() {
                 let cmax = built
                     .beams
@@ -2572,7 +2894,9 @@ impl Renderer {
                     b0.shape[0],
                     b0.extra[2] < -0.5,
                     b0.extra[3],
-                    b0.dir_cos[0], b0.dir_cos[1], b0.dir_cos[2],
+                    b0.dir_cos[0],
+                    b0.dir_cos[1],
+                    b0.dir_cos[2],
                 );
             }
             beam_fixture.resize(beam_fixture.len() + built.beams.len(), i);
@@ -2591,18 +2915,16 @@ impl Renderer {
         // dynamic-offset render buffer (for the depth pass) + the packed sample
         // buffer (for the lighting shaders), and its layer is stamped into
         // misc.w (-1 = unshadowed).
-        let mut shadow_order: Vec<usize> = (0..gpu_fixtures.len())
-            .filter(|&i| gpu_fixtures[i].dir_cos[3] > 1e-4)
-            .collect();
+        let mut shadow_order = std::mem::take(&mut self.shadow_order_cpu);
+        shadow_order.clear();
+        shadow_order.extend((0..gpu_fixtures.len()).filter(|&i| gpu_fixtures[i].dir_cos[3] > 1e-4));
         shadow_order.sort_by(|&a, &b| {
             gpu_fixtures[a].dir_cos[3]
                 .partial_cmp(&gpu_fixtures[b].dir_cos[3])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         // Shadows only matter in the lit Beauty view (unlit/wireframe skip lighting).
-        let max_shadows = if settings.mode == ViewportMode::Beauty
-            && std::env::var("GLOWSTONE_NOSHADOW").is_err()
-        {
+        let max_shadows = if settings.mode == ViewportMode::Beauty && !self.debug.disable_shadows {
             // Capped by the user's `shadow_max` lever (each hero map is a depth pass,
             // ~2-3 ms at Retina) — can only reduce below the atlas-sized `shadow::MAX`.
             (settings.shadow_max as usize).min(shadow::MAX)
@@ -2611,11 +2933,13 @@ impl Renderer {
         };
         // sample_mats holds ALL atlas layers (heroes 0..n_shadows + the shared
         // occluder at shadow::SHARED); identity for the unused middle slots.
-        let mut sample_mats: Vec<[[f32; 4]; 4]> =
-            vec![Mat4::IDENTITY.to_cols_array_2d(); shadow::LAYERS];
-        let mut shadowed_fixtures: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut sample_mats = std::mem::take(&mut self.sample_mats_cpu);
+        sample_mats.clear();
+        sample_mats.resize(shadow::LAYERS, Mat4::IDENTITY.to_cols_array_2d());
+        let mut shadowed_fixtures = std::mem::take(&mut self.shadowed_fixtures_cpu);
+        shadowed_fixtures.clear();
         let mut n_shadows = 0usize;
-        for fi in shadow_order {
+        for fi in shadow_order.iter().copied() {
             if n_shadows >= max_shadows {
                 break;
             }
@@ -2639,7 +2963,8 @@ impl Renderer {
             // beam never hits anything that close to its own lens) restores precision
             // so partial / distant occluders block correctly.
             let near = (range * 0.03).clamp(0.4, 3.0);
-            let vp = Mat4::perspective_rh(fov, 1.0, near, range) * Mat4::look_to_rh(origin, bdir, up);
+            let vp =
+                Mat4::perspective_rh(fov, 1.0, near, range) * Mat4::look_to_rh(origin, bdir, up);
             let cols = vp.to_cols_array_2d();
             self.queue.write_buffer(
                 &self.shadow.render_matrices,
@@ -2661,7 +2986,7 @@ impl Renderer {
         // per-beam shadows); zero phantoms, and it reclaims the pass (~0.5 ms). A future
         // direction-binned version could restore correct occlusion for all beams.
         let mut shared_layer = -1i32;
-        if max_shadows > 0 && std::env::var("GLOWSTONE_SHARED").is_ok() {
+        if max_shadows > 0 && self.debug.shared_shadow {
             let mut lo = Vec3::splat(f32::INFINITY);
             let mut hi = Vec3::splat(f32::NEG_INFINITY);
             let mut mean_dir = Vec3::ZERO;
@@ -2688,8 +3013,14 @@ impl Renderer {
                 let radius = ((hi - lo).length() * 0.5).max(1.0);
                 let eye = center - dir * (radius + 5.0);
                 let up = if dir.y.abs() > 0.95 { Vec3::Z } else { Vec3::Y };
-                let vp = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 2.0 + 10.0)
-                    * Mat4::look_to_rh(eye, dir, up);
+                let vp = Mat4::orthographic_rh(
+                    -radius,
+                    radius,
+                    -radius,
+                    radius,
+                    0.1,
+                    radius * 2.0 + 10.0,
+                ) * Mat4::look_to_rh(eye, dir, up);
                 let cols = vp.to_cols_array_2d();
                 self.queue.write_buffer(
                     &self.shadow.render_matrices,
@@ -2701,8 +3032,11 @@ impl Renderer {
             }
         }
         if n_shadows > 0 || shared_layer >= 0 {
-            self.queue
-                .write_buffer(&self.shadow.sample_matrices, 0, bytemuck::cast_slice(&sample_mats));
+            self.queue.write_buffer(
+                &self.shadow.sample_matrices,
+                0,
+                bytemuck::cast_slice(&sample_mats),
+            );
         }
 
         // --- LED walls as cheap, blurred area lights. One wide, soft "beam" per
@@ -2791,10 +3125,16 @@ impl Renderer {
             // edges touch r) — otherwise the screen AABB under-covers the projected disc
             // and an edge fragment lands in an unscattered tile (a beam pop).
             const RING_CIRCUM: f32 = 1.082_392_3; // 1/cos(π/8)
-            let build_tiles = gpu_fixtures.len() >= TILE_MIN_LIGHTS
-                && std::env::var("GLOWSTONE_NOCULL").is_err();
-            let mut wide: Vec<u32> = Vec::new();
-            let mut per_tile: Vec<Vec<u32>> = vec![Vec::new(); n_tiles];
+            let build_tiles = gpu_fixtures.len() >= TILE_MIN_LIGHTS && !self.debug.disable_culling;
+            let mut wide = std::mem::take(&mut self.tile_wide_cpu);
+            wide.clear();
+            let mut per_tile = std::mem::take(&mut self.tile_per_tile_cpu);
+            if per_tile.len() < n_tiles {
+                per_tile.resize_with(n_tiles, Vec::new);
+            }
+            for tile in per_tile.iter_mut().take(n_tiles) {
+                tile.clear();
+            }
             let to_screen = |p: Vec3| -> Option<(f32, f32)> {
                 let clip = view_proj * p.extend(1.0);
                 if clip.w <= 1e-4 {
@@ -2885,10 +3225,14 @@ impl Renderer {
                 }
             }
             // Flatten to CSR: each tile's slice is [wide-prefix..., its narrow beams].
-            let mut offsets: Vec<u32> = Vec::with_capacity(n_tiles + 1);
-            let mut flat: Vec<u32> = Vec::with_capacity(n_tiles * wide.len() + 64);
+            let mut offsets = std::mem::take(&mut self.tile_offsets_cpu);
+            offsets.clear();
+            offsets.reserve(n_tiles + 1);
+            let mut flat = std::mem::take(&mut self.tile_lights_cpu);
+            flat.clear();
+            flat.reserve(n_tiles * wide.len() + 64);
             offsets.push(0);
-            for tile in &per_tile {
+            for tile in per_tile.iter().take(n_tiles) {
                 flat.extend_from_slice(&wide);
                 flat.extend_from_slice(tile);
                 offsets.push(flat.len() as u32);
@@ -2896,11 +3240,16 @@ impl Renderer {
             if flat.is_empty() {
                 flat.push(0); // storage buffers can't bind 0 bytes
             }
-            self.tile_offsets.upload(&self.device, &self.queue, &offsets);
+            self.tile_offsets
+                .upload(&self.device, &self.queue, &offsets);
             self.tile_lights.upload(&self.device, &self.queue, &flat);
             // Beams an average ray marches (wide prefix + tile-local). Drives the
             // volumetric step budget below.
             avg_tile_beams = (flat.len() / n_tiles).max(1);
+            self.tile_wide_cpu = wide;
+            self.tile_per_tile_cpu = per_tile;
+            self.tile_offsets_cpu = offsets;
+            self.tile_lights_cpu = flat;
         }
 
         // Keep the storage binding non-empty (≥1 element) even with no wheels.
@@ -2954,8 +3303,8 @@ impl Renderer {
             } else {
                 1.0
             };
-            let step_max = (settings.steps as f32 * sparse_bonus * (1.0 - 0.25 * pressure))
-                .clamp(48.0, 176.0);
+            let step_max =
+                (settings.steps as f32 * sparse_bonus * (1.0 - 0.25 * pressure)).clamp(48.0, 176.0);
             let step_min = if pressure > 0.5 && march_beams >= 16 {
                 48.0
             } else {
@@ -3004,10 +3353,14 @@ impl Renderer {
                 counts: [
                     // x: HYBRID sentinel -2 = raymarch heroes only (froxel does the
                     // masses); otherwise the shared-occluder atlas layer (-1 = none).
-                    if use_froxel { -2.0 } else { shared_layer as f32 },
+                    if use_froxel {
+                        -2.0
+                    } else {
+                        shared_layer as f32
+                    },
                     step_cap,
                     target_dt,
-                    if std::env::var("GLOWSTONE_JITTER").is_ok() { 1.0 } else { 0.0 },
+                    if self.debug.jitter { 1.0 } else { 0.0 },
                 ],
                 // Same chroma read-up strength as the froxel pass (below) so the
                 // hybrid masses/heroes seam lifts saturated colours identically.
@@ -3044,36 +3397,40 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.volumetric_uniform, 0, bytemuck::bytes_of(&vol));
 
-            if use_froxel {
-                if let Some(fx) = &self.froxel {
-                    let (lo, hi) = (media_min, media_max);
-                    let near = 0.3_f32;
-                    // Far = distance to the farthest fog-box corner, so the grid
-                    // spans the whole box along every ray.
-                    let mut far = near + 1.0;
-                    for cx in [lo.x, hi.x] {
-                        for cy in [lo.y, hi.y] {
-                            for cz in [lo.z, hi.z] {
-                                far = far.max((Vec3::new(cx, cy, cz) - eye).length());
-                            }
+            if use_froxel && let Some(fx) = &self.froxel {
+                let (lo, hi) = (media_min, media_max);
+                let near = 0.3_f32;
+                // Far = distance to the farthest fog-box corner, so the grid
+                // spans the whole box along every ray.
+                let mut far = near + 1.0;
+                for cx in [lo.x, hi.x] {
+                    for cy in [lo.y, hi.y] {
+                        for cz in [lo.z, hi.z] {
+                            far = far.max((Vec3::new(cx, cy, cz) - eye).length());
                         }
                     }
-                    let fu = FroxelUniform {
-                        inv_view_proj: inv_vp.to_cols_array_2d(),
-                        eye_time: [eye.x, eye.y, eye.z, time],
-                        fog_min_density: [lo.x, lo.y, lo.z, media_density],
-                        fog_max_g: [hi.x, hi.y, hi.z, media_g],
-                        albedo_beam: [media_color[0], media_color[1], media_color[2], settings.beam_intensity],
-                        dims: [
-                            fx.dims.0 as f32,
-                            fx.dims.1 as f32,
-                            fx.dims.2 as f32,
-                            shared_layer as f32,
-                        ],
-                        planes: [near, far, settings.chroma_haze, 0.0],
-                    };
-                    self.queue.write_buffer(&fx.uniform, 0, bytemuck::bytes_of(&fu));
                 }
+                let fu = FroxelUniform {
+                    inv_view_proj: inv_vp.to_cols_array_2d(),
+                    eye_time: [eye.x, eye.y, eye.z, time],
+                    fog_min_density: [lo.x, lo.y, lo.z, media_density],
+                    fog_max_g: [hi.x, hi.y, hi.z, media_g],
+                    albedo_beam: [
+                        media_color[0],
+                        media_color[1],
+                        media_color[2],
+                        settings.beam_intensity,
+                    ],
+                    dims: [
+                        fx.dims.0 as f32,
+                        fx.dims.1 as f32,
+                        fx.dims.2 as f32,
+                        shared_layer as f32,
+                    ],
+                    planes: [near, far, settings.chroma_haze, 0.0],
+                };
+                self.queue
+                    .write_buffer(&fx.uniform, 0, bytemuck::bytes_of(&fu));
             }
         }
 
@@ -3239,18 +3596,56 @@ impl Renderer {
                         label: Some("froxel-compute-bg"),
                         layout: &fx.compute_layout,
                         entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: fx.uniform.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: fixtures_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.noise_view) },
-                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.noise_sampler) },
-                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.gobo_atlas.view) },
-                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.gobo_atlas.sampler) },
-                            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.shadow.array_view) },
-                            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.shadow.sampler) },
-                            wgpu::BindGroupEntry { binding: 8, resource: self.shadow.sample_matrices.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 9, resource: wheels_binding() },
-                            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(out) },
-                            wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(inp) },
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: fx.uniform.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: fixtures_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&self.noise_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(&self.noise_sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(&self.gobo_atlas.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::Sampler(&self.gobo_atlas.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.shadow.array_view,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: wgpu::BindingResource::Sampler(&self.shadow.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 8,
+                                resource: self.shadow.sample_matrices.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 9,
+                                resource: wheels_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 10,
+                                resource: wgpu::BindingResource::TextureView(out),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 11,
+                                resource: wgpu::BindingResource::TextureView(inp),
+                            },
                         ],
                     })
                 };
@@ -3260,10 +3655,24 @@ impl Renderer {
                     label: Some("froxel-composite-bg"),
                     layout: &fx.composite_layout,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: fx.uniform.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&fx.result_view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&fx.sampler) },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: fx.uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&fx.result_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&fx.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(
+                                self.viewport.depth_view(),
+                            ),
+                        },
                     ],
                 });
                 (inject_bg, integrate_bg, comp_bg)
@@ -3297,10 +3706,8 @@ impl Renderer {
             }
             // History is trustworthy only if last frame wrote the EMA at this size.
             let resized = self.viewport.size != self.prev_size;
-            let history_valid = self.ema_valid
-                && !resized
-                && self.frame_index != 0
-                && std::env::var("GLOWSTONE_NOTEMPORAL").is_err();
+            let history_valid =
+                self.ema_valid && !resized && self.frame_index != 0 && !self.debug.disable_temporal;
             let moving = cur_view_proj != self.prev_view_proj || sig != self.prev_beam_sig;
             if moving || !history_valid {
                 self.accum_frames = 0;
@@ -3332,7 +3739,8 @@ impl Renderer {
                 eye: [eye.x, eye.y, eye.z, 250.0],
                 params: [opacity, 0.0, 0.0, 0.0],
             };
-            self.queue.write_buffer(&self.temporal_uniform, 0, bytemuck::bytes_of(&tu));
+            self.queue
+                .write_buffer(&self.temporal_uniform, 0, bytemuck::bytes_of(&tu));
             self.prev_beam_sig = sig;
         }
         let temporal_bg = if temporal_on {
@@ -3340,11 +3748,28 @@ impl Renderer {
                 label: Some("vol-temporal-bg"),
                 layout: &self.vol_temporal_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.temporal_uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(self.viewport.vol_view()) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(self.viewport.vol_ema_view(prev_ema)) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.vol_linear_sampler) },
-                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.temporal_uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(self.viewport.vol_view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.viewport.vol_ema_view(prev_ema),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.vol_linear_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()),
+                    },
                 ],
             }))
         } else {
@@ -3361,9 +3786,18 @@ impl Renderer {
             label: Some("composite-bg"),
             layout: &self.composite_upsample_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(composite_src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(composite_src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(self.viewport.depth_view()),
+                },
             ],
         });
         let bright_bg = self.single_tex_bg(self.viewport.hdr_view());
@@ -3402,13 +3836,16 @@ impl Renderer {
         // it just doesn't all CAST hero shadows.
         const SHADOW_MIN_PX: f32 = 3.0;
         const SHADOW_MAX_CASTERS: usize = 96;
-        let mut casters: Vec<(usize, f32)> = Vec::new();
+        let mut casters = std::mem::take(&mut self.shadow_casters_cpu);
+        casters.clear();
 
         // Pass 0: shadow maps — one depth-only pass per hero beam (layers 0..n)
         // plus the ONE shared occluder (layer shadow::SHARED), each rendering the
         // solid occluders (floor + MVR geometry + fixture models) from that layer's
         // viewpoint into its atlas layer.
-        let mut render_layers: Vec<usize> = (0..n_shadows).collect();
+        let mut render_layers = std::mem::take(&mut self.render_layers_cpu);
+        render_layers.clear();
+        render_layers.extend(0..n_shadows);
         if shared_layer >= 0 {
             render_layers.push(shadow::SHARED);
         }
@@ -3428,7 +3865,11 @@ impl Renderer {
                 ..Default::default()
             });
             spass.set_pipeline(&self.shadow.pipeline);
-            spass.set_bind_group(0, &self.shadow.render_bg, &[(layer as u64 * self.shadow.align) as u32]);
+            spass.set_bind_group(
+                0,
+                &self.shadow.render_bg,
+                &[(layer as u64 * self.shadow.align) as u32],
+            );
             spass.set_vertex_buffer(0, self.floor_mesh.vertex_buffer.slice(..));
             spass.set_vertex_buffer(1, self.floor_instances.buffer.slice(..));
             spass.draw(0..self.floor_mesh.vertex_count, 0..1);
@@ -3438,10 +3879,10 @@ impl Renderer {
                 let svp = Mat4::from_cols_array_2d(&sample_mats[layer]);
                 casters.clear();
                 for (di, (_, _, lo, hi)) in scene_geom_draws.iter().enumerate() {
-                    if let Some(px) = clip_proj_px(&svp, *lo, *hi, shadow::RES as f32) {
-                        if px >= SHADOW_MIN_PX {
-                            casters.push((di, px));
-                        }
+                    if let Some(px) = clip_proj_px(&svp, *lo, *hi, shadow::RES as f32)
+                        && px >= SHADOW_MIN_PX
+                    {
+                        casters.push((di, px));
                     }
                 }
                 // Cap to the biggest N (the visible silhouettes); bounds a beam aimed
@@ -3471,6 +3912,12 @@ impl Renderer {
                 }
             }
         }
+
+        self.shadow_order_cpu = shadow_order;
+        self.sample_mats_cpu = sample_mats;
+        self.shadowed_fixtures_cpu = shadowed_fixtures;
+        self.shadow_casters_cpu = casters;
+        self.render_layers_cpu = render_layers;
 
         // Pass 0.5: DEPTH PRE-PASS — write the opaque scene depth with NO fragment work
         // so the main forward pass runs its heavy per-fragment light loop EXACTLY once per
@@ -3604,7 +4051,9 @@ impl Renderer {
             // Equal (once per visible pixel); otherwise the plain Less+write pipeline
             // against the depth cleared this pass.
             let mesh_pipe = if settings.mode == ViewportMode::Wireframe {
-                self.mesh_wire_pipeline.as_ref().unwrap_or(&self.mesh_pipeline)
+                self.mesh_wire_pipeline
+                    .as_ref()
+                    .unwrap_or(&self.mesh_pipeline)
             } else if use_prepass {
                 &self.mesh_depth_equal
             } else {
@@ -3672,7 +4121,11 @@ impl Renderer {
                     if transparent {
                         continue;
                     }
-                    let bg = self.screen_runtime.get(&si).map(|r| &r.bind_group).unwrap_or(&self.wall_placeholder_bg);
+                    let bg = self
+                        .screen_runtime
+                        .get(&si)
+                        .map(|r| &r.bind_group)
+                        .unwrap_or(&self.wall_placeholder_bg);
                     pass.set_bind_group(1, bg, &[]);
                     pass.draw(0..self.quad_mesh.vertex_count, j as u32..j as u32 + 1);
                 }
@@ -3683,7 +4136,11 @@ impl Renderer {
                     if !transparent {
                         continue;
                     }
-                    let bg = self.screen_runtime.get(&si).map(|r| &r.bind_group).unwrap_or(&self.wall_placeholder_bg);
+                    let bg = self
+                        .screen_runtime
+                        .get(&si)
+                        .map(|r| &r.bind_group)
+                        .unwrap_or(&self.wall_placeholder_bg);
                     pass.set_bind_group(1, bg, &[]);
                     pass.draw(0..self.quad_mesh.vertex_count, j as u32..j as u32 + 1);
                 }
@@ -3798,7 +4255,8 @@ impl Renderer {
                 // near, far, world-radius (~0.6 m) in px at 1 m, intensity.
                 params: [camera.znear, camera.zfar, 0.6 * focal_px, 2.1],
             };
-            self.queue.write_buffer(&self.ao_uniform, 0, bytemuck::bytes_of(&ao));
+            self.queue
+                .write_buffer(&self.ao_uniform, 0, bytemuck::bytes_of(&ao));
             let ao_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ssao-bg"),
                 layout: &self.ssao_layout,
@@ -3869,7 +4327,10 @@ impl Renderer {
                         view: self.viewport.hdr_view(),
                         depth_slice: None,
                         resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
                     })],
                     depth_stencil_attachment: None,
                     ..Default::default()
@@ -3893,7 +4354,12 @@ impl Renderer {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.0,
+                                    g: 0.0,
+                                    b: 0.0,
+                                    a: 1.0,
+                                }),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -3915,7 +4381,10 @@ impl Renderer {
                             view: self.viewport.vol_ema_view(cur_ema),
                             depth_slice: None,
                             resolve_target: None,
-                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
                         })],
                         depth_stencil_attachment: None,
                         timestamp_writes: self.ts_rp(gpu_timer::P_VOLTEMP),
@@ -3932,7 +4401,10 @@ impl Renderer {
                         view: self.viewport.hdr_view(),
                         depth_slice: None,
                         resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: self.ts_rp(gpu_timer::P_COMPOSITE),
@@ -3961,7 +4433,10 @@ impl Renderer {
                     view: self.viewport.hdr_view(),
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: self.viewport.depth_view(),
@@ -4006,13 +4481,41 @@ impl Renderer {
         }
 
         // Pass 3: bloom bright-pass (HDR -> bloom[0]).
-        self.fullscreen(encoder, "bloom-bright", &self.bloom_bright, self.viewport.bloom_view(0), &bright_bg, self.ts_rp(gpu_timer::P_BLOOM_BRIGHT));
+        self.fullscreen(
+            encoder,
+            "bloom-bright",
+            &self.bloom_bright,
+            self.viewport.bloom_view(0),
+            &bright_bg,
+            self.ts_rp(gpu_timer::P_BLOOM_BRIGHT),
+        );
         // Pass 4: separable blur (bloom[0] -> bloom[1] -> bloom[0]).
-        self.fullscreen(encoder, "bloom-blur-h", &self.bloom_blur_h, self.viewport.bloom_view(1), &blur_h_bg, self.ts_rp(gpu_timer::P_BLOOM_H));
-        self.fullscreen(encoder, "bloom-blur-v", &self.bloom_blur_v, self.viewport.bloom_view(0), &blur_v_bg, self.ts_rp(gpu_timer::P_BLOOM_V));
+        self.fullscreen(
+            encoder,
+            "bloom-blur-h",
+            &self.bloom_blur_h,
+            self.viewport.bloom_view(1),
+            &blur_h_bg,
+            self.ts_rp(gpu_timer::P_BLOOM_H),
+        );
+        self.fullscreen(
+            encoder,
+            "bloom-blur-v",
+            &self.bloom_blur_v,
+            self.viewport.bloom_view(0),
+            &blur_v_bg,
+            self.ts_rp(gpu_timer::P_BLOOM_V),
+        );
 
         // Pass 5: tonemap/resolve (HDR + bloom -> LDR, sRGB-encoded).
-        self.fullscreen(encoder, "tonemap", &self.tonemap_pipeline, self.viewport.ldr_view(), &tonemap_bg, self.ts_rp(gpu_timer::P_TONEMAP));
+        self.fullscreen(
+            encoder,
+            "tonemap",
+            &self.tonemap_pipeline,
+            self.viewport.ldr_view(),
+            &tonemap_bg,
+            self.ts_rp(gpu_timer::P_TONEMAP),
+        );
 
         // Resolve this frame's per-pass GPU timestamps into the ring (read back async in
         // render()); skipped automatically if the ring slot is still being read.
@@ -4027,6 +4530,17 @@ impl Renderer {
         self.last_timings.geom_draws =
             (ranges.len() + gdtf_groups.len() + scene_geom_groups.len()) as u32;
         self.last_timings.render_px = self.viewport.size;
+
+        self.fixture_instances_cpu = fixture_instances;
+        self.fixture_ranges_cpu = ranges;
+        self.line_vertices_cpu = lines;
+        self.co2_upload_cpu = co2_upload;
+        self.wall_instances_cpu = wall_instances;
+        self.wall_draws_cpu = wall_draws;
+        self.gpu_fixtures_cpu = gpu_fixtures;
+        self.beam_fixture_cpu = beam_fixture;
+        self.lens_instances_cpu = lens_instances;
+        self.gpu_wheels_cpu = gpu_wheels;
 
         // Advance temporal-accumulation state for next frame. `ema_valid` reflects
         // whether the EMA was actually written this frame (so next frame knows whether
@@ -4101,7 +4615,12 @@ fn beam_spec(fixture: &Fixture, frame: Option<fixture_model::BeamFrame>) -> Beam
     };
     // Show the indicator at the current (zoomed) angle for GDTF fixtures.
     let angle = match &fixture.gdtf {
-        Some(g) => optics::map_attr(g, "Zoom", fixture.optics.zoom, (fixture.beam_angle, fixture.beam_angle)),
+        Some(g) => optics::map_attr(
+            g,
+            "Zoom",
+            fixture.optics.zoom,
+            (fixture.beam_angle, fixture.beam_angle),
+        ),
         None => fixture.beam_angle,
     };
     BeamSpec {
@@ -4187,7 +4706,9 @@ fn lens_disc(
     candela: f32,
     shutter: [f32; 4],
 ) -> LensInstance {
-    lens_instance(origin, dir, right, up, r, r, true, color, level, tan_half, n_order, candela, shutter)
+    lens_instance(
+        origin, dir, right, up, r, r, true, color, level, tan_half, n_order, candela, shutter,
+    )
 }
 
 /// Build the GPU beam + lens for a laser engine: a thin, near-collimated streak.
@@ -4196,15 +4717,14 @@ fn lens_disc(
 /// under-samples in the half-res raymarch and breaks into speckle, so the
 /// rendered core is a few cm with a soft super-Gaussian edge — wide enough to
 /// read as a continuous streak — while a tiny divergence keeps it collimated.
-fn build_laser(
-    f: &fixture_model::BeamFrame,
-    fixture: &Fixture,
-    atlas_layers: f32,
-) -> BeamBuild {
+fn build_laser(f: &fixture_model::BeamFrame, fixture: &Fixture, atlas_layers: f32) -> BeamBuild {
     const LASER_RANGE: f32 = 80.0;
     const LASER_CORE: f32 = 0.11;
     let i = (fixture.intensity * fixture.optics.dimmer).max(0.0);
-    let tan_half = (fixture.beam_angle * 0.5).to_radians().tan().clamp(2.5e-3, 0.02);
+    let tan_half = (fixture.beam_angle * 0.5)
+        .to_radians()
+        .tan()
+        .clamp(2.5e-3, 0.02);
     let g = i * 1.2; // HDR gain; the no-falloff streak keeps it bright far out
     BeamBuild {
         beams: if i < 1e-4 {
@@ -4213,10 +4733,15 @@ fn build_laser(
             vec![FixtureGpu {
                 pos_range: [f.origin.x, f.origin.y, f.origin.z, LASER_RANGE],
                 dir_cos: [f.dir.x, f.dir.y, f.dir.z, tan_half],
-                color: [fixture.color[0] * g, fixture.color[1] * g, fixture.color[2] * g, LASER_CORE],
+                color: [
+                    fixture.color[0] * g,
+                    fixture.color[1] * g,
+                    fixture.color[2] * g,
+                    LASER_CORE,
+                ],
                 cookie_r: [f.right.x, f.right.y, f.right.z, 0.0], // wheel offset 0
                 cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],          // wheel count 0 (no wheels)
-                extra: [-1.0, 0.0, 0.0, 0.0], // anim layer = none
+                extra: [-1.0, 0.0, 0.0, 0.0],                     // anim layer = none
                 shape: [4.0, 8.0, 1.0, 0.0], // soft-ish edge → survives downsampling
                 misc: [0.0, 1.0, atlas_layers, -1.0], // misc.y = laser flag
                 cmyf: [0.0, 0.0, 0.0, 0.0],
@@ -4290,10 +4815,15 @@ fn build_beam_gpus(
                 vec![FixtureGpu {
                     pos_range: [f.origin.x, f.origin.y, f.origin.z, RANGE],
                     dir_cos: [f.dir.x, f.dir.y, f.dir.z, tan_half],
-                    color: [fixture.color[0] * i, fixture.color[1] * i, fixture.color[2] * i, Fixture::BODY_RADIUS],
+                    color: [
+                        fixture.color[0] * i,
+                        fixture.color[1] * i,
+                        fixture.color[2] * i,
+                        Fixture::BODY_RADIUS,
+                    ],
                     cookie_r: [f.right.x, f.right.y, f.right.z, 0.0], // wheel offset 0
                     cookie_u: [f.up.x, f.up.y, f.up.z, 0.0],          // wheel count 0 (no wheels)
-                    extra: [-1.0, 0.0, 0.0, 0.0], // anim layer = none
+                    extra: [-1.0, 0.0, 0.0, 0.0],                     // anim layer = none
                     shape: [6.0, 8.0, 1.0, 0.0],
                     misc: [0.0, 0.0, atlas_layers, -1.0],
                     cmyf: [0.0, 0.0, 0.0, 0.0],
@@ -4315,7 +4845,13 @@ fn build_beam_gpus(
         };
     };
 
-    let o = optics::resolve(gdtf, fixture.mode_index, &fixture.optics, &fixture.motion, time);
+    let o = optics::resolve(
+        gdtf,
+        fixture.mode_index,
+        &fixture.optics,
+        &fixture.motion,
+        time,
+    );
     let emitters = fixture.emitters();
 
     // Dynamic wheel chain: every engaged gobo/colour wheel becomes a WheelGpu in
@@ -4340,7 +4876,11 @@ fn build_beam_gpus(
     // CA damping keys on a REAL gobo (gobo_engaged), not "a gobo wheel is present"
     // — the disc is always emitted now, so an open beam must still get full CA.
     let has_pattern = o.anim.is_some() || o.gobo_engaged;
-    let ca_strength = if has_pattern { o.ca_strength * 0.18 } else { o.ca_strength };
+    let ca_strength = if has_pattern {
+        o.ca_strength * 0.18
+    } else {
+        o.ca_strength
+    };
     wheels_out.extend(my_wheels);
     let cmyf = [o.cmy[0], o.cmy[1], o.cmy[2], 0.0];
     let (anim_layer, anim_scroll) = match &o.anim {
@@ -4393,15 +4933,19 @@ fn build_beam_gpus(
         misc: [ca_strength, 0.0, atlas_layers, -1.0], // misc.w = shadow layer (-1 = none)
         // cmyf.w = shutter-blade edge softness: crisp on a narrow beam (the gate
         // images sharply on a beam fixture), blurred out on a wide wash.
-        cmyf: [cmyf[0], cmyf[1], cmyf[2], (0.45 + 0.5 * focus_defocus + 0.7 * o.frost + tan_half * 0.4).clamp(0.2, 1.3)],
+        cmyf: [
+            cmyf[0],
+            cmyf[1],
+            cmyf[2],
+            (0.45 + 0.5 * focus_defocus + 0.7 * o.frost + tan_half * 0.4).clamp(0.2, 1.3),
+        ],
     };
 
     // ----- single-emitter path (classic moving head; prism expansion) -----
     if emitters.len() <= 1 {
         let frame = frames.first().copied().unwrap_or_else(fallback_frame);
         let em_beam = emitters.first().map(|e| &e.beam).unwrap_or(&gdtf.beam);
-        let flux_norm =
-            (optics::FIXTURE_FLUX_CAP / optics::emitter_flux(em_beam, 1)).min(1.0);
+        let flux_norm = (optics::FIXTURE_FLUX_CAP / optics::emitter_flux(em_beam, 1)).min(1.0);
         let cone = optics::emitter_cone(gdtf, em_beam, &fixture.optics, o.frost, 1, flux_norm);
         let lens_radius = em_beam.beam_radius.max(0.02);
         let cell = fixture.cells.first().copied().unwrap_or([1.0, 1.0, 1.0]);
@@ -4419,7 +4963,18 @@ fn build_beam_gpus(
         let beams = if effective * cell_lit < 1e-4 || !cone.shaft {
             Vec::new()
         } else if o.prism.is_empty() {
-            vec![make(&frame, frame.dir, frame.right, frame.up, base_color, cone.tan_half, cone.n_order, lens_radius, shutter_close, shutter_kind)]
+            vec![make(
+                &frame,
+                frame.dir,
+                frame.right,
+                frame.up,
+                base_color,
+                cone.tan_half,
+                cone.n_order,
+                lens_radius,
+                shutter_close,
+                shutter_kind,
+            )]
         } else {
             // Each facet is a separated aerial beam: deflect the axis, rebuild
             // its basis, split energy. While the prism is sliding in (prism_insert
@@ -4429,16 +4984,47 @@ fn build_beam_gpus(
                 .prism
                 .iter()
                 .map(|p| {
-                    let d = (frame.dir + frame.right * p.offset[0] + frame.up * p.offset[1]).normalize_or_zero();
+                    let d = (frame.dir + frame.right * p.offset[0] + frame.up * p.offset[1])
+                        .normalize_or_zero();
                     let (r2, u2) = ortho_basis(d, frame.up);
-                    let c = [base_color[0] * p.weight, base_color[1] * p.weight, base_color[2] * p.weight];
-                    make(&frame, d, r2, u2, c, cone.tan_half, cone.n_order, lens_radius, shutter_close, shutter_kind)
+                    let c = [
+                        base_color[0] * p.weight,
+                        base_color[1] * p.weight,
+                        base_color[2] * p.weight,
+                    ];
+                    make(
+                        &frame,
+                        d,
+                        r2,
+                        u2,
+                        c,
+                        cone.tan_half,
+                        cone.n_order,
+                        lens_radius,
+                        shutter_close,
+                        shutter_kind,
+                    )
                 })
                 .collect();
             let straight = (1.0 - o.prism_insert).clamp(0.0, 1.0);
             if straight > 0.01 {
-                let c = [base_color[0] * straight, base_color[1] * straight, base_color[2] * straight];
-                out.push(make(&frame, frame.dir, frame.right, frame.up, c, cone.tan_half, cone.n_order, lens_radius, shutter_close, shutter_kind));
+                let c = [
+                    base_color[0] * straight,
+                    base_color[1] * straight,
+                    base_color[2] * straight,
+                ];
+                out.push(make(
+                    &frame,
+                    frame.dir,
+                    frame.right,
+                    frame.up,
+                    c,
+                    cone.tan_half,
+                    cone.n_order,
+                    lens_radius,
+                    shutter_close,
+                    shutter_kind,
+                ));
             }
             out
         };
@@ -4449,7 +5035,12 @@ fn build_beam_gpus(
         let lens_shutter = if shutter_kind > 0.5 {
             // Lens-face blade: a touch sharper than the projected beam (it's right
             // at the glass) but still blurs with frost / focus error.
-            [shutter_close, shutter_kind, (0.12 + 0.4 * focus_defocus + 0.5 * o.frost).clamp(0.08, 1.0), 0.0]
+            [
+                shutter_close,
+                shutter_kind,
+                (0.12 + 0.4 * focus_defocus + 0.5 * o.frost).clamp(0.08, 1.0),
+                0.0,
+            ]
         } else {
             [0.0; 4]
         };
@@ -4523,8 +5114,14 @@ fn build_beam_gpus(
             continue;
         };
         let cell = fixture.cells.get(i).copied().unwrap_or([1.0, 1.0, 1.0]);
-        let cone =
-            optics::emitter_cone(gdtf, &em.beam, &fixture.optics, o.frost, emitters.len(), flux_norm);
+        let cone = optics::emitter_cone(
+            gdtf,
+            &em.beam,
+            &fixture.optics,
+            o.frost,
+            emitters.len(),
+            flux_norm,
+        );
         let tint = [
             o.tint[0] * cell[0] * fixture.color[0],
             o.tint[1] * cell[1] * fixture.color[1],
@@ -4582,7 +5179,10 @@ fn build_beam_gpus(
     // collapse to one disc beam. Non-uniform broad washes also collapse when
     // their cells physically overlap into one haze mass; narrow/steered pixel
     // emitters stay separate so real pixel shafts remain visible.
-    let lit: Vec<&Cell> = cells.iter().filter(|c| c.lit > 1e-4 && c.cone.shaft).collect();
+    let lit: Vec<&Cell> = cells
+        .iter()
+        .filter(|c| c.lit > 1e-4 && c.cone.shaft)
+        .collect();
     if lit.is_empty() {
         return BeamBuild { beams, lenses };
     }
@@ -4700,8 +5300,24 @@ fn build_beam_gpus(
         } else {
             cl[0].cone.n_order
         };
-        let agg_frame = fixture_model::BeamFrame { origin: centroid, dir: mean_dir, right, up };
-        make(&agg_frame, mean_dir, right, up, color, tan_eff, n_order, spread_r.max(cl[0].lens_r), 0.0, 0.0)
+        let agg_frame = fixture_model::BeamFrame {
+            origin: centroid,
+            dir: mean_dir,
+            right,
+            up,
+        };
+        make(
+            &agg_frame,
+            mean_dir,
+            right,
+            up,
+            color,
+            tan_eff,
+            n_order,
+            spread_r.max(cl[0].lens_r),
+            0.0,
+            0.0,
+        )
     };
 
     // Per-cell SHAFT cone: a real LED cell images far tighter than its broad
@@ -4718,7 +5334,10 @@ fn build_beam_gpus(
     const SHAFT_NARROW: f32 = 0.72;
     const SHAFT_N_ORDER: f32 = 3.0;
     let shaft_cone = |c: &Cell| -> (f32, f32) {
-        (c.cone.tan_half * SHAFT_NARROW, c.cone.n_order.max(SHAFT_N_ORDER))
+        (
+            c.cone.tan_half * SHAFT_NARROW,
+            c.cone.n_order.max(SHAFT_N_ORDER),
+        )
     };
 
     let cluster_shape_compatible = |cl: &[&Cell]| -> bool {
@@ -5003,8 +5622,14 @@ fn push_selection_gizmo(out: &mut Vec<LineVertex>, p: Vec3) {
         (Vec3::Y, [0.4, 0.9, 0.4]),
         (Vec3::Z, [0.4, 0.6, 1.0]),
     ] {
-        out.push(LineVertex { position: p.to_array(), color });
-        out.push(LineVertex { position: (p + dir * len).to_array(), color });
+        out.push(LineVertex {
+            position: p.to_array(),
+            color,
+        });
+        out.push(LineVertex {
+            position: (p + dir * len).to_array(),
+            color,
+        });
     }
 }
 
@@ -5037,8 +5662,14 @@ fn push_beam_indicator(out: &mut Vec<LineVertex>, spec: &BeamSpec) {
         .collect();
 
     let mut line = |a: Vec3, b: Vec3| {
-        out.push(LineVertex { position: a.to_array(), color });
-        out.push(LineVertex { position: b.to_array(), color });
+        out.push(LineVertex {
+            position: a.to_array(),
+            color,
+        });
+        out.push(LineVertex {
+            position: b.to_array(),
+            color,
+        });
     };
 
     for k in 0..SEGS {

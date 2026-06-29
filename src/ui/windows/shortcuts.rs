@@ -32,8 +32,14 @@ pub fn shortcuts_window(ctx: &egui::Context, open: &mut bool) {
                 ink.primary,
                 pill,
                 &[
-                    ("Orbit / Pan / Zoom", "drag / Shift+drag / scroll".to_string()),
-                    ("Select (multi / range)", "click / ⌘·Ctrl·Shift+click".to_string()),
+                    (
+                        "Orbit / Pan / Zoom",
+                        "drag / Shift+drag / scroll".to_string(),
+                    ),
+                    (
+                        "Select (multi / range)",
+                        "click / ⌘·Ctrl·Shift+click".to_string(),
+                    ),
                 ],
             );
 

@@ -4,7 +4,7 @@
 //! GDTF actually exposes, each greyed when unsupported/inert.
 
 use super::props::{self, Props};
-use super::{approx, InspectorState};
+use super::{InspectorState, approx};
 use crate::gdtf::{GdtfFixture, WheelKind};
 use crate::optics::{self, OpticField, OpticalControls, ShutterKind};
 use crate::scene::Fixture;
@@ -68,11 +68,20 @@ fn optic_row(
     }
 }
 
-pub(super) fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &GdtfFixture, state: &mut InspectorState) {
+pub(super) fn optics_section(
+    ui: &mut egui::Ui,
+    fixture: &mut Fixture,
+    gdtf: &GdtfFixture,
+    state: &mut InspectorState,
+) {
     const BEAM_COMMON: [OpticField; 3] = [OpticField::Zoom, OpticField::Focus, OpticField::Iris];
     const BEAM_ADV: [OpticField; 3] = [OpticField::Ca, OpticField::Shutter, OpticField::Strobe];
-    const COLOR_COMMON: [OpticField; 4] =
-        [OpticField::Cto, OpticField::Cyan, OpticField::Magenta, OpticField::Yellow];
+    const COLOR_COMMON: [OpticField; 4] = [
+        OpticField::Cto,
+        OpticField::Cyan,
+        OpticField::Magenta,
+        OpticField::Yellow,
+    ];
     const COLOR_ADV: [OpticField; 1] = [OpticField::Green];
 
     let beam_angle = fixture.beam_angle;
@@ -94,12 +103,16 @@ pub(super) fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &Gd
         .map(|&f| (f.label(), optic_inert(fixture, f)))
         .collect();
     let inert = |f: OpticField| inert_of.get(f.label()).copied().unwrap_or(false);
-    let show_shutter_blades = OpticField::Shutter.supported(gdtf) || fixture.shutter != ShutterKind::None;
-    let shutter_opts: Vec<(ShutterKind, &str)> = ShutterKind::ALL.iter().map(|&k| (k, k.label())).collect();
+    let show_shutter_blades =
+        OpticField::Shutter.supported(gdtf) || fixture.shutter != ShutterKind::None;
+    let shutter_opts: Vec<(ShutterKind, &str)> =
+        ShutterKind::ALL.iter().map(|&k| (k, k.label())).collect();
     let beam_common_labels: Vec<&str> = BEAM_COMMON.iter().map(|f| f.label()).collect();
     let color_common_labels: Vec<&str> = COLOR_COMMON.iter().map(|f| f.label()).collect();
-    let wheel_names: Vec<&str> =
-        components.iter().map(|c| c.wheel.as_deref().unwrap_or(c.attribute.as_str())).collect();
+    let wheel_names: Vec<&str> = components
+        .iter()
+        .map(|c| c.wheel.as_deref().unwrap_or(c.attribute.as_str()))
+        .collect();
 
     props::with(ui, state, |p| {
         p.group("Optics", "", true, |p| {
@@ -148,12 +161,26 @@ pub(super) fn optics_section(ui: &mut egui::Ui, fixture: &mut Fixture, gdtf: &Gd
                     .as_deref()
                     .map(|n| format!("{} · {n}", comp.attribute))
                     .unwrap_or_else(|| comp.attribute.clone());
-                let Some(w) = fixture.optics.wheels.get_mut(i) else { continue };
-                p.f32(&name, &mut w.value).range(0.0..=1.0).slider().decimals(2).tip(value_label);
+                let Some(w) = fixture.optics.wheels.get_mut(i) else {
+                    continue;
+                };
+                p.f32(&name, &mut w.value)
+                    .range(0.0..=1.0)
+                    .slider()
+                    .decimals(2)
+                    .tip(value_label);
                 if comp.has_index || comp.kind == WheelKind::Prism {
-                    p.f32("index", &mut w.index).range(0.0..=1.0).slider().decimals(2);
+                    p.f32("index", &mut w.index)
+                        .range(0.0..=1.0)
+                        .slider()
+                        .decimals(2);
                 }
-                if comp.has_spin || matches!(comp.kind, WheelKind::Color | WheelKind::Animation | WheelKind::Prism) {
+                if comp.has_spin
+                    || matches!(
+                        comp.kind,
+                        WheelKind::Color | WheelKind::Animation | WheelKind::Prism
+                    )
+                {
                     p.f32("spin", &mut w.spin)
                         .range(0.0..=1.0)
                         .slider()

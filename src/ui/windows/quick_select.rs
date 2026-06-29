@@ -37,15 +37,25 @@ pub fn quick_select_window(
     // other kinds the T/M rows render disabled (kept in the layout so the key→id
     // mapping is stable).
     let fx = kind == SelKind::Fixtures;
-    let primary = if fx { selection.primary_fixture().filter(|&i| i < n) } else { None };
+    let primary = if fx {
+        selection.primary_fixture().filter(|&i| i < n)
+    } else {
+        None
+    };
     let prof = primary.map(|i| scene.fixtures[i].profile.clone());
     let maker = primary
         .and_then(|i| scene.fixtures[i].gdtf.as_ref())
         .map(|g| g.manufacturer.clone())
         .filter(|m| !m.is_empty());
-    let type_n = prof.as_ref().map(|p| scene.fixtures.iter().filter(|f| &f.profile == p).count());
+    let type_n = prof
+        .as_ref()
+        .map(|p| scene.fixtures.iter().filter(|f| &f.profile == p).count());
     let maker_n = maker.as_ref().map(|m| {
-        scene.fixtures.iter().filter(|f| f.gdtf.as_ref().map(|g| &g.manufacturer) == Some(m)).count()
+        scene
+            .fixtures
+            .iter()
+            .filter(|f| f.gdtf.as_ref().map(|g| &g.manufacturer) == Some(m))
+            .count()
     });
 
     // The active kind's current selection (owned, so it survives the mutation below).
@@ -124,7 +134,9 @@ pub fn quick_select_window(
             1 => prof.map(|p| (0..n).filter(|&i| scene.fixtures[i].profile == p).collect()),
             2 => maker.map(|m| {
                 (0..n)
-                    .filter(|&i| scene.fixtures[i].gdtf.as_ref().map(|g| &g.manufacturer) == Some(&m))
+                    .filter(|&i| {
+                        scene.fixtures[i].gdtf.as_ref().map(|g| &g.manufacturer) == Some(&m)
+                    })
                     .collect()
             }),
             3 => {
@@ -149,7 +161,13 @@ pub fn quick_select_window(
 
 /// One row of the quick-select palette: label on the left, count + key badge on
 /// the right, full-width clickable.
-fn quick_row(ui: &mut egui::Ui, key: char, label: &str, count: Option<usize>, enabled: bool) -> egui::Response {
+fn quick_row(
+    ui: &mut egui::Ui,
+    key: char,
+    label: &str,
+    count: Option<usize>,
+    enabled: bool,
+) -> egui::Response {
     let ink = theme::ink(!ui.visuals().dark_mode);
     let h = 26.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
@@ -168,9 +186,16 @@ fn quick_row(ui: &mut egui::Ui, key: char, label: &str, count: Option<usize>, en
     );
     let mut x = rect.right() - 8.0;
     // key badge
-    let badge = egui::Rect::from_center_size(egui::pos2(x - 8.0, rect.center().y), egui::vec2(18.0, 16.0));
+    let badge =
+        egui::Rect::from_center_size(egui::pos2(x - 8.0, rect.center().y), egui::vec2(18.0, 16.0));
     painter.rect_filled(badge, 3.0, ui.visuals().extreme_bg_color);
-    painter.text(badge.center(), egui::Align2::CENTER_CENTER, key, egui::FontId::monospace(11.0), ink.secondary);
+    painter.text(
+        badge.center(),
+        egui::Align2::CENTER_CENTER,
+        key,
+        egui::FontId::monospace(11.0),
+        ink.secondary,
+    );
     x -= 26.0;
     if let Some(c) = count {
         painter.text(

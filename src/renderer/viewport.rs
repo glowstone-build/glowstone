@@ -181,11 +181,25 @@ impl Viewport {
     fn create_targets(
         device: &wgpu::Device,
         size: (u32, u32),
-    ) -> (Target, Target, Target, Target, [Target; 2], Target, [Target; 2]) {
+    ) -> (
+        Target,
+        Target,
+        Target,
+        Target,
+        [Target; 2],
+        Target,
+        [Target; 2],
+    ) {
         let attach_sample =
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
 
-        let hdr = Target::new(device, "viewport-hdr", size, Self::HDR_FORMAT, attach_sample);
+        let hdr = Target::new(
+            device,
+            "viewport-hdr",
+            size,
+            Self::HDR_FORMAT,
+            attach_sample,
+        );
         let depth = Target::new(
             device,
             "viewport-depth",
@@ -216,10 +230,28 @@ impl Viewport {
         // Half-res volumetric (4x fewer rays). The shader samples the nearest
         // opaque depth over each ray's footprint so the beam still stops
         // cleanly at edges (no bleeding past the floor).
-        let vol = Target::new(device, "viewport-vol", half, Self::VOL_FORMAT, attach_sample);
+        let vol = Target::new(
+            device,
+            "viewport-vol",
+            half,
+            Self::VOL_FORMAT,
+            attach_sample,
+        );
         let vol_ema = [
-            Target::new(device, "viewport-vol-ema0", half, Self::VOL_FORMAT, attach_sample),
-            Target::new(device, "viewport-vol-ema1", half, Self::VOL_FORMAT, attach_sample),
+            Target::new(
+                device,
+                "viewport-vol-ema0",
+                half,
+                Self::VOL_FORMAT,
+                attach_sample,
+            ),
+            Target::new(
+                device,
+                "viewport-vol-ema1",
+                half,
+                Self::VOL_FORMAT,
+                attach_sample,
+            ),
         ];
 
         (hdr, depth, ldr, sel_mask, bloom, vol, vol_ema)

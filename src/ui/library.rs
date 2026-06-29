@@ -10,9 +10,9 @@ use std::sync::Arc;
 use egui::{Color32, RichText, Sense};
 use glam::Vec3;
 
+use super::GdtfTextures;
 use super::panels::{paint_truncated, placement_point};
 use super::theme;
-use super::GdtfTextures;
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::{Library, Scene, Selection};
 
@@ -173,13 +173,27 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
     use theme::icon;
     let mut rows = Vec::new();
     for (i, g) in library.gdtf.iter().enumerate() {
-        let beam = if g.beam.beam_type.is_empty() { "" } else { g.beam.beam_type.as_str() };
+        let beam = if g.beam.beam_type.is_empty() {
+            ""
+        } else {
+            g.beam.beam_type.as_str()
+        };
         rows.push(LibRow {
             kind: LibKind::Gdtf(i),
             icon: icon::FIXTURE,
             name: g.name.clone(),
-            meta: format!("{} · {} · {} mode{}", g.manufacturer, beam, g.modes.len(), if g.modes.len() == 1 { "" } else { "s" }),
-            category: if g.manufacturer.is_empty() { "Imported".into() } else { g.manufacturer.clone() },
+            meta: format!(
+                "{} · {} · {} mode{}",
+                g.manufacturer,
+                beam,
+                g.modes.len(),
+                if g.modes.len() == 1 { "" } else { "s" }
+            ),
+            category: if g.manufacturer.is_empty() {
+                "Imported".into()
+            } else {
+                g.manufacturer.clone()
+            },
             accent: false,
             source: Some(g.source),
         });
@@ -189,7 +203,11 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             kind: LibKind::Fixture(i),
             icon: if p.laser { icon::COLOR } else { icon::FIXTURE },
             name: p.name.to_string(),
-            meta: if p.laser { "Laser engine".into() } else { format!("{:.0}° beam", p.default_beam_angle) },
+            meta: if p.laser {
+                "Laser engine".into()
+            } else {
+                format!("{:.0}° beam", p.default_beam_angle)
+            },
             category: p.category.to_string(),
             accent: p.laser,
             source: Some(crate::gdtf::FixtureSource::Builtin),
@@ -202,7 +220,12 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             icon: icon::ENVIRONMENT,
             name: p.name.to_string(),
             meta: format!("{w:.0} × {h:.0} × {d:.0} m"),
-            category: if p.category.is_empty() { "Environment" } else { p.category }.to_string(),
+            category: if p.category.is_empty() {
+                "Environment"
+            } else {
+                p.category
+            }
+            .to_string(),
             accent: false,
             source: None,
         });
@@ -215,7 +238,10 @@ fn library_rows(library: &Library) -> Vec<LibRow> {
             name: p.name.to_string(),
             meta: format!(
                 "{:.1}mm · {:.0}×{:.0}mm{}",
-                pitch, p.cabinet_mm[0], p.cabinet_mm[1], if p.transparent { " · mesh" } else { "" }
+                pitch,
+                p.cabinet_mm[0],
+                p.cabinet_mm[1],
+                if p.transparent { " · mesh" } else { "" }
             ),
             category: p.category.to_string(),
             accent: p.transparent,
@@ -233,7 +259,9 @@ fn add_library_row(row: &LibRow, library: &Library, scene: &mut Scene, place: Ve
             let arc = library.gdtf[i].clone();
             Selection::fixture(scene.add_gdtf(arc, place))
         }
-        LibKind::Fixture(i) => Selection::fixture(scene.add_fixture_at(&library.fixtures[i], place)),
+        LibKind::Fixture(i) => {
+            Selection::fixture(scene.add_fixture_at(&library.fixtures[i], place))
+        }
         LibKind::Env(i) => {
             Selection::environment(scene.add_environment_at(&library.environments[i], place))
         }
@@ -254,9 +282,9 @@ pub(crate) fn add_active_library_item(
     cursor: Option<Vec3>,
 ) -> Option<Selection> {
     let rows = library_rows(library);
-    let row = rows
-        .iter()
-        .find(|r| crate::ui::lib_prefs::entry_key(library, r.kind.item()).as_deref() == Some(active))?;
+    let row = rows.iter().find(|r| {
+        crate::ui::lib_prefs::entry_key(library, r.kind.item()).as_deref() == Some(active)
+    })?;
     let place = cursor.unwrap_or_else(|| placement_point(scene, camera));
     Some(add_library_row(row, library, scene, place))
 }
@@ -297,17 +325,25 @@ pub fn library_browser(
             }
             ui.separator();
             let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
-            if ui.add_enabled(can_export, egui::Button::new(theme::ico(icon::EXPORT)))
+            if ui
+                .add_enabled(can_export, egui::Button::new(theme::ico(icon::EXPORT)))
                 .on_hover_text("Export the scene to MVR")
                 .clicked()
-                && let Some(path) = rfd::FileDialog::new().add_filter("MVR scene", &["mvr"]).set_file_name("scene.mvr").save_file()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("MVR scene", &["mvr"])
+                    .set_file_name("scene.mvr")
+                    .save_file()
+                && let Err(e) = crate::mvr::export_path(scene, &path)
             {
-                if let Err(e) = crate::mvr::export_path(scene, &path) {
-                    log::error!("MVR export failed: {e}");
-                }
+                log::error!("MVR export failed: {e}");
             }
-            if ui.button(theme::ico(icon::IMPORT_MVR)).on_hover_text("Import an MVR scene").clicked()
-                && let Some(path) = rfd::FileDialog::new().add_filter("MVR scene", &["mvr"]).pick_file()
+            if ui
+                .button(theme::ico(icon::IMPORT_MVR))
+                .on_hover_text("Import an MVR scene")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("MVR scene", &["mvr"])
+                    .pick_file()
             {
                 match crate::mvr::MvrImport::load_path(&path) {
                     Ok(import) => {
@@ -320,12 +356,16 @@ pub fn library_browser(
                     Err(e) => log::error!("MVR import failed: {e}"),
                 }
             }
-            if ui.button(theme::ico(icon::IMPORT_GDTF)).on_hover_text("Import a GDTF fixture into the library").clicked()
-                && let Some(path) = rfd::FileDialog::new().add_filter("GDTF fixture", &["gdtf"]).pick_file()
+            if ui
+                .button(theme::ico(icon::IMPORT_GDTF))
+                .on_hover_text("Import a GDTF fixture into the library")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("GDTF fixture", &["gdtf"])
+                    .pick_file()
+                && let Err(e) = library.import_gdtf(&path)
             {
-                if let Err(e) = library.import_gdtf(&path) {
-                    log::error!("GDTF import failed: {e}");
-                }
+                log::error!("GDTF import failed: {e}");
             }
         });
     });
@@ -344,7 +384,8 @@ pub fn library_browser(
         }
     });
     ui.horizontal(|ui| {
-        ui.label(theme::ico(icon::SORT).weak()).on_hover_text("Sort by");
+        ui.label(theme::ico(icon::SORT).weak())
+            .on_hover_text("Sort by");
         for s in [LibSort::Category, LibSort::Name, LibSort::Manufacturer] {
             if ui.selectable_label(lib.sort == s, s.label()).clicked() {
                 lib.sort = s;
@@ -358,7 +399,10 @@ pub fn library_browser(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for c in LibChip::ORDER {
-            if ui.selectable_label(lib.chip == c, RichText::new(c.label()).small()).clicked() {
+            if ui
+                .selectable_label(lib.chip == c, RichText::new(c.label()).small())
+                .clicked()
+            {
                 lib.chip = c;
                 lib.selected.clear();
                 lib.anchor = None;
@@ -373,8 +417,10 @@ pub fn library_browser(
     let key_of = |row: &LibRow| lib_prefs::entry_key(library, row.kind.item()).unwrap_or_default();
 
     // Content-class chip first (cheap partition), THEN fuzzy/sort over what's left.
-    let mut rows: Vec<LibRow> =
-        all_rows.into_iter().filter(|r| chip_matches(lib.chip, r)).collect();
+    let mut rows: Vec<LibRow> = all_rows
+        .into_iter()
+        .filter(|r| chip_matches(lib.chip, r))
+        .collect();
     let q = lib.search.trim().to_lowercase();
     let fuzzy = !q.is_empty();
     if fuzzy {
@@ -390,13 +436,16 @@ pub fn library_browser(
                 s.map(|s| (s, r))
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
         rows = scored.into_iter().map(|(_, r)| r).collect();
     } else {
         match lib.sort {
-            LibSort::Name => rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            LibSort::Name => rows.sort_by_key(|a| a.name.to_lowercase()),
             LibSort::Manufacturer => rows.sort_by(|a, b| {
-                a.category.to_lowercase().cmp(&b.category.to_lowercase()).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                a.category
+                    .to_lowercase()
+                    .cmp(&b.category.to_lowercase())
+                    .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             }),
             LibSort::Category => {} // keep build order (already category-grouped)
         }
@@ -408,7 +457,11 @@ pub fn library_browser(
     // the Lasers chip is active). Only shown when not searching (a query searches
     // the full list).
     let pinned = !fuzzy;
-    let catalog = if pinned { library_rows(library) } else { Vec::new() };
+    let catalog = if pinned {
+        library_rows(library)
+    } else {
+        Vec::new()
+    };
     let recent_rows: Vec<LibRow> = if pinned {
         lib_prefs
             .recent
@@ -419,7 +472,11 @@ pub fn library_browser(
         Vec::new()
     };
     let fav_rows: Vec<LibRow> = if pinned {
-        catalog.iter().filter(|r| lib_prefs.is_favourite(&key_of(r))).map(clone_lib_row).collect()
+        catalog
+            .iter()
+            .filter(|r| lib_prefs.is_favourite(&key_of(r)))
+            .map(clone_lib_row)
+            .collect()
     } else {
         Vec::new()
     };
@@ -428,8 +485,15 @@ pub fn library_browser(
     let mut add_keys: Vec<String> = Vec::new(); // recent keys to record after the borrow ends
     let n_sel = lib.selected.len();
     ui.horizontal(|ui| {
-        let label = if n_sel > 1 { format!("{}  Add {n_sel}", icon::ADD) } else { format!("{}  Add", icon::ADD) };
-        if ui.add_enabled(n_sel > 0, egui::Button::new(label)).on_hover_text("Add the selected templates to the scene at the cursor (Enter)").clicked()
+        let label = if n_sel > 1 {
+            format!("{}  Add {n_sel}", icon::ADD)
+        } else {
+            format!("{}  Add", icon::ADD)
+        };
+        if ui
+            .add_enabled(n_sel > 0, egui::Button::new(label))
+            .on_hover_text("Add the selected templates to the scene at the cursor (Enter)")
+            .clicked()
             || (n_sel > 0
                 && !super::text_focus_active(ui.ctx())
                 && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)))
@@ -448,7 +512,11 @@ pub fn library_browser(
                 *selection = sel;
             }
         }
-        ui.label(RichText::new(format!("{} items", rows.len())).weak().small());
+        ui.label(
+            RichText::new(format!("{} items", rows.len()))
+                .weak()
+                .small(),
+        );
     });
     ui.separator();
 
@@ -459,12 +527,18 @@ pub fn library_browser(
     let mut thumb_ids: HashMap<usize, egui::TextureId> = HashMap::new();
     for (gi, g) in library.gdtf.iter().enumerate() {
         let key = Arc::as_ptr(g) as usize;
-        let tex = gdtf_textures.entry(key).or_insert_with(|| super::inspector::load_gdtf_textures(ui.ctx(), g));
+        let tex = gdtf_textures
+            .entry(key)
+            .or_insert_with(|| super::inspector::load_gdtf_textures(ui.ctx(), g));
         if let Some(t) = &tex.thumbnail {
             thumb_ids.insert(gi, t.id());
         }
     }
-    let thumb_of = |row: &LibRow| row.kind.gdtf_index().and_then(|gi| thumb_ids.get(&gi).copied());
+    let thumb_of = |row: &LibRow| {
+        row.kind
+            .gdtf_index()
+            .and_then(|gi| thumb_ids.get(&gi).copied())
+    };
 
     // --- the list (rich, selectable rows; shift = range, ⌘/Ctrl = toggle) ---
     let ink = theme::ink(!ui.visuals().dark_mode);
@@ -475,76 +549,84 @@ pub fn library_browser(
     let mut toggle_fav: Option<String> = None;
     let mut drop_add: Option<LibRow> = None; // a row dragged out into the viewport
     let mut dragging: Option<String> = None; // label of the row being dragged (cursor pill)
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        // Pinned pseudo-categories: Recent + Favourites (#20).
-        for (title, items) in [("RECENT", &recent_rows), ("FAVOURITES", &fav_rows)] {
-            if items.is_empty() {
-                continue;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // Pinned pseudo-categories: Recent + Favourites (#20).
+            for (title, items) in [("RECENT", &recent_rows), ("FAVOURITES", &fav_rows)] {
+                if items.is_empty() {
+                    continue;
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(title).size(10.0).strong().color(ink.tertiary));
+                for row in items {
+                    let key = key_of(row);
+                    let starred = lib_prefs.is_favourite(&key);
+                    let (resp, star) =
+                        library_row_widget(ui, row, false, starred, &ink, accent, thumb_of(row));
+                    if star {
+                        toggle_fav = Some(key);
+                    } else if resp.clicked() || resp.double_clicked() {
+                        add_now = Some(clone_lib_row(row));
+                    }
+                    if resp.dragged() {
+                        dragging = Some(row.name.clone());
+                    }
+                    if resp.drag_stopped()
+                        && ui
+                            .input(|i| i.pointer.interact_pos())
+                            .is_some_and(|p| !panel_rect.contains(p))
+                    {
+                        drop_add = Some(clone_lib_row(row));
+                    }
+                }
+                ui.add_space(2.0);
+                ui.separator();
             }
-            ui.add_space(4.0);
-            ui.label(RichText::new(title).size(10.0).strong().color(ink.tertiary));
-            for row in items {
+
+            // The full catalog (category-grouped when sorted by Category + not searching).
+            let mut last_cat = String::new();
+            for (ri, row) in rows.iter().enumerate() {
+                if !fuzzy && lib.sort == LibSort::Category && row.category != last_cat {
+                    last_cat = row.category.clone();
+                    // Same header style as the Replace dialog (theme::section) so the
+                    // Library and Replace lists read as one consistent categorisation.
+                    theme::section(ui, &row.category.to_uppercase());
+                }
                 let key = key_of(row);
+                let selected = lib.selected.contains(&ri);
                 let starred = lib_prefs.is_favourite(&key);
-                let (resp, star) = library_row_widget(ui, row, false, starred, &ink, accent, thumb_of(row));
+                let (row_resp, star) =
+                    library_row_widget(ui, row, selected, starred, &ink, accent, thumb_of(row));
                 if star {
                     toggle_fav = Some(key);
-                } else if resp.clicked() || resp.double_clicked() {
+                } else if row_resp.clicked() {
+                    clicked = Some((ri, ui.input(|i| i.modifiers)));
+                }
+                if row_resp.double_clicked() {
                     add_now = Some(clone_lib_row(row));
                 }
-                if resp.dragged() {
+                // Drag-to-place: while a row is dragged show a cursor pill; on release
+                // OUTSIDE the panel (i.e. over the viewport) drop it into the scene.
+                if row_resp.dragged() {
                     dragging = Some(row.name.clone());
                 }
-                if resp.drag_stopped()
-                    && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !panel_rect.contains(p))
+                if row_resp.drag_stopped()
+                    && ui
+                        .input(|i| i.pointer.interact_pos())
+                        .is_some_and(|p| !panel_rect.contains(p))
                 {
                     drop_add = Some(clone_lib_row(row));
                 }
             }
-            ui.add_space(2.0);
-            ui.separator();
-        }
-
-        // The full catalog (category-grouped when sorted by Category + not searching).
-        let mut last_cat = String::new();
-        for (ri, row) in rows.iter().enumerate() {
-            if !fuzzy && lib.sort == LibSort::Category && row.category != last_cat {
-                last_cat = row.category.clone();
-                // Same header style as the Replace dialog (theme::section) so the
-                // Library and Replace lists read as one consistent categorisation.
-                theme::section(ui, &row.category.to_uppercase());
+            // Apply a select-click (after the loop so we don't borrow rows mid-iter).
+            if let Some((ri, mods)) = clicked {
+                apply_lib_click(lib, ri, &mods, rows.len());
+                // Remember the highlighted row by its STABLE key so the viewport's Enter
+                // can add it (see `add_active_library_item`).
+                lib.active = rows.get(ri).map(&key_of);
             }
-            let key = key_of(row);
-            let selected = lib.selected.contains(&ri);
-            let starred = lib_prefs.is_favourite(&key);
-            let (row_resp, star) = library_row_widget(ui, row, selected, starred, &ink, accent, thumb_of(row));
-            if star {
-                toggle_fav = Some(key);
-            } else if row_resp.clicked() {
-                clicked = Some((ri, ui.input(|i| i.modifiers)));
-            }
-            if row_resp.double_clicked() {
-                add_now = Some(clone_lib_row(row));
-            }
-            // Drag-to-place: while a row is dragged show a cursor pill; on release
-            // OUTSIDE the panel (i.e. over the viewport) drop it into the scene.
-            if row_resp.dragged() {
-                dragging = Some(row.name.clone());
-            }
-            if row_resp.drag_stopped()
-                && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !panel_rect.contains(p))
-            {
-                drop_add = Some(clone_lib_row(row));
-            }
-        }
-        // Apply a select-click (after the loop so we don't borrow rows mid-iter).
-        if let Some((ri, mods)) = clicked {
-            apply_lib_click(lib, ri, &mods, rows.len());
-            // Remember the highlighted row by its STABLE key so the viewport's Enter
-            // can add it (see `add_active_library_item`).
-            lib.active = rows.get(ri).map(|r| key_of(r));
-        }
-    });
+        });
 
     // Drain the deferred channels now the scroll closure's borrows are released.
     if let Some(key) = toggle_fav {
@@ -575,7 +657,8 @@ pub fn library_browser(
             ));
             let text = format!("{}  {}", icon::ADD, name);
             let font = egui::FontId::proportional(12.0);
-            let galley = painter.layout_no_wrap(text, font, theme::ink(!ui.visuals().dark_mode).primary);
+            let galley =
+                painter.layout_no_wrap(text, font, theme::ink(!ui.visuals().dark_mode).primary);
             let pad = egui::vec2(8.0, 4.0);
             let at = p + egui::vec2(14.0, 6.0);
             let bg = egui::Rect::from_min_size(at, galley.size() + pad * 2.0);
@@ -648,12 +731,18 @@ fn library_row_widget(
     let h = 34.0;
     // click_and_drag so a row can be DRAGGED out into the viewport to place it
     // (S2b); a plain click still selects, a double-click still adds.
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click_and_drag());
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
     if selected {
         painter.rect_filled(rect, 4.0, visuals.selection.bg_fill);
-        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, accent),
+            egui::StrokeKind::Inside,
+        );
     } else if resp.hovered() {
         painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
     }
@@ -682,11 +771,29 @@ fn library_row_widget(
         }
     }
     let text_w = (rect.width() - 30.0 - 40.0).max(40.0);
-    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 4.0), &row.name, 13.0, ink.primary, text_w);
+    paint_truncated(
+        &painter,
+        rect.left_top() + egui::vec2(30.0, 4.0),
+        &row.name,
+        13.0,
+        ink.primary,
+        text_w,
+    );
     // Reserve room on the meta line for the colour-coded source chip + action
     // gutter (bug 11 + the chip/icon overlap fix): chip ~70px + the 44px gutter.
-    let meta_w = if row.source.is_some() { (text_w - 110.0).max(30.0) } else { text_w };
-    paint_truncated(&painter, rect.left_top() + egui::vec2(30.0, 19.0), &row.meta, 10.5, ink.tertiary, meta_w);
+    let meta_w = if row.source.is_some() {
+        (text_w - 110.0).max(30.0)
+    } else {
+        text_w
+    };
+    paint_truncated(
+        &painter,
+        rect.left_top() + egui::vec2(30.0, 19.0),
+        &row.meta,
+        10.5,
+        ink.tertiary,
+        meta_w,
+    );
     // Source provenance: a clean colour-coded TEXT tag (no floating dot), right-
     // aligned at a fixed gutter and VERTICALLY CENTERED so it reads as a consistent
     // right-hand column across rows (the dot-on-a-margin looked awful). Sits left of
@@ -735,7 +842,12 @@ fn library_row_widget(
     {
         star_clicked = true;
     }
-    (resp.on_hover_text("Click to select · double-click or drag to viewport to add · star = favourite"), star_clicked)
+    (
+        resp.on_hover_text(
+            "Click to select · double-click or drag to viewport to add · star = favourite",
+        ),
+        star_clicked,
+    )
 }
 
 #[cfg(test)]
@@ -744,7 +856,15 @@ mod chip_tests {
 
     // --- library content-class chip predicate (S2c) ---------------------------
     fn row(kind: LibKind, accent: bool) -> LibRow {
-        LibRow { kind, icon: "", name: String::new(), meta: String::new(), category: String::new(), accent, source: None }
+        LibRow {
+            kind,
+            icon: "",
+            name: String::new(),
+            meta: String::new(),
+            category: String::new(),
+            accent,
+            source: None,
+        }
     }
 
     #[test]
@@ -763,32 +883,71 @@ mod chip_tests {
     #[test]
     fn chip_fixtures_includes_gdtf_and_non_laser_profiles_only() {
         // Imported GDTF + a built-in NON-laser profile pass.
-        assert!(chip_matches(LibChip::Fixtures, &row(LibKind::Gdtf(0), false)));
-        assert!(chip_matches(LibChip::Fixtures, &row(LibKind::Fixture(0), false)));
+        assert!(chip_matches(
+            LibChip::Fixtures,
+            &row(LibKind::Gdtf(0), false)
+        ));
+        assert!(chip_matches(
+            LibChip::Fixtures,
+            &row(LibKind::Fixture(0), false)
+        ));
         // A laser profile (accent) is NOT a "fixture" under this chip.
-        assert!(!chip_matches(LibChip::Fixtures, &row(LibKind::Fixture(1), true)));
+        assert!(!chip_matches(
+            LibChip::Fixtures,
+            &row(LibKind::Fixture(1), true)
+        ));
         // Screens / environments are excluded.
-        assert!(!chip_matches(LibChip::Fixtures, &row(LibKind::Screen(0), false)));
-        assert!(!chip_matches(LibChip::Fixtures, &row(LibKind::Env(0), false)));
+        assert!(!chip_matches(
+            LibChip::Fixtures,
+            &row(LibKind::Screen(0), false)
+        ));
+        assert!(!chip_matches(
+            LibChip::Fixtures,
+            &row(LibKind::Env(0), false)
+        ));
     }
 
     #[test]
     fn chip_lasers_is_only_accented_profiles() {
-        assert!(chip_matches(LibChip::Lasers, &row(LibKind::Fixture(0), true)));
-        assert!(!chip_matches(LibChip::Lasers, &row(LibKind::Fixture(0), false)));
+        assert!(chip_matches(
+            LibChip::Lasers,
+            &row(LibKind::Fixture(0), true)
+        ));
+        assert!(!chip_matches(
+            LibChip::Lasers,
+            &row(LibKind::Fixture(0), false)
+        ));
         // A GDTF is never classed as a laser by this chip (accent is irrelevant).
         assert!(!chip_matches(LibChip::Lasers, &row(LibKind::Gdtf(0), true)));
     }
 
     #[test]
     fn chip_screens_environments_imported_partition_by_kind() {
-        assert!(chip_matches(LibChip::Screens, &row(LibKind::Screen(0), false)));
-        assert!(!chip_matches(LibChip::Screens, &row(LibKind::Env(0), false)));
-        assert!(chip_matches(LibChip::Environments, &row(LibKind::Env(0), false)));
-        assert!(!chip_matches(LibChip::Environments, &row(LibKind::Screen(0), false)));
+        assert!(chip_matches(
+            LibChip::Screens,
+            &row(LibKind::Screen(0), false)
+        ));
+        assert!(!chip_matches(
+            LibChip::Screens,
+            &row(LibKind::Env(0), false)
+        ));
+        assert!(chip_matches(
+            LibChip::Environments,
+            &row(LibKind::Env(0), false)
+        ));
+        assert!(!chip_matches(
+            LibChip::Environments,
+            &row(LibKind::Screen(0), false)
+        ));
         // Imported = GDTF rows only (a built-in profile, even non-laser, is not).
-        assert!(chip_matches(LibChip::Imported, &row(LibKind::Gdtf(0), false)));
-        assert!(!chip_matches(LibChip::Imported, &row(LibKind::Fixture(0), false)));
+        assert!(chip_matches(
+            LibChip::Imported,
+            &row(LibKind::Gdtf(0), false)
+        ));
+        assert!(!chip_matches(
+            LibChip::Imported,
+            &row(LibKind::Fixture(0), false)
+        ));
     }
 }
 
@@ -810,17 +969,21 @@ mod library_add_tests {
 
         let mut scene = Scene::default();
         let camera = OrbitCamera::default();
-        let count =
-            |s: &Scene| s.fixtures.len() + s.geometry.len() + s.screens.len() + s.environments.len();
+        let count = |s: &Scene| {
+            s.fixtures.len() + s.geometry.len() + s.screens.len() + s.environments.len()
+        };
         let before = count(&scene);
-        let sel = add_active_library_item(&library, &mut scene, &camera, &key, Some(glam::Vec3::ZERO));
+        let sel =
+            add_active_library_item(&library, &mut scene, &camera, &key, Some(glam::Vec3::ZERO));
         assert!(sel.is_some(), "a resolvable key adds + returns a selection");
         assert_eq!(count(&scene), before + 1, "exactly one entity is added");
 
         // An unknown key resolves to nothing → no add, no panic (cursor None is fine,
         // placement_point is only reached once a row resolves).
         let mid = count(&scene);
-        assert!(add_active_library_item(&library, &mut scene, &camera, "nope::missing", None).is_none());
+        assert!(
+            add_active_library_item(&library, &mut scene, &camera, "nope::missing", None).is_none()
+        );
         assert_eq!(count(&scene), mid, "an unknown key adds nothing");
     }
 }

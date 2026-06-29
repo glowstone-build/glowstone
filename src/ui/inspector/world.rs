@@ -3,9 +3,9 @@
 //! Render-properties property tabs shown when the World root node is selected.
 
 use super::super::render_panel::{self, RenderPhase, RenderUiState};
+use super::InspectorState;
 use super::props::{self, Props};
 use super::theme;
-use super::InspectorState;
 use crate::scene::Scene;
 use egui::{DragValue, RichText, Slider};
 
@@ -39,13 +39,22 @@ fn world_inspector(p: &mut Props, world: &mut crate::scene::World, ink: &theme::
                     Err(e) => log::error!("load HDRI {}: {e}", path.display()),
                 }
             }
-            if world.hdri.is_some() && ui.button(theme::ico(icon::CLOSE)).on_hover_text("Remove the environment map").clicked() {
+            if world.hdri.is_some()
+                && ui
+                    .button(theme::ico(icon::CLOSE))
+                    .on_hover_text("Remove the environment map")
+                    .clicked()
+            {
                 world.hdri = None;
                 world.hdri_name.clear();
             }
         });
         let name = if world.hdri.is_some() {
-            if world.hdri_name.is_empty() { "loaded".to_string() } else { world.hdri_name.clone() }
+            if world.hdri_name.is_empty() {
+                "loaded".to_string()
+            } else {
+                world.hdri_name.clone()
+            }
         } else {
             "none (dark void)".to_string()
         };
@@ -74,7 +83,12 @@ fn world_inspector(p: &mut Props, world: &mut crate::scene::World, ink: &theme::
     });
     if !enabled {
         p.custom_block(&["Brightness", "Ambient", "Rotation", "Background"], |ui| {
-            ui.label(RichText::new("Load a map to light the scene from the environment.").weak().small().color(ink.muted));
+            ui.label(
+                RichText::new("Load a map to light the scene from the environment.")
+                    .weak()
+                    .small()
+                    .color(ink.muted),
+            );
         });
     }
 }
@@ -112,7 +126,7 @@ pub(super) fn render_properties(
             egui::ComboBox::from_id_salt("render-engine")
                 .selected_text(crate::renderer::ENGINE_NAME)
                 .show_ui(ui, |ui| {
-                    ui.selectable_label(true, crate::renderer::ENGINE_NAME);
+                    let _ = ui.selectable_label(true, crate::renderer::ENGINE_NAME);
                 });
         });
 
@@ -142,7 +156,8 @@ pub(super) fn render_properties(
         // the restart hint when the chosen backend differs from the running one.
         p.custom_block(&["Render"], |ui| {
             // Hint when the chosen backend differs from the running one.
-            if !render_ui.gpu_selected.is_empty() && render_ui.gpu_selected != render_ui.gpu_active {
+            if !render_ui.gpu_selected.is_empty() && render_ui.gpu_selected != render_ui.gpu_active
+            {
                 ui.label(
                     RichText::new(format!("Restart to switch to {}", render_ui.gpu_selected))
                         .small()
@@ -157,7 +172,9 @@ pub(super) fn render_properties(
                     if ui
                         .add_sized(
                             [w, 28.0],
-                            egui::Button::new(RichText::new(format!("{}  Render", icon::RENDER_GO)).strong()),
+                            egui::Button::new(
+                                RichText::new(format!("{}  Render", icon::RENDER_GO)).strong(),
+                            ),
                         )
                         .on_hover_text("Render the current view as a still image")
                         .clicked()
@@ -167,8 +184,11 @@ pub(super) fn render_properties(
                 });
                 cols[1].add_enabled_ui(false, |ui| {
                     let w = ui.available_width();
-                    ui.add_sized([w, 28.0], egui::Button::new(format!("{}  Animation", icon::ANIMATION)))
-                        .on_hover_text("Animation rendering — coming soon");
+                    ui.add_sized(
+                        [w, 28.0],
+                        egui::Button::new(format!("{}  Animation", icon::ANIMATION)),
+                    )
+                    .on_hover_text("Animation rendering — coming soon");
                 });
             });
             ui.add_space(4.0);
@@ -180,7 +200,10 @@ pub(super) fn render_properties(
                 .show_ui(ui, |ui| {
                     for d in RenderDisplay::ALL {
                         ui.add_enabled_ui(d.enabled(), |ui| {
-                            if ui.selectable_label(scene.render.display == d, d.label()).clicked() {
+                            if ui
+                                .selectable_label(scene.render.display == d, d.label())
+                                .clicked()
+                            {
                                 scene.render.display = d;
                             }
                         });
@@ -189,7 +212,9 @@ pub(super) fn render_properties(
         });
         p.custom_block(&["Render to image file"], |ui| {
             ui.checkbox(&mut scene.render.write_to_disk, "Render to image file")
-                .on_hover_text("Write the result to the output file as soon as the render completes");
+                .on_hover_text(
+                    "Write the result to the output file as soon as the render completes",
+                );
             ui.add_space(4.0);
         });
 
@@ -198,16 +223,27 @@ pub(super) fn render_properties(
             // res_x / res_y / resolution_percentage are u32: edit through DragValue<u32>
             // / Slider<u32> verbatim so the integer types + suffixes stay bit-identical.
             p.custom("Resolution X", true, |ui| {
-                ui.add(DragValue::new(&mut scene.render.res_x).range(16..=8192).speed(2.0).suffix(" px"));
+                ui.add(
+                    DragValue::new(&mut scene.render.res_x)
+                        .range(16..=8192)
+                        .speed(2.0)
+                        .suffix(" px"),
+                );
             });
             p.custom("Resolution Y", true, |ui| {
-                ui.add(DragValue::new(&mut scene.render.res_y).range(16..=8192).speed(2.0).suffix(" px"));
+                ui.add(
+                    DragValue::new(&mut scene.render.res_y)
+                        .range(16..=8192)
+                        .speed(2.0)
+                        .suffix(" px"),
+                );
             });
             // Scale: a u32 percentage slider with " %" suffix — a custom widget so the
             // integer type + suffix stay bit-identical.
             p.custom("Scale", true, |ui| {
                 // Range matches RenderConfig::output_size's clamp (up to 400% supersample).
-                ui.spacing_mut().slider_width = (ui.available_width() - super::INSPECTOR_SLIDER_READOUT).max(24.0);
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - super::INSPECTOR_SLIDER_READOUT).max(24.0);
                 ui.add(Slider::new(&mut scene.render.resolution_percentage, 10..=400).suffix(" %"));
             });
             p.custom("Format", true, |ui| {
@@ -215,7 +251,10 @@ pub(super) fn render_properties(
                     .selected_text(scene.render.format.label())
                     .show_ui(ui, |ui| {
                         for f in RenderFormat::ALL {
-                            if ui.selectable_label(scene.render.format == f, f.label()).clicked() {
+                            if ui
+                                .selectable_label(scene.render.format == f, f.label())
+                                .clicked()
+                            {
                                 scene.render.format = f;
                             }
                         }
@@ -246,9 +285,17 @@ pub(super) fn render_properties(
                 });
             });
             let (w, h) = scene.render.output_size();
-            p.custom_block(&["Resolution X", "Resolution Y", "Scale", "Format", "File"], |ui| {
-                ui.label(RichText::new(format!("Renders at {w}×{h} px")).weak().small().color(ink.muted));
-            });
+            p.custom_block(
+                &["Resolution X", "Resolution Y", "Scale", "Format", "File"],
+                |ui| {
+                    ui.label(
+                        RichText::new(format!("Renders at {w}×{h} px"))
+                            .weak()
+                            .small()
+                            .color(ink.muted),
+                    );
+                },
+            );
         });
 
         // --- Sampling (Viewport vs Render, like Blender's two sub-panels) ---
@@ -320,8 +367,12 @@ pub(super) fn render_properties(
         p.group("Performance", icon::SETTINGS, false, |p| {
             p.subhead("Viewport (preview)");
             p.custom("Shadow maps", true, |ui| {
-                ui.add(DragValue::new(&mut settings.shadow_max).range(0..=16).speed(1.0))
-                    .on_hover_text("Preview hero shadow maps — fewer is faster");
+                ui.add(
+                    DragValue::new(&mut settings.shadow_max)
+                        .range(0..=16)
+                        .speed(1.0),
+                )
+                .on_hover_text("Preview hero shadow maps — fewer is faster");
             });
             p.custom("Froxel", true, |ui| {
                 ui.checkbox(&mut settings.froxel_volumetric, "")
@@ -330,8 +381,12 @@ pub(super) fn render_properties(
 
             p.subhead("Render (final)");
             p.custom("Shadow maps", true, |ui| {
-                ui.add(DragValue::new(&mut scene.render.shadow_max).range(0..=16).speed(1.0))
-                    .on_hover_text("Render hero shadow maps");
+                ui.add(
+                    DragValue::new(&mut scene.render.shadow_max)
+                        .range(0..=16)
+                        .speed(1.0),
+                )
+                .on_hover_text("Render hero shadow maps");
             });
             p.custom("Froxel", true, |ui| {
                 ui.checkbox(&mut scene.render.froxel_volumetric, "")
@@ -339,19 +394,45 @@ pub(super) fn render_properties(
             });
             p.custom("Overlays", true, |ui| {
                 ui.checkbox(&mut scene.render.show_overlays, "")
-                    .on_hover_text("Include the origin grid + gizmos in the render (off = clean plate)");
+                    .on_hover_text(
+                        "Include the origin grid + gizmos in the render (off = clean plate)",
+                    );
             });
         });
 
         // --- Color Management (SHARED with the viewport — preview matches render) -
         p.group("Color Management", icon::COLOR, true, |p| {
-            p.custom_block(&["Exposure", "Bloom", "Beam intensity", "Gobo sharpness", "Chroma haze"], |ui| {
-                ui.label(RichText::new("Shared with the viewport — what you preview is what you render.").small().weak().color(ink.muted));
-            });
-            p.f32("Exposure", &mut settings.exposure).range(0.05..=8.0).slider();
-            p.f32("Bloom", &mut settings.bloom).range(0.0..=2.0).slider();
-            p.f32("Beam intensity", &mut settings.beam_intensity).range(0.0..=2000.0).slider();
-            p.f32("Gobo sharpness", &mut settings.gobo_sharpness).range(0.0..=2.0).slider();
+            p.custom_block(
+                &[
+                    "Exposure",
+                    "Bloom",
+                    "Beam intensity",
+                    "Gobo sharpness",
+                    "Chroma haze",
+                ],
+                |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Shared with the viewport — what you preview is what you render.",
+                        )
+                        .small()
+                        .weak()
+                        .color(ink.muted),
+                    );
+                },
+            );
+            p.f32("Exposure", &mut settings.exposure)
+                .range(0.05..=8.0)
+                .slider();
+            p.f32("Bloom", &mut settings.bloom)
+                .range(0.0..=2.0)
+                .slider();
+            p.f32("Beam intensity", &mut settings.beam_intensity)
+                .range(0.0..=2000.0)
+                .slider();
+            p.f32("Gobo sharpness", &mut settings.gobo_sharpness)
+                .range(0.0..=2.0)
+                .slider();
             p.f32("Chroma haze", &mut settings.chroma_haze)
                 .range(0.0..=2.0)
                 .slider()
@@ -364,7 +445,8 @@ pub(super) fn render_properties(
             // Fog density: drive the active (non-hidden) fog volume, or a "no fog
             // volume" placeholder — a custom slider (indirect target + placeholder).
             p.custom("Fog density", true, |ui| {
-                ui.spacing_mut().slider_width = (ui.available_width() - super::INSPECTOR_SLIDER_READOUT).max(24.0);
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - super::INSPECTOR_SLIDER_READOUT).max(24.0);
                 match scene.environments.iter_mut().find(|e| !e.hidden) {
                     Some(env) => {
                         ui.add(Slider::new(&mut env.density, 0.0..=2.0))
@@ -383,7 +465,15 @@ pub(super) fn render_properties(
                 ui.add_enabled_ui(false, |ui| {
                     ui.checkbox(&mut scene.render.motion_blur, "Enable");
                 });
-                ui.label(RichText::new(format!("Not yet supported by {}", crate::renderer::ENGINE_NAME)).weak().small().color(ink.muted));
+                ui.label(
+                    RichText::new(format!(
+                        "Not yet supported by {}",
+                        crate::renderer::ENGINE_NAME
+                    ))
+                    .weak()
+                    .small()
+                    .color(ink.muted),
+                );
             });
         });
 
@@ -393,7 +483,12 @@ pub(super) fn render_properties(
                 ui.add_enabled_ui(false, |ui| {
                     ui.checkbox(&mut scene.render.caustics, "Enable");
                 });
-                ui.label(RichText::new("Not implemented").weak().small().color(ink.muted));
+                ui.label(
+                    RichText::new("Not implemented")
+                        .weak()
+                        .small()
+                        .color(ink.muted),
+                );
             });
         });
     });

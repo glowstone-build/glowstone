@@ -55,7 +55,7 @@ pub fn operator_search_window(
         .into_iter()
         .filter_map(|c| crate::ui::lib_prefs::fuzzy_score(q, c.label).map(|s| (s, c)))
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0)); // best match first; stable sort preserves ties' order
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0)); // best match first; stable sort preserves ties' order
     let list: Vec<&'static Command> = scored.into_iter().map(|(_, c)| c).collect();
 
     // --- keyboard navigation (read before the window so it works before focus
@@ -120,24 +120,25 @@ pub fn operator_search_window(
                 ui.label(RichText::new("No matching operators").weak());
                 return;
             }
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                for (i, c) in list.iter().enumerate() {
-                    let enabled = runnable(c.id);
-                    let resp = op_row(ui, c, i == state.idx, enabled);
-                    if resp.clicked() && enabled {
-                        picked = Some(c.id);
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    for (i, c) in list.iter().enumerate() {
+                        let enabled = runnable(c.id);
+                        let resp = op_row(ui, c, i == state.idx, enabled);
+                        if resp.clicked() && enabled {
+                            picked = Some(c.id);
+                        }
                     }
-                }
-            });
+                });
         });
 
     // Enter runs the highlighted row (if it's runnable).
-    if commit {
-        if let Some(c) = list.get(state.idx) {
-            if runnable(c.id) {
-                picked = Some(c.id);
-            }
-        }
+    if commit
+        && let Some(c) = list.get(state.idx)
+        && runnable(c.id)
+    {
+        picked = Some(c.id);
     }
 
     if picked.is_some() {

@@ -59,7 +59,8 @@ impl<'a> Reader<'a> {
         self.take(2).map(|s| u16::from_le_bytes([s[0], s[1]]))
     }
     fn u32(&mut self) -> Option<u32> {
-        self.take(4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        self.take(4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
     fn fourcc(&mut self) -> Option<[u8; 4]> {
         self.take(4).map(|s| [s[0], s[1], s[2], s[3]])
@@ -103,7 +104,10 @@ pub fn parse_header(b: &[u8]) -> Option<Header> {
     let _part_count = r.u16()?;
     let _part = r.u16()?;
     let content_type = r.fourcc()?;
-    Some(Header { content_type, message_size })
+    Some(Header {
+        content_type,
+        message_size,
+    })
 }
 
 fn write_header(out: &mut Vec<u8>, content_type: &[u8; 4], total_size: u32) {
@@ -157,7 +161,12 @@ pub fn parse_ploc(b: &[u8]) -> Option<PeerLocation> {
     let kind = r.cstring()?;
     let name = r.cstring()?;
     let state = r.cstring().unwrap_or_default();
-    Some(PeerLocation { listening_tcp_port, kind, name, state })
+    Some(PeerLocation {
+        listening_tcp_port,
+        kind,
+        name,
+        state,
+    })
 }
 
 /// Build a PLoc announce for THIS peer (so servers see us as a Visualiser).
@@ -290,9 +299,22 @@ pub fn parse_stfr(b: &[u8]) -> Option<StreamFrame> {
         None
     };
     // For fragmented formats `buffer_size` includes the 12-byte preamble.
-    let img_len = if fragmented { buffer_size.saturating_sub(12) } else { buffer_size };
+    let img_len = if fragmented {
+        buffer_size.saturating_sub(12)
+    } else {
+        buffer_size
+    };
     let buffer = r.take(img_len.min(r.remaining()))?.to_vec();
-    Some(StreamFrame { source_id, format, width, height, msex_minor: vmin, uuid, fragment, buffer })
+    Some(StreamFrame {
+        source_id,
+        format,
+        width,
+        height,
+        msex_minor: vmin,
+        uuid,
+        fragment,
+        buffer,
+    })
 }
 
 /// Decode a *complete* (non-fragmented, or already-reassembled) frame image into
@@ -395,7 +417,14 @@ mod tests {
         assert_eq!(m.len(), 38);
     }
 
-    fn build_stfr(minor: u8, format: &[u8; 4], w: u16, h: u16, uuid: Option<&str>, buf: &[u8]) -> Vec<u8> {
+    fn build_stfr(
+        minor: u8,
+        format: &[u8; 4],
+        w: u16,
+        h: u16,
+        uuid: Option<&str>,
+        buf: &[u8],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.push(1);
         body.push(minor);
@@ -429,7 +458,8 @@ mod tests {
         assert!(sf.fragment.is_none());
         assert_eq!(sf.msex_minor, 1, "version carried on the frame");
         let (w, h, rgba) =
-            image_to_rgba(&sf.format, sf.width, sf.height, &sf.buffer, sf.msex_minor).expect("rgba");
+            image_to_rgba(&sf.format, sf.width, sf.height, &sf.buffer, sf.msex_minor)
+                .expect("rgba");
         assert_eq!((w, h), (2, 1));
         // 1.1 = RGB order, so pixels pass straight through, alpha forced 255.
         assert_eq!(&rgba[0..4], &[10, 20, 30, 255]);
@@ -444,7 +474,8 @@ mod tests {
         assert_eq!(sf.msex_minor, 0, "v1.0 carried on the frame");
         // Decode through the frame's own version (the live path) — must be BGR.
         let (_, _, rgba) =
-            image_to_rgba(&sf.format, sf.width, sf.height, &sf.buffer, sf.msex_minor).expect("rgba");
+            image_to_rgba(&sf.format, sf.width, sf.height, &sf.buffer, sf.msex_minor)
+                .expect("rgba");
         // BGR (10,20,30) → RGB (30,20,10).
         assert_eq!(&rgba[0..4], &[30, 20, 10, 255]);
     }

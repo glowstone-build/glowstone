@@ -41,6 +41,9 @@ impl Default for UniverseFrame {
 /// network thread and read (pointer-cloned) by the render thread each frame.
 #[derive(Clone, Debug, Default)]
 pub struct UniverseSnapshot {
+    /// Monotonic snapshot version. Bumped whenever the receive thread publishes a
+    /// fresh immutable frame set.
+    pub generation: u64,
     /// Active universes keyed by 1-based universe id.
     pub frames: HashMap<u16, UniverseFrame>,
 }
@@ -97,7 +100,8 @@ mod tests {
     fn liveness_respects_staleness() {
         let mut snap = UniverseSnapshot::default();
         snap.frames.insert(1, frame_with(1, 1, Duration::ZERO));
-        snap.frames.insert(2, frame_with(1, 1, Duration::from_secs(10)));
+        snap.frames
+            .insert(2, frame_with(1, 1, Duration::from_secs(10)));
         let stale = Duration::from_secs(3);
         assert!(snap.is_live(1, stale), "fresh universe is live");
         assert!(!snap.is_live(2, stale), "10s-old universe is stale");

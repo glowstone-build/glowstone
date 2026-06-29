@@ -138,10 +138,19 @@ impl Notifier {
             Severity::Warn => log::warn!("{text}"),
             _ => log::info!("{text}"),
         }
-        self.toasts.push(Toast { severity, text: text.clone(), age: 0.0, ttl: severity.ttl() });
+        self.toasts.push(Toast {
+            severity,
+            text: text.clone(),
+            age: 0.0,
+            ttl: severity.ttl(),
+        });
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.log.push(LogEntry { severity, text, seq });
+        self.log.push(LogEntry {
+            severity,
+            text,
+            seq,
+        });
         if self.log.len() > LOG_CAP {
             // Drop the oldest overflow in one shot (rare; only on a long session).
             let drop = self.log.len() - LOG_CAP;
@@ -251,9 +260,7 @@ impl Notifier {
                 if self.log.is_empty() {
                     ui.add_space(8.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new("No notifications yet").color(pal.ink_muted),
-                        );
+                        ui.label(egui::RichText::new("No notifications yet").color(pal.ink_muted));
                     });
                     return;
                 }
@@ -287,7 +294,11 @@ fn log_row(ui: &mut egui::Ui, e: &LogEntry, pal: &theme::Palette) {
                 .small()
                 .color(pal.ink_muted),
         );
-        ui.label(egui::RichText::new(e.severity.icon()).color(accent).size(13.0));
+        ui.label(
+            egui::RichText::new(e.severity.icon())
+                .color(accent)
+                .size(13.0),
+        );
         ui.label(
             egui::RichText::new(format!("{:<5}", e.severity.label()))
                 .monospace()
@@ -295,7 +306,11 @@ fn log_row(ui: &mut egui::Ui, e: &LogEntry, pal: &theme::Palette) {
                 .color(accent),
         );
         // Let the message wrap within the remaining width.
-        ui.label(egui::RichText::new(&e.text).color(pal.ink_secondary).size(12.5));
+        ui.label(
+            egui::RichText::new(&e.text)
+                .color(pal.ink_secondary)
+                .size(12.5),
+        );
     });
 }
 
@@ -315,7 +330,11 @@ fn toast_row(ui: &mut egui::Ui, t: &Toast, pal: &theme::Palette) {
         .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.6)))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(t.severity.icon()).color(accent).size(14.0));
+                ui.label(
+                    egui::RichText::new(t.severity.icon())
+                        .color(accent)
+                        .size(14.0),
+                );
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(&t.text).color(fg).size(12.5));
             });
@@ -361,7 +380,10 @@ impl StatusStack {
     pub fn push(&mut self, text: impl Into<String>) -> StatusHandle {
         let handle = StatusHandle(self.next_id);
         self.next_id += 1;
-        self.stack.push(StatusMsg { handle, text: text.into() });
+        self.stack.push(StatusMsg {
+            handle,
+            text: text.into(),
+        });
         handle
     }
 
@@ -425,7 +447,12 @@ mod tests {
 
     #[test]
     fn alpha_fades_in_last_window_only() {
-        let mut t = Toast { severity: Severity::Info, text: String::new(), age: 0.0, ttl: 3.0 };
+        let mut t = Toast {
+            severity: Severity::Info,
+            text: String::new(),
+            age: 0.0,
+            ttl: 3.0,
+        };
         assert_eq!(t.alpha(), 1.0, "full alpha well before expiry");
         t.age = t.ttl - FADE * 0.5; // halfway through the fade window
         assert!(t.alpha() > 0.0 && t.alpha() < 1.0, "fading near the end");
@@ -478,8 +505,12 @@ mod tests {
         n.info("first");
         n.warn("second");
         n.error("third");
-        let newest_first: Vec<(&str, Severity)> =
-            n.log().iter().rev().map(|e| (e.text.as_str(), e.severity)).collect();
+        let newest_first: Vec<(&str, Severity)> = n
+            .log()
+            .iter()
+            .rev()
+            .map(|e| (e.text.as_str(), e.severity))
+            .collect();
         assert_eq!(
             newest_first,
             vec![
@@ -499,8 +530,15 @@ mod tests {
             n.info(format!("msg {i}"));
         }
         let seqs: Vec<u64> = n.log().iter().map(|e| e.seq).collect();
-        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seq strictly increasing");
-        assert_eq!(*seqs.first().unwrap(), 5, "first retained ordinal past the dropped 5");
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "seq strictly increasing"
+        );
+        assert_eq!(
+            *seqs.first().unwrap(),
+            5,
+            "first retained ordinal past the dropped 5"
+        );
         assert_eq!(*seqs.last().unwrap(), (LOG_CAP + 5 - 1) as u64);
     }
 

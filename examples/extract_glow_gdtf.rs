@@ -20,7 +20,10 @@ struct Extract {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let show = &args[1];
-    let out_dir = args.get(2).cloned().unwrap_or_else(|| "/tmp/glow_gdtf".into());
+    let out_dir = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "/tmp/glow_gdtf".into());
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let bytes = std::fs::read(show).unwrap();

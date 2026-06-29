@@ -13,20 +13,20 @@ mod gizmo;
 mod inspector;
 mod lib_prefs;
 mod library;
-mod ops;
-mod pies;
-mod setup;
-mod splash;
 pub mod nav_gizmo;
 mod notify;
 pub(crate) mod op;
+mod ops;
 mod outliner;
 mod panels;
 mod pie;
+mod pies;
 mod render_panel;
+mod setup;
+mod splash;
 pub use panels::ScreenSources;
 pub use render_panel::{
-    default_filename, save_image, RenderPhase, RenderRequest, RenderStatus, RenderUiState,
+    RenderPhase, RenderRequest, RenderStatus, RenderUiState, default_filename, save_image,
 };
 pub mod project;
 mod share_window;
@@ -87,7 +87,13 @@ pub(crate) struct DupDefaults {
 
 impl Default for DupDefaults {
     fn default() -> Self {
-        Self { x: 0.0, y: 0.0, z: 0.0, angle: 0.0, count: 1 }
+        Self {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            angle: 0.0,
+            count: 1,
+        }
     }
 }
 
@@ -96,12 +102,18 @@ impl Default for DupDefaults {
 /// add/operator dialogs) check this so committing a value box with Enter can't leak
 /// into them and fire an unintended action (bug 8).
 pub(crate) fn text_focus_active(ctx: &egui::Context) -> bool {
-    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("glowstone.text_focus")).unwrap_or(false))
+    ctx.data(|d| {
+        d.get_temp::<bool>(egui::Id::new("glowstone.text_focus"))
+            .unwrap_or(false)
+    })
 }
 
 /// The last-used Duplicate values (or all-zero defaults on first use).
 pub(crate) fn dup_defaults(ctx: &egui::Context) -> DupDefaults {
-    ctx.data(|d| d.get_temp::<DupDefaults>(egui::Id::new("glowstone.dup.defaults")).unwrap_or_default())
+    ctx.data(|d| {
+        d.get_temp::<DupDefaults>(egui::Id::new("glowstone.dup.defaults"))
+            .unwrap_or_default()
+    })
 }
 
 /// Remember the Duplicate values just used, so the next Duplicate reuses them.
@@ -113,7 +125,14 @@ pub(crate) fn set_dup_defaults(ctx: &egui::Context, v: DupDefaults) {
 /// last-used values (all-zero on first use — never a preset fan).
 pub(crate) fn duplicate_dialog_for(ctx: &egui::Context, fixture: usize) -> DuplicateDialog {
     let d = dup_defaults(ctx);
-    DuplicateDialog { fixture, x: d.x, y: d.y, z: d.z, y_angle: d.angle, count: d.count }
+    DuplicateDialog {
+        fixture,
+        x: d.x,
+        y: d.y,
+        z: d.z,
+        y_angle: d.angle,
+        count: d.count,
+    }
 }
 
 /// State of the open Replace-fixtures dialog (Shift+R). Swaps the selected
@@ -258,8 +277,16 @@ impl NumInput {
     /// The typed readout for the header pill, e.g. `-4.0`. Shows a lone `-` when
     /// only the sign is set, so the user sees their keystroke land.
     pub fn display(&self) -> String {
-        let s = if self.str.is_empty() { "0" } else { self.str.as_str() };
-        if self.sign { format!("-{s}") } else { s.to_string() }
+        let s = if self.str.is_empty() {
+            "0"
+        } else {
+            self.str.as_str()
+        };
+        if self.sign {
+            format!("-{s}")
+        } else {
+            s.to_string()
+        }
     }
 }
 
@@ -370,8 +397,15 @@ impl TransformOp {
         // A duplicate-grab reads a typed number as the array clone-COUNT (the mouse
         // drives the offset), so its hint shows copies, never metres/degrees.
         if self.from_duplicate {
-            let n = if self.num.active { (self.num.value().round() as i64).max(1) } else { 1 };
-            return format!("Duplicate · {n} cop{}    drag: offset · type: count · Enter confirm · Esc cancel", if n == 1 { "y" } else { "ies" });
+            let n = if self.num.active {
+                (self.num.value().round() as i64).max(1)
+            } else {
+                1
+            };
+            return format!(
+                "Duplicate · {n} cop{}    drag: offset · type: count · Enter confirm · Esc cancel",
+                if n == 1 { "y" } else { "ies" }
+            );
         }
         if self.num.active {
             // Blender-style typed readout: "Move X: 4.0 m" / "Rotate Z: -45°" /
@@ -407,20 +441,6 @@ impl TransformOp {
 }
 
 impl Tab {
-    /// Every editor type — the SpaceType registry the header's editor-type
-    /// switcher offers (`docs/RESEARCH-blender-framework.md` §2.2).
-    pub(crate) const ALL: [Tab; 9] = [
-        Tab::Viewport,
-        Tab::Scene,
-        Tab::Library,
-        Tab::Inspector,
-        Tab::DmxMonitor,
-        Tab::Connectivity,
-        Tab::Patch,
-        Tab::Cues,
-        Tab::Render,
-    ];
-
     /// Panels shown in the Window menu (Viewport is fixed, so excluded there).
     const TOGGLEABLE: [Tab; 8] = [
         Tab::Scene,
@@ -476,6 +496,8 @@ pub struct Ui {
     pub settings: RenderSettings,
     pub prefs: Preferences,
     pub requested_viewport_px: (u32, u32),
+    /// Whether the live Viewport tab was drawn during the current egui frame.
+    viewport_visible: bool,
     /// Cross-cut render state: the UI↔app mailbox + the finished still image
     /// (driven by the app's `RenderJob`). The Render dock tab + the World ▸
     /// Render Properties inspector read/write it.
@@ -732,6 +754,13 @@ impl Ui {
         self.notify.error(msg);
     }
 
+    /// True when the live Viewport tab painted in the most recent [`show`](Self::show)
+    /// call. The app uses this to skip the 3D scene pass while only non-viewport UI is
+    /// visible.
+    pub fn viewport_visible(&self) -> bool {
+        self.viewport_visible
+    }
+
     /// Build the whole docked UI for one egui frame.
     ///
     /// `DockArea::show` wraps the dock in a full-window `CentralPanel` and
@@ -739,6 +768,10 @@ impl Ui {
     /// managing a panel or style. It is deprecated only in favor of eframe's
     /// `App::ui`; for a non-eframe app this ctx-based call is the right one.
     #[allow(deprecated)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Frame-level UI entry point bundles app subsystems until the app frame context is extracted."
+    )]
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -801,7 +834,11 @@ impl Ui {
             && self.selection.has_object()
             && shortcuts::poll(
                 ctx,
-                shortcuts::ActiveContext { viewport_focused: true, transform_active: false, box_select_active: false },
+                shortcuts::ActiveContext {
+                    viewport_focused: true,
+                    transform_active: false,
+                    box_select_active: false,
+                },
                 &shortcuts::active(),
             )
             .iter()
@@ -837,6 +874,7 @@ impl Ui {
         // Reset the per-frame inspector drag edges before the dock OR-accumulates
         // this frame's signals into them (#13).
         self.inspector_edit = panels::InspectorEdit::default();
+        self.viewport_visible = false;
 
         // One call hands back all the disjoint DMX borrows the panels need.
         let dmxv = dmx.view();
@@ -850,6 +888,7 @@ impl Ui {
             prefs: &self.prefs,
             viewport_texture,
             requested_viewport_px: &mut self.requested_viewport_px,
+            viewport_visible: &mut self.viewport_visible,
             viewport_focused: &mut self.viewport_focused,
             box_select_armed: &mut self.box_select_armed,
             duplicate: &mut self.duplicate,
@@ -988,18 +1027,30 @@ impl Ui {
             self.pending_lib_add = false;
             if let Some(active) = self.lib.active.clone() {
                 let cursor = self.cursor_3d_set.then_some(self.cursor_3d);
-                if let Some(sel) = library::add_active_library_item(&self.library, scene, camera, &active, cursor) {
+                if let Some(sel) =
+                    library::add_active_library_item(&self.library, scene, camera, &active, cursor)
+                {
                     self.selection = sel;
                 }
             }
         }
-        replace_window(ctx, &self.library, scene, &mut self.selection, dmx.patch_mut(), &mut self.replace);
+        replace_window(
+            ctx,
+            &self.library,
+            scene,
+            &mut self.selection,
+            dmx.patch_mut(),
+            &mut self.replace,
+        );
 
         // Patch / Unpatch dialogs (committed here, where the patch is reachable).
         // On confirm, P assigns sequential addresses to the selected devices from
         // the chosen start slot; U disables their patch entries.
         if windows::patch_dialog_window(ctx, &mut self.patch_dialog) {
-            let (u, a) = (self.patch_dialog.start_universe, self.patch_dialog.start_address);
+            let (u, a) = (
+                self.patch_dialog.start_universe,
+                self.patch_dialog.start_address,
+            );
             let kind = self.patch_dialog.kind;
             self.run_op(
                 "fixture.patch",
@@ -1035,7 +1086,16 @@ impl Ui {
         // pipeline so the (before, after) undo step is pushed uniformly.
         if let Some(d) = duplicate_window(ctx, &mut self.duplicate) {
             // Remember these values so the NEXT Duplicate reuses them (bug 3).
-            set_dup_defaults(ctx, DupDefaults { x: d.x, y: d.y, z: d.z, angle: d.y_angle, count: d.count });
+            set_dup_defaults(
+                ctx,
+                DupDefaults {
+                    x: d.x,
+                    y: d.y,
+                    z: d.z,
+                    angle: d.y_angle,
+                    count: d.count,
+                },
+            );
             self.run_op(
                 "fixture.duplicate",
                 "Duplicate",
@@ -1043,19 +1103,17 @@ impl Ui {
                 scene,
                 dmx,
                 true,
-                |cx| {
-                    match cx.scene.duplicate_fixture(
-                        d.fixture,
-                        Vec3::new(d.x, d.y, d.z),
-                        d.y_angle,
-                        d.count,
-                    ) {
-                        Some(first) => {
-                            *cx.selection = Selection::fixture(first);
-                            op::OpStatus::Finished
-                        }
-                        None => op::OpStatus::Cancelled,
+                |cx| match cx.scene.duplicate_fixture(
+                    d.fixture,
+                    Vec3::new(d.x, d.y, d.z),
+                    d.y_angle,
+                    d.count,
+                ) {
+                    Some(first) => {
+                        *cx.selection = Selection::fixture(first);
+                        op::OpStatus::Finished
                     }
+                    None => op::OpStatus::Cancelled,
                 },
             );
         }
@@ -1097,7 +1155,11 @@ impl Ui {
             .map(|c| (c.id, c.invoke.is_none() || self.op_runnable(c.id)))
             .collect();
         let picked = windows::operator_search_window(ctx, &mut self.op_search, |id| {
-            runnable.iter().find(|(cid, _)| *cid == id).map(|(_, ok)| *ok).unwrap_or(false)
+            runnable
+                .iter()
+                .find(|(cid, _)| *cid == id)
+                .map(|(_, ok)| *ok)
+                .unwrap_or(false)
         });
         if let Some(id) = picked {
             self.run_palette_command(ctx, id, scene, camera, dmx);
@@ -1105,9 +1167,13 @@ impl Ui {
         // The Shift+A Add menu: on a pick, drop the entity into the scene + select
         // it (the menu itself stays library-only, decoupled from the mutation). The
         // menu also owns starring (mutates + persists `lib_prefs` directly).
-        if let Some(action) =
-            windows::add_menu_window(ctx, &self.library, &mut self.add_menu, &mut self.lib_prefs, &mut self.gdtf_textures)
-        {
+        if let Some(action) = windows::add_menu_window(
+            ctx,
+            &self.library,
+            &mut self.add_menu,
+            &mut self.lib_prefs,
+            &mut self.gdtf_textures,
+        ) {
             use windows::AddAction;
             // #19: drop at the viewport cursor/camera anchor, not the origin. When the
             // 3D cursor has been positioned this session (Shift-RMB / Snap to selection)
@@ -1161,12 +1227,11 @@ impl Ui {
                             .get(i)
                             .cloned()
                             .map(|p| Selection::pyro(cx.scene.add_pyro_at(&p, place))),
-                        AddAction::Environment(i) => cx
-                            .library
-                            .environments
-                            .get(i)
-                            .cloned()
-                            .map(|p| Selection::environment(cx.scene.add_environment_at(&p, place))),
+                        AddAction::Environment(i) => {
+                            cx.library.environments.get(i).cloned().map(|p| {
+                                Selection::environment(cx.scene.add_environment_at(&p, place))
+                            })
+                        }
                     };
                     match new {
                         Some(sel) => {
@@ -1203,7 +1268,9 @@ impl Ui {
         // already drawn this frame; the slot is read again next frame — a one-frame
         // lag that's imperceptible for a passive hint.)
         match &self.transform {
-            Some(op) => self.status_msgs.set_hint(format!("{} in progress", op.kind.label())),
+            Some(op) => self
+                .status_msgs
+                .set_hint(format!("{} in progress", op.kind.label())),
             None => self.status_msgs.clear_hint(),
         }
 
@@ -1214,6 +1281,34 @@ impl Ui {
         // The welcome / recover splash sits above everything (it's the first
         // thing on a fresh launch).
         self.splash_window(ctx, scene, camera, dmx);
+
+        self.prune_gdtf_texture_cache(scene);
+    }
+
+    fn prune_gdtf_texture_cache(&mut self, scene: &Scene) {
+        if self.gdtf_textures.is_empty() {
+            return;
+        }
+
+        let mut live = std::collections::HashSet::new();
+        live.extend(
+            self.library
+                .gdtf
+                .iter()
+                .map(|gdtf| Arc::as_ptr(gdtf) as usize),
+        );
+        for fixture in &scene.fixtures {
+            live.extend(
+                fixture
+                    .gdtf
+                    .iter()
+                    .chain(fixture.model_src.iter())
+                    .map(|gdtf| Arc::as_ptr(gdtf) as usize),
+            );
+        }
+        if live.len() < self.gdtf_textures.len() {
+            self.gdtf_textures.retain(|key, _| live.contains(key));
+        }
     }
 }
 
@@ -1287,7 +1382,10 @@ fn duplicate_window(
 /// Used inside `ui.horizontal` rows; mirror the spec in `panels.rs`.
 pub(crate) fn status_dot(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
     // Small inline cell just wide enough for the circle; vertically centred.
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, ui.spacing().interact_size.y), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(8.0, ui.spacing().interact_size.y),
+        egui::Sense::hover(),
+    );
     ui.painter().circle_filled(rect.center(), 3.5, color);
     ui.add_space(5.0); // breathing room before the words
     ui.label(egui::RichText::new(label).size(11.0).color(color));
@@ -1311,8 +1409,12 @@ fn replace_window(
     }
 
     let Some(d) = dialog.as_mut() else { return };
-    let targets: Vec<usize> =
-        selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+    let targets: Vec<usize> = selection
+        .fixtures
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.fixtures.len())
+        .collect();
     if targets.is_empty() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         *dialog = None;
         return;
@@ -1460,10 +1562,18 @@ fn replace_window(
                     let f = &scene.fixtures[i];
                     (f.position, f.orientation, f.pan, f.tilt, f.optics.dimmer)
                 };
-                let name = if many { format!("{new_base} {}", j + 1) } else { new_base.clone() };
+                let name = if many {
+                    format!("{new_base} {}", j + 1)
+                } else {
+                    new_base.clone()
+                };
                 let mut nf = match &p {
-                    Picked::Gdtf(gi) => crate::scene::Fixture::from_gdtf(gdtf_arcs[*gi].clone(), name, pos),
-                    Picked::Profile(pi) => crate::scene::Fixture::from_profile(&library.fixtures[*pi], name, pos),
+                    Picked::Gdtf(gi) => {
+                        crate::scene::Fixture::from_gdtf(gdtf_arcs[*gi].clone(), name, pos)
+                    }
+                    Picked::Profile(pi) => {
+                        crate::scene::Fixture::from_profile(&library.fixtures[*pi], name, pos)
+                    }
                 };
                 nf.orientation = orient;
                 nf.pan = pan;
@@ -1492,6 +1602,7 @@ struct PanelViewer<'a> {
     prefs: &'a Preferences,
     viewport_texture: egui::TextureId,
     requested_viewport_px: &'a mut (u32, u32),
+    viewport_visible: &'a mut bool,
     viewport_focused: &'a mut bool,
     box_select_armed: &'a mut bool,
     duplicate: &'a mut Option<DuplicateDialog>,
@@ -1585,10 +1696,7 @@ fn tool_rail(ui: &mut egui::Ui, active: &mut ActiveTool) {
             let resp = ui
                 .add_sized(
                     [30.0, 28.0],
-                    egui::SelectableLabel::new(
-                        selected,
-                        egui::RichText::new(tool.icon()).size(16.0),
-                    ),
+                    egui::Button::selectable(selected, egui::RichText::new(tool.icon()).size(16.0)),
                 )
                 .on_hover_text(tool.tooltip());
             if resp.clicked() {
@@ -1612,6 +1720,7 @@ impl TabViewer for PanelViewer<'_> {
         editor::header(self, ui, tab);
         match tab {
             Tab::Viewport => {
+                *self.viewport_visible = true;
                 // §2.2: carve the N-panel (right sidebar) + T-panel (left tool rail)
                 // from the leaf's `ui` BEFORE the main viewport content, so the
                 // texture/main region shrinks to the space between them and still
@@ -1623,9 +1732,9 @@ impl TabViewer for PanelViewer<'_> {
                     // toggle-buttons, one per `ActiveTool`, with the active tool
                     // highlighted. Clicking sets `active_tool` — which `viewport()`
                     // reads to decide whether the screen-space xform gizmo draws.
-                    egui::SidePanel::left(id_base.with("t-panel"))
+                    egui::Panel::left(id_base.with("t-panel"))
                         .resizable(false)
-                        .exact_width(40.0)
+                        .exact_size(40.0)
                         .show_inside(ui, |ui| {
                             tool_rail(ui, self.active_tool);
                         });
@@ -1690,7 +1799,19 @@ impl TabViewer for PanelViewer<'_> {
                 let mut e = panels::InspectorEdit::default();
                 let render_active = self.render_active;
                 ui.add_enabled_ui(!render_active, |ui| {
-                    inspector::inspector(ui, self.scene, self.selection, self.dmx_patch, self.gdtf_textures, self.profile, self.screen_sources, self.inspector_state, &mut e, self.render, self.settings);
+                    inspector::inspector(
+                        ui,
+                        self.scene,
+                        self.selection,
+                        self.dmx_patch,
+                        self.gdtf_textures,
+                        self.profile,
+                        self.screen_sources,
+                        self.inspector_state,
+                        &mut e,
+                        self.render,
+                        self.settings,
+                    );
                 });
                 self.inspector_edit.started |= e.started;
                 self.inspector_edit.stopped |= e.stopped;
@@ -1739,8 +1860,8 @@ impl TabViewer for PanelViewer<'_> {
         // schedule) keep horizontal scroll.
         match tab {
             Tab::Viewport | Tab::Render => [false, false], // draw their own image
-            Tab::DmxMonitor | Tab::Patch => [true, true], // wide tables
-            _ => [false, true], // fit width, vertical scroll only
+            Tab::DmxMonitor | Tab::Patch => [true, true],  // wide tables
+            _ => [false, true],                            // fit width, vertical scroll only
         }
     }
 }

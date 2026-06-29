@@ -36,7 +36,11 @@ fn periodic_value_noise(x: usize, y: usize, z: usize, size: usize, period: usize
     let scale = period as f32 / size as f32;
     let (fx, fy, fz) = (x as f32 * scale, y as f32 * scale, z as f32 * scale);
     let (ix, iy, iz) = (fx.floor() as i32, fy.floor() as i32, fz.floor() as i32);
-    let (tx, ty, tz) = (quintic(fx.fract()), quintic(fy.fract()), quintic(fz.fract()));
+    let (tx, ty, tz) = (
+        quintic(fx.fract()),
+        quintic(fy.fract()),
+        quintic(fz.fract()),
+    );
 
     let p = period as i32;
     let corner = |dx: i32, dy: i32, dz: i32| {

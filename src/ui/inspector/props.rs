@@ -34,7 +34,9 @@ use std::ops::RangeInclusive;
 
 use egui::{DragValue, RichText, Slider};
 
-use super::{approx, approx_rgb, reset_arrow, InspectorState, INSPECTOR_LABEL_W, INSPECTOR_SLIDER_READOUT};
+use super::{
+    INSPECTOR_LABEL_W, INSPECTOR_SLIDER_READOUT, InspectorState, approx, approx_rgb, reset_arrow,
+};
 
 /// A type whose editable properties can be shown in the Inspector. Implementors only
 /// DECLARE what their properties are + their type; [`Props`] renders them uniformly.
@@ -54,7 +56,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut InspectorState, obj: &mut impl Inspec
 pub fn with(ui: &mut egui::Ui, state: &mut InspectorState, body: impl FnOnce(&mut Props)) {
     let mut pending: Vec<(String, bool)> = Vec::new();
     {
-        let mut p = Props { state, pending: &mut pending, salt: String::new(), mode: PropMode::Render(ui) };
+        let mut p = Props {
+            state,
+            pending: &mut pending,
+            salt: String::new(),
+            mode: PropMode::Render(ui),
+        };
         body(&mut p);
     }
     if !pending.is_empty() {
@@ -210,7 +217,11 @@ impl<'a> Props<'a> {
                 }
                 let open = self.state.open_state(title, default_open);
                 let filtering = self.state.query().is_some();
-                let header = if icon.is_empty() { title.to_string() } else { format!("{icon}  {title}") };
+                let header = if icon.is_empty() {
+                    title.to_string()
+                } else {
+                    format!("{icon}  {title}")
+                };
                 let state = self.state;
                 let pending = &mut *self.pending;
                 let resp = egui::CollapsingHeader::new(header)
@@ -258,8 +269,12 @@ impl<'a> Props<'a> {
                     ch = ch.open(Some(true)); // surface matched advanced rows
                 }
                 ch.show(ui, |ui| {
-                    let mut inner =
-                        Props { state, pending, salt: group_salt, mode: PropMode::Render(ui) };
+                    let mut inner = Props {
+                        state,
+                        pending,
+                        salt: group_salt,
+                        mode: PropMode::Render(ui),
+                    };
                     body(&mut inner);
                 });
             }
@@ -331,7 +346,17 @@ impl<'a> Props<'a> {
         let (ry, rx, rz) = value.to_euler(glam::EulerRot::YXZ);
         let (mut ex, mut ey, mut ez) = (rx.to_degrees(), ry.to_degrees(), rz.to_degrees());
         let differs = !approx(ex, 0.0) || !approx(ey, 0.0) || !approx(ez, 0.0);
-        if self.vec3_raw(label, differs, 0.5, "°", ["X", "Y", "Z"], None, &mut ex, &mut ey, &mut ez) {
+        if self.vec3_raw(
+            label,
+            differs,
+            0.5,
+            "°",
+            ["X", "Y", "Z"],
+            None,
+            &mut ex,
+            &mut ey,
+            &mut ez,
+        ) {
             *value = glam::Quat::from_euler(
                 glam::EulerRot::YXZ,
                 ey.to_radians(),
@@ -468,21 +493,30 @@ impl<'a> Props<'a> {
                     return false;
                 }
                 let mut changed = false;
-                let comps: [(&str, &mut f32); 3] = [(prefixes[0], x), (prefixes[1], y), (prefixes[2], z)];
+                let comps: [(&str, &mut f32); 3] =
+                    [(prefixes[0], x), (prefixes[1], y), (prefixes[2], z)];
                 let mut reset = false;
                 for (i, (axis, comp)) in comps.into_iter().enumerate() {
-                    let r = field_shell(ui, label, if i == 0 { differs } else { false }, i != 0, true, |ui| {
-                        let mut d = DragValue::new(comp).speed(speed).prefix(format!("{axis} "));
-                        if let Some(r) = &range {
-                            d = d.range(r.clone());
-                        }
-                        if !suffix.is_empty() {
-                            d = d.suffix(suffix);
-                        }
-                        if ui.add(d).changed() {
-                            changed = true;
-                        }
-                    });
+                    let r = field_shell(
+                        ui,
+                        label,
+                        if i == 0 { differs } else { false },
+                        i != 0,
+                        true,
+                        |ui| {
+                            let mut d =
+                                DragValue::new(comp).speed(speed).prefix(format!("{axis} "));
+                            if let Some(r) = &range {
+                                d = d.range(r.clone());
+                            }
+                            if !suffix.is_empty() {
+                                d = d.suffix(suffix);
+                            }
+                            if ui.add(d).changed() {
+                                changed = true;
+                            }
+                        },
+                    );
                     if i == 0 {
                         reset = r;
                     }
@@ -608,8 +642,14 @@ impl<'p, 'a> NumField<'p, 'a> {
                 let range = self.range.clone();
                 let tip = self.tip.clone();
                 let text_value = self.text_value.clone();
-                let (speed, suffix, decimals, slider, enabled, no_clamp) =
-                    (self.speed, self.suffix, self.decimals, self.slider, self.enabled, self.no_clamp);
+                let (speed, suffix, decimals, slider, enabled, no_clamp) = (
+                    self.speed,
+                    self.suffix,
+                    self.decimals,
+                    self.slider,
+                    self.enabled,
+                    self.no_clamp,
+                );
                 let mut changed = false;
                 let build = |ui: &mut egui::Ui| {
                     let resp = if slider {
@@ -711,7 +751,9 @@ impl<'p, 'a> Vec3Field<'p, 'a> {
         let (mut x, mut y, mut z) = (self.value.x, self.value.y, self.value.z);
         // A plain vector (Position/Center/Size) has no recoverable default → no revert
         // arrow (`differs = false`); reset-to-identity rotations go through `Props::rotation`.
-        let changed = self.p.vec3_raw(&label, false, speed, suffix, prefixes, range, &mut x, &mut y, &mut z);
+        let changed = self.p.vec3_raw(
+            &label, false, speed, suffix, prefixes, range, &mut x, &mut y, &mut z,
+        );
         if changed {
             *self.value = glam::vec3(x, y, z);
         }

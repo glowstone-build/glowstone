@@ -300,14 +300,7 @@ pub fn floor_plane(half_size: f32) -> Vec<MeshVertex> {
         normal: up,
         emissive: 0.0,
     };
-    vec![
-        p(-h, -h),
-        p(-h, h),
-        p(h, h),
-        p(-h, -h),
-        p(h, h),
-        p(h, -h),
-    ]
+    vec![p(-h, -h), p(-h, h), p(h, h), p(-h, -h), p(h, h), p(h, -h)]
 }
 
 /// A capped cylinder for a PAR-can body: back cap at the local origin, lens at
@@ -424,9 +417,21 @@ pub fn disc(segments: u32) -> Vec<MeshVertex> {
     for i in 0..seg {
         let a0 = i as f32 / seg as f32 * TAU;
         let a1 = (i + 1) as f32 / seg as f32 * TAU;
-        verts.push(MeshVertex { position: [0.0, 0.0, 0.0], normal: n, emissive: 1.0 });
-        verts.push(MeshVertex { position: [a0.cos(), a0.sin(), 0.0], normal: n, emissive: 1.0 });
-        verts.push(MeshVertex { position: [a1.cos(), a1.sin(), 0.0], normal: n, emissive: 1.0 });
+        verts.push(MeshVertex {
+            position: [0.0, 0.0, 0.0],
+            normal: n,
+            emissive: 1.0,
+        });
+        verts.push(MeshVertex {
+            position: [a0.cos(), a0.sin(), 0.0],
+            normal: n,
+            emissive: 1.0,
+        });
+        verts.push(MeshVertex {
+            position: [a1.cos(), a1.sin(), 0.0],
+            normal: n,
+            emissive: 1.0,
+        });
     }
     verts
 }
@@ -437,10 +442,18 @@ pub fn disc(segments: u32) -> Vec<MeshVertex> {
 /// the per-instance model matrix carries the real, possibly non-square, W×H scale.
 pub fn lens_quad() -> Vec<MeshVertex> {
     let n = [0.0, 0.0, 1.0];
-    let v = |x: f32, y: f32| MeshVertex { position: [x, y, 0.0], normal: n, emissive: 1.0 };
+    let v = |x: f32, y: f32| MeshVertex {
+        position: [x, y, 0.0],
+        normal: n,
+        emissive: 1.0,
+    };
     vec![
-        v(-1.0, -1.0), v(1.0, -1.0), v(1.0, 1.0),
-        v(-1.0, -1.0), v(1.0, 1.0), v(-1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, -1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(-1.0, 1.0),
     ]
 }
 
@@ -452,7 +465,11 @@ pub fn unit_quad(nx: u32, ny: u32) -> Vec<MeshVertex> {
     let nx = nx.max(1);
     let ny = ny.max(1);
     let n = [0.0, 0.0, 1.0];
-    let p = |x: f32, y: f32| MeshVertex { position: [x, y, 0.0], normal: n, emissive: 1.0 };
+    let p = |x: f32, y: f32| MeshVertex {
+        position: [x, y, 0.0],
+        normal: n,
+        emissive: 1.0,
+    };
     let at = |i: u32, j: u32| {
         let x = i as f32 / nx as f32 - 0.5;
         let y = j as f32 / ny as f32 - 0.5;
@@ -484,10 +501,22 @@ pub fn grid_and_axes(half_extent: f32, step: f32) -> Vec<LineVertex> {
         let p = i as f32 * step;
         let color = if i == 0 { major_color } else { grid_color };
         // Lifted a hair above the floor plane to avoid z-fighting.
-        verts.push(LineVertex { position: [p, 0.002, -half_extent], color });
-        verts.push(LineVertex { position: [p, 0.002, half_extent], color });
-        verts.push(LineVertex { position: [-half_extent, 0.002, p], color });
-        verts.push(LineVertex { position: [half_extent, 0.002, p], color });
+        verts.push(LineVertex {
+            position: [p, 0.002, -half_extent],
+            color,
+        });
+        verts.push(LineVertex {
+            position: [p, 0.002, half_extent],
+            color,
+        });
+        verts.push(LineVertex {
+            position: [-half_extent, 0.002, p],
+            color,
+        });
+        verts.push(LineVertex {
+            position: [half_extent, 0.002, p],
+            color,
+        });
     }
 
     let axis_len = (half_extent * 0.25).max(1.5);
@@ -495,18 +524,41 @@ pub fn grid_and_axes(half_extent: f32, step: f32) -> Vec<LineVertex> {
     let x_axis = [0.90, 0.25, 0.25];
     let y_axis = [0.35, 0.85, 0.35];
     let z_axis = [0.30, 0.55, 0.95];
-    verts.push(LineVertex { position: [0.0, y, 0.0], color: x_axis });
-    verts.push(LineVertex { position: [axis_len, y, 0.0], color: x_axis });
-    verts.push(LineVertex { position: [0.0, y, 0.0], color: y_axis });
-    verts.push(LineVertex { position: [0.0, axis_len, 0.0], color: y_axis });
-    verts.push(LineVertex { position: [0.0, y, 0.0], color: z_axis });
-    verts.push(LineVertex { position: [0.0, y, axis_len], color: z_axis });
+    verts.push(LineVertex {
+        position: [0.0, y, 0.0],
+        color: x_axis,
+    });
+    verts.push(LineVertex {
+        position: [axis_len, y, 0.0],
+        color: x_axis,
+    });
+    verts.push(LineVertex {
+        position: [0.0, y, 0.0],
+        color: y_axis,
+    });
+    verts.push(LineVertex {
+        position: [0.0, axis_len, 0.0],
+        color: y_axis,
+    });
+    verts.push(LineVertex {
+        position: [0.0, y, 0.0],
+        color: z_axis,
+    });
+    verts.push(LineVertex {
+        position: [0.0, y, axis_len],
+        color: z_axis,
+    });
 
     verts
 }
 
 /// Append the 12 edges of an axis-aligned box (`min`..`max`) to `out` as lines.
-pub fn push_box_wireframe(out: &mut Vec<LineVertex>, min: [f32; 3], max: [f32; 3], color: [f32; 3]) {
+pub fn push_box_wireframe(
+    out: &mut Vec<LineVertex>,
+    min: [f32; 3],
+    max: [f32; 3],
+    color: [f32; 3],
+) {
     let corner = |xi: usize, yi: usize, zi: usize| LineVertex {
         position: [
             if xi == 0 { min[0] } else { max[0] },

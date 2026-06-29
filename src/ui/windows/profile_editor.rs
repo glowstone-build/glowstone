@@ -8,8 +8,8 @@ use egui::{Grid, RichText, ScrollArea, Sense, Slider};
 
 use super::Preferences;
 use crate::scene::{Scene, Selection};
-use crate::ui::theme;
 use crate::ui::GdtfTextures;
+use crate::ui::theme;
 
 /// The Fixture Profile editor's currently-open detail tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,7 +68,11 @@ pub struct ProfileEditor {
 
 impl ProfileEditor {
     pub fn new(fixture: usize) -> Self {
-        Self { fixture, tab: ProfileTab::Identity, emitter: 0 }
+        Self {
+            fixture,
+            tab: ProfileTab::Identity,
+            emitter: 0,
+        }
     }
 }
 
@@ -127,18 +131,21 @@ pub fn profile_editor_window(
                     if emitters.is_empty() {
                         ui.label(RichText::new("(single source)").italics().color(ink.muted));
                     }
-                    ScrollArea::vertical().id_salt("prof-emitters").max_height(body_h).show(ui, |ui| {
-                        for (i, em) in emitters.iter().enumerate() {
-                            let on = ed.emitter == i;
-                            // Index reads quiet + monospace; the name carries the
-                            // weight when selected so the active emitter is clear.
-                            let tag = RichText::new(format!("{i:>2}  ·  {}", em.name))
-                                .color(if on { ink.primary } else { ink.secondary });
-                            if ui.selectable_label(on, tag).clicked() {
-                                ed.emitter = i;
+                    ScrollArea::vertical()
+                        .id_salt("prof-emitters")
+                        .max_height(body_h)
+                        .show(ui, |ui| {
+                            for (i, em) in emitters.iter().enumerate() {
+                                let on = ed.emitter == i;
+                                // Index reads quiet + monospace; the name carries the
+                                // weight when selected so the active emitter is clear.
+                                let tag = RichText::new(format!("{i:>2}  ·  {}", em.name))
+                                    .color(if on { ink.primary } else { ink.secondary });
+                                if ui.selectable_label(on, tag).clicked() {
+                                    ed.emitter = i;
+                                }
                             }
-                        }
-                    });
+                        });
                 });
                 ui.separator();
                 // Right: tabbed detail, in a fixed-height scroll so the window
@@ -200,27 +207,35 @@ fn ro(ui: &mut egui::Ui, k: &str, v: impl Into<String>) {
     ui.end_row();
 }
 
-fn tab_identity(ui: &mut egui::Ui, fixture: &mut crate::scene::Fixture, gdtf: &crate::gdtf::GdtfFixture) {
+fn tab_identity(
+    ui: &mut egui::Ui,
+    fixture: &mut crate::scene::Fixture,
+    gdtf: &crate::gdtf::GdtfFixture,
+) {
     let ink = theme::ink(!ui.visuals().dark_mode);
     theme::section(ui, "IDENTITY");
     ui.add_space(2.0);
-    Grid::new("prof-id").num_columns(2).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
-        ro(ui, "Manufacturer", &gdtf.manufacturer);
-        ro(ui, "Model", &gdtf.name);
-        ro(ui, "Long name", &gdtf.long_name);
-        ro(ui, "Short name", &gdtf.short_name);
-        if !gdtf.spec.is_empty() {
-            ro(ui, "GDTF file", &gdtf.spec);
-        }
-        ui.label(RichText::new("Instance name").color(ink.secondary));
-        ui.text_edit_singleline(&mut fixture.name);
-        ui.end_row();
-        if let Some(m) = fixture.mvr.as_deref_mut() {
-            ui.label(RichText::new("Fixture ID").color(ink.secondary));
-            ui.text_edit_singleline(&mut m.fixture_id);
+    Grid::new("prof-id")
+        .num_columns(2)
+        .spacing([14.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ro(ui, "Manufacturer", &gdtf.manufacturer);
+            ro(ui, "Model", &gdtf.name);
+            ro(ui, "Long name", &gdtf.long_name);
+            ro(ui, "Short name", &gdtf.short_name);
+            if !gdtf.spec.is_empty() {
+                ro(ui, "GDTF file", &gdtf.spec);
+            }
+            ui.label(RichText::new("Instance name").color(ink.secondary));
+            ui.text_edit_singleline(&mut fixture.name);
             ui.end_row();
-        }
-    });
+            if let Some(m) = fixture.mvr.as_deref_mut() {
+                ui.label(RichText::new("Fixture ID").color(ink.secondary));
+                ui.text_edit_singleline(&mut m.fixture_id);
+                ui.end_row();
+            }
+        });
     if !gdtf.description.is_empty() {
         ui.add_space(8.0);
         theme::section(ui, "DESCRIPTION");
@@ -233,16 +248,20 @@ fn tab_physical(ui: &mut egui::Ui, gdtf: &crate::gdtf::GdtfFixture, prefs: &Pref
     let b = &gdtf.beam;
     theme::section(ui, "LAMP & BEAM");
     ui.add_space(2.0);
-    Grid::new("prof-phys").num_columns(2).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
-        ro(ui, "Lamp", &b.lamp_type);
-        ro(ui, "Power", format!("{:.0} W", b.power));
-        ro(ui, "Luminous flux", format!("{:.0} lm", b.luminous_flux));
-        ro(ui, "Colour temp", format!("{:.0} K", b.color_temp));
-        ro(ui, "CRI", format!("{:.0}", b.cri));
-        let (r, u) = prefs.len(b.beam_radius);
-        ro(ui, "Beam radius", format!("{r:.3}{u}"));
-        ro(ui, "Models", format!("{}", gdtf.models.len()));
-    });
+    Grid::new("prof-phys")
+        .num_columns(2)
+        .spacing([14.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ro(ui, "Lamp", &b.lamp_type);
+            ro(ui, "Power", format!("{:.0} W", b.power));
+            ro(ui, "Luminous flux", format!("{:.0} lm", b.luminous_flux));
+            ro(ui, "Colour temp", format!("{:.0} K", b.color_temp));
+            ro(ui, "CRI", format!("{:.0}", b.cri));
+            let (r, u) = prefs.len(b.beam_radius);
+            ro(ui, "Beam radius", format!("{r:.3}{u}"));
+            ro(ui, "Models", format!("{}", gdtf.models.len()));
+        });
 }
 
 fn tab_optics(
@@ -259,31 +278,50 @@ fn tab_optics(
         .unwrap_or_else(|| gdtf.beam.clone());
     theme::section(ui, "OPTICAL CHAIN");
     ui.add_space(2.0);
-    Grid::new("prof-optics").num_columns(2).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
-        ro(ui, "Beam type", &beam.beam_type);
-        ro(ui, "Beam angle", format!("{:.1}°", beam.beam_angle));
-        ro(ui, "Field angle", format!("{:.1}°", beam.field_angle));
-        ro(ui, "Beam radius", format!("{:.3} m", beam.beam_radius));
-        ro(ui, "Luminous flux", format!("{:.0} lm", beam.luminous_flux));
-        ro(ui, "Colour temp", format!("{:.0} K", beam.color_temp));
-    });
+    Grid::new("prof-optics")
+        .num_columns(2)
+        .spacing([14.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ro(ui, "Beam type", &beam.beam_type);
+            ro(ui, "Beam angle", format!("{:.1}°", beam.beam_angle));
+            ro(ui, "Field angle", format!("{:.1}°", beam.field_angle));
+            ro(ui, "Beam radius", format!("{:.3} m", beam.beam_radius));
+            ro(ui, "Luminous flux", format!("{:.0} lm", beam.luminous_flux));
+            ro(ui, "Colour temp", format!("{:.0} K", beam.color_temp));
+        });
     ui.add_space(10.0);
     theme::section(ui, "MODELED — NOT IN GDTF");
     ui.add_space(2.0);
-    Grid::new("prof-optics-mod").num_columns(3).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
-        ui.label(RichText::new("Move speed").color(ink.secondary));
-        ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0));
-        modeled(ui);
-        ui.end_row();
-        let (pmax, tmax) = fixture.max_slew();
-        ui.label(RichText::new(format!("{}  pan / tilt", theme::icon::ARROW_RIGHT)).color(ink.tertiary));
-        ui.label(RichText::new(format!("{pmax:.0} / {tmax:.0} °/s")).monospace().color(ink.primary));
-        ui.label("");
-        ui.end_row();
-    });
+    Grid::new("prof-optics-mod")
+        .num_columns(3)
+        .spacing([12.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label(RichText::new("Move speed").color(ink.secondary));
+            ui.add(Slider::new(&mut fixture.move_speed, 0.0..=1.0));
+            modeled(ui);
+            ui.end_row();
+            let (pmax, tmax) = fixture.max_slew();
+            ui.label(
+                RichText::new(format!("{}  pan / tilt", theme::icon::ARROW_RIGHT))
+                    .color(ink.tertiary),
+            );
+            ui.label(
+                RichText::new(format!("{pmax:.0} / {tmax:.0} °/s"))
+                    .monospace()
+                    .color(ink.primary),
+            );
+            ui.label("");
+            ui.end_row();
+        });
 }
 
-fn tab_modes(ui: &mut egui::Ui, fixture: &mut crate::scene::Fixture, gdtf: &crate::gdtf::GdtfFixture) {
+fn tab_modes(
+    ui: &mut egui::Ui,
+    fixture: &mut crate::scene::Fixture,
+    gdtf: &crate::gdtf::GdtfFixture,
+) {
     let ink = theme::ink(!ui.visuals().dark_mode);
     theme::section(ui, "DMX MODE — PER INSTANCE");
     ui.add_space(2.0);
@@ -307,32 +345,50 @@ fn tab_modes(ui: &mut egui::Ui, fixture: &mut crate::scene::Fixture, gdtf: &crat
     }
 }
 
-fn tab_channels(ui: &mut egui::Ui, fixture: &crate::scene::Fixture, gdtf: &crate::gdtf::GdtfFixture) {
+fn tab_channels(
+    ui: &mut egui::Ui,
+    fixture: &crate::scene::Fixture,
+    gdtf: &crate::gdtf::GdtfFixture,
+) {
     let ink = theme::ink(!ui.visuals().dark_mode);
-    let Some(mode) = gdtf.modes.get(fixture.mode_index) else { return };
+    let Some(mode) = gdtf.modes.get(fixture.mode_index) else {
+        return;
+    };
     theme::section(ui, "DMX CHANNELS");
-    ui.label(RichText::new(format!("{}  ·  {} ch", mode.name, mode.footprint)).small().color(ink.tertiary));
+    ui.label(
+        RichText::new(format!("{}  ·  {} ch", mode.name, mode.footprint))
+            .small()
+            .color(ink.tertiary),
+    );
     ui.add_space(2.0);
-    Grid::new("prof-chan").num_columns(4).spacing([12.0, 3.0]).striped(true).show(ui, |ui| {
-        let head = |ui: &mut egui::Ui, t: &str| {
-            ui.label(RichText::new(t).small().strong().color(ink.secondary));
-        };
-        head(ui, "Addr");
-        head(ui, "Geometry");
-        head(ui, "Attribute");
-        head(ui, "Function");
-        ui.end_row();
-        for rc in &mode.resolved {
-            let ch = &mode.channels[rc.channel];
-            let addr = rc.offsets.first().map(|o| o.to_string()).unwrap_or_else(|| "—".into());
-            ui.label(RichText::new(addr).monospace().color(ink.primary));
-            let geo = rc.instance.clone().unwrap_or_else(|| ch.geometry.clone());
-            ui.label(RichText::new(geo).small().color(ink.tertiary));
-            ui.label(RichText::new(&ch.attribute).small().color(ink.primary));
-            ui.label(RichText::new(&ch.function).small().color(ink.muted));
+    Grid::new("prof-chan")
+        .num_columns(4)
+        .spacing([12.0, 3.0])
+        .striped(true)
+        .show(ui, |ui| {
+            let head = |ui: &mut egui::Ui, t: &str| {
+                ui.label(RichText::new(t).small().strong().color(ink.secondary));
+            };
+            head(ui, "Addr");
+            head(ui, "Geometry");
+            head(ui, "Attribute");
+            head(ui, "Function");
             ui.end_row();
-        }
-    });
+            for rc in &mode.resolved {
+                let ch = &mode.channels[rc.channel];
+                let addr = rc
+                    .offsets
+                    .first()
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "—".into());
+                ui.label(RichText::new(addr).monospace().color(ink.primary));
+                let geo = rc.instance.clone().unwrap_or_else(|| ch.geometry.clone());
+                ui.label(RichText::new(geo).small().color(ink.tertiary));
+                ui.label(RichText::new(&ch.attribute).small().color(ink.primary));
+                ui.label(RichText::new(&ch.function).small().color(ink.muted));
+                ui.end_row();
+            }
+        });
 }
 
 fn tab_wheels(ui: &mut egui::Ui, gdtf: &crate::gdtf::GdtfFixture, tex: &GdtfTextures) {
@@ -355,7 +411,11 @@ fn tab_wheels(ui: &mut egui::Ui, gdtf: &crate::gdtf::GdtfFixture, tex: &GdtfText
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             for (si, slot) in wheel.slots.iter().enumerate() {
-                let handle = tex.wheels.get(wi).and_then(|w| w.get(si)).and_then(|h| h.as_ref());
+                let handle = tex
+                    .wheels
+                    .get(wi)
+                    .and_then(|w| w.get(si))
+                    .and_then(|h| h.as_ref());
                 let size = egui::vec2(40.0, 40.0);
                 if let Some(h) = handle {
                     ui.image((h.id(), size)).on_hover_text(&slot.name);
@@ -363,7 +423,13 @@ fn tab_wheels(ui: &mut egui::Ui, gdtf: &crate::gdtf::GdtfFixture, tex: &GdtfText
                     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
                     let col = slot
                         .color
-                        .map(|c| egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8))
+                        .map(|c| {
+                            egui::Color32::from_rgb(
+                                (c[0] * 255.0) as u8,
+                                (c[1] * 255.0) as u8,
+                                (c[2] * 255.0) as u8,
+                            )
+                        })
                         .unwrap_or(empty);
                     ui.painter().rect_filled(rect, 4.0, col);
                     resp.on_hover_text(&slot.name);
@@ -374,17 +440,35 @@ fn tab_wheels(ui: &mut egui::Ui, gdtf: &crate::gdtf::GdtfFixture, tex: &GdtfText
     }
 }
 
-fn tab_defaults(ui: &mut egui::Ui, fixture: &crate::scene::Fixture, gdtf: &crate::gdtf::GdtfFixture) {
+fn tab_defaults(
+    ui: &mut egui::Ui,
+    fixture: &crate::scene::Fixture,
+    gdtf: &crate::gdtf::GdtfFixture,
+) {
     let ink = theme::ink(!ui.visuals().dark_mode);
-    let Some(mode) = gdtf.modes.get(fixture.mode_index) else { return };
+    let Some(mode) = gdtf.modes.get(fixture.mode_index) else {
+        return;
+    };
     theme::section(ui, "CHANNEL DEFAULTS");
-    ui.label(RichText::new("InitialFunction values from the GDTF.").small().color(ink.tertiary));
+    ui.label(
+        RichText::new("InitialFunction values from the GDTF.")
+            .small()
+            .color(ink.tertiary),
+    );
     ui.add_space(2.0);
-    Grid::new("prof-def").num_columns(2).spacing([14.0, 3.0]).striped(true).show(ui, |ui| {
-        for ch in &mode.channels {
-            ui.label(RichText::new(&ch.attribute).small().color(ink.secondary));
-            ui.label(RichText::new(format!("{:.3}", ch.default)).monospace().color(ink.primary));
-            ui.end_row();
-        }
-    });
+    Grid::new("prof-def")
+        .num_columns(2)
+        .spacing([14.0, 3.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for ch in &mode.channels {
+                ui.label(RichText::new(&ch.attribute).small().color(ink.secondary));
+                ui.label(
+                    RichText::new(format!("{:.3}", ch.default))
+                        .monospace()
+                        .color(ink.primary),
+                );
+                ui.end_row();
+            }
+        });
 }

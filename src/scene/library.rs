@@ -86,6 +86,10 @@ pub struct PyroProfile {
     /// Default hard particle cap for this emitter (perf bound).
     pub default_max_particles: u32,
     /// A motorised / moving-nozzle variant (exposes pan/tilt/spin in the UI).
+    #[expect(
+        dead_code,
+        reason = "Pyro profile capability flag is reserved for library filtering and inspector gating."
+    )]
     pub moving: bool,
 }
 

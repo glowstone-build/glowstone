@@ -90,7 +90,7 @@ impl TestPattern {
 /// RGB cells are read from Art-Net/sACN starting at `universe`/`start_address`;
 /// this is patched INLINE (not through `PatchTable`, not the per-cell `cells`
 /// composite). See `docs/RESEARCH-led-ndi.md`.
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PixelMap {
     pub cols: u32,
@@ -101,7 +101,12 @@ pub struct PixelMap {
 
 impl Default for PixelMap {
     fn default() -> Self {
-        Self { cols: 16, rows: 9, universe: 1, start_address: 1 }
+        Self {
+            cols: 16,
+            rows: 9,
+            universe: 1,
+            start_address: 1,
+        }
     }
 }
 
@@ -128,7 +133,10 @@ pub enum ScreenContent {
     /// A flat linear-RGB colour across the whole surface.
     SolidColor([f32; 3]),
     /// A still image (bundled bytes, like `World.hdri`), decoded by the renderer.
-    Image { name: String, bytes: std::sync::Arc<Vec<u8>> },
+    Image {
+        name: String,
+        bytes: std::sync::Arc<Vec<u8>>,
+    },
     /// A live NDI source — only the stable source NAME is serialized; frames
     /// arrive at runtime via [`LedScreen::frame`].
     Ndi { source: String },
@@ -160,7 +168,6 @@ impl ScreenContent {
             Self::PixelMapDmx(_) => "Pixel-map DMX",
         }
     }
-
 }
 
 /// A runtime content frame (tightly-packed RGBA8, top-down rows) handed to the
@@ -239,11 +246,7 @@ pub struct LedScreen {
 
 impl LedScreen {
     /// Build a wall from a library component at `transform` (a default 4×2 array).
-    pub fn from_profile(
-        profile: &ScreenProfile,
-        name: impl Into<String>,
-        transform: Mat4,
-    ) -> Self {
+    pub fn from_profile(profile: &ScreenProfile, name: impl Into<String>, transform: Mat4) -> Self {
         Self {
             name: name.into(),
             sequence: 0,
@@ -308,7 +311,9 @@ impl LedScreen {
 
     /// World-space surface normal (the emitting face, local +Z).
     pub fn world_normal(&self) -> Vec3 {
-        self.transform.transform_vector3(Vec3::Z).normalize_or_zero()
+        self.transform
+            .transform_vector3(Vec3::Z)
+            .normalize_or_zero()
     }
 
     /// World-space AABB of the four surface corners — for outliner framing and a
@@ -458,7 +463,11 @@ mod tests {
     fn wall() -> LedScreen {
         let lib = Library::standard();
         // "Indoor 3.9mm": 500×500 mm cabinet, 128×128 px.
-        let p = lib.screens.iter().find(|p| p.name == "Indoor 3.9mm").unwrap();
+        let p = lib
+            .screens
+            .iter()
+            .find(|p| p.name == "Indoor 3.9mm")
+            .unwrap();
         LedScreen::from_profile(p, "W", Mat4::IDENTITY)
     }
 
@@ -482,11 +491,19 @@ mod tests {
         // A 4×2 default wall (2.0 × 1.0 m) at the origin, facing +Z.
         let s = wall();
         // Ray from +Z straight at the centre → hits at z-distance 5.
-        let t = s.ray_hit(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).expect("centre hit");
+        let t = s
+            .ray_hit(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0))
+            .expect("centre hit");
         assert!((t - 5.0).abs() < 1e-3);
         // Ray well outside the rectangle (x = 10 m) → miss.
-        assert!(s.ray_hit(Vec3::new(10.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).is_none());
+        assert!(
+            s.ray_hit(Vec3::new(10.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0))
+                .is_none()
+        );
         // Ray pointing away from the wall → miss.
-        assert!(s.ray_hit(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, 1.0)).is_none());
+        assert!(
+            s.ray_hit(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, 1.0))
+                .is_none()
+        );
     }
 }

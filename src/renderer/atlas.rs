@@ -39,7 +39,7 @@ pub struct GoboAtlas {
 
 impl GoboAtlas {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let mip_count = 32 - (RES.leading_zeros()) ; // floor(log2(RES)) + 1
+        let mip_count = 32 - (RES.leading_zeros()); // floor(log2(RES)) + 1
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gobo-atlas"),
             size: wgpu::Extent3d {
@@ -102,55 +102,58 @@ impl GoboAtlas {
     /// lose its colour entirely while moving) always fits.
     pub fn ensure(&mut self, queue: &wgpu::Queue, key: usize, gdtf: &Arc<GdtfFixture>) {
         for colour_pass in [true, false] {
-        for wheel in &gdtf.wheels {
-            let has_media = wheel.slots.iter().any(|s| s.media.is_some());
-            let is_prism = wheel.slots.iter().any(|s| !s.facets.is_empty());
-            let has_color = wheel.slots.iter().any(|s| s.color.is_some());
-            // Bake: gobo/animation wheels (imagery) AND colour wheels (solid
-            // dichroic-colour slots) — both are sampled as the physical wheel.
-            // Prisms (facets) are CPU beam-expansion, not atlas slots.
-            let bake = (has_media || has_color) && !is_prism;
-            if !bake {
-                continue;
-            }
-            // A pure colour wheel (solid dichroic slots, no imagery) is packed
-            // into ONE layer as vertical colour bands — sampled horizontally by
-            // slot in the shader (`opt_color_strip`). A gobo/animation wheel still
-            // gets one image layer per slot. This keeps virtual colour wheels
-            // (often 60+ slots) from each eating 60+ of the 512² atlas layers.
-            let is_color_wheel = !has_media;
-            if is_color_wheel != colour_pass {
-                continue; // colour wheels in pass 1, gobo/anim in pass 2
-            }
-            let k = (key, wheel.name.clone());
-            if self.base_of.contains_key(&k) {
-                continue;
-            }
-            let count = wheel.slots.len() as u32;
-            let layers_needed = if is_color_wheel { 1 } else { count };
-            if self.next_layer + layers_needed > LAYERS {
-                log::warn!("gobo atlas full; skipping wheel '{}'", wheel.name);
-                continue;
-            }
-            let base = self.next_layer;
-            if is_color_wheel {
-                self.write_with_mips(queue, base, color_strip(&wheel.slots));
-                self.next_layer += 1;
-            } else {
-                for (i, slot) in wheel.slots.iter().enumerate() {
-                    let rgba = slot
-                        .media
-                        .as_deref()
-                        .and_then(decode_gobo)
-                        // A media wheel's slot with no image = open (white).
-                        .unwrap_or_else(|| vec![255u8; (RES * RES * 4) as usize]);
-                    self.write_with_mips(queue, base + i as u32, rgba);
+            for wheel in &gdtf.wheels {
+                let has_media = wheel.slots.iter().any(|s| s.media.is_some());
+                let is_prism = wheel.slots.iter().any(|s| !s.facets.is_empty());
+                let has_color = wheel.slots.iter().any(|s| s.color.is_some());
+                // Bake: gobo/animation wheels (imagery) AND colour wheels (solid
+                // dichroic-colour slots) — both are sampled as the physical wheel.
+                // Prisms (facets) are CPU beam-expansion, not atlas slots.
+                let bake = (has_media || has_color) && !is_prism;
+                if !bake {
+                    continue;
                 }
-                self.next_layer += count;
+                // A pure colour wheel (solid dichroic slots, no imagery) is packed
+                // into ONE layer as vertical colour bands — sampled horizontally by
+                // slot in the shader (`opt_color_strip`). A gobo/animation wheel still
+                // gets one image layer per slot. This keeps virtual colour wheels
+                // (often 60+ slots) from each eating 60+ of the 512² atlas layers.
+                let is_color_wheel = !has_media;
+                if is_color_wheel != colour_pass {
+                    continue; // colour wheels in pass 1, gobo/anim in pass 2
+                }
+                let k = (key, wheel.name.clone());
+                if self.base_of.contains_key(&k) {
+                    continue;
+                }
+                let count = wheel.slots.len() as u32;
+                let layers_needed = if is_color_wheel { 1 } else { count };
+                if self.next_layer + layers_needed > LAYERS {
+                    log::warn!("gobo atlas full; skipping wheel '{}'", wheel.name);
+                    continue;
+                }
+                let base = self.next_layer;
+                if is_color_wheel {
+                    self.write_with_mips(queue, base, color_strip(&wheel.slots));
+                    self.next_layer += 1;
+                } else {
+                    for (i, slot) in wheel.slots.iter().enumerate() {
+                        let rgba = slot
+                            .media
+                            .as_deref()
+                            .and_then(decode_gobo)
+                            // A media wheel's slot with no image = open (white).
+                            .unwrap_or_else(|| vec![255u8; (RES * RES * 4) as usize]);
+                        self.write_with_mips(queue, base + i as u32, rgba);
+                    }
+                    self.next_layer += count;
+                }
+                self.base_of.insert(k, base);
+                log::info!(
+                    "atlas: wheel '{}' -> base {base} (+{layers_needed})",
+                    wheel.name
+                );
             }
-            self.base_of.insert(k, base);
-            log::info!("atlas: wheel '{}' -> base {base} (+{layers_needed})", wheel.name);
-        }
         }
     }
 
@@ -164,7 +167,11 @@ impl GoboAtlas {
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
                 mip_level: mip,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             rgba,
@@ -173,7 +180,11 @@ impl GoboAtlas {
                 bytes_per_row: Some(dim * 4),
                 rows_per_image: Some(dim),
             },
-            wgpu::Extent3d { width: dim, height: dim, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: dim,
+                height: dim,
+                depth_or_array_layers: 1,
+            },
         );
     }
 

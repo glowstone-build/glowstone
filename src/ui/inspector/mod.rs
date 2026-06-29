@@ -99,14 +99,20 @@ const INSPECTOR_SLIDER_READOUT: f32 = 42.0;
 impl InspectorState {
     /// Load the persisted collapse map (config dir); missing/garbled ⇒ default.
     pub fn load() -> Self {
-        let Some(p) = inspector_state_path() else { return Self::default() };
-        let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
+        let Some(p) = inspector_state_path() else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return Self::default();
+        };
         serde_json::from_str(&text).unwrap_or_default()
     }
 
     /// Persist the collapse map (best-effort; a write failure is non-fatal).
     pub fn save(&self) {
-        let Some(p) = inspector_state_path() else { return };
+        let Some(p) = inspector_state_path() else {
+            return;
+        };
         if let Ok(text) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(&p, text);
         }
@@ -175,7 +181,11 @@ fn inspector_state_path() -> Option<std::path::PathBuf> {
 /// in the inspector header + (drawn directly) the library / Replace rows.
 pub(crate) fn source_chip(ui: &mut egui::Ui, source: crate::gdtf::FixtureSource) {
     let [r, g, b] = source.color_rgb();
-    ui.label(egui::RichText::new(source.label()).size(11.0).color(Color32::from_rgb(r, g, b)));
+    ui.label(
+        egui::RichText::new(source.label())
+            .size(11.0)
+            .color(Color32::from_rgb(r, g, b)),
+    );
 }
 
 // ============================================================================
@@ -240,7 +250,9 @@ fn bulk_f32_row(
         None => {
             // Mixed: a placeholder that unifies on click (adopts the seed value).
             if ui
-                .add(egui::Button::new(RichText::new("— Multiple —").small().weak()))
+                .add(egui::Button::new(
+                    RichText::new("— Multiple —").small().weak(),
+                ))
                 .on_hover_text("Values differ — click to set all to the active value")
                 .clicked()
             {
@@ -273,13 +285,20 @@ fn common_transform_axis(
     refs: &[ObjectRef],
     value: impl Fn(ObjectTransformValues) -> f32 + Copy,
 ) -> Option<f32> {
-    common_f32(refs.iter().filter_map(|&obj| object_transform_values(scene, obj).map(value)))
+    common_f32(
+        refs.iter()
+            .filter_map(|&obj| object_transform_values(scene, obj).map(value)),
+    )
 }
 
 fn any_rotation_modified(scene: &Scene, refs: &[ObjectRef]) -> bool {
-    refs.iter().filter_map(|&obj| object_transform_values(scene, obj)).any(|v| {
-        !approx(v.rotation_deg.x, 0.0) || !approx(v.rotation_deg.y, 0.0) || !approx(v.rotation_deg.z, 0.0)
-    })
+    refs.iter()
+        .filter_map(|&obj| object_transform_values(scene, obj))
+        .any(|v| {
+            !approx(v.rotation_deg.x, 0.0)
+                || !approx(v.rotation_deg.y, 0.0)
+                || !approx(v.rotation_deg.z, 0.0)
+        })
 }
 
 pub(super) fn object_transform_bulk(
@@ -296,16 +315,18 @@ pub(super) fn object_transform_bulk(
     if refs.is_empty() {
         return;
     }
-    let Some(primary) = object_transform_values(scene, refs[0]) else { return };
+    let Some(primary) = object_transform_values(scene, refs[0]) else {
+        return;
+    };
     let scale_common = common_f32(
         refs.iter()
             .filter_map(|&obj| object_transform_values(scene, obj).and_then(|v| v.uniform_scale)),
     );
     let scale_seed = primary.uniform_scale;
     let scale_supported = scale_seed.is_some()
-        && refs
-            .iter()
-            .all(|&obj| object_transform_values(scene, obj).is_some_and(|v| v.uniform_scale.is_some()));
+        && refs.iter().all(|&obj| {
+            object_transform_values(scene, obj).is_some_and(|v| v.uniform_scale.is_some())
+        });
     let row_labels: &[&str] = if scale_supported {
         &["Position", "Rotation", "Scale"]
     } else {
@@ -360,7 +381,9 @@ pub(super) fn object_transform_bulk(
                         any_rotation_modified(scene, &refs),
                         scene,
                         &refs,
-                        |scene, obj, axis, value| scene.set_object_rotation_axis_deg(obj, axis, value),
+                        |scene, obj, axis, value| {
+                            scene.set_object_rotation_axis_deg(obj, axis, value)
+                        },
                     );
 
                     if scale_supported {
@@ -411,7 +434,9 @@ fn bulk_transform_vec3_rows(
             },
             |ui| {
                 ui.horizontal(|ui| {
-                    let mut drag = DragValue::new(&mut value).speed(speed).prefix(format!("{prefix} "));
+                    let mut drag = DragValue::new(&mut value)
+                        .speed(speed)
+                        .prefix(format!("{prefix} "));
                     if !suffix.is_empty() {
                         drag = drag.suffix(suffix);
                     }
@@ -464,7 +489,11 @@ fn bulk_transform_scale_row(
         |ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .add(DragValue::new(&mut value).speed(0.005).range(0.001..=1000.0))
+                    .add(
+                        DragValue::new(&mut value)
+                            .speed(0.005)
+                            .range(0.001..=1000.0),
+                    )
                     .changed()
                 {
                     for &obj in refs {
@@ -530,10 +559,12 @@ fn row(
     clicked
 }
 
-/// The fixed 2-column inspector ROW layout (Blender-style): a fixed-width LABEL cell
-/// + a VALUE cell that FILLS its width (justified) — so every section's columns line
-/// up at the same x AND no widget (slider / field / combo) can overflow the panel.
+/// The fixed 2-column inspector ROW layout (Blender-style): a fixed-width LABEL
+/// cell and a VALUE cell that FILLS its width (justified), so every section's
+/// columns line up at the same x AND no widget (slider / field / combo) can
+/// overflow the panel.
 /// The draggable DragValue/Slider input is untouched; widgets just fill the cell now.
+///
 /// Call inside a 2-column `Grid` (adds both cells + `end_row`); `panel_w` is
 /// [`InspectorState::panel_w`]. Used by `row` AND the optics/wheel sliders that build
 /// their own value widget. 48 ≈ category indent + grid spacing + a right margin, so
@@ -660,20 +691,30 @@ fn vec3_rows(
             changed |= ui.add(dv).changed();
         },
     );
-    field_row(ui, state.panel_w, |_ui| {}, |ui| {
-        let mut dv = DragValue::new(y).speed(speed).prefix("Y ");
-        if !suffix.is_empty() {
-            dv = dv.suffix(suffix);
-        }
-        changed |= ui.add(dv).changed();
-    });
-    field_row(ui, state.panel_w, |_ui| {}, |ui| {
-        let mut dv = DragValue::new(z).speed(speed).prefix("Z ");
-        if !suffix.is_empty() {
-            dv = dv.suffix(suffix);
-        }
-        changed |= ui.add(dv).changed();
-    });
+    field_row(
+        ui,
+        state.panel_w,
+        |_ui| {},
+        |ui| {
+            let mut dv = DragValue::new(y).speed(speed).prefix("Y ");
+            if !suffix.is_empty() {
+                dv = dv.suffix(suffix);
+            }
+            changed |= ui.add(dv).changed();
+        },
+    );
+    field_row(
+        ui,
+        state.panel_w,
+        |_ui| {},
+        |ui| {
+            let mut dv = DragValue::new(z).speed(speed).prefix("Z ");
+            if !suffix.is_empty() {
+                dv = dv.suffix(suffix);
+            }
+            changed |= ui.add(dv).changed();
+        },
+    );
     if reset {
         *x = 0.0;
         *y = 0.0;
@@ -760,7 +801,11 @@ impl FixtureDefaults {
 /// already-pinned id if held, else the single selected fixture (no world / env /
 /// geometry / screen / multi-selection in play). `None` when there's nothing a
 /// single-fixture pin could target — the button is then disabled.
-fn current_pin_target(scene: &Scene, selection: &Selection, state: &InspectorState) -> Option<crate::scene::EntityId> {
+fn current_pin_target(
+    scene: &Scene,
+    selection: &Selection,
+    state: &InspectorState,
+) -> Option<crate::scene::EntityId> {
     if let Some(id) = state.pinned {
         return Some(id);
     }
@@ -770,7 +815,12 @@ fn current_pin_target(scene: &Scene, selection: &Selection, state: &InspectorSta
     if !selection.geometry.is_empty() || !selection.screens.is_empty() {
         return None;
     }
-    let ids: Vec<usize> = selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+    let ids: Vec<usize> = selection
+        .fixtures
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.fixtures.len())
+        .collect();
     match ids.as_slice() {
         [i] => Some(scene.fixtures[*i].id),
         _ => None,
@@ -812,7 +862,11 @@ pub fn inspector(
     });
     // Header toggles (P2 #64 + #65): "show only modified" and the inspector PIN.
     ui.horizontal(|ui| {
-        if !state.filter.trim().is_empty() && ui.small_button(format!("{}  clear", theme::icon::CLOSE)).clicked() {
+        if !state.filter.trim().is_empty()
+            && ui
+                .small_button(format!("{}  clear", theme::icon::CLOSE))
+                .clicked()
+        {
             state.filter.clear();
         }
         ui.toggle_value(&mut state.show_modified, "Modified only")
@@ -823,9 +877,12 @@ pub fn inspector(
         let pinned = state.pinned.is_some();
         let resp = ui.add_enabled(
             pinned || pin_target.is_some(),
-            egui::SelectableLabel::new(pinned, format!("{}  Pin", theme::icon::PROFILE)),
+            egui::Button::selectable(pinned, format!("{}  Pin", theme::icon::PROFILE)),
         );
-        if resp.on_hover_text("Lock the inspector to this fixture across selection changes").clicked() {
+        if resp
+            .on_hover_text("Lock the inspector to this fixture across selection changes")
+            .clicked()
+        {
             state.pinned = if pinned { None } else { pin_target };
         }
     });
@@ -835,8 +892,16 @@ pub fn inspector(
             Some(idx) => {
                 let name = scene.fixtures[idx].name.clone();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}  pinned: {name}", theme::icon::PROFILE)).small().strong());
-                    if ui.small_button(theme::icon::CLOSE).on_hover_text("Unpin — follow selection").clicked() {
+                    ui.label(
+                        RichText::new(format!("{}  pinned: {name}", theme::icon::PROFILE))
+                            .small()
+                            .strong(),
+                    );
+                    if ui
+                        .small_button(theme::icon::CLOSE)
+                        .on_hover_text("Unpin — follow selection")
+                        .clicked()
+                    {
                         state.pinned = None;
                     }
                 });
@@ -852,12 +917,28 @@ pub fn inspector(
     // a slider/DragValue drag INSIDE the inspector becomes one undo step without
     // instrumenting every widget. `inspector_body` is the prior function body
     // verbatim (its early returns become early returns from the closure).
-    let resp = ui.scope(|ui| inspector_body(ui, scene, selection, patch, gdtf_textures, profile, sources, state, render_ui, settings));
+    let resp = ui.scope(|ui| {
+        inspector_body(
+            ui,
+            scene,
+            selection,
+            patch,
+            gdtf_textures,
+            profile,
+            sources,
+            state,
+            render_ui,
+            settings,
+        )
+    });
     let content = resp.response.rect;
     let ctx = ui.ctx();
     // A widget id is "in the inspector" when its last-frame rect lies within the
     // panel content rect (read_response gives the rect; missing ⇒ not ours).
-    let in_panel = |id: egui::Id| ctx.read_response(id).is_some_and(|r| content.contains(r.rect.center()));
+    let in_panel = |id: egui::Id| {
+        ctx.read_response(id)
+            .is_some_and(|r| content.contains(r.rect.center()))
+    };
     *edit = InspectorEdit {
         started: ctx.drag_started_id().is_some_and(in_panel),
         stopped: ctx.drag_stopped_id().is_some_and(in_panel),
@@ -901,16 +982,16 @@ fn inspector_body(
     // selection and stays on that fixture (resolved by stable id, so it survives
     // reorders). A stale pin (deleted fixture) is cleared by the header banner,
     // so here it simply falls through to the selection path.
-    if let Some(pin) = state.pinned {
-        if let Some(idx) = scene.fixture_index_of(pin) {
-            let fixture = &mut scene.fixtures[idx];
-            if fixture.is_gdtf() {
-                gdtf_inspector(ui, fixture, patch, gdtf_textures, idx, profile, state);
-            } else {
-                fixture_inspector(ui, fixture, state);
-            }
-            return;
+    if let Some(pin) = state.pinned
+        && let Some(idx) = scene.fixture_index_of(pin)
+    {
+        let fixture = &mut scene.fixtures[idx];
+        if fixture.is_gdtf() {
+            gdtf_inspector(ui, fixture, patch, gdtf_textures, idx, profile, state);
+        } else {
+            fixture_inspector(ui, fixture, state);
         }
+        return;
     }
 
     // World is the top of the hierarchy: the render properties (resolution /
@@ -931,10 +1012,18 @@ fn inspector_body(
     }
 
     // Static geometry (Objects) takes the Inspector when selected.
-    let geo: Vec<usize> = selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
+    let geo: Vec<usize> = selection
+        .geometry
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.geometry.len())
+        .collect();
     if !geo.is_empty() {
         if geo.len() > 1 {
-            let refs = geo.iter().map(|&i| ObjectRef::Geometry(i)).collect::<Vec<_>>();
+            let refs = geo
+                .iter()
+                .map(|&i| ObjectRef::Geometry(i))
+                .collect::<Vec<_>>();
             object_transform_bulk(ui, scene, &refs, state);
         }
         geometry_inspector(ui, scene, &geo, state, geo.len() == 1);
@@ -942,18 +1031,38 @@ fn inspector_body(
     }
 
     // LED screens take the Inspector when selected.
-    let scr: Vec<usize> = selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
+    let scr: Vec<usize> = selection
+        .screens
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.screens.len())
+        .collect();
     if let Some(&primary) = scr.first() {
         if scr.len() > 1 {
-            let refs = scr.iter().map(|&i| ObjectRef::Screen(i)).collect::<Vec<_>>();
+            let refs = scr
+                .iter()
+                .map(|&i| ObjectRef::Screen(i))
+                .collect::<Vec<_>>();
             object_transform_bulk(ui, scene, &refs, state);
         }
-        screen::led_screen_inspector(ui, &mut scene.screens[primary], scr.len(), sources, state, scr.len() == 1);
+        screen::led_screen_inspector(
+            ui,
+            &mut scene.screens[primary],
+            scr.len(),
+            sources,
+            state,
+            scr.len() == 1,
+        );
         return;
     }
 
     // Pyro devices (CO2 cannons + cold-spark machines) take the Inspector.
-    let pyro: Vec<usize> = selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
+    let pyro: Vec<usize> = selection
+        .pyro
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.pyro.len())
+        .collect();
     if let Some(&primary) = pyro.first() {
         if pyro.len() > 1 {
             let refs = pyro.iter().map(|&i| ObjectRef::Pyro(i)).collect::<Vec<_>>();
@@ -1005,7 +1114,11 @@ fn fixture_inspector(ui: &mut egui::Ui, fixture: &mut Fixture, state: &mut Inspe
             source_chip(ui, fixture.source);
         });
     });
-    ui.label(RichText::new(format!("{} · {}", fixture.category, fixture.profile)).weak().small());
+    ui.label(
+        RichText::new(format!("{} · {}", fixture.category, fixture.profile))
+            .weak()
+            .small(),
+    );
     ui.separator();
 
     // The editable property grid (Transform + Fixture) is declared by `impl Inspect
@@ -1073,17 +1186,29 @@ fn geometry_inspector(
         return;
     };
     ui.heading(g.name.as_str());
-    let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
+    let kind = g
+        .mvr
+        .as_ref()
+        .map(|m| m.kind.as_str())
+        .filter(|k| !k.is_empty())
+        .unwrap_or("Object");
     ui.label(
-        RichText::new(format!("{kind} · {} model{}", g.models.len(), if g.models.len() == 1 { "" } else { "s" }))
-            .weak()
-            .small(),
+        RichText::new(format!(
+            "{kind} · {} model{}",
+            g.models.len(),
+            if g.models.len() == 1 { "" } else { "s" }
+        ))
+        .weak()
+        .small(),
     );
     if ids.len() > 1 {
         ui.label(
-            RichText::new(format!("{} objects — transform applies to all; other edits affect the active object", ids.len()))
-                .weak()
-                .small(),
+            RichText::new(format!(
+                "{} objects — transform applies to all; other edits affect the active object",
+                ids.len()
+            ))
+            .weak()
+            .small(),
         );
     }
     ui.separator();
@@ -1151,7 +1276,11 @@ fn pyro_inspector(
     show_transform: bool,
 ) {
     ui.heading(d.name.as_str());
-    ui.label(RichText::new(format!("{} · {}", d.kind.label(), d.profile_name)).weak().small());
+    ui.label(
+        RichText::new(format!("{} · {}", d.kind.label(), d.profile_name))
+            .weak()
+            .small(),
+    );
     if count > 1 {
         ui.label(
             RichText::new(format!("{count} devices — edits apply to all selected"))
@@ -1210,9 +1339,26 @@ fn apply_pyro_bulk_delta(
         )+ };
     }
     prop!(
-        height_m, throw_m, speed, density, cone_deg, color_t0_k, color_t1_k, brightness,
-        opacity, tint, spin_rpm, pan, tilt, max_particles, quality, dissipation,
-        viewport_hq, thickness, mode, hidden,
+        height_m,
+        throw_m,
+        speed,
+        density,
+        cone_deg,
+        color_t0_k,
+        color_t1_k,
+        brightness,
+        opacity,
+        tint,
+        spin_rpm,
+        pan,
+        tilt,
+        max_particles,
+        quality,
+        dissipation,
+        viewport_hq,
+        thickness,
+        mode,
+        hidden,
     );
 }
 
@@ -1239,8 +1385,14 @@ fn gdtf_inspector(
     let tertiary = pal.ink_tertiary;
     let muted = pal.ink_muted;
     let patch_entry = patch.get(fixture_id);
-    let mode_index = patch_entry.map(|p| p.mode_index).unwrap_or(fixture.mode_index);
-    let mode_name = gdtf.modes.get(mode_index).map(|m| m.name.as_str()).unwrap_or("unknown mode");
+    let mode_index = patch_entry
+        .map(|p| p.mode_index)
+        .unwrap_or(fixture.mode_index);
+    let mode_name = gdtf
+        .modes
+        .get(mode_index)
+        .map(|m| m.name.as_str())
+        .unwrap_or("unknown mode");
     let patch_conflict = patch
         .conflicts()
         .iter()
@@ -1264,16 +1416,33 @@ fn gdtf_inspector(
         meta_sep(ui, muted);
         meta_value(ui, gdtf.long_name.as_str(), secondary, false);
         meta_sep(ui, muted);
-        meta_value(ui, fixture.source.label(), Color32::from_rgb(sr, sg, sb), false);
+        meta_value(
+            ui,
+            fixture.source.label(),
+            Color32::from_rgb(sr, sg, sb),
+            false,
+        );
     });
 
     ui.horizontal_wrapped(|ui| {
         meta_label(ui, "Patch", tertiary);
         match patch_entry {
             Some(p) if p.enabled => {
-                let end = p.address.saturating_add(p.footprint.saturating_sub(1)).min(512);
-                let patch_color = if patch_conflict { pal.conflict } else { pal.accent };
-                meta_value(ui, format!("U{} {:03}-{:03}", p.universe, p.address, end), patch_color, true);
+                let end = p
+                    .address
+                    .saturating_add(p.footprint.saturating_sub(1))
+                    .min(512);
+                let patch_color = if patch_conflict {
+                    pal.conflict
+                } else {
+                    pal.accent
+                };
+                meta_value(
+                    ui,
+                    format!("U{} {:03}-{:03}", p.universe, p.address, end),
+                    patch_color,
+                    true,
+                );
                 meta_sep(ui, muted);
                 meta_value(ui, format!("{} ch", p.footprint), secondary, false);
                 meta_sep(ui, muted);
@@ -1284,7 +1453,12 @@ fn gdtf_inspector(
                 }
             }
             Some(p) => {
-                meta_value(ui, format!("unpatched · {} ch reserved", p.footprint), pal.warn, true);
+                meta_value(
+                    ui,
+                    format!("unpatched · {} ch reserved", p.footprint),
+                    pal.warn,
+                    true,
+                );
             }
             None => {
                 meta_value(ui, "no patch entry", pal.warn, true);
@@ -1315,7 +1489,12 @@ fn gdtf_inspector(
     ui.horizontal_wrapped(|ui| {
         meta_value(ui, b.beam_type.as_str(), secondary, false);
         meta_sep(ui, muted);
-        meta_value(ui, format!("beam {:.0}° / field {:.0}°", b.beam_angle, b.field_angle), secondary, false);
+        meta_value(
+            ui,
+            format!("beam {:.0}° / field {:.0}°", b.beam_angle, b.field_angle),
+            secondary,
+            false,
+        );
         meta_sep(ui, muted);
         meta_value(ui, format!("throw {:.2}", b.throw_ratio), secondary, false);
     });
@@ -1329,7 +1508,12 @@ fn gdtf_inspector(
             if emitters.len() > visible {
                 meta_sep(ui, muted);
                 let overlays = emitters.len() - visible;
-                meta_value(ui, format!("{overlays} overlay{}", if overlays == 1 { "" } else { "s" }), muted, false);
+                meta_value(
+                    ui,
+                    format!("{overlays} overlay{}", if overlays == 1 { "" } else { "s" }),
+                    muted,
+                    false,
+                );
             }
             meta_sep(ui, muted);
             meta_value(ui, emitters[0].beam.beam_type.as_str(), secondary, false);
@@ -1346,13 +1530,21 @@ fn gdtf_inspector(
 
     // MVR patch identity (FixtureID, DMX address, mode) when imported from a scene.
     if let Some(m) = fixture.mvr.as_deref() {
-        let id = if m.fixture_id.is_empty() { "—" } else { m.fixture_id.as_str() };
+        let id = if m.fixture_id.is_empty() {
+            "—"
+        } else {
+            m.fixture_id.as_str()
+        };
         let addr = m
             .addresses
             .first()
             .map(|a| format!("{}.{:03}", a.universe(), a.channel()))
             .unwrap_or_else(|| "—".into());
-        let mode = if m.gdtf_mode.is_empty() { "—" } else { m.gdtf_mode.as_str() };
+        let mode = if m.gdtf_mode.is_empty() {
+            "—"
+        } else {
+            m.gdtf_mode.as_str()
+        };
         ui.horizontal_wrapped(|ui| {
             meta_label(ui, "MVR", tertiary);
             meta_value(ui, format!("ID {id}"), muted, false);
@@ -1485,7 +1677,11 @@ fn emitter_layout_preview(
     let mut lo = [f32::MAX, f32::MAX];
     let mut hi = [f32::MIN, f32::MIN];
     let mut any = false;
-    for (i, e) in emitters.iter().enumerate().filter(|(_, e)| e.merged_into.is_none()) {
+    for (i, e) in emitters
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.merged_into.is_none())
+    {
         any = true;
         if let Some(cell) = mesh_shapes.get(i).and_then(|s| s.as_ref()) {
             for &[x, y] in &cell.outline {
@@ -1507,17 +1703,23 @@ fn emitter_layout_preview(
     let span_x = (hi[0] - lo[0]).max(1e-3);
     let span_y = (hi[1] - lo[1]).max(1e-3);
     let outer_w = ui.available_width().max(80.0);
-    let max_face_w = (outer_w - 24.0).max(40.0).min(220.0);
+    let max_face_w = (outer_w - 24.0).clamp(40.0, 220.0);
     let outer_h = (max_face_w * span_y / span_x + 18.0).clamp(76.0, 160.0);
     ui.add_space(2.0);
     let (canvas, _) = ui.allocate_exact_size(egui::vec2(outer_w, outer_h), Sense::hover());
     let painter = ui.painter_at(canvas);
     let pal = theme::Palette::get(ui);
     painter.rect_filled(canvas, 3.0, pal.input);
-    painter.rect_stroke(canvas, 3.0, egui::Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        canvas,
+        3.0,
+        egui::Stroke::new(1.0, pal.border),
+        egui::StrokeKind::Inside,
+    );
     let max_face_h = (canvas.height() - 16.0).max(40.0);
     let scale = (max_face_w / span_x).min(max_face_h / span_y);
-    let face = egui::Rect::from_center_size(canvas.center(), egui::vec2(span_x * scale, span_y * scale));
+    let face =
+        egui::Rect::from_center_size(canvas.center(), egui::vec2(span_x * scale, span_y * scale));
     let level = (fixture.intensity * fixture.optics.dimmer).clamp(0.0, 1.0);
     // World (right, up) → canvas pixel. `up` is +y, screen y is down, so flip.
     let map = |x: f32, y: f32| -> egui::Pos2 {
@@ -1541,10 +1743,18 @@ fn emitter_layout_preview(
         };
         let col = Color32::from_rgb(lit(c[0]), lit(c[1]), lit(c[2]));
         if let Some(cell) = mesh_shapes.get(i).and_then(|s| s.as_ref()) {
-            let outline = cell.outline.iter().map(|&[x, y]| map(x, y)).collect::<Vec<_>>();
+            let outline = cell
+                .outline
+                .iter()
+                .map(|&[x, y]| map(x, y))
+                .collect::<Vec<_>>();
             if outline.len() >= 3 {
                 cells.push((
-                    EmitterPreviewPaintShape::Polygon { outline, depth: cell.depth, area: cell.area },
+                    EmitterPreviewPaintShape::Polygon {
+                        outline,
+                        depth: cell.depth,
+                        area: cell.area,
+                    },
                     col,
                 ));
                 continue;
@@ -1566,7 +1776,14 @@ fn emitter_layout_preview(
             ));
         } else {
             let round = (cell.width().min(cell.height()) * 0.06).clamp(1.0, 3.0);
-            cells.push((EmitterPreviewPaintShape::Rect { rect: cell, round, depth: 0.0 }, col));
+            cells.push((
+                EmitterPreviewPaintShape::Rect {
+                    rect: cell,
+                    round,
+                    depth: 0.0,
+                },
+                col,
+            ));
         }
     }
     cells.sort_by(|a, b| {
@@ -1583,15 +1800,29 @@ fn emitter_layout_preview(
 }
 
 enum EmitterPreviewPaintShape {
-    Polygon { outline: Vec<egui::Pos2>, depth: f32, area: f32 },
-    Circle { center: egui::Pos2, radius: f32, depth: f32 },
-    Rect { rect: egui::Rect, round: f32, depth: f32 },
+    Polygon {
+        outline: Vec<egui::Pos2>,
+        depth: f32,
+        area: f32,
+    },
+    Circle {
+        center: egui::Pos2,
+        radius: f32,
+        depth: f32,
+    },
+    Rect {
+        rect: egui::Rect,
+        round: f32,
+        depth: f32,
+    },
 }
 
 impl EmitterPreviewPaintShape {
     fn depth(&self) -> f32 {
         match self {
-            Self::Polygon { depth, .. } | Self::Circle { depth, .. } | Self::Rect { depth, .. } => *depth,
+            Self::Polygon { depth, .. } | Self::Circle { depth, .. } | Self::Rect { depth, .. } => {
+                *depth
+            }
         }
     }
 
@@ -1606,7 +1837,11 @@ impl EmitterPreviewPaintShape {
     fn fill(&self, painter: &egui::Painter, color: Color32) {
         match self {
             Self::Polygon { outline, .. } => {
-                painter.add(egui::Shape::convex_polygon(outline.clone(), color, egui::Stroke::NONE));
+                painter.add(egui::Shape::convex_polygon(
+                    outline.clone(),
+                    color,
+                    egui::Stroke::NONE,
+                ));
             }
             Self::Circle { center, radius, .. } => {
                 painter.circle_filled(*center, *radius, color);
@@ -1634,7 +1869,10 @@ impl EmitterPreviewPaintShape {
     }
 }
 
-fn build_emitter_preview_shapes(gdtf: &GdtfFixture, mode_index: usize) -> Vec<Option<EmitterPreviewCell>> {
+fn build_emitter_preview_shapes(
+    gdtf: &GdtfFixture,
+    mode_index: usize,
+) -> Vec<Option<EmitterPreviewCell>> {
     let emitters = gdtf.emitters(mode_index);
     if emitters.is_empty() {
         return Vec::new();
@@ -1685,7 +1923,10 @@ fn build_emitter_preview_shapes(gdtf: &GdtfFixture, mode_index: usize) -> Vec<Op
                 ring.r = (ring.r * n + p.r) / (n + 1.0);
                 ring.items.push(p);
             }
-            _ => rings.push(Ring { r: p.r, items: vec![p] }),
+            _ => rings.push(Ring {
+                r: p.r,
+                items: vec![p],
+            }),
         }
     }
     if !rings.iter().any(|r| r.items.len() >= 6) {
@@ -1712,14 +1953,23 @@ fn build_emitter_preview_shapes(gdtf: &GdtfFixture, mode_index: usize) -> Vec<Op
         if items.len() == 1 && inner <= max_r * 0.08 {
             let outline = circle_polygon(outer, 40);
             let area = polygon_area_2d(&outline);
-            out[items[0].idx] = Some(EmitterPreviewCell { outline, depth: 0.0, area });
+            out[items[0].idx] = Some(EmitterPreviewCell {
+                outline,
+                depth: 0.0,
+                area,
+            });
             continue;
         }
         if items.len() < 2 {
             let e = &emitters[items[0].idx];
-            let outline = ellipse_polygon(e.pos[0], e.pos[1], e.aperture.half_w, e.aperture.half_h, 28);
+            let outline =
+                ellipse_polygon(e.pos[0], e.pos[1], e.aperture.half_w, e.aperture.half_h, 28);
             let area = polygon_area_2d(&outline);
-            out[items[0].idx] = Some(EmitterPreviewCell { outline, depth: 0.0, area });
+            out[items[0].idx] = Some(EmitterPreviewCell {
+                outline,
+                depth: 0.0,
+                area,
+            });
             continue;
         }
 
@@ -1739,7 +1989,11 @@ fn build_emitter_preview_shapes(gdtf: &GdtfFixture, mode_index: usize) -> Vec<Op
             let end = (theta + next) * 0.5;
             let outline = annular_sector_polygon(inner, outer, start, end);
             let area = polygon_area_2d(&outline);
-            out[items[i].idx] = Some(EmitterPreviewCell { outline, depth: 0.0, area });
+            out[items[i].idx] = Some(EmitterPreviewCell {
+                outline,
+                depth: 0.0,
+                area,
+            });
         }
     }
     out
@@ -1765,7 +2019,9 @@ fn ellipse_polygon(cx: f32, cy: f32, rx: f32, ry: f32, steps: usize) -> Vec<[f32
 
 fn annular_sector_polygon(inner: f32, outer: f32, start: f32, end: f32) -> Vec<[f32; 2]> {
     let span = (end - start).abs().max(1e-4);
-    let steps = ((span / std::f32::consts::TAU) * 48.0).ceil().clamp(2.0, 10.0) as usize;
+    let steps = ((span / std::f32::consts::TAU) * 48.0)
+        .ceil()
+        .clamp(2.0, 10.0) as usize;
     let mut pts = Vec::with_capacity((steps + 1) * 2);
     for s in 0..=steps {
         let t = start + (end - start) * (s as f32 / steps as f32);
@@ -1811,7 +2067,11 @@ pub(crate) fn load_gdtf_textures(ctx: &egui::Context, gdtf: &GdtfFixture) -> Gdt
                 .collect()
         })
         .collect();
-    GdtfTextures { thumbnail, wheels, emitter_shapes: HashMap::new() }
+    GdtfTextures {
+        thumbnail,
+        wheels,
+        emitter_shapes: HashMap::new(),
+    }
 }
 
 fn decode_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
@@ -1823,7 +2083,6 @@ fn decode_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui:
     let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
     Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
 }
-
 
 /// S3-properties (#6 reset-to-default, #7 multi-edit mixed detection): the pure
 /// reductions + default resolution the inspector rows render off of.
@@ -1847,7 +2106,10 @@ mod property_tests {
 
     #[test]
     fn common_rgb_per_channel() {
-        assert_eq!(common_rgb([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]), Some([1.0, 0.0, 0.0]));
+        assert_eq!(
+            common_rgb([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+            Some([1.0, 0.0, 0.0])
+        );
         // One channel differs → mixed.
         assert_eq!(common_rgb([[1.0, 0.0, 0.0], [1.0, 0.0, 0.5]]), None);
     }
@@ -1884,9 +2146,11 @@ mod property_tests {
 
     #[test]
     fn show_modified_composes_with_filter() {
-        let mut st = InspectorState::default();
-        st.show_modified = true;
-        st.filter = "zoom".into();
+        let st = InspectorState {
+            show_modified: true,
+            filter: "zoom".into(),
+            ..Default::default()
+        };
         // Must pass BOTH gates: matches the filter AND differs from default.
         assert!(st.row_shown("Zoom", true)); // matches + modified
         assert!(!st.row_shown("Zoom", false)); // matches but at default
@@ -1930,13 +2194,21 @@ mod property_tests {
         // Nothing selected → no target.
         assert_eq!(current_pin_target(&scene, &Selection::default(), &st), None);
         // World / multi-fixture → no single-fixture target.
-        let mut world = Selection::default();
-        world.world = true;
+        let world = Selection {
+            world: true,
+            ..Default::default()
+        };
         assert_eq!(current_pin_target(&scene, &world, &st), None);
-        let multi = Selection { fixtures: vec![0, 1], ..Default::default() };
+        let multi = Selection {
+            fixtures: vec![0, 1],
+            ..Default::default()
+        };
         assert_eq!(current_pin_target(&scene, &multi, &st), None);
         // A single fixture → its id.
-        assert_eq!(current_pin_target(&scene, &Selection::fixture(0), &st), Some(scene.fixtures[0].id));
+        assert_eq!(
+            current_pin_target(&scene, &Selection::fixture(0), &st),
+            Some(scene.fixtures[0].id)
+        );
     }
 
     #[test]
@@ -1945,12 +2217,15 @@ mod property_tests {
         // left its default (tolerant equality avoids f32-dust false positives).
         let def = OpticalControls::default();
         let mut o = def.clone();
-        assert!(!(!approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def))));
+        assert!(approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def)));
         OpticField::Zoom.set(&mut o, def.zoom + 0.2);
-        assert!(!approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def)));
+        assert!(!approx(
+            OpticField::Zoom.get(&o),
+            OpticField::Zoom.get(&def)
+        ));
         // Reset writes the default back → predicate clears.
         OpticField::Zoom.set(&mut o, OpticField::Zoom.get(&def));
-        assert!(!(!approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def))));
+        assert!(approx(OpticField::Zoom.get(&o), OpticField::Zoom.get(&def)));
     }
 
     // --- S1: Inspector filter predicate + collapse persistence -------------
@@ -1968,8 +2243,10 @@ mod property_tests {
 
     #[test]
     fn filter_hides_non_matching_rows() {
-        let mut st = InspectorState::default();
-        st.filter = "dim".into();
+        let mut st = InspectorState {
+            filter: "dim".into(),
+            ..Default::default()
+        };
         // Fuzzy/substring match on the label (case-insensitive).
         assert!(st.row_visible("Dimmer"));
         assert!(!st.row_visible("Pan"));
@@ -1981,8 +2258,10 @@ mod property_tests {
 
     #[test]
     fn filter_hides_category_with_no_matching_row() {
-        let mut st = InspectorState::default();
-        st.filter = "zoom".into();
+        let st = InspectorState {
+            filter: "zoom".into(),
+            ..Default::default()
+        };
         // Optics has Zoom → visible; Transform has none → hidden.
         assert!(st.category_visible(&["Zoom", "Focus", "Iris"]));
         assert!(!st.category_visible(&["Pan", "Tilt", "Position"]));
@@ -1992,9 +2271,11 @@ mod property_tests {
 
     #[test]
     fn filter_force_opens_visible_categories() {
-        let mut st = InspectorState::default();
+        let mut st = InspectorState {
+            collapsed: [("Transform".into(), false)].into_iter().collect(),
+            ..Default::default()
+        };
         // Off-filter a stored-collapsed category stays collapsed.
-        st.collapsed.insert("Transform".into(), false);
         assert!(!st.open_state("Transform", true));
         // With a filter active, a visible category force-opens so matches show.
         st.filter = "pan".into();
@@ -2006,8 +2287,10 @@ mod property_tests {
         // The remembered open/closed map survives a serialize → deserialize cycle
         // (the on-disk persistence format), while the live filter does NOT (it's
         // serde-skipped — a fresh session always starts unfiltered).
-        let mut st = InspectorState::default();
-        st.filter = "transient".into();
+        let mut st = InspectorState {
+            filter: "transient".into(),
+            ..Default::default()
+        };
         st.collapsed.insert("Transform".into(), false);
         st.collapsed.insert("Optics".into(), true);
 

@@ -14,15 +14,27 @@ fn main() {
         .collect();
 
     let mut xml = String::new();
-    zip.by_name("description.xml").unwrap().read_to_string(&mut xml).unwrap();
+    zip.by_name("description.xml")
+        .unwrap()
+        .read_to_string(&mut xml)
+        .unwrap();
     let doc = roxmltree::Document::parse(&xml).unwrap();
 
     for m in doc.descendants().filter(|n| n.has_tag_name("Model")) {
         let name = m.attribute("Name").unwrap_or("");
         let file = m.attribute("File").unwrap_or("");
-        let dw: f32 = m.attribute("Width").and_then(|v| v.parse().ok()).unwrap_or(0.0);
-        let dh: f32 = m.attribute("Height").and_then(|v| v.parse().ok()).unwrap_or(0.0);
-        let dl: f32 = m.attribute("Length").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let dw: f32 = m
+            .attribute("Width")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let dh: f32 = m
+            .attribute("Height")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let dl: f32 = m
+            .attribute("Length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
         if file.is_empty() {
             continue;
         }
@@ -44,7 +56,11 @@ fn main() {
         let decl_max = dw.max(dh).max(dl).max(1e-6);
         let baked_max = size[0].max(size[1]).max(size[2]);
         let ratio = baked_max / decl_max;
-        let flag = if ratio > 3.0 || ratio < 0.33 { "  <<< OUT OF SCALE" } else { "" };
+        let flag = if !(0.33..=3.0).contains(&ratio) {
+            "  <<< OUT OF SCALE"
+        } else {
+            ""
+        };
         println!(
             "{name:24} decl {:.3}x{:.3}x{:.3}  baked {:.3}x{:.3}x{:.3}  ratio {:.1}x{}",
             dw, dh, dl, size[0], size[1], size[2], ratio, flag
@@ -58,7 +74,13 @@ fn glb_bbox(bytes: &[u8]) -> ([f32; 3], [f32; 3]) {
     let mut min = [f32::MAX; 3];
     let mut max = [f32::MIN; 3];
     // Walk node hierarchy to apply transforms (matches the renderer's collect_node).
-    fn node(n: &gltf::Node, parent: [[f32; 4]; 4], blob: Option<&[u8]>, mn: &mut [f32; 3], mx: &mut [f32; 3]) {
+    fn node(
+        n: &gltf::Node,
+        parent: [[f32; 4]; 4],
+        blob: Option<&[u8]>,
+        mn: &mut [f32; 3],
+        mx: &mut [f32; 3],
+    ) {
         let local = n.transform().matrix();
         let world = matmul(parent, local);
         if let Some(mesh) = n.mesh() {
@@ -89,8 +111,8 @@ fn glb_bbox(bytes: &[u8]) -> ([f32; 3], [f32; 3]) {
 
 fn identity() -> [[f32; 4]; 4] {
     let mut m = [[0.0; 4]; 4];
-    for i in 0..4 {
-        m[i][i] = 1.0;
+    for (i, row) in m.iter_mut().enumerate() {
+        row[i] = 1.0;
     }
     m
 }

@@ -267,7 +267,12 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// label that groups a block of controls. Optionally icon-led.
 pub fn section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
-    ui.label(RichText::new(text).size(10.5).strong().color(ink_for(ui).tertiary));
+    ui.label(
+        RichText::new(text)
+            .size(10.5)
+            .strong()
+            .color(ink_for(ui).tertiary),
+    );
 }
 
 fn ink_for(ui: &egui::Ui) -> Ink {
@@ -313,7 +318,12 @@ pub fn accent(prefs: &Preferences) -> Color32 {
 /// the fill + hairline; `expand` is the egui hover bloom; `fg` the label ink.
 /// One call shape per state keeps the accent + surfaces coherent: bump the base
 /// and every state tracks it.
-fn widget_state(bg: Color32, stroke: Color32, fg: Color32, expand: f32) -> egui::style::WidgetVisuals {
+fn widget_state(
+    bg: Color32,
+    stroke: Color32,
+    fg: Color32,
+    expand: f32,
+) -> egui::style::WidgetVisuals {
     egui::style::WidgetVisuals {
         bg_fill: bg,
         weak_bg_fill: bg,
@@ -336,7 +346,11 @@ pub fn apply(ctx: &egui::Context, prefs: &Preferences) {
     // Publish the role table for direct reads this frame (Palette::get).
     ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, p));
 
-    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
 
     v.panel_fill = p.canvas;
     v.window_fill = p.window;
@@ -372,11 +386,23 @@ pub fn apply(ctx: &egui::Context, prefs: &Preferences) {
     // Deliberate, distinct type scale (14-base would be loose for a console;
     // body 13 reads dense without strain). Weight/colour carry most hierarchy.
     style.text_styles = [
-        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+        (
+            TextStyle::Small,
+            FontId::new(11.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(13.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
-        (TextStyle::Heading, FontId::new(15.0, FontFamily::Proportional)),
+        (
+            TextStyle::Button,
+            FontId::new(13.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(12.0, FontFamily::Monospace),
+        ),
+        (
+            TextStyle::Heading,
+            FontId::new(15.0, FontFamily::Proportional),
+        ),
     ]
     .into();
 
@@ -437,8 +463,14 @@ mod tests {
     /// dark mode) — the "one hue, lightness steps only" contract.
     #[test]
     fn palette_dark_light_and_ramp() {
-        let dark = Palette::build(&Preferences { theme_light: false, ..Default::default() });
-        let light = Palette::build(&Preferences { theme_light: true, ..Default::default() });
+        let dark = Palette::build(&Preferences {
+            theme_light: false,
+            ..Default::default()
+        });
+        let light = Palette::build(&Preferences {
+            theme_light: true,
+            ..Default::default()
+        });
         assert_ne!(dark.canvas, light.canvas);
         // Dark ramp ascends in lightness from canvas to surface_hi.
         let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
@@ -449,7 +481,10 @@ mod tests {
     /// The accent role tracks the preference triple exactly.
     #[test]
     fn palette_accent_follows_pref() {
-        let prefs = Preferences { accent: [1.0, 0.0, 0.0], ..Default::default() };
+        let prefs = Preferences {
+            accent: [1.0, 0.0, 0.0],
+            ..Default::default()
+        };
         let p = Palette::build(&prefs);
         assert_eq!(p.accent, Color32::from_rgb(255, 0, 0));
     }

@@ -76,16 +76,33 @@ pub fn inject_spec(spec: &str) -> UniverseSnapshot {
 }
 
 fn snapshot_from(bufs: HashMap<u16, [u8; 512]>) -> UniverseSnapshot {
-    let mut snap = UniverseSnapshot { frames: HashMap::new() };
+    let mut snap = UniverseSnapshot {
+        generation: 1,
+        frames: HashMap::new(),
+    };
     let now = Instant::now();
     for (u, levels) in bufs {
-        snap.frames.insert(u, UniverseFrame { levels, sources: 1, last_update: now });
+        snap.frames.insert(
+            u,
+            UniverseFrame {
+                levels,
+                sources: 1,
+                last_update: now,
+            },
+        );
     }
     snap
 }
 
 /// Write one fixture's designed look into its universe buffer.
-fn write_fixture(buf: &mut [u8; 512], fixture: &crate::scene::Fixture, address: u16, mode_index: usize, i: usize, n: usize) {
+fn write_fixture(
+    buf: &mut [u8; 512],
+    fixture: &crate::scene::Fixture,
+    address: u16,
+    mode_index: usize,
+    i: usize,
+    n: usize,
+) {
     let mut put = |offset0: u16, width: u8, v01: f32| {
         let start = (address as usize).saturating_sub(1) + offset0 as usize;
         let coarse = (v01.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -99,7 +116,9 @@ fn write_fixture(buf: &mut [u8; 512], fixture: &crate::scene::Fixture, address: 
     match fixture.gdtf.as_ref().and_then(|g| g.modes.get(mode_index)) {
         Some(mode) => {
             for ch in &mode.channels {
-                let Some(first) = ch.offsets.iter().copied().min() else { continue };
+                let Some(first) = ch.offsets.iter().copied().min() else {
+                    continue;
+                };
                 if let Some(v01) = gdtf_value(&ch.attribute, ch, i, n) {
                     put((first - 1) as u16, ch.resolution.max(1), v01);
                 }
@@ -121,7 +140,7 @@ fn gdtf_value(attr: &str, ch: &DmxChannel, i: usize, n: usize) -> Option<f32> {
     match attr {
         "Dimmer" => Some(1.0),
         "Shutter1" => Some(open_shutter(ch)),
-        "Iris" => Some(1.0),  // 1 = open (0 would close the beam)
+        "Iris" => Some(1.0), // 1 = open (0 would close the beam)
         "Focus1" | "Focus2" => Some(0.5),
         "Zoom" => Some(0.4),
         "Pan" => Some(fan(i, n)),

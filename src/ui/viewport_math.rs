@@ -14,8 +14,12 @@ use crate::scene::{ObjectRef, Scene, Selection};
 /// Extend the selection to every fixture sharing a profile with the current
 /// selection ("Select same type").
 pub(super) fn select_same_type(scene: &Scene, selection: &mut Selection) {
-    let mut types: Vec<&str> =
-        selection.fixtures.iter().filter_map(|&i| scene.fixtures.get(i)).map(|f| f.profile.as_str()).collect();
+    let mut types: Vec<&str> = selection
+        .fixtures
+        .iter()
+        .filter_map(|&i| scene.fixtures.get(i))
+        .map(|f| f.profile.as_str())
+        .collect();
     types.sort_unstable();
     types.dedup();
     if types.is_empty() {
@@ -34,7 +38,11 @@ pub(super) fn select_same_type(scene: &Scene, selection: &mut Selection) {
 /// Frame the camera on the selected fixtures (their AABB). No-op if nothing
 /// selected.
 pub(super) fn frame_selection(scene: &Scene, selection: &Selection, camera: &mut OrbitCamera) {
-    let mut it = selection.fixtures.iter().filter_map(|&i| scene.fixtures.get(i)).map(|f| f.position);
+    let mut it = selection
+        .fixtures
+        .iter()
+        .filter_map(|&i| scene.fixtures.get(i))
+        .map(|f| f.position);
     let Some(first) = it.next() else { return };
     let (mut lo, mut hi) = (first, first);
     for p in it {
@@ -52,10 +60,18 @@ pub(super) fn frame_selection(scene: &Scene, selection: &Selection, camera: &mut
 /// centroid. Individual-Origins has no single pivot (the applier uses each
 /// element's own anchor) so it returns the Median like the others. Empty
 /// selection → origin.
-pub(super) fn compute_pivot(scene: &Scene, objs: &[ObjectRef], mode: PivotMode, cursor_3d: Vec3) -> Vec3 {
+pub(super) fn compute_pivot(
+    scene: &Scene,
+    objs: &[ObjectRef],
+    mode: PivotMode,
+    cursor_3d: Vec3,
+) -> Vec3 {
     match mode {
         PivotMode::Cursor3d => cursor_3d,
-        PivotMode::Active => objs.first().and_then(|&o| scene.object_anchor(o)).unwrap_or(Vec3::ZERO),
+        PivotMode::Active => objs
+            .first()
+            .and_then(|&o| scene.object_anchor(o))
+            .unwrap_or(Vec3::ZERO),
         // Median + Individual both seed from the centroid (Individual's per-element
         // pivots are applied in apply_transform via `op.individual`).
         PivotMode::Median | PivotMode::Individual => {
@@ -116,11 +132,19 @@ pub(super) fn snapshot_starts(
         .iter()
         .map(|&i| (i, scene.fixtures[i].position, scene.fixtures[i].orientation))
         .collect();
-    let geo_start = gids.iter().map(|&i| (i, scene.geometry[i].transform)).collect();
-    let screen_start = sids.iter().map(|&i| (i, scene.screens[i].transform)).collect();
+    let geo_start = gids
+        .iter()
+        .map(|&i| (i, scene.geometry[i].transform))
+        .collect();
+    let screen_start = sids
+        .iter()
+        .map(|&i| (i, scene.screens[i].transform))
+        .collect();
     let pyro_start = pids.iter().map(|&i| (i, scene.pyro[i].transform)).collect();
-    let env_start =
-        eids.iter().map(|&i| (i, scene.environments[i].center, scene.environments[i].size)).collect();
+    let env_start = eids
+        .iter()
+        .map(|&i| (i, scene.environments[i].center, scene.environments[i].size))
+        .collect();
     (start, geo_start, screen_start, pyro_start, env_start)
 }
 
@@ -285,7 +309,10 @@ pub(super) fn snap_preview_point(op: &TransformOp, scene: &Scene, snap_on: bool)
         return scene.fixtures.get(*i).map(|f| f.position);
     }
     if let Some((i, _)) = op.geo_start.first() {
-        return scene.geometry.get(*i).map(|g| g.transform.w_axis.truncate());
+        return scene
+            .geometry
+            .get(*i)
+            .map(|g| g.transform.w_axis.truncate());
     }
     None
 }
@@ -294,14 +321,22 @@ pub(super) fn snap_preview_point(op: &TransformOp, scene: &Scene, snap_on: bool)
 /// point, tinted to read as "this is where it lands". Screen-space sized so it stays
 /// legible at any zoom. No-op when the point is behind the camera / off the rect math.
 pub(super) fn draw_snap_marker(painter: &egui::Painter, world: Vec3, vp: Mat4, rect: egui::Rect) {
-    let Some(c) = OrbitCamera::project_to_screen(world, vp, rect) else { return };
+    let Some(c) = OrbitCamera::project_to_screen(world, vp, rect) else {
+        return;
+    };
     let col = egui::Color32::from_rgb(120, 230, 255); // cyan — the "snap" accent
     let r = 6.0;
     painter.circle_stroke(c, r, egui::Stroke::new(1.5, col));
     // A small plus through the centre so the exact point reads even over busy geometry.
     let x = r + 3.0;
-    painter.line_segment([c - egui::vec2(x, 0.0), c + egui::vec2(x, 0.0)], egui::Stroke::new(1.0, col));
-    painter.line_segment([c - egui::vec2(0.0, x), c + egui::vec2(0.0, x)], egui::Stroke::new(1.0, col));
+    painter.line_segment(
+        [c - egui::vec2(x, 0.0), c + egui::vec2(x, 0.0)],
+        egui::Stroke::new(1.0, col),
+    );
+    painter.line_segment(
+        [c - egui::vec2(0.0, x), c + egui::vec2(0.0, x)],
+        egui::Stroke::new(1.0, col),
+    );
 }
 
 #[cfg(test)]
@@ -310,8 +345,22 @@ mod tests {
     use crate::ui::panels::{apply_transform, update_dup_array};
     use crate::ui::{Axis, NumInput, SnapSettings, TransformOrientation};
 
-    fn make_op(kind: TransformKind, axis: Option<Axis>, pivot: Vec3, idx: usize, p0: Vec3) -> TransformOp {
-        make_op_q(kind, axis, pivot, idx, p0, Quat::IDENTITY, TransformOrientation::Global)
+    fn make_op(
+        kind: TransformKind,
+        axis: Option<Axis>,
+        pivot: Vec3,
+        idx: usize,
+        p0: Vec3,
+    ) -> TransformOp {
+        make_op_q(
+            kind,
+            axis,
+            pivot,
+            idx,
+            p0,
+            Quat::IDENTITY,
+            TransformOrientation::Global,
+        )
     }
 
     /// Like [`make_op`] but with an explicit start-orientation Quat (the Local-basis
@@ -325,7 +374,29 @@ mod tests {
         q: Quat,
         orientation: TransformOrientation,
     ) -> TransformOp {
-        TransformOp { kind, axis, start_screen: egui::pos2(0.0, 0.0), viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), pivot, start: vec![(idx, p0, q)], geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(), gizmo_hovered_axis: None, gizmo_plane_normal: None, gizmo_view: false, from_gizmo: false, num: NumInput::default(), individual: false, snap: SnapSettings::default(), from_duplicate: false, dup_base: Vec::new(), dup_extra: Vec::new(), orientation }
+        TransformOp {
+            kind,
+            axis,
+            start_screen: egui::pos2(0.0, 0.0),
+            viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
+            pivot,
+            start: vec![(idx, p0, q)],
+            geo_start: Vec::new(),
+            screen_start: Vec::new(),
+            pyro_start: Vec::new(),
+            env_start: Vec::new(),
+            gizmo_hovered_axis: None,
+            gizmo_plane_normal: None,
+            gizmo_view: false,
+            from_gizmo: false,
+            num: NumInput::default(),
+            individual: false,
+            snap: SnapSettings::default(),
+            from_duplicate: false,
+            dup_base: Vec::new(),
+            dup_extra: Vec::new(),
+            orientation,
+        }
     }
 
     #[test]
@@ -333,7 +404,9 @@ mod tests {
         let mut scene = Scene::demo(); // one fixture at index 0
         // Simulate Shift+D's clone: a base copy of fixture 0.
         let base = scene.duplicate_object(ObjectRef::Fixture(0)).unwrap();
-        let ObjectRef::Fixture(bi) = base else { panic!("expected a fixture") };
+        let ObjectRef::Fixture(bi) = base else {
+            panic!("expected a fixture")
+        };
         let home = scene.fixtures[bi].position;
         let n_before = scene.fixtures.len();
         // The grab has moved the base copy by `delta` from its op-start home.
@@ -344,11 +417,19 @@ mod tests {
         op.from_duplicate = true;
         op.dup_base = vec![base];
         // Type "3" → an array of 3 (the base copy #1 + two LIVE extras #2/#3).
-        op.num = NumInput { str: "3".into(), sign: false, active: true };
+        op.num = NumInput {
+            str: "3".into(),
+            sign: false,
+            active: true,
+        };
 
         update_dup_array(&mut op, &mut scene);
         assert_eq!(op.dup_extra.len(), 2, "count 3 → 2 extra clones");
-        assert_eq!(scene.fixtures.len(), n_before + 2, "extras pushed onto the scene");
+        assert_eq!(
+            scene.fixtures.len(),
+            n_before + 2,
+            "extras pushed onto the scene"
+        );
         let e0 = match op.dup_extra[0] {
             ObjectRef::Fixture(i) => i,
             _ => panic!("fixture"),
@@ -366,7 +447,11 @@ mod tests {
         op.num = NumInput::default();
         update_dup_array(&mut op, &mut scene);
         assert!(op.dup_extra.is_empty(), "count 1 → no extras");
-        assert_eq!(scene.fixtures.len(), n_before, "extras removed from the scene");
+        assert_eq!(
+            scene.fixtures.len(),
+            n_before,
+            "extras removed from the scene"
+        );
     }
 
     #[test]
@@ -398,7 +483,10 @@ mod tests {
             viewport: rect,
             pivot: p0,
             start: vec![(0, p0, scene.fixtures[0].orientation)],
-            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(),
+            screen_start: Vec::new(),
+            pyro_start: Vec::new(),
+            env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: Some(Axis::Z),
             gizmo_view: false,
@@ -408,7 +496,8 @@ mod tests {
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
             from_duplicate: false,
-            dup_base: Vec::new(), dup_extra: Vec::new(),
+            dup_base: Vec::new(),
+            dup_extra: Vec::new(),
         };
         // Drag to a clearly different screen point so the in-plane delta is nonzero.
         apply_transform(&o, &mut scene, &cam, egui::pos2(560.0, 180.0), false);
@@ -453,8 +542,15 @@ mod tests {
         apply_transform(&o, &mut scene, &cam, egui::pos2(560.0, 180.0), false);
         let d = scene.fixtures[0].position - p0;
         let fwd = cam.view_basis().2;
-        assert!(d.dot(fwd).abs() < 1e-3, "view-plane move leaked along camera forward: {}", d.dot(fwd));
-        assert!(d.length() > 1e-3, "view-plane drag produced no motion: {d:?}");
+        assert!(
+            d.dot(fwd).abs() < 1e-3,
+            "view-plane move leaked along camera forward: {}",
+            d.dot(fwd)
+        );
+        assert!(
+            d.length() > 1e-3,
+            "view-plane drag produced no motion: {d:?}"
+        );
     }
 
     /// #72 VIEW-axis rotate: a view-ring drag spins the fixture about the CAMERA
@@ -499,8 +595,14 @@ mod tests {
         // (rotation about the forward axis through the pivot).
         let r0 = p0 - pivot;
         let r1 = p1 - pivot;
-        assert!((r0.length() - r1.length()).abs() < 1e-3, "radius changed under view rotate");
-        assert!((r0.dot(fwd) - r1.dot(fwd)).abs() < 1e-3, "moved along the camera-forward axis");
+        assert!(
+            (r0.length() - r1.length()).abs() < 1e-3,
+            "radius changed under view rotate"
+        );
+        assert!(
+            (r0.dot(fwd) - r1.dot(fwd)).abs() < 1e-3,
+            "moved along the camera-forward axis"
+        );
     }
 
     /// #70 snap preview: while a Move is live with Vertex snap engaged, the preview
@@ -510,7 +612,9 @@ mod tests {
     fn snap_preview_matches_snapped_destination() {
         let mut scene = Scene::demo();
         // Need a second fixture as a snap target node.
-        scene.duplicate_fixture(0, Vec3::new(5.0, 0.0, 2.0), 0.0, 1).expect("dup");
+        scene
+            .duplicate_fixture(0, Vec3::new(5.0, 0.0, 2.0), 0.0, 1)
+            .expect("dup");
         let cam = OrbitCamera::default();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let aspect = rect.width() / rect.height();
@@ -519,9 +623,11 @@ mod tests {
         // Cursor placed over the target fixture's projected origin so Vertex snaps to it.
         let cursor = OrbitCamera::project_to_screen(target, cam.view_proj(aspect), rect)
             .expect("target on screen");
-        let mut snap = SnapSettings::default();
-        snap.on = true;
-        snap.mode = crate::ui::SnapMode::Vertex;
+        let snap = SnapSettings {
+            on: true,
+            mode: crate::ui::SnapMode::Vertex,
+            ..Default::default()
+        };
         let o = TransformOp {
             kind: TransformKind::Move,
             axis: None,
@@ -548,7 +654,10 @@ mod tests {
         apply_transform(&o, &mut scene, &cam, cursor, true);
         let marker = snap_preview_point(&o, &scene, true).expect("preview while Move+snap");
         // The marker is the primary origin's snapped destination = the target node.
-        assert!((marker - target).length() < 1e-3, "preview {marker:?} != target {target:?}");
+        assert!(
+            (marker - target).length() < 1e-3,
+            "preview {marker:?} != target {target:?}"
+        );
         // Snap off → no marker; Rotate → no marker.
         assert!(snap_preview_point(&o, &scene, false).is_none());
         let rot = make_op(TransformKind::Rotate, None, p0, 0, p0);
@@ -561,11 +670,23 @@ mod tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 + Vec3::new(2.0, 0.0, 0.0);
         let o = make_op(TransformKind::Rotate, Some(Axis::Y), pivot, 0, p0);
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(80.0, 0.0), false);
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(80.0, 0.0),
+            false,
+        );
         let before = (p0 - pivot).length();
         let after = (scene.fixtures[0].position - pivot).length();
-        assert!((before - after).abs() < 1e-3, "radius changed {before} -> {after}");
-        assert!((scene.fixtures[0].position.y - p0.y).abs() < 1e-4, "Y rotation changed height");
+        assert!(
+            (before - after).abs() < 1e-3,
+            "radius changed {before} -> {after}"
+        );
+        assert!(
+            (scene.fixtures[0].position.y - p0.y).abs() < 1e-4,
+            "Y rotation changed height"
+        );
     }
 
     #[test]
@@ -574,7 +695,13 @@ mod tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
         let o = make_op(TransformKind::Scale, None, pivot, 0, p0);
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(200.0, 0.0), false);
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(200.0, 0.0),
+            false,
+        );
         let before = (p0 - pivot).length();
         let after = (scene.fixtures[0].position - pivot).length();
         assert!(after > before, "expected expansion {before} -> {after}");
@@ -586,27 +713,73 @@ mod tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
         let o = make_op(TransformKind::Scale, None, pivot, 0, p0);
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(-100000.0, 0.0), false);
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(-100000.0, 0.0),
+            false,
+        );
         let after = (scene.fixtures[0].position - pivot).length();
         assert!(after > 0.0, "geometry collapsed to the pivot");
     }
 
     #[test]
     fn numinput_value_parses() {
-        let n = NumInput { str: "4.5".into(), sign: false, active: true };
+        let n = NumInput {
+            str: "4.5".into(),
+            sign: false,
+            active: true,
+        };
         assert!((n.value() - 4.5).abs() < 1e-6);
-        let n = NumInput { str: "4".into(), sign: true, active: true };
+        let n = NumInput {
+            str: "4".into(),
+            sign: true,
+            active: true,
+        };
         assert!((n.value() + 4.0).abs() < 1e-6);
         assert_eq!(NumInput::default().value(), 0.0);
-        assert_eq!(NumInput { str: ".".into(), sign: false, active: true }.value(), 0.0);
+        assert_eq!(
+            NumInput {
+                str: ".".into(),
+                sign: false,
+                active: true
+            }
+            .value(),
+            0.0
+        );
     }
 
     #[test]
     fn numinput_display_shows_sign() {
-        assert_eq!(NumInput { str: "4.0".into(), sign: false, active: true }.display(), "4.0");
-        assert_eq!(NumInput { str: "45".into(), sign: true, active: true }.display(), "-45");
+        assert_eq!(
+            NumInput {
+                str: "4.0".into(),
+                sign: false,
+                active: true
+            }
+            .display(),
+            "4.0"
+        );
+        assert_eq!(
+            NumInput {
+                str: "45".into(),
+                sign: true,
+                active: true
+            }
+            .display(),
+            "-45"
+        );
         // Lone sign before any digit still renders, so the keystroke lands.
-        assert_eq!(NumInput { str: String::new(), sign: true, active: true }.display(), "-0");
+        assert_eq!(
+            NumInput {
+                str: String::new(),
+                sign: true,
+                active: true
+            }
+            .display(),
+            "-0"
+        );
     }
 
     #[test]
@@ -616,7 +789,11 @@ mod tests {
         let p0 = scene.fixtures[0].position;
         let cam = OrbitCamera::default();
         let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
-        o.num = NumInput { str: "4".into(), sign: false, active: true };
+        o.num = NumInput {
+            str: "4".into(),
+            sign: false,
+            active: true,
+        };
         // A wild mouse position must be ignored once numinput is active.
         apply_transform(&o, &mut scene, &cam, egui::pos2(9999.0, -9999.0), false);
         let d = scene.fixtures[0].position - p0;
@@ -629,8 +806,18 @@ mod tests {
         let mut scene = Scene::demo();
         let p0 = scene.fixtures[0].position;
         let mut o = make_op(TransformKind::Move, None, p0, 0, p0);
-        o.num = NumInput { str: "2.5".into(), sign: true, active: true };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        o.num = NumInput {
+            str: "2.5".into(),
+            sign: true,
+            active: true,
+        };
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(0.0, 0.0),
+            false,
+        );
         let d = scene.fixtures[0].position - p0;
         assert!((d.x + 2.5).abs() < 1e-4, "expected -2.5 on X, got {}", d.x);
     }
@@ -642,8 +829,18 @@ mod tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 - Vec3::new(1.0, 0.0, 0.0); // fixture sits at pivot + X
         let mut o = make_op(TransformKind::Rotate, Some(Axis::Y), pivot, 0, p0);
-        o.num = NumInput { str: "90".into(), sign: false, active: true };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        o.num = NumInput {
+            str: "90".into(),
+            sign: false,
+            active: true,
+        };
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(0.0, 0.0),
+            false,
+        );
         let off = scene.fixtures[0].position - pivot;
         // +X (1,0,0) rotated 90° about +Y → (0,0,-1) in glam's RH convention.
         assert!((off.x).abs() < 1e-4, "x not zeroed: {}", off.x);
@@ -656,11 +853,24 @@ mod tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 - Vec3::new(3.0, 0.0, 0.0);
         let mut o = make_op(TransformKind::Scale, None, pivot, 0, p0);
-        o.num = NumInput { str: "2".into(), sign: false, active: true };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(12345.0, 0.0), false);
+        o.num = NumInput {
+            str: "2".into(),
+            sign: false,
+            active: true,
+        };
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(12345.0, 0.0),
+            false,
+        );
         let before = (p0 - pivot).length();
         let after = (scene.fixtures[0].position - pivot).length();
-        assert!((after - before * 2.0).abs() < 1e-4, "expected ×2, {before} -> {after}");
+        assert!(
+            (after - before * 2.0).abs() < 1e-4,
+            "expected ×2, {before} -> {after}"
+        );
     }
 
     // --- #4 snap: quantization composes with the typed-amount apply path ------
@@ -670,12 +880,30 @@ mod tests {
         let mut scene = Scene::demo();
         let p0 = scene.fixtures[0].position;
         let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
-        o.num = NumInput { str: "1.4".into(), sign: false, active: true };
-        o.snap = SnapSettings { on: true, move_step: 1.0, ..Default::default() };
+        o.num = NumInput {
+            str: "1.4".into(),
+            sign: false,
+            active: true,
+        };
+        o.snap = SnapSettings {
+            on: true,
+            move_step: 1.0,
+            ..Default::default()
+        };
         // snap_on = true (caller would XOR Ctrl; here passed directly).
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), true);
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(0.0, 0.0),
+            true,
+        );
         let d = scene.fixtures[0].position - p0;
-        assert!((d.x - 1.0).abs() < 1e-4, "expected snapped +1 m, got {}", d.x);
+        assert!(
+            (d.x - 1.0).abs() < 1e-4,
+            "expected snapped +1 m, got {}",
+            d.x
+        );
     }
 
     #[test]
@@ -684,11 +912,29 @@ mod tests {
         let mut scene = Scene::demo();
         let p0 = scene.fixtures[0].position;
         let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
-        o.num = NumInput { str: "1.4".into(), sign: false, active: true };
-        o.snap = SnapSettings { on: true, move_step: 1.0, ..Default::default() };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        o.num = NumInput {
+            str: "1.4".into(),
+            sign: false,
+            active: true,
+        };
+        o.snap = SnapSettings {
+            on: true,
+            move_step: 1.0,
+            ..Default::default()
+        };
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(0.0, 0.0),
+            false,
+        );
         let d = scene.fixtures[0].position - p0;
-        assert!((d.x - 1.4).abs() < 1e-4, "expected exact 1.4 m, got {}", d.x);
+        assert!(
+            (d.x - 1.4).abs() < 1e-4,
+            "expected exact 1.4 m, got {}",
+            d.x
+        );
     }
 
     #[test]
@@ -698,14 +944,32 @@ mod tests {
         let p0 = scene.fixtures[0].position;
         let pivot = p0 - Vec3::new(1.0, 0.0, 0.0);
         let mut o = make_op(TransformKind::Rotate, Some(Axis::Y), pivot, 0, p0);
-        o.num = NumInput { str: "20".into(), sign: false, active: true };
-        o.snap = SnapSettings { on: true, rotate_deg: 15.0, ..Default::default() };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), true);
+        o.num = NumInput {
+            str: "20".into(),
+            sign: false,
+            active: true,
+        };
+        o.snap = SnapSettings {
+            on: true,
+            rotate_deg: 15.0,
+            ..Default::default()
+        };
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(0.0, 0.0),
+            true,
+        );
         // Offset length is preserved by rotation; check the snapped angle: +X (len 1)
         // rotated 15° about +Y → z = -sin(15°).
         let off = scene.fixtures[0].position - pivot;
         let expect_z = -(15f32.to_radians()).sin();
-        assert!((off.z - expect_z).abs() < 1e-3, "expected 15° snap (z={expect_z}), got {}", off.z);
+        assert!(
+            (off.z - expect_z).abs() < 1e-3,
+            "expected 15° snap (z={expect_z}), got {}",
+            off.z
+        );
     }
 
     // --- #5 Individual Origins: each element transforms about its OWN origin ----
@@ -716,7 +980,9 @@ mod tests {
         // Median pivot, by contrast, would orbit both about their centroid.
         let mut scene = Scene::demo();
         // Ensure a second fixture exists at a distinct position.
-        scene.duplicate_fixture(0, Vec3::new(6.0, 0.0, 0.0), 0.0, 1).expect("dup");
+        scene
+            .duplicate_fixture(0, Vec3::new(6.0, 0.0, 0.0), 0.0, 1)
+            .expect("dup");
         assert!(scene.fixtures.len() >= 2);
         let p0a = scene.fixtures[0].position;
         let p0b = scene.fixtures[1].position;
@@ -730,23 +996,43 @@ mod tests {
             viewport: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)),
             pivot: median,
             start: vec![(0, p0a, q0a), (1, p0b, scene.fixtures[1].orientation)],
-            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(),
+            screen_start: Vec::new(),
+            pyro_start: Vec::new(),
+            env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,
             from_gizmo: false,
-            num: NumInput { str: "90".into(), sign: false, active: true },
+            num: NumInput {
+                str: "90".into(),
+                sign: false,
+                active: true,
+            },
             individual: true,
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
             from_duplicate: false,
-            dup_base: Vec::new(), dup_extra: Vec::new(),
+            dup_base: Vec::new(),
+            dup_extra: Vec::new(),
         };
         o.num.active = true;
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(0.0, 0.0),
+            false,
+        );
         // Positions unchanged (each spun about itself)...
-        assert!((scene.fixtures[0].position - p0a).length() < 1e-4, "fixture 0 moved");
-        assert!((scene.fixtures[1].position - p0b).length() < 1e-4, "fixture 1 moved");
+        assert!(
+            (scene.fixtures[0].position - p0a).length() < 1e-4,
+            "fixture 0 moved"
+        );
+        assert!(
+            (scene.fixtures[1].position - p0b).length() < 1e-4,
+            "fixture 1 moved"
+        );
         // ...but the orientation DID rotate.
         assert!(
             scene.fixtures[0].orientation.angle_between(q0a) > 0.1,
@@ -759,7 +1045,9 @@ mod tests {
         // Same two fixtures, but Median pivot → both ORBIT the shared centroid, so
         // their positions move (the contrast to Individual Origins above).
         let mut scene = Scene::demo();
-        scene.duplicate_fixture(0, Vec3::new(6.0, 0.0, 0.0), 0.0, 1).expect("dup");
+        scene
+            .duplicate_fixture(0, Vec3::new(6.0, 0.0, 0.0), 0.0, 1)
+            .expect("dup");
         let p0a = scene.fixtures[0].position;
         let p0b = scene.fixtures[1].position;
         let median = (p0a + p0b) * 0.5;
@@ -773,19 +1061,33 @@ mod tests {
                 (0, p0a, scene.fixtures[0].orientation),
                 (1, p0b, scene.fixtures[1].orientation),
             ],
-            geo_start: Vec::new(), screen_start: Vec::new(), pyro_start: Vec::new(), env_start: Vec::new(),
+            geo_start: Vec::new(),
+            screen_start: Vec::new(),
+            pyro_start: Vec::new(),
+            env_start: Vec::new(),
             gizmo_hovered_axis: None,
             gizmo_plane_normal: None,
             gizmo_view: false,
             from_gizmo: false,
-            num: NumInput { str: "90".into(), sign: false, active: true },
+            num: NumInput {
+                str: "90".into(),
+                sign: false,
+                active: true,
+            },
             individual: false,
             snap: SnapSettings::default(),
             orientation: TransformOrientation::Global,
             from_duplicate: false,
-            dup_base: Vec::new(), dup_extra: Vec::new(),
+            dup_base: Vec::new(),
+            dup_extra: Vec::new(),
         };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(0.0, 0.0),
+            false,
+        );
         // At least one position moved (they orbited the centroid).
         assert!(
             (scene.fixtures[0].position - p0a).length() > 0.1
@@ -812,20 +1114,36 @@ mod tests {
             q,
             TransformOrientation::Local,
         );
-        o.num = NumInput { str: "90".into(), sign: false, active: true };
-        apply_transform(&o, &mut scene, &OrbitCamera::default(), egui::pos2(0.0, 0.0), false);
+        o.num = NumInput {
+            str: "90".into(),
+            sign: false,
+            active: true,
+        };
+        apply_transform(
+            &o,
+            &mut scene,
+            &OrbitCamera::default(),
+            egui::pos2(0.0, 0.0),
+            false,
+        );
         // The applied delta rotation = orientation_after * orientation_before⁻¹.
         let delta = scene.fixtures[0].orientation * q.inverse();
         let (axis, angle) = delta.to_axis_angle();
         // Spun 90° about the LOCAL X = world (q * X) = (0,0,-1) (sign-agnostic).
         let local_x = q * Vec3::X;
-        assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 1e-3, "angle {angle}");
+        assert!(
+            (angle - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
+            "angle {angle}"
+        );
         assert!(
             axis.dot(local_x).abs() > 0.999,
             "spin axis {axis:?} not aligned to local X {local_x:?}"
         );
         // And it is NOT world X (which Global would have used).
-        assert!(axis.dot(Vec3::X).abs() < 1e-2, "leaked onto world X: {axis:?}");
+        assert!(
+            axis.dot(Vec3::X).abs() < 1e-2,
+            "leaked onto world X: {axis:?}"
+        );
     }
 
     #[test]
@@ -839,13 +1157,29 @@ mod tests {
         let (right, up, fwd) = cam.view_basis();
         let mut o = make_op(TransformKind::Move, Some(Axis::X), p0, 0, p0);
         o.orientation = TransformOrientation::View;
-        o.num = NumInput { str: "3".into(), sign: false, active: true };
+        o.num = NumInput {
+            str: "3".into(),
+            sign: false,
+            active: true,
+        };
         apply_transform(&o, &mut scene, &cam, egui::pos2(0.0, 0.0), false);
         let d = scene.fixtures[0].position - p0;
         // Moved 3 m along screen-right, and stayed in the screen plane.
-        assert!((d.dot(right) - 3.0).abs() < 1e-3, "expected +3 along screen-right, got {}", d.dot(right));
-        assert!(d.dot(fwd).abs() < 1e-3, "leaked toward the viewer: {}", d.dot(fwd));
-        assert!(d.dot(up).abs() < 1e-3, "leaked onto screen-up: {}", d.dot(up));
+        assert!(
+            (d.dot(right) - 3.0).abs() < 1e-3,
+            "expected +3 along screen-right, got {}",
+            d.dot(right)
+        );
+        assert!(
+            d.dot(fwd).abs() < 1e-3,
+            "leaked toward the viewer: {}",
+            d.dot(fwd)
+        );
+        assert!(
+            d.dot(up).abs() < 1e-3,
+            "leaked onto screen-up: {}",
+            d.dot(up)
+        );
     }
 
     #[test]
@@ -858,10 +1192,17 @@ mod tests {
         let cam = OrbitCamera::default();
         let mut o = make_op(TransformKind::Move, Some(Axis::Z), p0, 0, p0);
         o.orientation = TransformOrientation::Global;
-        o.num = NumInput { str: "2".into(), sign: false, active: true };
+        o.num = NumInput {
+            str: "2".into(),
+            sign: false,
+            active: true,
+        };
         apply_transform(&o, &mut a, &cam, egui::pos2(0.0, 0.0), false);
         let d = a.fixtures[0].position - p0;
-        assert!((d.z - 2.0).abs() < 1e-4 && d.x.abs() < 1e-4 && d.y.abs() < 1e-4, "global Z move wrong: {d:?}");
+        assert!(
+            (d.z - 2.0).abs() < 1e-4 && d.x.abs() < 1e-4 && d.y.abs() < 1e-4,
+            "global Z move wrong: {d:?}"
+        );
         // Untouched control scene stays put.
         assert_eq!(b.fixtures[0].position, p0);
         let _ = &mut b;
@@ -876,9 +1217,16 @@ mod tests {
         let ro = Vec3::new(5.0, 10.0, 0.0);
         let rd = Vec3::new(0.0, -1.0, 0.0);
         let p = ray_axis_closest_point(ro, rd, Vec3::ZERO, Vec3::X);
-        assert!((p.x - 5.0).abs() < 1e-4, "expected x=5 on the axis, got {}", p.x);
+        assert!(
+            (p.x - 5.0).abs() < 1e-4,
+            "expected x=5 on the axis, got {}",
+            p.x
+        );
         // The result lies ON the axis line (y=z=0).
-        assert!(p.y.abs() < 1e-4 && p.z.abs() < 1e-4, "off the X axis line: {p:?}");
+        assert!(
+            p.y.abs() < 1e-4 && p.z.abs() < 1e-4,
+            "off the X axis line: {p:?}"
+        );
         // A second cursor further along maps further along — monotone, no drift.
         let q = ray_axis_closest_point(Vec3::new(9.0, 3.0, 0.0), rd, Vec3::ZERO, Vec3::X);
         assert!((q.x - 9.0).abs() < 1e-4, "expected x=9, got {}", q.x);
@@ -891,7 +1239,10 @@ mod tests {
         let ro = Vec3::new(0.0, 2.0, 0.0);
         let rd = Vec3::X; // parallel to the X axis
         let p = ray_axis_closest_point(ro, rd, Vec3::new(1.0, 0.0, 0.0), Vec3::X);
-        assert!((p - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4, "should hold the pivot, got {p:?}");
+        assert!(
+            (p - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4,
+            "should hold the pivot, got {p:?}"
+        );
     }
 
     #[test]
@@ -904,7 +1255,10 @@ mod tests {
             Vec3::Y,
         )
         .expect("should hit the plane");
-        assert!((hit - Vec3::new(2.0, 0.0, 3.0)).length() < 1e-4, "wrong plane hit: {hit:?}");
+        assert!(
+            (hit - Vec3::new(2.0, 0.0, 3.0)).length() < 1e-4,
+            "wrong plane hit: {hit:?}"
+        );
         // A ray parallel to the plane misses (None).
         assert!(ray_plane_point(Vec3::new(0.0, 5.0, 0.0), Vec3::X, Vec3::ZERO, Vec3::Y).is_none());
     }
@@ -929,22 +1283,38 @@ mod tests {
         scene.fixtures[1].position = target;
         scene.fixtures[1].hidden = false;
 
-        let mut cam = OrbitCamera::default();
-        cam.target = target; // centre the view on the node so it projects to rect-centre
+        let mut cam = OrbitCamera {
+            target, // centre the view on the node so it projects to rect-centre
+            ..Default::default()
+        };
         cam.set_aspect(1.0);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 600.0));
         let vp = cam.view_proj(1.0);
         // Cursor sitting on the projected target node.
         let cursor = OrbitCamera::project_to_screen(target, vp, rect).expect("target on screen");
-        let got = nearest_origin_screen(&scene, vp, rect, cursor, &[0], 18.0).expect("a node in range");
-        assert!((got - target).length() < 1e-3, "expected the node origin {target:?}, got {got:?}");
+        let got =
+            nearest_origin_screen(&scene, vp, rect, cursor, &[0], 18.0).expect("a node in range");
+        assert!(
+            (got - target).length() < 1e-3,
+            "expected the node origin {target:?}, got {got:?}"
+        );
 
         // Excluding fixture 1 too (no other nodes) → nothing in range.
         let none = nearest_origin_screen(&scene, vp, rect, cursor, &[0, 1], 18.0);
         assert!(none.is_none(), "expected no snap target, got {none:?}");
 
         // A cursor far from any node → out of the pixel threshold → None.
-        let far = nearest_origin_screen(&scene, vp, rect, cursor + egui::vec2(300.0, 0.0), &[0], 18.0);
-        assert!(far.is_none(), "cursor off all nodes should not snap, got {far:?}");
+        let far = nearest_origin_screen(
+            &scene,
+            vp,
+            rect,
+            cursor + egui::vec2(300.0, 0.0),
+            &[0],
+            18.0,
+        );
+        assert!(
+            far.is_none(),
+            "cursor off all nodes should not snap, got {far:?}"
+        );
     }
 }

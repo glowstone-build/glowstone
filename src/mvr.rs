@@ -352,7 +352,9 @@ fn walk_children(
                 }
             }
             "Fixture" => {
-                fixtures.push(parse_fixture(&child, mvr_xform, layer_uuid, resources, gdtf_cache));
+                fixtures.push(parse_fixture(
+                    &child, mvr_xform, layer_uuid, resources, gdtf_cache,
+                ));
             }
             // An LED video wall → a first-class LedScreen (placement + the
             // glowstone round-trip attributes; foreign MVRs get sensible defaults).
@@ -400,7 +402,10 @@ fn parse_fixture(
             a.children()
                 .filter(|n| n.has_tag_name("Address"))
                 .map(|n| MvrAddress {
-                    break_id: n.attribute("break").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    break_id: n
+                        .attribute("break")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
                     absolute: n.text().and_then(|v| v.trim().parse().ok()).unwrap_or(0),
                 })
                 .collect()
@@ -523,9 +528,7 @@ fn parse_video_screen(node: &roxmltree::Node, mvr_xform: Mat4) -> crate::scene::
     let content = if let Some(kind) = node.attribute("glowstoneContent") {
         decode_content(kind, node.attribute("glowstoneContentArg").unwrap_or(""))
     } else {
-        let src = node
-            .descendants()
-            .find(|n| n.has_tag_name("Source"));
+        let src = node.descendants().find(|n| n.has_tag_name("Source"));
         match src.and_then(|n| n.attribute("type")) {
             Some("NDI") => crate::scene::screen::ScreenContent::Ndi {
                 source: src.and_then(|n| n.text()).unwrap_or("").trim().to_string(),
@@ -542,9 +545,15 @@ fn parse_video_screen(node: &roxmltree::Node, mvr_xform: Mat4) -> crate::scene::
     LedScreen {
         name: attr(node, "name"),
         sequence: 0,
-        panel_type: node.attribute("glowstonePanelType").unwrap_or("Imported").to_string(),
+        panel_type: node
+            .attribute("glowstonePanelType")
+            .unwrap_or("Imported")
+            .to_string(),
         transform: mvr_to_world() * mvr_xform,
-        cabinet_mm: [a_f32("glowstoneCabinetW", 500.0), a_f32("glowstoneCabinetH", 500.0)],
+        cabinet_mm: [
+            a_f32("glowstoneCabinetW", 500.0),
+            a_f32("glowstoneCabinetH", 500.0),
+        ],
         cabinet_px: [a_u32("glowstoneCabPxX", 128), a_u32("glowstoneCabPxY", 128)],
         panels_wide: a_u32("glowstonePanelsWide", 4).max(1),
         panels_high: a_u32("glowstonePanelsHigh", 2).max(1),
@@ -575,9 +584,13 @@ fn encode_content(c: &crate::scene::screen::ScreenContent) -> (&'static str, Str
         C::Image { name, .. } => ("image", name.clone()),
         C::Ndi { source } => ("ndi", source.clone()),
         C::Citp { source } => ("citp", source.clone()),
-        C::PixelMapDmx(pm) => {
-            ("dmx", format!("{},{},{},{}", pm.cols, pm.rows, pm.universe, pm.start_address))
-        }
+        C::PixelMapDmx(pm) => (
+            "dmx",
+            format!(
+                "{},{},{},{}",
+                pm.cols, pm.rows, pm.universe, pm.start_address
+            ),
+        ),
     }
 }
 
@@ -587,18 +600,31 @@ fn decode_content(kind: &str, arg: &str) -> crate::scene::screen::ScreenContent 
     use crate::scene::screen::{PixelMap, ScreenContent as C, TestPattern};
     match kind {
         "solid" => {
-            let v: Vec<f32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let v: Vec<f32> = arg
+                .split(',')
+                .filter_map(|x| x.trim().parse().ok())
+                .collect();
             C::SolidColor([
                 *v.first().unwrap_or(&0.5),
                 *v.get(1).unwrap_or(&0.5),
                 *v.get(2).unwrap_or(&0.5),
             ])
         }
-        "image" => C::Image { name: arg.to_string(), bytes: std::sync::Arc::new(Vec::new()) },
-        "ndi" => C::Ndi { source: arg.to_string() },
-        "citp" => C::Citp { source: arg.to_string() },
+        "image" => C::Image {
+            name: arg.to_string(),
+            bytes: std::sync::Arc::new(Vec::new()),
+        },
+        "ndi" => C::Ndi {
+            source: arg.to_string(),
+        },
+        "citp" => C::Citp {
+            source: arg.to_string(),
+        },
         "dmx" => {
-            let v: Vec<u32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let v: Vec<u32> = arg
+                .split(',')
+                .filter_map(|x| x.trim().parse().ok())
+                .collect();
             C::PixelMapDmx(PixelMap {
                 cols: (*v.first().unwrap_or(&16)).clamp(1, 256),
                 rows: (*v.get(1).unwrap_or(&9)).clamp(1, 256),
@@ -629,7 +655,10 @@ fn parse_header(root: &roxmltree::Node) -> MvrHeader {
             .map(|a| {
                 a.children()
                     .filter(|n| n.has_tag_name(tag))
-                    .map(|n| MvrNamed { uuid: attr(&n, "uuid"), name: attr(&n, "name") })
+                    .map(|n| MvrNamed {
+                        uuid: attr(&n, "uuid"),
+                        name: attr(&n, "name"),
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -641,14 +670,23 @@ fn parse_header(root: &roxmltree::Node) -> MvrHeader {
         .map(|l| {
             l.children()
                 .filter(|n| n.has_tag_name("Layer"))
-                .map(|n| MvrNamed { uuid: attr(&n, "uuid"), name: attr(&n, "name") })
+                .map(|n| MvrNamed {
+                    uuid: attr(&n, "uuid"),
+                    name: attr(&n, "name"),
+                })
                 .collect()
         })
         .unwrap_or_default();
 
     MvrHeader {
-        ver_major: root.attribute("verMajor").and_then(|v| v.parse().ok()).unwrap_or(1),
-        ver_minor: root.attribute("verMinor").and_then(|v| v.parse().ok()).unwrap_or(5),
+        ver_major: root
+            .attribute("verMajor")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
+        ver_minor: root
+            .attribute("verMinor")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5),
         provider: root.attribute("provider").unwrap_or("").to_string(),
         provider_version: root.attribute("providerVersion").unwrap_or("").to_string(),
         layers,
@@ -663,7 +701,10 @@ fn parse_header(root: &roxmltree::Node) -> MvrHeader {
 
 /// Parse an embedded GDTF by its resolved archive name, tagging it with that
 /// name + raw bytes so an export can reference and re-bundle the right file.
-fn load_gdtf_named(name: &str, resources: &HashMap<String, Arc<Vec<u8>>>) -> Option<Arc<GdtfFixture>> {
+fn load_gdtf_named(
+    name: &str,
+    resources: &HashMap<String, Arc<Vec<u8>>>,
+) -> Option<Arc<GdtfFixture>> {
     let bytes = resources.get(name)?.clone();
     match GdtfFixture::load_bytes(&bytes) {
         Ok(mut g) => {
@@ -853,17 +894,20 @@ pub fn export_bytes(scene: &crate::scene::Scene) -> Result<Vec<u8>, String> {
         .map(|m| m.resources.clone())
         .unwrap_or_default();
     for f in &scene.fixtures {
-        if let Some(g) = &f.gdtf {
-            if !g.spec.is_empty() {
-                if let Some(raw) = &g.raw {
-                    resources.entry(g.spec.clone()).or_insert_with(|| raw.clone());
-                }
-            }
+        if let Some(g) = &f.gdtf
+            && !g.spec.is_empty()
+            && let Some(raw) = &g.raw
+        {
+            resources
+                .entry(g.spec.clone())
+                .or_insert_with(|| raw.clone());
         }
     }
     for obj in &scene.geometry {
         for m in &obj.models {
-            resources.entry(m.file.clone()).or_insert_with(|| m.glb.clone());
+            resources
+                .entry(m.file.clone())
+                .or_insert_with(|| m.glb.clone());
         }
     }
 
@@ -874,7 +918,8 @@ pub fn export_bytes(scene: &crate::scene::Scene) -> Result<Vec<u8>, String> {
             .compression_method(zip::CompressionMethod::Deflated);
         zw.start_file("GeneralSceneDescription.xml", opts)
             .map_err(|e| format!("zip xml: {e}"))?;
-        zw.write_all(xml.as_bytes()).map_err(|e| format!("write xml: {e}"))?;
+        zw.write_all(xml.as_bytes())
+            .map_err(|e| format!("write xml: {e}"))?;
         // Deterministic order for reproducible archives.
         let mut names: Vec<&String> = resources.keys().collect();
         names.sort();
@@ -916,20 +961,33 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
         }
     };
 
-    let mut order: Vec<String> = header.map(|h| h.layers.iter().map(|l| l.uuid.clone()).collect()).unwrap_or_default();
-    let mut names: HashMap<String, String> =
-        header.map(|h| h.layers.iter().map(|l| (l.uuid.clone(), l.name.clone())).collect()).unwrap_or_default();
+    let mut order: Vec<String> = header
+        .map(|h| h.layers.iter().map(|l| l.uuid.clone()).collect())
+        .unwrap_or_default();
+    let mut names: HashMap<String, String> = header
+        .map(|h| {
+            h.layers
+                .iter()
+                .map(|l| (l.uuid.clone(), l.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut fx_by_layer: HashMap<String, Vec<usize>> = HashMap::new();
     let mut obj_by_layer: HashMap<String, Vec<usize>> = HashMap::new();
-    let ensure_layer = |uuid: &str, order: &mut Vec<String>, names: &mut HashMap<String, String>| {
-        if !order.iter().any(|u| u == uuid) {
-            order.push(uuid.to_string());
-            names.entry(uuid.to_string()).or_insert_with(|| {
-                if uuid == DEFAULT_LAYER_UUID { "glowstone".into() } else { "Layer".into() }
-            });
-        }
-    };
+    let ensure_layer =
+        |uuid: &str, order: &mut Vec<String>, names: &mut HashMap<String, String>| {
+            if !order.iter().any(|u| u == uuid) {
+                order.push(uuid.to_string());
+                names.entry(uuid.to_string()).or_insert_with(|| {
+                    if uuid == DEFAULT_LAYER_UUID {
+                        "glowstone".into()
+                    } else {
+                        "Layer".into()
+                    }
+                });
+            }
+        };
     for (i, f) in scene.fixtures.iter().enumerate() {
         let l = layer_uuid_of(f.mvr.as_ref().map(|m| m.layer.as_str()).unwrap_or(""));
         ensure_layer(&l, &mut order, &mut names);
@@ -956,7 +1014,10 @@ fn build_xml(scene: &crate::scene::Scene) -> String {
     s.push_str("  <Scene>\n    <Layers>\n");
 
     for layer_uuid in &order {
-        let lname = names.get(layer_uuid).cloned().unwrap_or_else(|| "Layer".into());
+        let lname = names
+            .get(layer_uuid)
+            .cloned()
+            .unwrap_or_else(|| "Layer".into());
         let fxs = fx_by_layer.get(layer_uuid).cloned().unwrap_or_default();
         let objs = obj_by_layer.get(layer_uuid).cloned().unwrap_or_default();
         let write_screens = layer_uuid == DEFAULT_LAYER_UUID && !scene.screens.is_empty();
@@ -1030,7 +1091,11 @@ fn write_fixture(s: &mut String, f: &crate::scene::Fixture, idx: usize) {
     let mode = meta
         .map(|m| m.gdtf_mode.clone())
         .filter(|x| !x.is_empty())
-        .or_else(|| f.gdtf.as_ref().and_then(|g| g.modes.first().map(|m| m.name.clone())))
+        .or_else(|| {
+            f.gdtf
+                .as_ref()
+                .and_then(|g| g.modes.first().map(|m| m.name.clone()))
+        })
         .unwrap_or_default();
 
     s.push_str(&format!(
@@ -1038,7 +1103,10 @@ fn write_fixture(s: &mut String, f: &crate::scene::Fixture, idx: usize) {
         xml_escape(&f.name),
         uuid
     ));
-    s.push_str(&format!("            <Matrix>{}</Matrix>\n", format_matrix(base)));
+    s.push_str(&format!(
+        "            <Matrix>{}</Matrix>\n",
+        format_matrix(base)
+    ));
 
     if let Some(cmds) = meta.map(|m| &m.custom_commands).filter(|c| !c.is_empty()) {
         s.push_str("            <CustomCommands>\n");
@@ -1051,10 +1119,19 @@ fn write_fixture(s: &mut String, f: &crate::scene::Fixture, idx: usize) {
         s.push_str("            </CustomCommands>\n");
     }
     if let Some(cls) = meta.and_then(|m| m.classing.as_ref()) {
-        s.push_str(&format!("            <Classing>{}</Classing>\n", xml_escape(cls)));
+        s.push_str(&format!(
+            "            <Classing>{}</Classing>\n",
+            xml_escape(cls)
+        ));
     }
-    s.push_str(&format!("            <GDTFSpec>{}</GDTFSpec>\n", xml_escape(&spec)));
-    s.push_str(&format!("            <GDTFMode>{}</GDTFMode>\n", xml_escape(&mode)));
+    s.push_str(&format!(
+        "            <GDTFSpec>{}</GDTFSpec>\n",
+        xml_escape(&spec)
+    ));
+    s.push_str(&format!(
+        "            <GDTFMode>{}</GDTFMode>\n",
+        xml_escape(&mode)
+    ));
 
     s.push_str("            <Addresses>\n");
     let addrs = meta.map(|m| m.addresses.as_slice()).unwrap_or(&[]);
@@ -1071,7 +1148,10 @@ fn write_fixture(s: &mut String, f: &crate::scene::Fixture, idx: usize) {
     s.push_str("            </Addresses>\n");
 
     let fid = meta.map(|m| m.fixture_id.clone()).unwrap_or_default();
-    s.push_str(&format!("            <FixtureID>{}</FixtureID>\n", xml_escape(&fid)));
+    s.push_str(&format!(
+        "            <FixtureID>{}</FixtureID>\n",
+        xml_escape(&fid)
+    ));
     s.push_str(&format!(
         "            <UnitNumber>{}</UnitNumber>\n",
         meta.map(|m| m.unit_number).unwrap_or(0)
@@ -1090,9 +1170,7 @@ fn write_fixture(s: &mut String, f: &crate::scene::Fixture, idx: usize) {
         .and_then(|m| m.color_raw.as_ref())
         .filter(|raw| {
             crate::gdtf::parse_cie_xyy(raw)
-                .map(|rgb| {
-                    (0..3).all(|i| (rgb[i] - f.color[i]).abs() < 1e-3)
-                })
+                .map(|rgb| (0..3).all(|i| (rgb[i] - f.color[i]).abs() < 1e-3))
                 .unwrap_or(false)
         })
         .cloned()
@@ -1107,7 +1185,10 @@ fn write_fixture(s: &mut String, f: &crate::scene::Fixture, idx: usize) {
     ));
     s.push_str("            <Mappings/>\n");
     if let Some(pos) = meta.and_then(|m| m.position.as_ref()) {
-        s.push_str(&format!("            <Position>{}</Position>\n", xml_escape(pos)));
+        s.push_str(&format!(
+            "            <Position>{}</Position>\n",
+            xml_escape(pos)
+        ));
     }
     s.push_str("          </Fixture>\n");
 }
@@ -1152,7 +1233,10 @@ fn write_object(s: &mut String, o: &crate::scene::SceneGeometry, idx: usize) {
     }
     s.push_str("            </Geometries>\n");
     if let Some(cls) = meta.and_then(|m| m.classing.as_ref()) {
-        s.push_str(&format!("            <Classing>{}</Classing>\n", xml_escape(cls)));
+        s.push_str(&format!(
+            "            <Classing>{}</Classing>\n",
+            xml_escape(cls)
+        ));
     }
     s.push_str("            <GDTFSpec></GDTFSpec>\n            <GDTFMode></GDTFMode>\n");
     s.push_str(&format!("          </{kind}>\n"));
@@ -1177,7 +1261,10 @@ fn write_video_screen(s: &mut String, sc: &crate::scene::LedScreen, idx: usize) 
         sc.panels_wide, sc.panels_high, sc.gap_mm, sc.curvature_deg, sc.nits, sc.gamma, sc.opacity, sc.emit,
         sc.pixel_shape.code() as i32, kind, xml_escape(&arg),
     ));
-    s.push_str(&format!("            <Matrix>{}</Matrix>\n", format_matrix(sc.transform)));
+    s.push_str(&format!(
+        "            <Matrix>{}</Matrix>\n",
+        format_matrix(sc.transform)
+    ));
     let src_type = match &sc.content {
         C::Ndi { .. } => Some("NDI"),
         C::Citp { .. } => Some("CITP"),
@@ -1232,8 +1319,8 @@ mod tests {
 
     #[test]
     fn video_screen_round_trips_through_mvr() {
-        use crate::scene::screen::{LedScreen, ScreenContent};
         use crate::scene::ScreenProfile;
+        use crate::scene::screen::{LedScreen, ScreenContent};
         let prof = ScreenProfile {
             name: "Indoor 3.9mm",
             category: "LED Wall",
@@ -1252,7 +1339,9 @@ mod tests {
         sc.panels_high = 4;
         sc.nits = 4500.0;
         sc.curvature_deg = 20.0;
-        sc.content = ScreenContent::Ndi { source: "HOST (Out)".into() };
+        sc.content = ScreenContent::Ndi {
+            source: "HOST (Out)".into(),
+        };
 
         let mut scene = crate::scene::Scene::demo();
         scene.fixtures.clear();
@@ -1271,7 +1360,10 @@ mod tests {
         assert!((s.curvature_deg - 20.0).abs() < 1e-3);
         assert!(matches!(&s.content, ScreenContent::Ndi { source } if source == "HOST (Out)"));
         let t = s.transform.w_axis.truncate();
-        assert!((t - Vec3::new(1.0, 2.5, -3.0)).length() < 1e-2, "translation {t:?}");
+        assert!(
+            (t - Vec3::new(1.0, 2.5, -3.0)).length() < 1e-2,
+            "translation {t:?}"
+        );
     }
 
     #[test]
@@ -1327,7 +1419,10 @@ mod tests {
             </Geometries>
           </SceneObject></R>"#;
         let doc = roxmltree::Document::parse(xml).unwrap();
-        let node = doc.descendants().find(|n| n.has_tag_name("SceneObject")).unwrap();
+        let node = doc
+            .descendants()
+            .find(|n| n.has_tag_name("SceneObject"))
+            .unwrap();
         let mut resources: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
         resources.insert("scaled.3ds".into(), Arc::new(vec![0u8; 4]));
         resources.insert("plain.3ds".into(), Arc::new(vec![0u8; 4]));
@@ -1344,7 +1439,10 @@ mod tests {
 
         // Export re-emits the matrix and a re-parse recovers the same scale.
         let re = parse_matrix(&format_geo_matrix(scaled.matrix)).expect("reparse");
-        assert!((re.transform_point3(Vec3::X).x - 0.0254).abs() < 1e-6, "round-trip");
+        assert!(
+            (re.transform_point3(Vec3::X).x - 0.0254).abs() < 1e-6,
+            "round-trip"
+        );
     }
 
     /// Regression guard for the renderer's fixture root composition: the importer
@@ -1359,21 +1457,34 @@ mod tests {
         let (pos, orient) = fixture_base(world);
 
         // Correct world position: 5 m up in +Y.
-        assert!((pos - Vec3::new(0.0, 5.0, 0.0)).length() < 1e-4, "pos {pos:?}");
+        assert!(
+            (pos - Vec3::new(0.0, 5.0, 0.0)).length() < 1e-4,
+            "pos {pos:?}"
+        );
         // No residual rotation — so the renderer's trailing gdtf_to_world is the
         // only basis change, exactly like a plain GDTF fixture at that point.
-        assert!(orient.angle_between(Quat::IDENTITY) < 1e-3, "orient {orient:?}");
+        assert!(
+            orient.angle_between(Quat::IDENTITY) < 1e-3,
+            "orient {orient:?}"
+        );
 
         // The renderer reconstructs the root as translate·from_quat·gdtf_to_world.
         let root = Mat4::from_translation(pos) * Mat4::from_quat(orient) * mvr_to_world();
         // GDTF beams emit local -Z; under the correct root that is straight DOWN
         // (the bug rendered it as (0,0,+1) — horizontal).
         let dir = root.transform_vector3(Vec3::NEG_Z).normalize();
-        assert!((dir - Vec3::NEG_Y).length() < 1e-4, "beam dir {dir:?}, want straight down");
+        assert!(
+            (dir - Vec3::NEG_Y).length() < 1e-4,
+            "beam dir {dir:?}, want straight down"
+        );
 
         // And export inverts it back to the original MVR matrix.
         let reparsed = parse_matrix(&format_matrix(export_fixture_world(pos, orient))).unwrap();
-        for (a, b) in m_mvr.to_cols_array().iter().zip(reparsed.to_cols_array().iter()) {
+        for (a, b) in m_mvr
+            .to_cols_array()
+            .iter()
+            .zip(reparsed.to_cols_array().iter())
+        {
             assert!((a - b).abs() < 1e-3, "matrix {a} vs {b}");
         }
     }

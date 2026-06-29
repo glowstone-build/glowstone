@@ -36,7 +36,10 @@ pub struct PieItem {
 
 impl PieItem {
     pub fn new(icon: &'static str, label: impl Into<String>) -> Self {
-        Self { icon, label: label.into() }
+        Self {
+            icon,
+            label: label.into(),
+        }
     }
 }
 
@@ -65,7 +68,10 @@ pub struct Pie<'a> {
 
 impl<'a> Pie<'a> {
     pub fn new(items: &'a [PieItem]) -> Self {
-        Self { items, accent: egui::Color32::from_rgb(90, 170, 255) }
+        Self {
+            items,
+            accent: egui::Color32::from_rgb(90, 170, 255),
+        }
     }
 
     /// Tint the highlighted-sector wedge + ring (defaults to a cyan-blue).
@@ -115,7 +121,10 @@ impl<'a> Pie<'a> {
             // Dim backdrop.
             painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(60));
 
-            let pointer = ui.ctx().input(|i| i.pointer.interact_pos()).unwrap_or(center);
+            let pointer = ui
+                .ctx()
+                .input(|i| i.pointer.interact_pos())
+                .unwrap_or(center);
             let offset = pointer - center;
             let dist = offset.length();
             let in_dead_zone = dist < Self::DEAD_ZONE;
@@ -123,13 +132,16 @@ impl<'a> Pie<'a> {
             // Which sector is the pointer pointing at? Sectors are centred on evenly
             // spaced directions starting at straight up (−Y) and going clockwise, so
             // the layout matches a clock face the user can predict.
-            let highlight =
-                if in_dead_zone { None } else { Some(sector_at(offset.x, offset.y, n)) };
+            let highlight = if in_dead_zone {
+                None
+            } else {
+                Some(sector_at(offset.x, offset.y, n))
+            };
 
             // Paint each sector's label/icon around the ring, highlighting the hovered.
             for (i, item) in self.items.iter().enumerate() {
-                let dir_ang = (i as f32 / n as f32) * std::f32::consts::TAU
-                    - std::f32::consts::FRAC_PI_2;
+                let dir_ang =
+                    (i as f32 / n as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
                 let dir = egui::vec2(dir_ang.cos(), dir_ang.sin());
                 let pos = center + dir * Self::RING;
                 let active = highlight == Some(i);
@@ -146,7 +158,11 @@ impl<'a> Pie<'a> {
                 let galley = painter.layout_no_wrap(
                     text,
                     egui::FontId::proportional(13.0),
-                    if active { egui::Color32::WHITE } else { egui::Color32::from_gray(220) },
+                    if active {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_gray(220)
+                    },
                 );
                 let pad = egui::vec2(10.0, 6.0);
                 let pill = egui::Rect::from_center_size(pos, galley.size() + pad * 2.0);
@@ -185,9 +201,8 @@ impl<'a> Pie<'a> {
             // a release in the dead zone (or no sector) cancels.
             let released = ui.ctx().input(|i| i.pointer.any_released());
             if resp.clicked() || released {
-                match highlight {
-                    Some(i) => chosen = Some(i),
-                    None => {} // dead zone / ambiguous → cancel
+                if let Some(i) = highlight {
+                    chosen = Some(i);
                 }
                 state.open = false;
             }
@@ -208,7 +223,11 @@ pub struct Choice<T> {
 
 impl<T> Choice<T> {
     pub fn new(icon: &'static str, label: impl Into<String>, value: T) -> Self {
-        Self { icon, label: label.into(), value }
+        Self {
+            icon,
+            label: label.into(),
+            value,
+        }
     }
 }
 
@@ -225,8 +244,10 @@ pub fn choose<T>(
     accent: egui::Color32,
     mut choices: Vec<Choice<T>>,
 ) -> Option<T> {
-    let items: Vec<PieItem> =
-        choices.iter().map(|c| PieItem::new(c.icon, c.label.clone())).collect();
+    let items: Vec<PieItem> = choices
+        .iter()
+        .map(|c| PieItem::new(c.icon, c.label.clone()))
+        .collect();
     Pie::new(&items)
         .accent(accent)
         .show(ctx, state)

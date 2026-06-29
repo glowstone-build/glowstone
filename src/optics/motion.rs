@@ -13,6 +13,7 @@
 //! - `phases[i]` — the gobo **image** rotation (radians) / prism rotation /
 //!   animation scroll (wrapping 0..1).
 //! - `shake_phases[i]` — gobo/colour shake oscillation.
+//!
 //! And `cmy` — the three CMY flag insertions, slewed toward their targets at
 //! ColorMixMSpeed so the flags visibly slide.
 
@@ -71,16 +72,11 @@ impl WheelMotion {
     fn insert_target(kind: WheelKind, value: f32) -> f32 {
         match kind {
             WheelKind::Frost => value.clamp(0.0, 1.0),
-            WheelKind::Prism => {
-                // `value` is a slot fraction (slot/(slots-1)); the open slot is 0,
-                // so ANY non-open selection should insert. resolve() still gates the
-                // actual facets on whether the rounded slot is a real prism slot.
-                if value > 0.01 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
+            // `value` is a slot fraction (slot/(slots-1)); the open slot is 0,
+            // so ANY non-open selection should insert. resolve() still gates the
+            // actual facets on whether the rounded slot is a real prism slot.
+            WheelKind::Prism if value > 0.01 => 1.0,
+            WheelKind::Prism => 0.0,
             _ => 0.0,
         }
     }
@@ -120,7 +116,11 @@ impl WheelMotion {
             }
             self.inserts[i] = Self::insert_target(comp.kind, ctl.value);
         }
-        self.cmy = [c.cmy[0].clamp(0.0, 1.0), c.cmy[1].clamp(0.0, 1.0), c.cmy[2].clamp(0.0, 1.0)];
+        self.cmy = [
+            c.cmy[0].clamp(0.0, 1.0),
+            c.cmy[1].clamp(0.0, 1.0),
+            c.cmy[2].clamp(0.0, 1.0),
+        ];
     }
 
     /// Advance all motion by `dt` seconds given the current controls + chain.
@@ -150,7 +150,12 @@ impl WheelMotion {
             let ctl = c.wheel(i);
             let slots = (comp.slots.max(1)) as f32;
             // Prism/frost slide in/out of the shaft over time (no instant pop-in).
-            slew_toward(&mut self.inserts[i], Self::insert_target(comp.kind, ctl.value), INSERT_RATE, dt);
+            slew_toward(
+                &mut self.inserts[i],
+                Self::insert_target(comp.kind, ctl.value),
+                INSERT_RATE,
+                dt,
+            );
             // Shake oscillation: 1..9 Hz, wrapping 0..1.
             if ctl.shake > 0.01 && matches!(comp.kind, WheelKind::Gobo | WheelKind::Color) {
                 let hz = 1.0 + 8.0 * ctl.shake;
@@ -189,7 +194,8 @@ impl WheelMotion {
                 }
                 WheelKind::Animation => {
                     if spin.abs() >= 1e-3 {
-                        self.phases[i] = (self.phases[i] + spin * (702.0 / 360.0) * dt).rem_euclid(1.0);
+                        self.phases[i] =
+                            (self.phases[i] + spin * (702.0 / 360.0) * dt).rem_euclid(1.0);
                     }
                 }
                 WheelKind::Frost => {}

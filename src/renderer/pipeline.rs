@@ -172,7 +172,10 @@ pub fn wall_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
 /// PREMULTIPLIED-alpha blending (`One` / `OneMinusSrcAlpha`) and **no depth
 /// write** (depth-test still on), drawn after the opaque scene so it shows
 /// through the gaps between lit LEDs.
-pub fn wall_alpha_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+pub fn wall_alpha_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
     let shader = load(device, "wall.wgsl", include_str!("../shaders/wall.wgsl"));
     let blend = wgpu::BlendState {
         color: wgpu::BlendComponent {
@@ -228,7 +231,10 @@ pub fn wall_alpha_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout)
 /// does NOT write depth (so it never clips the volumetric beams behind it, like
 /// the lens discs). Camera-only bind group; the quad is generated in the VS, so
 /// the only vertex buffer is the per-particle [`ParticleInstance`] stream.
-pub fn spark_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
+pub fn spark_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
     let blend = wgpu::BlendState {
         color: wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::One,
@@ -252,7 +258,11 @@ fn particle_pipeline(
     fs_entry: &str,
     label: &str,
 ) -> wgpu::RenderPipeline {
-    let shader = load(device, "particles.wgsl", include_str!("../shaders/particles.wgsl"));
+    let shader = load(
+        device,
+        "particles.wgsl",
+        include_str!("../shaders/particles.wgsl"),
+    );
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -291,8 +301,16 @@ pub fn mesh_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wg
 
 /// Same mesh pipeline drawn as wireframe (line polygon mode) for the Wireframe
 /// viewport mode. Requires the `POLYGON_MODE_LINE` device feature.
-pub fn mesh_wire_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout) -> wgpu::RenderPipeline {
-    mesh_pipeline_mode(device, layout, wgpu::PolygonMode::Line, "mesh-wire-pipeline")
+pub fn mesh_wire_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    mesh_pipeline_mode(
+        device,
+        layout,
+        wgpu::PolygonMode::Line,
+        "mesh-wire-pipeline",
+    )
 }
 
 fn mesh_pipeline_mode(
@@ -506,8 +524,13 @@ pub fn sel_outline_pipeline(
         alpha: wgpu::BlendComponent::REPLACE,
     };
     fullscreen_pipeline(
-        device, "sel-outline-pipeline", layout, &shader, "fs_outline",
-        Viewport::HDR_FORMAT, Some(blend),
+        device,
+        "sel-outline-pipeline",
+        layout,
+        &shader,
+        "fs_outline",
+        Viewport::HDR_FORMAT,
+        Some(blend),
     )
 }
 
@@ -811,7 +834,10 @@ pub fn ssao_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 
 /// SSAO: reads the depth buffer, MULTIPLY-blends an occlusion factor onto the HDR
 /// target (`out = ao * hdr`) so flat Unlit geometry gains contact/crevice shading.
-pub fn ssao_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgpu::RenderPipeline {
+pub fn ssao_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
     let shader = load(device, "ssao.wgsl", include_str!("../shaders/ssao.wgsl"));
     let blend = wgpu::BlendState {
         color: wgpu::BlendComponent {
@@ -822,7 +848,13 @@ pub fn ssao_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> w
         alpha: wgpu::BlendComponent::REPLACE,
     };
     fullscreen_pipeline(
-        device, "ssao-pipeline", layout, &shader, "fs_ssao", Viewport::HDR_FORMAT, Some(blend),
+        device,
+        "ssao-pipeline",
+        layout,
+        &shader,
+        "fs_ssao",
+        Viewport::HDR_FORMAT,
+        Some(blend),
     )
 }
 
@@ -975,7 +1007,11 @@ pub fn volumetric_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
-    let shader = load_with_optics(device, "volumetric.wgsl", include_str!("../shaders/volumetric.wgsl"));
+    let shader = load_with_optics(
+        device,
+        "volumetric.wgsl",
+        include_str!("../shaders/volumetric.wgsl"),
+    );
     fullscreen_pipeline(
         device,
         "volumetric-pipeline",
@@ -1021,16 +1057,38 @@ pub fn composite_pipeline(
 pub fn bloom_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::RenderPipeline) {
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+) {
     let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
     let bright = fullscreen_pipeline(
-        device, "bloom-bright", layout, &shader, "fs_bright", Viewport::HDR_FORMAT, None,
+        device,
+        "bloom-bright",
+        layout,
+        &shader,
+        "fs_bright",
+        Viewport::HDR_FORMAT,
+        None,
     );
     let blur_h = fullscreen_pipeline(
-        device, "bloom-blur-h", layout, &shader, "fs_blur_h", Viewport::HDR_FORMAT, None,
+        device,
+        "bloom-blur-h",
+        layout,
+        &shader,
+        "fs_blur_h",
+        Viewport::HDR_FORMAT,
+        None,
     );
     let blur_v = fullscreen_pipeline(
-        device, "bloom-blur-v", layout, &shader, "fs_blur_v", Viewport::HDR_FORMAT, None,
+        device,
+        "bloom-blur-v",
+        layout,
+        &shader,
+        "fs_blur_v",
+        Viewport::HDR_FORMAT,
+        None,
     );
     (bright, blur_h, blur_v)
 }
@@ -1042,7 +1100,13 @@ pub fn tonemap_pipeline(
 ) -> wgpu::RenderPipeline {
     let shader = load(device, "post.wgsl", include_str!("../shaders/post.wgsl"));
     fullscreen_pipeline(
-        device, "tonemap-pipeline", layout, &shader, "fs_tonemap", Viewport::LDR_FORMAT, None,
+        device,
+        "tonemap-pipeline",
+        layout,
+        &shader,
+        "fs_tonemap",
+        Viewport::LDR_FORMAT,
+        None,
     )
 }
 
@@ -1096,13 +1160,14 @@ pub fn froxel_compute_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("froxel-compute-bgl"),
         entries: &[
-            buf(0, false),                                   // Froxel uniform
-            buf(1, true),                                    // fixtures
-            tex3(2),                                         // noise 3d
-            samp(3, wgpu::SamplerBindingType::Filtering),    // noise samp
-            tex_arr(4),                                      // gobo atlas
-            samp(5, wgpu::SamplerBindingType::Filtering),    // gobo samp
-            wgpu::BindGroupLayoutEntry {                     // shadow atlas
+            buf(0, false),                                // Froxel uniform
+            buf(1, true),                                 // fixtures
+            tex3(2),                                      // noise 3d
+            samp(3, wgpu::SamplerBindingType::Filtering), // noise samp
+            tex_arr(4),                                   // gobo atlas
+            samp(5, wgpu::SamplerBindingType::Filtering), // gobo samp
+            wgpu::BindGroupLayoutEntry {
+                // shadow atlas
                 binding: 6,
                 visibility: c,
                 ty: wgpu::BindingType::Texture {
@@ -1112,10 +1177,11 @@ pub fn froxel_compute_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
-            samp(7, wgpu::SamplerBindingType::Comparison),   // shadow comparison samp
-            buf(8, true),                                    // shadow matrices
-            buf(9, true),                                    // wheels
-            wgpu::BindGroupLayoutEntry {                     // froxel_out (write storage)
+            samp(7, wgpu::SamplerBindingType::Comparison), // shadow comparison samp
+            buf(8, true),                                  // shadow matrices
+            buf(9, true),                                  // wheels
+            wgpu::BindGroupLayoutEntry {
+                // froxel_out (write storage)
                 binding: 10,
                 visibility: c,
                 ty: wgpu::BindingType::StorageTexture {
@@ -1134,7 +1200,11 @@ pub fn froxel_compute_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
 ) -> (wgpu::ComputePipeline, wgpu::ComputePipeline) {
-    let shader = load_with_optics(device, "froxel.wgsl", include_str!("../shaders/froxel.wgsl"));
+    let shader = load_with_optics(
+        device,
+        "froxel.wgsl",
+        include_str!("../shaders/froxel.wgsl"),
+    );
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("froxel-compute-pl"),
         bind_group_layouts: &[Some(layout)],
@@ -1150,7 +1220,10 @@ pub fn froxel_compute_pipelines(
             cache: None,
         })
     };
-    (make("inject", "froxel-inject"), make("integrate", "froxel-integrate"))
+    (
+        make("inject", "froxel-inject"),
+        make("integrate", "froxel-integrate"),
+    )
 }
 
 /// Bind-group layout for the froxel composite (fragment): Froxel uniform, the
@@ -1285,9 +1358,19 @@ pub fn vol_temporal_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
-    let shader = load(device, "vol_temporal.wgsl", include_str!("../shaders/vol_temporal.wgsl"));
+    let shader = load(
+        device,
+        "vol_temporal.wgsl",
+        include_str!("../shaders/vol_temporal.wgsl"),
+    );
     // No blend: writes the accumulated result directly into the EMA target.
     fullscreen_pipeline(
-        device, "vol-temporal", layout, &shader, "fs_main", Viewport::VOL_FORMAT, None,
+        device,
+        "vol-temporal",
+        layout,
+        &shader,
+        "fs_main",
+        Viewport::VOL_FORMAT,
+        None,
     )
 }

@@ -9,10 +9,10 @@
 //!   by a height amplitude ramp so the stalk stays coherent + only the head
 //!   churns), and an emergent **vortex-ring** kick on the leading edge → the
 //!   billowing mushroom/cauliflower head. The puffs are voxelized (Gaussian splat)
-//!   into a per-emitter density grid that the existing volumetric raymarch samples
-//!   + lights (every beam scatters through it, with thickness self-shadow + beam-
-//!   blocking) — the proven volumetric look, fed by a real simulation. Physics
-//!   distilled from the smoke-sim research (`docs/RESEARCH-pyro.md` lineage).
+//!   into a per-emitter density grid sampled and lit by the existing volumetric
+//!   raymarch; every beam scatters through it with thickness self-shadow and beam
+//!   blocking. Physics distilled from the smoke-sim research
+//!   (`docs/RESEARCH-pyro.md` lineage).
 //!
 //! Advanced once per real frame (`Renderer::advance_pyro`, the app tick) — never
 //! in `record_scene` (the double-advance trap).
@@ -39,10 +39,10 @@ const LOD_CULL_M: f32 = 120.0;
 /// is why it's a user-chosen quality knob, not a fixed value.
 pub fn quality_res(quality: u8) -> u32 {
     match quality.min(3) {
-        0 => 40,  // Low
-        1 => 52,  // Medium
-        2 => 64,  // High (default)
-        _ => 84,  // Ultra
+        0 => 40, // Low
+        1 => 52, // Medium
+        2 => 64, // High (default)
+        _ => 84, // Ultra
     }
 }
 /// Initial / fallback grid resolution before any device's quality is known.
@@ -59,21 +59,21 @@ pub const CO2_LAYERS: u32 = 8;
 /// dissipation). Most are derived per-device from the [`PyroDevice`].
 #[derive(Clone, Copy)]
 pub struct Co2Tune {
-    pub exit_speed: f32,   // m/s — high-pressure valve exit velocity (a CANNON)
-    pub cone_inner: f32,   // rad — tight launch cone
+    pub exit_speed: f32, // m/s — high-pressure valve exit velocity (a CANNON)
+    pub cone_inner: f32, // rad — tight launch cone
     pub cone_outer: f32,
     pub nozzle_radius: f32, // m — birth disk
-    pub drag_k0: f32,      // 1/s — fresh stem (low drag → shoots up)
-    pub drag_k1: f32,      // 1/s — aged head (high drag → stalls → billows)
-    pub buoy0: f32,        // m/s² — entrained-air updraft (small; dry-ice is dense)
-    pub buoy_decay: f32,   // 1/s — rise then stall
-    pub g_settle: f32,     // m/s² — slight downward settle (cold/dense), NOT 9.81
-    pub turb_str: f32,     // m/s² — curl turbulence accel
-    pub turb_freq: f32,    // 1/m — eddy scale (big rolling billows)
-    pub turb_scroll: f32,  // time-advance of the curl field (evolving eddies)
-    pub ring_out: f32,     // m/s² — cap radial-outward flare (mushroom)
-    pub ring_down: f32,    // m/s² — cap roll-back-down (toroidal recirculation)
-    pub front_frac: f32,   // cap zone is h > front_frac * front_h (EMA)
+    pub drag_k0: f32,       // 1/s — fresh stem (low drag → shoots up)
+    pub drag_k1: f32,       // 1/s — aged head (high drag → stalls → billows)
+    pub buoy0: f32,         // m/s² — entrained-air updraft (small; dry-ice is dense)
+    pub buoy_decay: f32,    // 1/s — rise then stall
+    pub g_settle: f32,      // m/s² — slight downward settle (cold/dense), NOT 9.81
+    pub turb_str: f32,      // m/s² — curl turbulence accel
+    pub turb_freq: f32,     // 1/m — eddy scale (big rolling billows)
+    pub turb_scroll: f32,   // time-advance of the curl field (evolving eddies)
+    pub ring_out: f32,      // m/s² — cap radial-outward flare (mushroom)
+    pub ring_down: f32,     // m/s² — cap roll-back-down (toroidal recirculation)
+    pub front_frac: f32,    // cap zone is h > front_frac * front_h (EMA)
     pub life_min: f32,
     pub life_max: f32,
     pub grow_rate: f32,    // radius = base * (1 + grow * t)
@@ -82,7 +82,7 @@ pub struct Co2Tune {
     pub burst_count: u32,  // puffs on the trigger rising edge (at output = 1)
     pub sustain_rate: f32, // puffs/s while held
     pub max_particles: usize,
-    pub sigma_scale: f32,  // grid density 0..1 → raymarch extinction σₜ
+    pub sigma_scale: f32, // grid density 0..1 → raymarch extinction σₜ
 }
 
 impl Co2Tune {
@@ -239,7 +239,11 @@ impl Co2Sim {
         for _ in 0..want.min(room) {
             let theta = tn.cone_inner + (tn.cone_outer - tn.cone_inner) * self.f01().sqrt();
             let phi = self.f01() * TAU;
-            let local = Vec3::new(theta.sin() * phi.cos(), theta.cos(), theta.sin() * phi.sin());
+            let local = Vec3::new(
+                theta.sin() * phi.cos(),
+                theta.cos(),
+                theta.sin() * phi.sin(),
+            );
             let speed = tn.exit_speed * self.rng2(0.85, 1.05);
             let v = basis * (local * speed);
             let jr = tn.nozzle_radius * self.f01().sqrt();
@@ -332,8 +336,7 @@ impl Co2Sim {
             let r = self.base_r[i] * (1.0 + tn.grow_rate * t);
             // Near-instant appear at the nozzle (0.03 ramp = visible smoke the moment
             // a puff is born → instant output), then a long dissipating tail.
-            let env =
-                tn.opacity_peak * smoothstep(0.0, 0.03, t) * (1.0 - smoothstep(0.55, 1.0, t));
+            let env = tn.opacity_peak * smoothstep(0.0, 0.03, t) * (1.0 - smoothstep(0.55, 1.0, t));
             let thin = (self.base_r[i] * self.base_r[i]) / (r * r); // mass-conserving
             let amp = env * thin;
             if amp < 1e-4 {
@@ -371,7 +374,12 @@ impl Co2Sim {
             *d = (*d).tanh() * 1.2;
         }
         Some(Co2Volume {
-            box_min: [self.box_min.x, self.box_min.y, self.box_min.z, tn.sigma_scale],
+            box_min: [
+                self.box_min.x,
+                self.box_min.y,
+                self.box_min.z,
+                tn.sigma_scale,
+            ],
             box_size: [self.box_size.x, self.box_size.y, self.box_size.z, 0.0],
         })
     }
@@ -513,7 +521,10 @@ impl PyroSystem {
                 PyroKind::ColdSpark => {
                     let dist = (cam_pos - dev.world_nozzle()).length();
                     let lod = lod_factor(dist);
-                    let sim = self.sims.entry(dev.id).or_insert_with(|| PyroSim::new(dev.id));
+                    let sim = self
+                        .sims
+                        .entry(dev.id)
+                        .or_insert_with(|| PyroSim::new(dev.id));
                     sim.advance(dev, dt, lod);
                     if !dev.hidden {
                         sim.build_spark(dev, &mut self.spark);
@@ -644,7 +655,11 @@ impl PyroSim {
             for _ in 0..n {
                 let theta = self.range(inner, outer);
                 let phi = self.f01() * TAU;
-                let local = Vec3::new(theta.sin() * phi.cos(), theta.cos(), theta.sin() * phi.sin());
+                let local = Vec3::new(
+                    theta.sin() * phi.cos(),
+                    theta.cos(),
+                    theta.sin() * phi.sin(),
+                );
                 let speed = v0 * self.range(0.82, 1.06);
                 let vel = to_axis * (local * speed);
                 let jr = nozzle_r * self.f01().sqrt();
@@ -725,7 +740,11 @@ fn twinkle(seed: u32, age: f32) -> f32 {
 }
 fn blackbody(temp: f32) -> Vec3 {
     let t = temp.clamp(1000.0, 6500.0) / 100.0;
-    let r = if t <= 66.0 { 255.0 } else { 329.7 * (t - 55.0).max(1e-3).powf(-0.1332) };
+    let r = if t <= 66.0 {
+        255.0
+    } else {
+        329.7 * (t - 55.0).max(1e-3).powf(-0.1332)
+    };
     let g = if t <= 66.0 {
         99.47 * t.ln() - 161.12
     } else {

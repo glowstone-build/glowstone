@@ -54,11 +54,14 @@ pub(super) fn fixture_order(scene: &Scene, patch: &PatchTable, sort: SceneSort) 
                     }
                 }
             };
-            order.sort_by(|&a, &b| key(a).cmp(&key(b)));
+            order.sort_by_key(|&a| key(a));
         }
         SceneSort::Name => {
             order.sort_by(|&a, &b| {
-                scene.fixtures[a].name.to_lowercase().cmp(&scene.fixtures[b].name.to_lowercase())
+                scene.fixtures[a]
+                    .name
+                    .to_lowercase()
+                    .cmp(&scene.fixtures[b].name.to_lowercase())
             });
         }
         SceneSort::Type => {
@@ -77,7 +80,12 @@ pub(super) fn fixture_order(scene: &Scene, patch: &PatchTable, sort: SceneSort) 
                 scene.fixtures[a]
                     .sequence
                     .cmp(&scene.fixtures[b].sequence)
-                    .then(scene.fixtures[a].name.to_lowercase().cmp(&scene.fixtures[b].name.to_lowercase()))
+                    .then(
+                        scene.fixtures[a]
+                            .name
+                            .to_lowercase()
+                            .cmp(&scene.fixtures[b].name.to_lowercase()),
+                    )
             });
         }
     }
@@ -99,7 +107,6 @@ pub fn scene_outliner(
     pending: &mut super::tree::TreeAction,
 ) {
     use theme::icon;
-    let ink = theme::ink(!ui.visuals().dark_mode);
     let accent = ui.visuals().selection.stroke.color;
 
     ui.horizontal(|ui| {
@@ -120,7 +127,12 @@ pub fn scene_outliner(
                 .hint_text(format!("{}  Filter…", icon::SEARCH))
                 .desired_width(w.max(40.0)),
         );
-        if has && ui.small_button(icon::CLOSE).on_hover_text("Clear filter").clicked() {
+        if has
+            && ui
+                .small_button(icon::CLOSE)
+                .on_hover_text("Clear filter")
+                .clicked()
+        {
             search.clear();
         }
     });
@@ -133,7 +145,10 @@ pub fn scene_outliner(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         for chip in super::tree::TypeChip::ORDER {
-            if ui.selectable_label(filter.kind == chip, RichText::new(chip.label()).small()).clicked() {
+            if ui
+                .selectable_label(filter.kind == chip, RichText::new(chip.label()).small())
+                .clicked()
+            {
                 filter.kind = chip;
             }
         }
@@ -159,7 +174,11 @@ pub fn scene_outliner(
         } else {
             RichText::new("Conflicts").small()
         };
-        if ui.selectable_label(filter.state.conflicts, conflict_txt).on_hover_text("Only address-conflicting fixtures").clicked() {
+        if ui
+            .selectable_label(filter.state.conflicts, conflict_txt)
+            .on_hover_text("Only address-conflicting fixtures")
+            .clicked()
+        {
             filter.state.conflicts = !filter.state.conflicts;
         }
     });
@@ -169,25 +188,35 @@ pub fn scene_outliner(
     // root (World/Fixtures/Objects/Screens nested beneath), replacing the old
     // flat CollapsingHeader folders. See src/ui/tree.rs.
     ui.horizontal(|ui| {
-        ui.label(theme::ico(icon::SORT).weak()).on_hover_text("Sort fixtures by");
-        for s in [SceneSort::Patch, SceneSort::Name, SceneSort::Type, SceneSort::Sequence] {
+        ui.label(theme::ico(icon::SORT).weak())
+            .on_hover_text("Sort fixtures by");
+        for s in [
+            SceneSort::Patch,
+            SceneSort::Name,
+            SceneSort::Type,
+            SceneSort::Sequence,
+        ] {
             ui.selectable_value(sort, s, s.label());
         }
     });
     egui::Frame::NONE
         .fill(ui.visuals().faint_bg_color)
-        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+        .stroke(egui::Stroke::new(
+            1.0,
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+        ))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(4, 4))
         .show(ui, |ui| {
-            let act = super::tree::scene_tree(ui, scene, selection, patch, anchor, *sort, search, *filter, expanded, rename);
+            let act = super::tree::scene_tree(
+                ui, scene, selection, patch, anchor, *sort, search, *filter, expanded, rename,
+            );
             // Defer hide/rename (need an undo step) to the post-dock consumer.
             if !matches!(act, super::tree::TreeAction::None) {
                 *pending = act;
             }
         });
     ui.add_space(6.0);
-
 
     // (Render/look controls live on the viewport overlay (Mode + Exposure), the
     // View menu (grid / gizmo / label toggles) and Preferences > Rendering — not

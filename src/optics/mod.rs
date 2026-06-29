@@ -40,7 +40,8 @@ pub enum ShutterKind {
 
 impl ShutterKind {
     /// All variants, for the inspector dropdown.
-    pub const ALL: [ShutterKind; 3] = [ShutterKind::None, ShutterKind::Blade, ShutterKind::Sawtooth];
+    pub const ALL: [ShutterKind; 3] =
+        [ShutterKind::None, ShutterKind::Blade, ShutterKind::Sawtooth];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -79,7 +80,12 @@ pub struct WheelControl {
 
 impl Default for WheelControl {
     fn default() -> Self {
-        Self { value: 0.0, index: 0.0, spin: 0.5, shake: 0.0 }
+        Self {
+            value: 0.0,
+            index: 0.0,
+            spin: 0.5,
+            shake: 0.0,
+        }
     }
 }
 
@@ -390,7 +396,11 @@ fn facet_count_from_wheel(wheel: &str) -> Option<usize> {
         return facet_count_from_name(wheel);
     }
     // A leading standalone number ("4 Prism") — not a trailing index ("Prism2").
-    wheel.split_whitespace().next().and_then(|t| t.parse::<usize>().ok()).filter(|n| (2..=16).contains(n))
+    wheel
+        .split_whitespace()
+        .next()
+        .and_then(|t| t.parse::<usize>().ok())
+        .filter(|n| (2..=16).contains(n))
 }
 
 /// Names that denote the "no prism" pass-through slot.
@@ -398,7 +408,9 @@ fn is_open_name(name: &str) -> bool {
     let n = name.trim().to_lowercase();
     n.is_empty()
         || n == "-"
-        || ["open", "out", "empty", "closed", "off", "none", "no prism"].iter().any(|k| n.contains(k))
+        || ["open", "out", "empty", "closed", "off", "none", "no prism"]
+            .iter()
+            .any(|k| n.contains(k))
 }
 
 /// Whether a wheel slot is an engaged prism (has facet geometry or a facet-count
@@ -407,7 +419,9 @@ fn is_prism_slot(slot: &crate::gdtf::WheelSlot, wheel: &str) -> bool {
     if is_open_name(&slot.name) {
         return false;
     }
-    !slot.facets.is_empty() || facet_count_from_name(&slot.name).is_some() || facet_count_from_wheel(wheel).is_some()
+    !slot.facets.is_empty()
+        || facet_count_from_name(&slot.name).is_some()
+        || facet_count_from_wheel(wheel).is_some()
 }
 
 fn prism_beams(gdtf: &GdtfFixture, wheel: &str, slot_idx: usize, rot: f32) -> Vec<PrismBeam> {
@@ -427,14 +441,20 @@ fn prism_beams(gdtf: &GdtfFixture, wheel: &str, slot_idx: usize, rot: f32) -> Ve
     } else {
         // Prefer the slot name ("4-Facet Circular Prism") over the wheel name; the
         // wheel-name reader rejects a trailing component index ("Prism2").
-        facet_count_from_name(&slot.name).or_else(|| facet_count_from_wheel(wheel)).unwrap_or(3)
+        facet_count_from_name(&slot.name)
+            .or_else(|| facet_count_from_wheel(wheel))
+            .unwrap_or(3)
     }
     .max(2);
 
     let (s, c) = rot.sin_cos();
     // Energy splits across facets, but keep copies punchy (sub-linear falloff).
     let w_each = 1.0 / (n as f32).sqrt();
-    let max_off = slot.facets.iter().map(|&[x, y]| (x * x + y * y).sqrt()).fold(0.0_f32, f32::max);
+    let max_off = slot
+        .facets
+        .iter()
+        .map(|&[x, y]| (x * x + y * y).sqrt())
+        .fold(0.0_f32, f32::max);
     if !slot.facets.is_empty() && max_off > 1e-3 {
         // Usable GDTF facet offsets: normalise so the largest deflects by MAX_DEFLECT.
         let spread = MAX_DEFLECT / max_off;
@@ -452,7 +472,10 @@ fn prism_beams(gdtf: &GdtfFixture, wheel: &str, slot_idx: usize, rot: f32) -> Ve
         (0..n)
             .map(|k| {
                 let a = rot + TAU * (k as f32) / (n as f32);
-                PrismBeam { offset: [MAX_DEFLECT * a.cos(), MAX_DEFLECT * a.sin()], weight: w_each }
+                PrismBeam {
+                    offset: [MAX_DEFLECT * a.cos(), MAX_DEFLECT * a.sin()],
+                    weight: w_each,
+                }
             })
             .collect()
     }
@@ -481,7 +504,11 @@ fn compose_prisms(a: Vec<PrismBeam>, b: Vec<PrismBeam>) -> Vec<PrismBeam> {
         })
         .collect();
     if out.len() > MAX_COPIES {
-        out.sort_by(|x, y| y.weight.partial_cmp(&x.weight).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|x, y| {
+            y.weight
+                .partial_cmp(&x.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(MAX_COPIES);
     }
     out
@@ -545,9 +572,16 @@ pub fn resolve(
                     if settled {
                         // Parked on a slot: uniform → fold the dichroic colour in.
                         let slot = (position.round() as i32).rem_euclid(comp.slots as i32) as usize;
-                        let col = gdtf.wheel(&wname).and_then(|w| w.slots.get(slot)).and_then(|s| s.color);
+                        let col = gdtf
+                            .wheel(&wname)
+                            .and_then(|w| w.slots.get(slot))
+                            .and_then(|s| s.color);
                         let t = color::dichroic_transmittance(col);
-                        color_fold = [color_fold[0] * t[0], color_fold[1] * t[1], color_fold[2] * t[2]];
+                        color_fold = [
+                            color_fold[0] * t[0],
+                            color_fold[1] * t[1],
+                            color_fold[2] * t[2],
+                        ];
                     } else {
                         // Moving / scrolling: spatial split across the beam.
                         wheels.push(WheelSel {
@@ -605,12 +639,20 @@ pub fn resolve(
                 if t > 0.005
                     && let Some(w) = comp.wheel.clone().or_else(|| wheel_name(gdtf, comp))
                 {
-                    let slot_idx =
-                        if comp.slots > 1 { (ctl.value.clamp(0.0, 1.0) * (comp.slots as f32 - 1.0)).round() as usize } else { 0 };
+                    let slot_idx = if comp.slots > 1 {
+                        (ctl.value.clamp(0.0, 1.0) * (comp.slots as f32 - 1.0)).round() as usize
+                    } else {
+                        0
+                    };
                     let set = prism_beams(gdtf, &w, slot_idx, m.phase(i) + ctl.index * TAU);
                     if !set.is_empty() {
-                        let scaled: Vec<PrismBeam> =
-                            set.iter().map(|p| PrismBeam { offset: p.offset, weight: p.weight * t }).collect();
+                        let scaled: Vec<PrismBeam> = set
+                            .iter()
+                            .map(|p| PrismBeam {
+                                offset: p.offset,
+                                weight: p.weight * t,
+                            })
+                            .collect();
                         prism = compose_prisms(prism, scaled);
                         prism_insert = prism_insert.max(t);
                     }
@@ -649,7 +691,11 @@ pub fn resolve(
     // --- shutter / strobe ---
     let shutter_gain = if c.strobe > 0.01 {
         let hz = map_attr(gdtf, "Shutter1Strobe", c.strobe, (0.5, 25.0));
-        if (time * hz).fract() < 0.5 { c.shutter } else { 0.0 }
+        if (time * hz).fract() < 0.5 {
+            c.shutter
+        } else {
+            0.0
+        }
     } else {
         c.shutter.clamp(0.0, 1.0)
     };
@@ -756,14 +802,19 @@ pub fn emitter_cone(
     // absolute (no per-emitter "nominal" anchor): a wide blinder pixel with a
     // default-25° Beam entry can't inflate itself via angle ratios.
     let flux = emitter_flux(beam, n_emitters) * flux_norm.clamp(0.0, 1.0);
-    let concentration = (solid_angle(ANGLE_REF) / solid_angle(zoom_deg).max(1e-5)).clamp(0.05, 24.0);
+    let concentration =
+        (solid_angle(ANGLE_REF) / solid_angle(zoom_deg).max(1e-5)).clamp(0.05, 24.0);
     let brightness = ((flux / FLUX_REF) * concentration).clamp(0.002, 24.0);
     let face_gain = concentration.clamp(0.25, 16.0);
 
     let beam_a = nominal;
     let field_a = beam.field_angle.max(beam_a);
     let ratio = (field_a.to_radians() * 0.5).tan() / (beam_a.to_radians() * 0.5).tan().max(1e-4);
-    let ratio_n = if ratio > 1.0001 { (0.6004 / ratio.ln()).clamp(1.2, 12.0) } else { 12.0 };
+    let ratio_n = if ratio > 1.0001 {
+        (0.6004 / ratio.ln()).clamp(1.2, 12.0)
+    } else {
+        12.0
+    };
     // BeamType drives the edge when the author left beam == field (most LED
     // washes do): Wash/Fresnel/PC read soft, Spot/Rectangle keep the hard edge.
     let type_n = match beam.beam_type.as_str() {
@@ -776,7 +827,13 @@ pub fn emitter_cone(
     // curve so even moderate frost reads as clearly diffused (not a crisp edge).
     let n_order = (type_n + (1.05 - type_n) * frost01.powf(0.6)).max(1.05);
     let shaft = !matches!(beam.beam_type.as_str(), "None" | "Glow");
-    EmitterCone { tan_half, brightness, face_gain, n_order, shaft }
+    EmitterCone {
+        tan_half,
+        brightness,
+        face_gain,
+        n_order,
+        shaft,
+    }
 }
 
 #[cfg(test)]
@@ -785,7 +842,12 @@ mod prism_tests {
     use crate::gdtf::WheelSlot;
 
     fn slot(name: &str, facets: Vec<[f32; 2]>) -> WheelSlot {
-        WheelSlot { name: name.to_string(), color: None, media: None, facets }
+        WheelSlot {
+            name: name.to_string(),
+            color: None,
+            media: None,
+            facets,
+        }
     }
 
     #[test]
@@ -813,7 +875,10 @@ mod prism_tests {
         assert!(!is_prism_slot(&slot("Out", vec![]), "Prism2"));
         assert!(!is_prism_slot(&slot("Open", vec![]), "4 Prism"));
         // A real prism slot engages (by name or by facet geometry).
-        assert!(is_prism_slot(&slot("4-Facet Circular Prism", vec![]), "4 Prism"));
+        assert!(is_prism_slot(
+            &slot("4-Facet Circular Prism", vec![]),
+            "4 Prism"
+        ));
         assert!(is_prism_slot(&slot("Prism", vec![[0.1, 0.0]]), "Prism2"));
     }
 }

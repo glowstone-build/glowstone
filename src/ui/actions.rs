@@ -1,5 +1,5 @@
-use super::*;
 use super::ops::{next_free_slot, patchable_count};
+use super::*;
 
 impl Ui {
     /// AABB of the current selection (or whole scene if nothing selected),
@@ -174,7 +174,9 @@ impl Ui {
             // after the dock, in `show`.
             Action::ViewPie => {
                 #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
-                let anchor = ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
+                let anchor = ctx
+                    .pointer_latest_pos()
+                    .unwrap_or_else(|| ctx.screen_rect().center());
                 self.view_pie.open_at(anchor);
             }
             // `Z` — open the radial Shading pie at the cursor (display mode + grid /
@@ -182,7 +184,9 @@ impl Ui {
             // here, drawn + resolved after the dock in `show`.
             Action::ShadingPie => {
                 #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
-                let anchor = ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
+                let anchor = ctx
+                    .pointer_latest_pos()
+                    .unwrap_or_else(|| ctx.screen_rect().center());
                 self.shading_pie.open_at(anchor);
             }
             // --- View bookmarks (P1 #34) ---------------------------------------
@@ -221,7 +225,12 @@ impl Ui {
             // objects/screens when one of those is the current selection). Mirrors
             // Blender's `A` acting on the active mode's collection.
             Action::SelectAll => {
-                let counts = (scene.fixtures.len(), scene.geometry.len(), scene.screens.len(), scene.pyro.len());
+                let counts = (
+                    scene.fixtures.len(),
+                    scene.geometry.len(),
+                    scene.screens.len(),
+                    scene.pyro.len(),
+                );
                 let kind = self.selection.active_kind();
                 self.selection.select_all_of(kind, counts);
                 self.scene_anchor = None;
@@ -245,36 +254,65 @@ impl Ui {
                     || !s.pyro.is_empty()
                     || s.environment.is_some();
                 if has_sel {
-                    let any_visible = s.fixtures.iter().any(|&i| scene.fixtures.get(i).is_some_and(|f| !f.hidden))
-                        || s.geometry.iter().any(|&i| scene.geometry.get(i).is_some_and(|g| !g.hidden))
-                        || s.screens.iter().any(|&i| scene.screens.get(i).is_some_and(|x| !x.hidden))
-                        || s.pyro.iter().any(|&i| scene.pyro.get(i).is_some_and(|p| !p.hidden))
-                        || s.environment.is_some_and(|i| scene.environments.get(i).is_some_and(|e| !e.hidden));
+                    let any_visible = s
+                        .fixtures
+                        .iter()
+                        .any(|&i| scene.fixtures.get(i).is_some_and(|f| !f.hidden))
+                        || s.geometry
+                            .iter()
+                            .any(|&i| scene.geometry.get(i).is_some_and(|g| !g.hidden))
+                        || s.screens
+                            .iter()
+                            .any(|&i| scene.screens.get(i).is_some_and(|x| !x.hidden))
+                        || s.pyro
+                            .iter()
+                            .any(|&i| scene.pyro.get(i).is_some_and(|p| !p.hidden))
+                        || s.environment
+                            .is_some_and(|i| scene.environments.get(i).is_some_and(|e| !e.hidden));
                     let hide = any_visible; // hide while anything's visible, else reveal
                     let before = self.undo_begin(scene, dmx.patch());
                     for &i in &self.selection.fixtures {
-                        if let Some(f) = scene.fixtures.get_mut(i) { f.hidden = hide; }
+                        if let Some(f) = scene.fixtures.get_mut(i) {
+                            f.hidden = hide;
+                        }
                     }
                     for &i in &self.selection.geometry {
-                        if let Some(g) = scene.geometry.get_mut(i) { g.hidden = hide; }
+                        if let Some(g) = scene.geometry.get_mut(i) {
+                            g.hidden = hide;
+                        }
                     }
                     for &i in &self.selection.screens {
-                        if let Some(x) = scene.screens.get_mut(i) { x.hidden = hide; }
+                        if let Some(x) = scene.screens.get_mut(i) {
+                            x.hidden = hide;
+                        }
                     }
                     for &i in &self.selection.pyro {
-                        if let Some(p) = scene.pyro.get_mut(i) { p.hidden = hide; }
+                        if let Some(p) = scene.pyro.get_mut(i) {
+                            p.hidden = hide;
+                        }
                     }
-                    if let Some(i) = self.selection.environment {
-                        if let Some(e) = scene.environments.get_mut(i) { e.hidden = hide; }
+                    if let Some(i) = self.selection.environment
+                        && let Some(e) = scene.environments.get_mut(i)
+                    {
+                        e.hidden = hide;
                     }
                     self.undo_push("Hide / Reveal", before, scene, dmx.patch());
-                    self.notify.success(if hide { "Hid selection" } else { "Revealed selection" });
+                    self.notify.success(if hide {
+                        "Hid selection"
+                    } else {
+                        "Revealed selection"
+                    });
                 }
             }
             // Invert (#88): flip membership within the active kind. Defaults to
             // fixtures when nothing is selected, so a bare Ctrl+I selects everything.
             Action::SelectInvert => {
-                let counts = (scene.fixtures.len(), scene.geometry.len(), scene.screens.len(), scene.pyro.len());
+                let counts = (
+                    scene.fixtures.len(),
+                    scene.geometry.len(),
+                    scene.screens.len(),
+                    scene.pyro.len(),
+                );
                 let kind = self.selection.active_kind();
                 self.selection.invert_within(kind, counts);
                 self.scene_anchor = None;
@@ -314,7 +352,9 @@ impl Ui {
                 // Anchor on the live cursor; fall back to the viewport-ish
                 // screen centre if the pointer position is unknown (keyboard).
                 #[allow(deprecated)] // egui 0.34 screen_rect — content_rect migration later
-                let anchor = ctx.pointer_latest_pos().unwrap_or_else(|| ctx.screen_rect().center());
+                let anchor = ctx
+                    .pointer_latest_pos()
+                    .unwrap_or_else(|| ctx.screen_rect().center());
                 self.add_menu.show_at(anchor);
             }
             // Patch / Unpatch (P/U) — works for whichever patchable device kind is
@@ -338,17 +378,31 @@ impl Ui {
                 let kind = self.selection.active_kind();
                 let count = patchable_count(&self.selection, kind);
                 if count > 0 {
-                    self.unpatch_dialog = windows::UnpatchDialog { open: true, count, kind };
+                    self.unpatch_dialog = windows::UnpatchDialog {
+                        open: true,
+                        count,
+                        kind,
+                    };
                 }
             }
             // Renumber the selected fixtures' sequence by stage position (rows then
             // columns); all fixtures if none selected.
             Action::RenumberSequence => {
-                let sel: Vec<usize> =
-                    self.selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+                let sel: Vec<usize> = self
+                    .selection
+                    .fixtures
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < scene.fixtures.len())
+                    .collect();
                 scene.renumber_sequences_by_position(&sel);
-                let n = if sel.is_empty() { scene.fixtures.len() } else { sel.len() };
-                self.notify.success(format!("Renumbered {n} fixtures by position"));
+                let n = if sel.is_empty() {
+                    scene.fixtures.len()
+                } else {
+                    sel.len()
+                };
+                self.notify
+                    .success(format!("Renumbered {n} fixtures by position"));
             }
             // --- 3D cursor (S1-3d-cursor) --------------------------------------
             // Snap the world cursor to the selection median (Blender's Shift+S →
@@ -358,7 +412,8 @@ impl Ui {
                 if let Some(p) = self.selection_median(scene) {
                     self.cursor_3d = p;
                     self.cursor_3d_set = true;
-                    self.notify.info(format!("Cursor {}  selection", theme::icon::ARROW_RIGHT));
+                    self.notify
+                        .info(format!("Cursor {}  selection", theme::icon::ARROW_RIGHT));
                 }
             }
             // Reset the world cursor to the origin and forget the "set this session"
@@ -366,7 +421,8 @@ impl Ui {
             Action::ResetCursor => {
                 self.cursor_3d = Vec3::ZERO;
                 self.cursor_3d_set = false;
-                self.notify.info(format!("Cursor {}  origin", theme::icon::ARROW_RIGHT));
+                self.notify
+                    .info(format!("Cursor {}  origin", theme::icon::ARROW_RIGHT));
             }
             // --- Edit / history -------------------------------------------------
             Action::Undo => self.do_undo(scene, dmx),
@@ -414,7 +470,10 @@ impl Ui {
             // the palette never offers the modal ones as dead picks. (Duplicate IS
             // a palette op, but via its `fixture.duplicate` dialog catalog entry,
             // not this keymap Action.)
-            Action::Transform(_) | Action::AxisLock(_) | Action::Duplicate | Action::DuplicateGrab => {
+            Action::Transform(_)
+            | Action::AxisLock(_)
+            | Action::Duplicate
+            | Action::DuplicateGrab => {
                 return false;
             }
         }
@@ -456,13 +515,49 @@ mod tests {
 
         // --- View / framing: handled, and the camera mutators reach the camera. ---
         cam.ortho = false;
-        assert!(Ui::new().dispatch_action(&ctx, Action::ToggleOrtho, &mut Scene::default(), &mut cam, &mut DmxIo::new()));
+        assert!(Ui::new().dispatch_action(
+            &ctx,
+            Action::ToggleOrtho,
+            &mut Scene::default(),
+            &mut cam,
+            &mut DmxIo::new()
+        ));
         assert!(cam.ortho, "ToggleOrtho flips the camera projection");
-        assert!(Ui::new().dispatch_action(&ctx, Action::View(CameraView::Front), &mut Scene::default(), &mut cam, &mut DmxIo::new()));
-        assert!(Ui::new().dispatch_action(&ctx, Action::OrbitStep(15.0, 0.0), &mut Scene::default(), &mut cam, &mut DmxIo::new()));
-        assert!(Ui::new().dispatch_action(&ctx, Action::FrameSelection, &mut Scene::default(), &mut cam, &mut DmxIo::new()));
-        assert!(Ui::new().dispatch_action(&ctx, Action::FrameAll, &mut Scene::default(), &mut cam, &mut DmxIo::new()));
-        assert!(Ui::new().dispatch_action(&ctx, Action::ViewCamera, &mut Scene::default(), &mut cam, &mut DmxIo::new()));
+        assert!(Ui::new().dispatch_action(
+            &ctx,
+            Action::View(CameraView::Front),
+            &mut Scene::default(),
+            &mut cam,
+            &mut DmxIo::new()
+        ));
+        assert!(Ui::new().dispatch_action(
+            &ctx,
+            Action::OrbitStep(15.0, 0.0),
+            &mut Scene::default(),
+            &mut cam,
+            &mut DmxIo::new()
+        ));
+        assert!(Ui::new().dispatch_action(
+            &ctx,
+            Action::FrameSelection,
+            &mut Scene::default(),
+            &mut cam,
+            &mut DmxIo::new()
+        ));
+        assert!(Ui::new().dispatch_action(
+            &ctx,
+            Action::FrameAll,
+            &mut Scene::default(),
+            &mut cam,
+            &mut DmxIo::new()
+        ));
+        assert!(Ui::new().dispatch_action(
+            &ctx,
+            Action::ViewCamera,
+            &mut Scene::default(),
+            &mut cam,
+            &mut DmxIo::new()
+        ));
 
         // ToggleLabels flips the pref; ViewPie opens the pie; N/T toggle regions.
         let (ui, _, _, h) = run(Action::ToggleLabels, noop);
@@ -471,7 +566,10 @@ mod tests {
         let (ui, _, _, h) = run(Action::ToggleStats, noop);
         assert!(h && ui.prefs.show_stats != Preferences::default().show_stats);
         let (ui, _, _, h) = run(Action::ToggleGrid, noop);
-        assert!(h && !ui.settings.show_grid, "ToggleGrid flips the render-settings grid flag");
+        assert!(
+            h && !ui.settings.show_grid,
+            "ToggleGrid flips the render-settings grid flag"
+        );
         let (ui, _, _, h) = run(Action::ToggleGizmos, noop);
         assert!(h && ui.prefs.show_gizmos != Preferences::default().show_gizmos);
         let (ui, _, _, h) = run(Action::ToggleHint, noop);
@@ -479,7 +577,10 @@ mod tests {
         let (ui, _, _, h) = run(Action::ViewPie, noop);
         assert!(h && ui.view_pie.open, "ViewPie opens the radial pie");
         let (ui, _, _, h) = run(Action::ShadingPie, noop);
-        assert!(h && ui.shading_pie.open, "ShadingPie opens the radial shading pie");
+        assert!(
+            h && ui.shading_pie.open,
+            "ShadingPie opens the radial shading pie"
+        );
         let (_ui, _, _, h) = run(Action::ToggleNPanel, noop);
         assert!(h, "ToggleNPanel handled (toggles the docked Inspector tab)");
         let (ui, _, _, h) = run(Action::ToggleTPanel, noop);
@@ -489,25 +590,43 @@ mod tests {
         let (ui, _, _, h) = run(Action::QuickSelect, noop);
         assert!(h && ui.quick_select, "QuickSelect arms the menu");
         let (ui, sc, _, h) = run(Action::SelectAll, noop);
-        assert!(h && ui.selection.fixtures == (0..sc.fixtures.len()).collect::<Vec<_>>(), "SelectAll selects every fixture (active kind)");
+        assert!(
+            h && ui.selection.fixtures == (0..sc.fixtures.len()).collect::<Vec<_>>(),
+            "SelectAll selects every fixture (active kind)"
+        );
         // Deselect (#88: Alt+A / Esc) now clears the selection.
         let (ui, _, _, h) = run(Action::Deselect, &sel);
-        assert!(h && ui.selection == Selection::default(), "Deselect clears the selection");
+        assert!(
+            h && ui.selection == Selection::default(),
+            "Deselect clears the selection"
+        );
         // Invert (#88) within the active kind flips membership: from {0} it must
         // include everything BUT 0; on the single-fixture demo that's empty.
         let (ui, sc, _, h) = run(Action::SelectInvert, &sel);
         let want: Vec<usize> = (0..sc.fixtures.len()).filter(|&i| i != 0).collect();
-        assert!(h && ui.selection.fixtures == want, "Invert flips membership within the active kind");
+        assert!(
+            h && ui.selection.fixtures == want,
+            "Invert flips membership within the active kind"
+        );
         // Invert from empty selects all (active kind defaults to fixtures).
         let clear: &dyn Fn(&mut Ui) = &|ui: &mut Ui| ui.selection = Selection::default();
         let (ui, sc, _, h) = run(Action::SelectInvert, clear);
-        assert!(h && ui.selection.fixtures == (0..sc.fixtures.len()).collect::<Vec<_>>(), "Invert from empty selects all");
+        assert!(
+            h && ui.selection.fixtures == (0..sc.fixtures.len()).collect::<Vec<_>>(),
+            "Invert from empty selects all"
+        );
         let (ui, _, _, h) = run(Action::Replace, &sel);
-        assert!(h && ui.replace.is_some(), "Replace opens its dialog with a selection");
+        assert!(
+            h && ui.replace.is_some(),
+            "Replace opens its dialog with a selection"
+        );
 
         // --- Object: Delete defers to pending_delete; Add opens the menu. ---
         let (ui, _, _, h) = run(Action::Delete, &sel);
-        assert!(h && ui.pending_delete, "Delete defers to the after-dock commit");
+        assert!(
+            h && ui.pending_delete,
+            "Delete defers to the after-dock commit"
+        );
         let (ui, _, _, h) = run(Action::AddMenu, noop);
         assert!(h && ui.add_menu.open, "AddMenu opens the cursor menu");
 
@@ -516,16 +635,28 @@ mod tests {
             ui.selection = Selection::fixture(0);
             ui.viewport_focused = true; // nudge_ok needs viewport focus + selection
         });
-        assert!(h && ui.pending_nudge.x > 0.0, "Nudge accumulates into pending_nudge");
+        assert!(
+            h && ui.pending_nudge.x > 0.0,
+            "Nudge accumulates into pending_nudge"
+        );
         // Without viewport focus, nudge is a guarded no-op (still handled).
         let (ui, _, _, h) = run(Action::Nudge(Dir::XPos, 0.1), &sel);
-        assert!(h && ui.pending_nudge == Vec3::ZERO, "Nudge guarded off without viewport focus");
+        assert!(
+            h && ui.pending_nudge == Vec3::ZERO,
+            "Nudge guarded off without viewport focus"
+        );
 
         // --- Patch / Unpatch open their dialogs (commit defers after the dock). ---
         let (ui, _, _, h) = run(Action::Patch, &sel);
-        assert!(h && ui.patch_dialog.open, "Patch opens its dialog with a selection");
+        assert!(
+            h && ui.patch_dialog.open,
+            "Patch opens its dialog with a selection"
+        );
         let (ui, _, _, h) = run(Action::Unpatch, &sel);
-        assert!(h && ui.unpatch_dialog.open, "Unpatch opens its dialog with a selection");
+        assert!(
+            h && ui.unpatch_dialog.open,
+            "Unpatch opens its dialog with a selection"
+        );
         // Patch/Unpatch are kind-aware: a pyro selection opens the dialog tagged Pyro
         // (so the confirm packs the inline PyroPatch instead of the fixture PatchTable).
         let pyro_sel: &dyn Fn(&mut Ui) = &|ui: &mut Ui| ui.selection = Selection::pyro(0);
@@ -542,7 +673,10 @@ mod tests {
         // Empty selection: P/U are guarded no-ops (still reported handled).
         let clear = &|ui: &mut Ui| ui.selection = Selection::default();
         let (ui, _, _, h) = run(Action::Patch, clear);
-        assert!(h && !ui.patch_dialog.open, "Patch guarded off with no selection");
+        assert!(
+            h && !ui.patch_dialog.open,
+            "Patch guarded off with no selection"
+        );
 
         // --- 3D cursor: snap to selection moves + marks set; reset zeroes + clears. ---
         // The demo `Scene::default()` has fixtures, so fixture 0 resolves → the cursor
@@ -550,18 +684,30 @@ mod tests {
         let (ui, scene, _, h) = run(Action::SnapCursorToSelection, &|ui: &mut Ui| {
             ui.selection = Selection::fixture(0);
         });
-        assert!(h && ui.cursor_3d_set, "SnapCursorToSelection moves the cursor + marks set");
-        assert_eq!(ui.cursor_3d, scene.fixtures[0].position, "cursor snaps to the fixture");
+        assert!(
+            h && ui.cursor_3d_set,
+            "SnapCursorToSelection moves the cursor + marks set"
+        );
+        assert_eq!(
+            ui.cursor_3d, scene.fixtures[0].position,
+            "cursor snaps to the fixture"
+        );
         // No addressable selection → the median is None, so the cursor stays unset.
         let (ui, _, _, h) = run(Action::SnapCursorToSelection, &|ui: &mut Ui| {
             ui.selection = Selection::default();
         });
-        assert!(h && !ui.cursor_3d_set, "empty selection → cursor stays unset");
+        assert!(
+            h && !ui.cursor_3d_set,
+            "empty selection → cursor stays unset"
+        );
         let (ui, _, _, h) = run(Action::ResetCursor, &|ui: &mut Ui| {
             ui.cursor_3d = Vec3::new(3.0, 4.0, 5.0);
             ui.cursor_3d_set = true;
         });
-        assert!(h && ui.cursor_3d == Vec3::ZERO && !ui.cursor_3d_set, "ResetCursor zeroes + clears");
+        assert!(
+            h && ui.cursor_3d == Vec3::ZERO && !ui.cursor_3d_set,
+            "ResetCursor zeroes + clears"
+        );
 
         // --- Edit / history + App / file all reach their effect (handled). ---
         let (ui, _, _, h) = run(Action::OperatorSearch, noop);
@@ -571,21 +717,48 @@ mod tests {
         // Undo/Redo/AdjustLast/New are handled (their effect needs IO / a file
         // picker — just assert they route, not no-op-fall-through). Save/SaveAs/Open
         // are omitted here: they spawn a native file dialog (no headless effect).
-        assert!(run(Action::Undo, noop).3, "Undo routes through dispatch_action");
-        assert!(run(Action::Redo, noop).3, "Redo routes through dispatch_action");
-        assert!(run(Action::AdjustLast, noop).3, "AdjustLast routes through dispatch_action");
-        assert!(run(Action::New, noop).3, "New routes through dispatch_action");
+        assert!(
+            run(Action::Undo, noop).3,
+            "Undo routes through dispatch_action"
+        );
+        assert!(
+            run(Action::Redo, noop).3,
+            "Redo routes through dispatch_action"
+        );
+        assert!(
+            run(Action::AdjustLast, noop).3,
+            "AdjustLast routes through dispatch_action"
+        );
+        assert!(
+            run(Action::New, noop).3,
+            "New routes through dispatch_action"
+        );
 
         // --- View bookmarks (P1 #34): save fills a slot; recall eases the camera. ---
         let (ui, _, _, h) = run(Action::SaveBookmark, noop);
-        assert!(h && ui.bookmarks.pose_in_slot(1).is_some(), "SaveBookmark fills slot 1");
+        assert!(
+            h && ui.bookmarks.pose_in_slot(1).is_some(),
+            "SaveBookmark fills slot 1"
+        );
         // Recall an empty slot is a handled no-op (just a notify); recall a saved one
         // routes (the camera mutation is exercised by the camera-side pose tests).
-        assert!(run(Action::RecallBookmark(1), noop).3, "RecallBookmark routes (empty slot)");
+        assert!(
+            run(Action::RecallBookmark(1), noop).3,
+            "RecallBookmark routes (empty slot)"
+        );
 
         // --- Viewport-owned: NOT handled here (dispatched in panels::viewport). ---
-        assert!(!run(Action::Transform(TransformKind::Move), noop).3, "Transform is viewport-owned");
-        assert!(!run(Action::AxisLock(Axis::X), noop).3, "AxisLock is viewport-owned");
-        assert!(!run(Action::Duplicate, noop).3, "Duplicate is viewport-owned");
+        assert!(
+            !run(Action::Transform(TransformKind::Move), noop).3,
+            "Transform is viewport-owned"
+        );
+        assert!(
+            !run(Action::AxisLock(Axis::X), noop).3,
+            "AxisLock is viewport-owned"
+        );
+        assert!(
+            !run(Action::Duplicate, noop).3,
+            "Duplicate is viewport-owned"
+        );
     }
 }

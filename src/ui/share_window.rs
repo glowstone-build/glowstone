@@ -57,10 +57,17 @@ pub fn fixture_library_window(
                 ui.label(RichText::new("GDTF Share").strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if share.logged_in {
-                        if ui.button(format!("{}  Sign out", theme::icon::SIGN_OUT)).clicked() {
+                        if ui
+                            .button(format!("{}  Sign out", theme::icon::SIGN_OUT))
+                            .clicked()
+                        {
                             share.logout();
                         }
-                        ui.label(RichText::new(format!("{}  signed in", theme::icon::USER)).small().color(theme::OK));
+                        ui.label(
+                            RichText::new(format!("{}  signed in", theme::icon::USER))
+                                .small()
+                                .color(theme::OK),
+                        );
                     } else if !share.user.is_empty() {
                         ui.label(RichText::new("signed out").small().weak());
                     }
@@ -150,9 +157,24 @@ fn login_card(ui: &mut egui::Ui, share: &mut Share, accent: egui::Color32) {
 fn signin_banner(ui: &mut egui::Ui, share: &mut Share) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{}  Sign in to download fixtures", theme::icon::SIGN_IN)).small());
-            ui.add(egui::TextEdit::singleline(&mut share.user).desired_width(130.0).hint_text("user"));
-            ui.add(egui::TextEdit::singleline(&mut share.password).password(true).desired_width(120.0).hint_text("password"));
+            ui.label(
+                RichText::new(format!(
+                    "{}  Sign in to download fixtures",
+                    theme::icon::SIGN_IN
+                ))
+                .small(),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut share.user)
+                    .desired_width(130.0)
+                    .hint_text("user"),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut share.password)
+                    .password(true)
+                    .desired_width(120.0)
+                    .hint_text("password"),
+            );
             let enabled = !share.is_busy() && can_submit(share);
             if ui.add_enabled(enabled, Button::new("Sign in")).clicked() {
                 share.login();
@@ -169,7 +191,10 @@ fn toolbar(ui: &mut egui::Ui, share: &mut Share, _accent: egui::Color32) {
     ui.horizontal(|ui| {
         let can_refresh = share.logged_in && !share.is_busy();
         if ui
-            .add_enabled(can_refresh, Button::new(format!("{}  Refresh", theme::icon::RESET)))
+            .add_enabled(
+                can_refresh,
+                Button::new(format!("{}  Refresh", theme::icon::RESET)),
+            )
             .on_hover_text("Re-fetch the full fixture list from GDTF Share")
             .clicked()
         {
@@ -182,14 +207,20 @@ fn toolbar(ui: &mut egui::Ui, share: &mut Share, _accent: egui::Color32) {
             }
             None => {
                 if !share.list.is_empty() {
-                    ui.label(RichText::new(format!("{} fixtures", share.list.len())).small().weak());
+                    ui.label(
+                        RichText::new(format!("{} fixtures", share.list.len()))
+                            .small()
+                            .weak(),
+                    );
                 }
             }
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.toggle_value(&mut share.updates_only, "Updates").on_hover_text("Only fixtures with a newer revision than the one you have");
-            ui.toggle_value(&mut share.downloaded_only, "Downloaded").on_hover_text("Only fixtures already in your cache");
+            ui.toggle_value(&mut share.updates_only, "Updates")
+                .on_hover_text("Only fixtures with a newer revision than the one you have");
+            ui.toggle_value(&mut share.downloaded_only, "Downloaded")
+                .on_hover_text("Only fixtures already in your cache");
             manufacturer_filter(ui, share);
             ui.add(
                 egui::TextEdit::singleline(&mut share.search)
@@ -201,21 +232,32 @@ fn toolbar(ui: &mut egui::Ui, share: &mut Share, _accent: egui::Color32) {
 }
 
 fn manufacturer_filter(ui: &mut egui::Ui, share: &mut Share) {
-    let selected = if share.manufacturer.is_empty() { "All makes".to_string() } else { share.manufacturer.clone() };
-    egui::ComboBox::from_id_salt("gdtf-mfr").selected_text(selected).width(150.0).show_ui(ui, |ui| {
-        ui.selectable_value(&mut share.manufacturer, String::new(), "All makes");
-        // Clone so the &share borrow ends before we mutate share.manufacturer.
-        let mfrs = share.manufacturers().to_vec();
-        for m in mfrs {
-            ui.selectable_value(&mut share.manufacturer, m.clone(), m);
-        }
-    });
+    let selected = if share.manufacturer.is_empty() {
+        "All makes".to_string()
+    } else {
+        share.manufacturer.clone()
+    };
+    egui::ComboBox::from_id_salt("gdtf-mfr")
+        .selected_text(selected)
+        .width(150.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut share.manufacturer, String::new(), "All makes");
+            // Clone so the &share borrow ends before we mutate share.manufacturer.
+            let mfrs = share.manufacturers().to_vec();
+            for m in mfrs {
+                ui.selectable_value(&mut share.manufacturer, m.clone(), m);
+            }
+        });
 }
 
 fn banners(ui: &mut egui::Ui, share: &Share) {
     if let Some(err) = &share.error {
         ui.add_space(4.0);
-        ui.label(RichText::new(format!("{}  {}", theme::icon::WARNING, err)).color(theme::CONFLICT).small());
+        ui.label(
+            RichText::new(format!("{}  {}", theme::icon::WARNING, err))
+                .color(theme::CONFLICT)
+                .small(),
+        );
     }
 }
 
@@ -234,69 +276,94 @@ fn catalogue(ui: &mut egui::Ui, share: &Share, add_clicks: &mut Vec<i64>, accent
         return;
     }
 
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, filtered.len(), |ui, range| {
-        for di in range {
-            let i = filtered[di];
-            let Some(e) = share.list.get(i) else { continue };
-            let status = share.status(i);
-            let row = ui.horizontal(|ui| {
-                ui.set_height(ROW_H - 6.0);
-                // status glyph
-                let (glyph, color) = match status {
-                    RowStatus::Cached => (theme::icon::CACHED, theme::OK),
-                    RowStatus::Update => (theme::icon::CLOUD, theme::WARN),
-                    RowStatus::Downloading => (theme::icon::DOWNLOAD, accent),
-                    RowStatus::Cloud => (theme::icon::CLOUD, ui.visuals().weak_text_color()),
-                };
-                ui.label(RichText::new(glyph).color(color));
-                ui.add_space(2.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, ROW_H, filtered.len(), |ui, range| {
+            for di in range {
+                let i = filtered[di];
+                let Some(e) = share.list.get(i) else { continue };
+                let status = share.status(i);
+                let row = ui.horizontal(|ui| {
+                    ui.set_height(ROW_H - 6.0);
+                    // status glyph
+                    let (glyph, color) = match status {
+                        RowStatus::Cached => (theme::icon::CACHED, theme::OK),
+                        RowStatus::Update => (theme::icon::CLOUD, theme::WARN),
+                        RowStatus::Downloading => (theme::icon::DOWNLOAD, accent),
+                        RowStatus::Cloud => (theme::icon::CLOUD, ui.visuals().weak_text_color()),
+                    };
+                    ui.label(RichText::new(glyph).color(color));
+                    ui.add_space(2.0);
 
-                ui.vertical(|ui| {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(&e.fixture).strong());
-                    let modes = e.modes.len();
-                    let rev = if e.revision.is_empty() { "—".to_string() } else { e.revision.clone() };
-                    ui.label(
-                        RichText::new(format!(
-                            "{}   ·   rev {}   ·   {} mode{}   ·   {}",
-                            e.manufacturer,
-                            rev,
-                            modes,
-                            if modes == 1 { "" } else { "s" },
-                            human_size(e.filesize),
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                });
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&e.fixture).strong());
+                        let modes = e.modes.len();
+                        let rev = if e.revision.is_empty() {
+                            "—".to_string()
+                        } else {
+                            e.revision.clone()
+                        };
+                        ui.label(
+                            RichText::new(format!(
+                                "{}   ·   rev {}   ·   {} mode{}   ·   {}",
+                                e.manufacturer,
+                                rev,
+                                modes,
+                                if modes == 1 { "" } else { "s" },
+                                human_size(e.filesize),
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    });
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    row_action(ui, share, e.rid, status, add_clicks, accent);
-                    if e.rating > 0.0 {
-                        ui.label(RichText::new(format!("{} {:.1}", theme::icon::STAR, e.rating)).small().weak());
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        row_action(ui, share, e.rid, status, add_clicks, accent);
+                        if e.rating > 0.0 {
+                            ui.label(
+                                RichText::new(format!("{} {:.1}", theme::icon::STAR, e.rating))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    });
                 });
-            });
-            row.response.on_hover_ui(|ui| detail_tooltip(ui, e));
-            ui.separator();
-        }
-    });
+                row.response.on_hover_ui(|ui| detail_tooltip(ui, e));
+                ui.separator();
+            }
+        });
 }
 
 /// Rich hover detail for a catalogue row (version, author, dates, mode list).
 fn detail_tooltip(ui: &mut egui::Ui, e: &ListEntry) {
     ui.set_max_width(280.0);
     ui.label(RichText::new(&e.fixture).strong());
-    let ver = if e.version.is_empty() { "?" } else { e.version.as_str() };
+    let ver = if e.version.is_empty() {
+        "?"
+    } else {
+        e.version.as_str()
+    };
     ui.label(RichText::new(format!("{} · GDTF spec {}", e.manufacturer, ver)).small());
-    let by: Vec<&str> = [e.uploader.as_str(), e.creator.as_str()].into_iter().filter(|s| !s.is_empty()).collect();
+    let by: Vec<&str> = [e.uploader.as_str(), e.creator.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
     if !by.is_empty() {
-        ui.label(RichText::new(format!("by {}", by.join(" · "))).small().weak());
+        ui.label(
+            RichText::new(format!("by {}", by.join(" · ")))
+                .small()
+                .weak(),
+        );
     }
     ui.label(
-        RichText::new(format!("added {}   ·   updated {}", unix_to_date(e.creation_date), unix_to_date(e.last_modified)))
-            .small()
-            .weak(),
+        RichText::new(format!(
+            "added {}   ·   updated {}",
+            unix_to_date(e.creation_date),
+            unix_to_date(e.last_modified)
+        ))
+        .small()
+        .weak(),
     );
     if !e.modes.is_empty() {
         ui.separator();
@@ -387,7 +454,12 @@ fn resolve_pending(share: &mut Share, library: &mut Library) {
     if share.pending_add.is_empty() {
         return;
     }
-    let ready: Vec<i64> = share.pending_add.iter().copied().filter(|rid| share.downloaded.contains(rid)).collect();
+    let ready: Vec<i64> = share
+        .pending_add
+        .iter()
+        .copied()
+        .filter(|rid| share.downloaded.contains(rid))
+        .collect();
     let failed: Vec<i64> = share
         .pending_add
         .iter()

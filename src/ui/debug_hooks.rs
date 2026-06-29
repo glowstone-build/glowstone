@@ -91,10 +91,20 @@ impl Ui {
                     .take(n)
                     .collect()
             }
-            None => scene.fixtures.iter().enumerate().filter(|(_, f)| f.is_gdtf()).map(|(i, _)| i).take(n).collect(),
+            None => scene
+                .fixtures
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.is_gdtf())
+                .map(|(i, _)| i)
+                .take(n)
+                .collect(),
         };
         if !pick.is_empty() {
-            self.selection = Selection { fixtures: pick, ..Default::default() };
+            self.selection = Selection {
+                fixtures: pick,
+                ..Default::default()
+            };
         }
     }
 }

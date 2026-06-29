@@ -18,11 +18,16 @@ impl Inspect for Environment {
         p.group("Transform", icon::INSPECTOR, true, |p| {
             p.vec3("Center", &mut self.center).speed(0.1);
             // Size keeps its W/H/D prefixes + range, stacked the same way.
-            p.vec3("Size", &mut self.size).prefixes(["W", "H", "D"]).range(0.1..=500.0).speed(0.1);
+            p.vec3("Size", &mut self.size)
+                .prefixes(["W", "H", "D"])
+                .range(0.1..=500.0)
+                .speed(0.1);
         });
 
         p.group("Volume", icon::ENVIRONMENT, true, |p| {
-            p.f32("Density", &mut self.density).speed(0.005).range(0.0..=4.0);
+            p.f32("Density", &mut self.density)
+                .speed(0.005)
+                .range(0.0..=4.0);
             p.color("Tint", &mut self.color, Some(D_COLOR));
             p.advanced("volume", |p| {
                 p.f32("Anisotropy", &mut self.anisotropy)

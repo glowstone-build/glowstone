@@ -30,7 +30,7 @@
 
 use std::time::Duration;
 
-use crate::gdtf::{component_attr, ChannelFunction, DmxChannel, DmxMode, GdtfFixture, WheelRole};
+use crate::gdtf::{ChannelFunction, DmxChannel, DmxMode, GdtfFixture, WheelRole, component_attr};
 use crate::scene::Fixture;
 
 use super::patch::{PatchTable, SYNTH};
@@ -60,14 +60,18 @@ pub fn apply(
         if !p.enabled || !snap.is_live(p.universe, stale) {
             continue;
         }
-        let Some(buf) = snap.get(p.universe) else { continue };
+        let Some(buf) = snap.get(p.universe) else {
+            continue;
+        };
         let (address, mode_index) = (p.address, p.mode_index);
 
         // Cloning the Arc is a pointer copy; it detaches the GDTF borrow from the
         // `&mut fixture` we write into.
         match fixture.gdtf.clone() {
             Some(gdtf) => {
-                let Some(mode) = gdtf.modes.get(mode_index) else { continue };
+                let Some(mode) = gdtf.modes.get(mode_index) else {
+                    continue;
+                };
                 fixture.optics.ensure_wheels(mode.components.len());
                 dump_footprint(&fixture.name, p.universe, address, mode.footprint, buf);
                 decode_gdtf(fixture, &gdtf, mode_index, mode, buf, address);
@@ -161,7 +165,9 @@ fn decode_gdtf(
         let v01 = if rc.offsets.is_empty() {
             ch.default
         } else {
-            let Some(first) = rc.offsets.iter().copied().min() else { continue };
+            let Some(first) = rc.offsets.iter().copied().min() else {
+                continue;
+            };
             let start = address + (first as u16).saturating_sub(1);
             match read_chan(buf, start, ch.resolution) {
                 Some(v) => v,
@@ -171,12 +177,12 @@ fn decode_gdtf(
 
         // Wheel components (any number of gobo/prism/color/animation/frost
         // wheels) route by attribute into the mode-aligned control list.
-        if let Some((kind, number, role)) = component_attr(&ch.attribute) {
-            if let Some(ci) = mode.component_index(kind, number) {
-                let slots = mode.components.get(ci).map(|c| c.slots).unwrap_or(0);
-                apply_wheel(fixture, ci, role, ch, v01, slots);
-                continue;
-            }
+        if let Some((kind, number, role)) = component_attr(&ch.attribute)
+            && let Some(ci) = mode.component_index(kind, number)
+        {
+            let slots = mode.components.get(ci).map(|c| c.slots).unwrap_or(0);
+            apply_wheel(fixture, ci, role, ch, v01, slots);
+            continue;
         }
 
         // Cell color/level layers (per-pixel, zone, or fixture-wide).
@@ -189,8 +195,8 @@ fn decode_gdtf(
             "ColorAdd_L" | "ColorAdd_Lime" | "ColorAdd_G_Y" => Some(5),
             _ => None,
         };
-        let is_layer_attr = cell_slot.is_some()
-            || matches!(ch.attribute.as_str(), "Dimmer" | "Shutter1");
+        let is_layer_attr =
+            cell_slot.is_some() || matches!(ch.attribute.as_str(), "Dimmer" | "Shutter1");
         if n_cells > 0 && is_layer_attr {
             let g = rc.group as usize;
             if groups.len() <= g {
@@ -235,7 +241,11 @@ fn decode_gdtf(
             } else {
                 tilt_deg(gdtf, mode_index, v01)
             };
-            let arr = if pan { &mut fixture.cell_pan } else { &mut fixture.cell_tilt };
+            let arr = if pan {
+                &mut fixture.cell_pan
+            } else {
+                &mut fixture.cell_tilt
+            };
             if arr.len() < n_cells {
                 arr.resize(n_cells, 0.0);
             }
@@ -275,8 +285,9 @@ fn decode_gdtf(
     // a colour layer covering a strict subset of cells, e.g. the Spiider's
     // Lens1/2/3). Used to tell a pixel fixture (master 0 == blackout) apart from
     // a layered wash whose heads are lit by FULL-coverage layers only.
-    let has_per_cell_color =
-        groups.iter().any(|g| has_color(g) && !g.cells.is_empty() && g.cells.len() < n_cells);
+    let has_per_cell_color = groups
+        .iter()
+        .any(|g| has_color(g) && !g.cells.is_empty() && g.cells.len() < n_cells);
     // Whether a FULL-COVERAGE colour layer exists — a colour group covering every
     // cell (empty `cells` is the authoring shorthand for "all", as is `>= n_cells`).
     // This is the layer that actually CARRIES the head level in a layered wash
@@ -284,8 +295,9 @@ fn decode_gdtf(
     // wash bar gated purely by one master Dimmer (e.g. ROXX Cluster "1CH DWE",
     // four lamps + one Dimmer, no colour) — has NONE, so its master 0 must stay a
     // real blackout and is NOT overridden below.
-    let has_full_coverage_color =
-        groups.iter().any(|g| has_color(g) && (g.cells.is_empty() || g.cells.len() >= n_cells));
+    let has_full_coverage_color = groups
+        .iter()
+        .any(|g| has_color(g) && (g.cells.is_empty() || g.cells.len() >= n_cells));
 
     // Master = dimmer/shutter-only group covering every cell. The LAST such
     // group in channel order wins (Robe puts the master after zone dimmers);
@@ -311,7 +323,8 @@ fn decode_gdtf(
     // black even at RGB 100%. (Fixtures WITH a master dimmer set it above.)
     if !master_dimmer {
         fixture.optics.dimmer = 1.0;
-    } else if n_cells > 1 && has_full_coverage_color && !has_per_cell_color && master_level <= 1e-4 {
+    } else if n_cells > 1 && has_full_coverage_color && !has_per_cell_color && master_level <= 1e-4
+    {
         // Layered wash whose heads are lit by a fixture-wide full-coverage colour
         // layer (e.g. the Volero Wave "Advanced" mode: the eight heads take their
         // colour from the BG/SHP wash, while a SEPARATE 16-bit "Grand" master sits
@@ -355,8 +368,16 @@ fn decode_gdtf(
         );
         let rgb = [folded[0] * scale, folded[1] * scale, folded[2] * scale];
         let content = rgb.iter().any(|&v| v > 1e-4);
-        let cov = if g.cells.is_empty() { n_cells } else { g.cells.len() };
-        let targets = if g.cells.is_empty() { &all_cells } else { &g.cells };
+        let cov = if g.cells.is_empty() {
+            n_cells
+        } else {
+            g.cells.len()
+        };
+        let targets = if g.cells.is_empty() {
+            &all_cells
+        } else {
+            &g.cells
+        };
         for &c in targets {
             let c = c as usize;
             if c >= n_cells {
@@ -400,12 +421,12 @@ fn decode_gdtf(
                 continue;
             }
             if covered[c] {
-                for k in 0..3 {
-                    cells[c][k] *= scale;
+                for cell in cells[c].iter_mut().take(3) {
+                    *cell *= scale;
                 }
             } else {
-                for k in 0..3 {
-                    cells[c][k] = white[k] * scale;
+                for (cell, white) in cells[c].iter_mut().zip(white).take(3) {
+                    *cell = white * scale;
                 }
                 covered[c] = true;
             }
@@ -435,17 +456,24 @@ fn decode_gdtf(
 /// Route one wheel-component channel value into the dynamic control list.
 /// `Value` roles get the rotation-subrange treatment: a value landing in a
 /// continuous-rotation channel function drives the spin instead of the select.
-fn apply_wheel(fixture: &mut Fixture, ci: usize, role: WheelRole, ch: &DmxChannel, v01: f32, slots: u32) {
+fn apply_wheel(
+    fixture: &mut Fixture,
+    ci: usize,
+    role: WheelRole,
+    ch: &DmxChannel,
+    v01: f32,
+    slots: u32,
+) {
     let Some(ctl) = fixture.optics.wheels.get_mut(ci) else {
         return;
     };
     // A "shake" channel-function sub-range oscillates the indexed element. It can
     // appear on any of the component's channels; handle it before the role.
-    if let Some((idx, f)) = active_function(ch, v01) {
-        if is_shake(f) {
-            ctl.shake = subrange_t(ch, idx, v01).max(0.1);
-            return;
-        }
+    if let Some((idx, f)) = active_function(ch, v01)
+        && is_shake(f)
+    {
+        ctl.shake = subrange_t(ch, idx, v01).max(0.1);
+        return;
     }
     match role {
         WheelRole::Value => {
@@ -460,7 +488,11 @@ fn apply_wheel(fixture: &mut Fixture, ci: usize, role: WheelRole, ch: &DmxChanne
                 // the profile slot. Rotation/shake sub-ranges were handled above.
                 if slots >= 1 {
                     let slot = select_slot(f, ch, idx, v01, slots);
-                    ctl.value = if slots > 1 { slot as f32 / (slots as f32 - 1.0) } else { 0.0 };
+                    ctl.value = if slots > 1 {
+                        slot as f32 / (slots as f32 - 1.0)
+                    } else {
+                        0.0
+                    };
                     return;
                 }
             }
@@ -597,7 +629,9 @@ fn apply_shutter(fixture: &mut Fixture, ch: &DmxChannel, v01: f32) {
 /// Decode the synthetic Dimmer/RGB/Pan16/Tilt16 map for a plain fixture.
 fn apply_synthetic(fixture: &mut Fixture, buf: &[u8; 512], address: u16) {
     for &(attr, off, width) in SYNTH {
-        let Some(v01) = read_chan(buf, address + off, width) else { continue };
+        let Some(v01) = read_chan(buf, address + off, width) else {
+            continue;
+        };
         match attr {
             "Dimmer" => fixture.optics.dimmer = v01,
             "ColorAdd_R" => fixture.color[0] = v01,
@@ -682,6 +716,7 @@ pub fn apply_screens(screens: &mut [crate::scene::LedScreen], snap: &UniverseSna
     use crate::scene::screen::{ScreenContent, ScreenFrame};
     for s in screens.iter_mut() {
         let ScreenContent::PixelMapDmx(pm) = &s.content else {
+            s.frame = None;
             continue;
         };
         // Clamp the grid so a crafted .glow / MVR file can't force a huge
@@ -714,8 +749,17 @@ pub fn apply_screens(screens: &mut [crate::scene::LedScreen], snap: &UniverseSna
         {
             continue;
         }
-        let generation = s.frame.as_ref().map(|f| f.generation.wrapping_add(1)).unwrap_or(1);
-        s.frame = Some(std::sync::Arc::new(ScreenFrame { width: cols, height: rows, rgba, generation }));
+        let generation = s
+            .frame
+            .as_ref()
+            .map(|f| f.generation.wrapping_add(1))
+            .unwrap_or(1);
+        s.frame = Some(std::sync::Arc::new(ScreenFrame {
+            width: cols,
+            height: rows,
+            rgba,
+            generation,
+        }));
     }
 }
 
@@ -742,7 +786,8 @@ pub fn apply_pyro(pyro: &mut [crate::scene::PyroDevice], snap: &UniverseSnapshot
             continue;
         }
         d.driven = true;
-        let read = |off: u16| -> u8 { snap.level(patch.universe, patch.address + off).unwrap_or(0) };
+        let read =
+            |off: u16| -> u8 { snap.level(patch.universe, patch.address + off).unwrap_or(0) };
         let unit = |v: u8| v as f32 / 255.0;
 
         match d.kind {
@@ -769,7 +814,11 @@ pub fn apply_pyro(pyro: &mut [crate::scene::PyroDevice], snap: &UniverseSnapshot
                 let spark = read(1);
                 let height = read(2);
                 d.armed = (50..=200).contains(&safety);
-                d.fire = if d.armed && spark >= 10 { unit(spark) } else { 0.0 };
+                d.fire = if d.armed && spark >= 10 {
+                    unit(spark)
+                } else {
+                    0.0
+                };
                 // Height channel → 1.5..6 m (the device's working apex).
                 d.height_m = 1.5 + unit(height) * (6.0 - 1.5);
                 if d.mode == PyroMode::Rich {
@@ -806,8 +855,8 @@ mod tests {
 
     #[test]
     fn pixelmap_screen_reads_rgb_grid_from_dmx() {
-        use crate::scene::screen::{LedScreen, PixelMap, ScreenContent};
         use crate::scene::ScreenProfile;
+        use crate::scene::screen::{LedScreen, PixelMap, ScreenContent};
         // 2×1 grid in universe 1 from address 1: cell0 RGB = ch1..3, cell1 = ch4..6.
         let mut levels = [0u8; 512];
         levels[0] = 255; // cell0 R
@@ -823,8 +872,12 @@ mod tests {
             default_nits: 1200.0,
         };
         let mut screen = LedScreen::from_profile(&prof, "W", Mat4::IDENTITY);
-        screen.content =
-            ScreenContent::PixelMapDmx(PixelMap { cols: 2, rows: 1, universe: 1, start_address: 1 });
+        screen.content = ScreenContent::PixelMapDmx(PixelMap {
+            cols: 2,
+            rows: 1,
+            universe: 1,
+            start_address: 1,
+        });
         let mut screens = vec![screen];
         apply_screens(&mut screens, &snap);
         let f = screens[0].frame.as_ref().expect("frame produced");
@@ -841,7 +894,11 @@ mod tests {
         let mut snap = UniverseSnapshot::default();
         snap.frames.insert(
             universe,
-            UniverseFrame { levels, sources: 1, last_update: std::time::Instant::now() },
+            UniverseFrame {
+                levels,
+                sources: 1,
+                last_update: std::time::Instant::now(),
+            },
         );
         snap
     }
@@ -860,7 +917,14 @@ mod tests {
         let mut t = PatchTable::new();
         t.sync(&scene);
         let p = t.get_mut(0).unwrap();
-        *p = Patch { universe, address, footprint, mode_index, enabled: true, source: PatchSource::Manual };
+        *p = Patch {
+            universe,
+            address,
+            footprint,
+            mode_index,
+            enabled: true,
+            source: PatchSource::Manual,
+        };
         t
     }
 
@@ -879,7 +943,13 @@ mod tests {
         let patch = one_patch(1, 1, 8, 0);
         let mut fixtures = vec![plain_fixture()];
         let mut live = Vec::new();
-        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap,
+            &mut live,
+            Duration::from_secs(2),
+        );
 
         let f = &fixtures[0];
         // Synthetic Dimmer drives the fixture dimmer (level), not the master.
@@ -899,7 +969,13 @@ mod tests {
         let patch = one_patch(1, 1, 8, 0);
         let mut fixtures = vec![plain_fixture()];
         let mut live = Vec::new();
-        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap,
+            &mut live,
+            Duration::from_secs(2),
+        );
         // -270 + 540 * ~0.5 ~= ~0.
         assert!(fixtures[0].pan.abs() < 0.1, "pan {}", fixtures[0].pan);
     }
@@ -909,11 +985,30 @@ mod tests {
         let snap = snapshot_with(1, [255; 512]);
         let patch = one_patch(2, 1, 8, 0); // patched to universe 2 (not present)
         let mut fixtures = vec![plain_fixture()];
-        let before = (fixtures[0].pan, fixtures[0].tilt, fixtures[0].intensity, fixtures[0].color);
+        let before = (
+            fixtures[0].pan,
+            fixtures[0].tilt,
+            fixtures[0].intensity,
+            fixtures[0].color,
+        );
         let mut live = Vec::new();
-        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
-        let after = (fixtures[0].pan, fixtures[0].tilt, fixtures[0].intensity, fixtures[0].color);
-        assert_eq!(before, after, "stale/absent universe must not move the fixture");
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap,
+            &mut live,
+            Duration::from_secs(2),
+        );
+        let after = (
+            fixtures[0].pan,
+            fixtures[0].tilt,
+            fixtures[0].intensity,
+            fixtures[0].color,
+        );
+        assert_eq!(
+            before, after,
+            "stale/absent universe must not move the fixture"
+        );
         assert_eq!(live, vec![false]);
     }
 
@@ -931,7 +1026,12 @@ mod tests {
         }
     }
 
-    fn chan(attr: &str, offset: u32, resolution: u8, functions: Vec<ChannelFunction>) -> DmxChannel {
+    fn chan(
+        attr: &str,
+        offset: u32,
+        resolution: u8,
+        functions: Vec<ChannelFunction>,
+    ) -> DmxChannel {
         let offsets: Vec<u32> = (0..resolution as u32).map(|k| offset + k).collect();
         DmxChannel {
             geometry: String::new(),
@@ -939,7 +1039,10 @@ mod tests {
             dmx_break: Some(1),
             default: 0.0,
             attribute: attr.to_string(),
-            function: functions.first().map(|f| f.name.clone()).unwrap_or_default(),
+            function: functions
+                .first()
+                .map(|f| f.name.clone())
+                .unwrap_or_default(),
             sets: Vec::new(),
             resolution,
             functions,
@@ -953,10 +1056,22 @@ mod tests {
         // (WheelSlotIndex is 1-based; 1 = first/open slot).
         let mut f = cf("Gobo1", "Select", 0.0, 0.0, 1.0);
         f.sets = vec![
-            ChannelSet { dmx_from: 0.0, slot: 1 },  // → slot 0 (open)
-            ChannelSet { dmx_from: 0.25, slot: 2 }, // → slot 1
-            ChannelSet { dmx_from: 0.5, slot: 3 },  // → slot 2
-            ChannelSet { dmx_from: 0.75, slot: 4 }, // → slot 3
+            ChannelSet {
+                dmx_from: 0.0,
+                slot: 1,
+            }, // → slot 0 (open)
+            ChannelSet {
+                dmx_from: 0.25,
+                slot: 2,
+            }, // → slot 1
+            ChannelSet {
+                dmx_from: 0.5,
+                slot: 3,
+            }, // → slot 2
+            ChannelSet {
+                dmx_from: 0.75,
+                slot: 4,
+            }, // → slot 3
         ];
         let ch = chan("Gobo1", 1, 1, vec![f]);
         assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.10, 4), 0);
@@ -974,7 +1089,10 @@ mod tests {
             "Gobo1",
             1,
             1,
-            vec![cf("Gobo1", "Select", 0.0, 0.0, 1.0), cf("Gobo1PosRotate", "Rotate CW", 0.5, 0.0, 1.0)],
+            vec![
+                cf("Gobo1", "Select", 0.0, 0.0, 1.0),
+                cf("Gobo1PosRotate", "Rotate CW", 0.5, 0.0, 1.0),
+            ],
         );
         assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.0, 5), 0); // t=0
         assert_eq!(select_slot(&ch.functions[0], &ch, 0, 0.25, 5), 2); // t=0.5 → round(0.5·4)
@@ -988,7 +1106,12 @@ mod tests {
         let channels = vec![
             chan("Pan", 1, 1, vec![cf("Pan", "Pan", 0.0, -270.0, 270.0)]),
             chan("Tilt", 2, 1, vec![cf("Tilt", "Tilt", 0.0, -135.0, 135.0)]),
-            chan("Dimmer", 3, 1, vec![cf("Dimmer", "Dimmer", 0.0, 0.0, 100.0)]),
+            chan(
+                "Dimmer",
+                3,
+                1,
+                vec![cf("Dimmer", "Dimmer", 0.0, 0.0, 100.0)],
+            ),
             chan(
                 "Shutter1",
                 4,
@@ -999,7 +1122,12 @@ mod tests {
                     cf("Shutter1Strobe", "Strobe", 16.0 / 256.0, 1.0, 25.0),
                 ],
             ),
-            chan("ColorSub_C", 5, 1, vec![cf("ColorSub_C", "Cyan", 0.0, 0.0, 1.0)]),
+            chan(
+                "ColorSub_C",
+                5,
+                1,
+                vec![cf("ColorSub_C", "Cyan", 0.0, 0.0, 1.0)],
+            ),
         ];
         let geometry = Geometry {
             name: "Base".into(),
@@ -1064,14 +1192,24 @@ mod tests {
         let patch = one_patch(1, 1, 5, 0);
         let mut fixtures = vec![gdtf_fixture()];
         let mut live = Vec::new();
-        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap,
+            &mut live,
+            Duration::from_secs(2),
+        );
 
         let f = &fixtures[0];
         assert!((f.pan - 270.0).abs() < 1e-3, "pan {}", f.pan);
         assert!((f.optics.dimmer - 128.0 / 255.0).abs() < 1e-4);
         assert!((f.optics.cmy[0] - 1.0).abs() < 1e-4);
         assert!((f.optics.shutter - 1.0).abs() < 1e-4, "open during strobe");
-        assert!(f.optics.strobe > 0.0, "strobe engaged, got {}", f.optics.strobe);
+        assert!(
+            f.optics.strobe > 0.0,
+            "strobe engaged, got {}",
+            f.optics.strobe
+        );
         assert_eq!(live, vec![true]);
     }
 
@@ -1081,7 +1219,13 @@ mod tests {
         let patch = one_patch(1, 1, 5, 0);
         let mut fixtures = vec![gdtf_fixture()];
         let mut live = Vec::new();
-        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap,
+            &mut live,
+            Duration::from_secs(2),
+        );
         assert_eq!(fixtures[0].optics.shutter, 0.0, "byte 0 closes the shutter");
         assert_eq!(fixtures[0].optics.strobe, 0.0);
     }
@@ -1153,16 +1297,29 @@ mod tests {
         };
         let mut fixtures = vec![fixture];
         let mut live = Vec::new();
-        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap,
+            &mut live,
+            Duration::from_secs(2),
+        );
         assert_eq!(live, vec![true]);
 
         let f = &fixtures[0];
-        assert!((f.optics.dimmer - 1.0).abs() < 1e-3, "master dimmer up, got {}", f.optics.dimmer);
+        assert!(
+            (f.optics.dimmer - 1.0).abs() < 1e-3,
+            "master dimmer up, got {}",
+            f.optics.dimmer
+        );
         assert!(f.optics.shutter > 0.5, "shutter open");
 
         // Cell order: P1 Zone1, P2..P7 Zone2, P8..P19 Zone3, then the flower.
         let c0 = f.cells[0];
-        assert!(c0[0] > 0.95 && c0[1] < 0.05 && c0[2] < 0.05, "pixel 1 red: {c0:?}");
+        assert!(
+            c0[0] > 0.95 && c0[1] < 0.05 && c0[2] < 0.05,
+            "pixel 1 red: {c0:?}"
+        );
         let c18 = f.cells[18];
         assert!(c18[2] > 0.95 && c18[0] < 0.05, "pixel 19 blue: {c18:?}");
         // All other pixels dark (background layer at 0).
@@ -1179,12 +1336,24 @@ mod tests {
         levels2[16] = 96; // bg shutter (17) open — closed by default, like the real head
         levels2[17] = 0xFF; // bg dimmer (18,19) coarse
         let snap2 = snapshot_with(1, levels2);
-        apply(&mut fixtures, &patch, &snap2, &mut live, Duration::from_secs(2));
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap2,
+            &mut live,
+            Duration::from_secs(2),
+        );
         let f = &fixtures[0];
         let c5 = f.cells[5];
-        assert!(c5[0] > 0.95 && (c5[1] - 0.5).abs() < 0.05, "bg layer on idle pixel: {c5:?}");
+        assert!(
+            c5[0] > 0.95 && (c5[1] - 0.5).abs() < 0.05,
+            "bg layer on idle pixel: {c5:?}"
+        );
         let c0 = f.cells[0];
-        assert!(c0[0] > 0.95 && c0[1] < 0.05 && c0[2] < 0.05, "driven red pixel overrides the global: {c0:?}");
+        assert!(
+            c0[0] > 0.95 && c0[1] < 0.05 && c0[2] < 0.05,
+            "driven red pixel overrides the global: {c0:?}"
+        );
 
         eprintln!("Spiider per-cell decode OK: {:?}…", &f.cells[..3]);
     }
@@ -1207,7 +1376,11 @@ mod tests {
             eprintln!("skip: volero gdtf not found");
             return;
         };
-        let adv = g.modes.iter().position(|m| m.name == "Advanced").expect("advanced");
+        let adv = g
+            .modes
+            .iter()
+            .position(|m| m.name == "Advanced")
+            .expect("advanced");
         assert_eq!(g.modes[adv].emitters.len(), 8, "eight heads");
         let fp = g.modes[adv].footprint as u16;
         assert_eq!(fp, 37, "37-channel mode");
@@ -1232,43 +1405,85 @@ mod tests {
         // --- Per-head tilt: drive each head's Tilt channel (offsets 30..37) to a
         // distinct value; each head must aim independently. ---
         let mut a = [0u8; 512];
-        for b in 0..4 { a[b] = 255; } // BG RGBW
-        a[5] = 105; a[6] = 255;       // BG shutter open + dimmer
-        a[7] = 105; a[8] = 255; a[9] = 255; // Base shutter + grand dimmer (16-bit)
-        for h in 0..8 { a[29 + h] = (h as u8) * 30; } // per-head tilts (offsets 30..37)
+        for value in a.iter_mut().take(4) {
+            *value = 255;
+        } // BG RGBW
+        a[5] = 105;
+        a[6] = 255; // BG shutter open + dimmer
+        a[7] = 105;
+        a[8] = 255;
+        a[9] = 255; // Base shutter + grand dimmer (16-bit)
+        for h in 0..8 {
+            a[29 + h] = (h as u8) * 30;
+        } // per-head tilts (offsets 30..37)
         let fa = run(a);
         assert_eq!(fa.cell_tilt.len(), 8, "one tilt per head");
         let distinct_tilts: std::collections::HashSet<i32> =
             fa.cell_tilt.iter().map(|t| t.round() as i32).collect();
-        assert_eq!(distinct_tilts.len(), 8, "eight distinct head tilts: {:?}", fa.cell_tilt);
-        assert!((fa.tilt).abs() < 1e-3, "the bar BODY does not tilt (only heads do): {}", fa.tilt);
+        assert_eq!(
+            distinct_tilts.len(),
+            8,
+            "eight distinct head tilts: {:?}",
+            fa.cell_tilt
+        );
+        assert!(
+            (fa.tilt).abs() < 1e-3,
+            "the bar BODY does not tilt (only heads do): {}",
+            fa.tilt
+        );
 
         // `assemble` must turn the per-head tilts into eight distinct beam aims.
         let root = glam::Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
         let asm = crate::renderer::fixture_model::assemble(
-            fa.gdtf.as_ref().unwrap(), adv, root, fa.pan_actual, fa.tilt_actual, &fa.cell_pan, &fa.cell_tilt,
+            fa.gdtf.as_ref().unwrap(),
+            adv,
+            root,
+            fa.pan_actual,
+            fa.tilt_actual,
+            &fa.cell_pan,
+            &fa.cell_tilt,
         );
         let dirs: Vec<Vec3> = asm.beams.iter().map(|b| b.dir).collect();
         assert_eq!(dirs.len(), 8, "eight emitter frames");
         let distinct_dirs = dirs.windows(2).filter(|w| w[0].dot(w[1]) < 0.999).count();
-        assert_eq!(distinct_dirs, 7, "every adjacent head aims differently: {dirs:?}");
+        assert_eq!(
+            distinct_dirs, 7,
+            "every adjacent head aims differently: {dirs:?}"
+        );
 
         // --- Layered dimmer: BG wash driven, Base "Grand" master parked at 0.
         // The heads must light (the bug was dimmer→0 gating them to black). ---
         let mut b = [0u8; 512];
-        for k in 0..4 { b[k] = 255; }
-        b[5] = 105; b[6] = 255; // BG shutter + dimmer up
-        b[7] = 105;             // Base shutter open, Base GRAND dimmer left at 0
+        for value in b.iter_mut().take(4) {
+            *value = 255;
+        }
+        b[5] = 105;
+        b[6] = 255; // BG shutter + dimmer up
+        b[7] = 105; // Base shutter open, Base GRAND dimmer left at 0
         let fb = run(b);
-        assert!(fb.optics.dimmer > 0.5, "parked grand master must not gate lit heads: {}", fb.optics.dimmer);
-        assert!(lit(fb.cells[0]) && lit(fb.cells[7]), "heads lit from the BG wash: {:?}", &fb.cells[..]);
+        assert!(
+            fb.optics.dimmer > 0.5,
+            "parked grand master must not gate lit heads: {}",
+            fb.optics.dimmer
+        );
+        assert!(
+            lit(fb.cells[0]) && lit(fb.cells[7]),
+            "heads lit from the BG wash: {:?}",
+            &fb.cells[..]
+        );
 
         // --- No colour layer driven (only the grand master up): heads stay dark.
         // The grand master alone can't conjure colour — correct blackout. ---
         let mut c = [0u8; 512];
-        c[7] = 105; c[8] = 255; c[9] = 255; // Base shutter + grand dimmer, BG/SHP = 0
+        c[7] = 105;
+        c[8] = 255;
+        c[9] = 255; // Base shutter + grand dimmer, BG/SHP = 0
         let fc = run(c);
-        assert!(!lit(fc.cells[0]), "no wash colour driven → heads dark: {:?}", fc.cells[0]);
+        assert!(
+            !lit(fc.cells[0]),
+            "no wash colour driven → heads dark: {:?}",
+            fc.cells[0]
+        );
     }
 
     /// A colour-LESS multi-emitter fixture — the ROXX Cluster B4-FC blinder in
@@ -1283,7 +1498,11 @@ mod tests {
             eprintln!("skip: Basic Festival MVR not found");
             return;
         };
-        let mi = gdtf.modes.iter().position(|m| m.name == "1CH DWE").expect("1CH DWE mode");
+        let mi = gdtf
+            .modes
+            .iter()
+            .position(|m| m.name == "1CH DWE")
+            .expect("1CH DWE mode");
         assert!(gdtf.modes[mi].emitters.len() > 1, "multi-emitter blinder");
         let fp = gdtf.modes[mi].footprint as u16;
         let garc = Arc::new(gdtf);
@@ -1304,23 +1523,47 @@ mod tests {
         };
         // Master parked at 0 must stay a real blackout (the regression: the
         // layered-dimmer fix forced it to 1.0 and the blinder blasted white).
-        assert!(dimmer_at(0) < 1e-3, "colourless blinder at master 0 must be dark, got {}", dimmer_at(0));
+        assert!(
+            dimmer_at(0) < 1e-3,
+            "colourless blinder at master 0 must be dark, got {}",
+            dimmer_at(0)
+        );
         // And it must track the master up — no 0→full discontinuity.
-        assert!((dimmer_at(255) - 1.0).abs() < 1e-3, "master full lights it, got {}", dimmer_at(255));
-        assert!((dimmer_at(128) - 128.0 / 255.0).abs() < 1e-2, "master mid tracks linearly, got {}", dimmer_at(128));
+        assert!(
+            (dimmer_at(255) - 1.0).abs() < 1e-3,
+            "master full lights it, got {}",
+            dimmer_at(255)
+        );
+        assert!(
+            (dimmer_at(128) - 128.0 / 255.0).abs() < 1e-2,
+            "master mid tracks linearly, got {}",
+            dimmer_at(128)
+        );
     }
 
     /// Load a GDTF member from the Basic Festival MVR (repo `.context` copy first,
     /// then the user's Downloads). `None` if neither is present.
     fn load_gdtf_from_mvr(member: &str) -> Option<GdtfFixture> {
         let candidates = [
-            format!("{}/.context/attachments/05W1Dh/Basic Festival.mvr", env!("CARGO_MANIFEST_DIR")),
-            format!("{}/Downloads/Basic Festival/Basic Festival.mvr", std::env::var("HOME").unwrap_or_default()),
+            format!(
+                "{}/.context/attachments/05W1Dh/Basic Festival.mvr",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            format!(
+                "{}/Downloads/Basic Festival/Basic Festival.mvr",
+                std::env::var("HOME").unwrap_or_default()
+            ),
         ];
         for path in candidates {
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())) else { continue };
-            let Ok(mut f) = zip.by_name(member) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())) else {
+                continue;
+            };
+            let Ok(mut f) = zip.by_name(member) else {
+                continue;
+            };
             let mut buf = Vec::new();
             if std::io::Read::read_to_end(&mut f, &mut buf).is_ok()
                 && let Ok(g) = GdtfFixture::load_bytes(&buf)
@@ -1346,9 +1589,9 @@ mod tests {
         let Some(mode_i) = gdtf.modes.iter().position(|m| {
             m.emitters.len() >= 8
                 && m.channels.iter().any(|c| c.attribute == "ColorAdd_R")
-                && m.resolved.iter().any(|rc| {
-                    m.channels[rc.channel].attribute == "Dimmer" && rc.offsets.is_empty()
-                })
+                && m.resolved
+                    .iter()
+                    .any(|rc| m.channels[rc.channel].attribute == "Dimmer" && rc.offsets.is_empty())
         }) else {
             eprintln!("skip: no pixel mode with a virtual cell dimmer");
             return;
@@ -1365,14 +1608,33 @@ mod tests {
         let patch = one_patch(1, 1, fp, mode_i);
         let mut fixtures = vec![fixture];
         let mut live = Vec::new();
-        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap,
+            &mut live,
+            Duration::from_secs(2),
+        );
         assert_eq!(live, vec![true]);
 
         let f = &fixtures[0];
-        let lit = f.cells.iter().filter(|c| c.iter().all(|&v| v > 0.9)).count();
-        assert_eq!(lit, n_cells, "every cell lit white at RGB full, got {lit}/{n_cells}: {:?}", &f.cells[..n_cells.min(3)]);
+        let lit = f
+            .cells
+            .iter()
+            .filter(|c| c.iter().all(|&v| v > 0.9))
+            .count();
+        assert_eq!(
+            lit,
+            n_cells,
+            "every cell lit white at RGB full, got {lit}/{n_cells}: {:?}",
+            &f.cells[..n_cells.min(3)]
+        );
         // No master dimmer in these modes → decode drives the level to full too.
-        assert!((f.optics.dimmer - 1.0).abs() < 1e-3, "dimmer raised, got {}", f.optics.dimmer);
+        assert!(
+            (f.optics.dimmer - 1.0).abs() < 1e-3,
+            "dimmer raised, got {}",
+            f.optics.dimmer
+        );
     }
 
     /// A synthetic monochrome pixel fixture — two colourless emitters, each with
@@ -1468,16 +1730,34 @@ mod tests {
         // Master full; cell 0 at ~half, cell 1 at full. The master drives the
         // fixture dimmer; each cell carries its OWN per-pixel level as white.
         let f = run(255, 128, 255);
-        assert!((f.optics.dimmer - 1.0).abs() < 1e-3, "master → dimmer: {}", f.optics.dimmer);
+        assert!(
+            (f.optics.dimmer - 1.0).abs() < 1e-3,
+            "master → dimmer: {}",
+            f.optics.dimmer
+        );
         let (c0, c1) = (f.cells[0], f.cells[1]);
-        assert!(c1.iter().all(|&v| v > 0.6), "cell 1 lit white at full: {c1:?}");
+        assert!(
+            c1.iter().all(|&v| v > 0.6),
+            "cell 1 lit white at full: {c1:?}"
+        );
         for k in 0..3 {
-            assert!((c0[k] - 0.5 * c1[k]).abs() < 0.06, "cell 0 ≈ half cell 1 (k{k}): {c0:?} vs {c1:?}");
+            assert!(
+                (c0[k] - 0.5 * c1[k]).abs() < 0.06,
+                "cell 0 ≈ half cell 1 (k{k}): {c0:?} vs {c1:?}"
+            );
         }
         // Per-cell dimmer 0 darkens ONLY that cell.
         let f = run(255, 0, 255);
-        assert!(f.cells[0].iter().all(|&v| v < 1e-3), "cell 0 dark at its dimmer 0: {:?}", f.cells[0]);
-        assert!(f.cells[1].iter().any(|&v| v > 0.6), "cell 1 still lit: {:?}", f.cells[1]);
+        assert!(
+            f.cells[0].iter().all(|&v| v < 1e-3),
+            "cell 0 dark at its dimmer 0: {:?}",
+            f.cells[0]
+        );
+        assert!(
+            f.cells[1].iter().any(|&v| v > 0.6),
+            "cell 1 still lit: {:?}",
+            f.cells[1]
+        );
     }
 
     /// The Ayrton Zonda 9 FX "Extended Pixel 1" mode layers a fixture-wide global
@@ -1492,7 +1772,9 @@ mod tests {
         let home = std::env::var("HOME").unwrap_or_default();
         let candidates = [
             "/tmp/zonda/131796.gdtf".to_string(),
-            format!("{home}/Library/Application Support/build.glowstone.glowstone/gdtf/131796.gdtf"),
+            format!(
+                "{home}/Library/Application Support/build.glowstone.glowstone/gdtf/131796.gdtf"
+            ),
         ];
         let Some(gdtf) = candidates
             .iter()
@@ -1526,13 +1808,25 @@ mod tests {
         let patch = one_patch(1, 1, fp, mi);
         let mut fixtures = vec![fixture];
         let mut live = Vec::new();
-        apply(&mut fixtures, &patch, &snap, &mut live, Duration::from_secs(2));
+        apply(
+            &mut fixtures,
+            &patch,
+            &snap,
+            &mut live,
+            Duration::from_secs(2),
+        );
         let f = &fixtures[0];
 
         let blue = f.cells[1];
-        assert!(blue[2] > 0.5 && blue[0] < 0.3 && blue[1] < 0.3, "LED 2 reads BLUE (per-pixel overrides white global): {blue:?}");
+        assert!(
+            blue[2] > 0.5 && blue[0] < 0.3 && blue[1] < 0.3,
+            "LED 2 reads BLUE (per-pixel overrides white global): {blue:?}"
+        );
         let bg = f.cells[2];
-        assert!(bg.iter().all(|&v| v > 0.5), "undriven LED 3 shows the white global: {bg:?}");
+        assert!(
+            bg.iter().all(|&v| v > 0.5),
+            "undriven LED 3 shows the white global: {bg:?}"
+        );
         eprintln!("Zonda per-pixel OK: driven {blue:?}  background {bg:?}");
     }
 }

@@ -295,7 +295,11 @@ pub fn preferences_window(
 /// Conflicting rows (two enabled commands sharing a trigger in one context) are
 /// drawn in the conflict colour with a tooltip. Every edit mutates `overrides` and
 /// persists to `keymap.json` immediately (the edit helpers call `save()`).
-fn keymap_editor(ui: &mut egui::Ui, overrides: &mut KeymapOverrides, state: &mut KeymapEditorState) {
+fn keymap_editor(
+    ui: &mut egui::Ui,
+    overrides: &mut KeymapOverrides,
+    state: &mut KeymapEditorState,
+) {
     let pal = theme::Palette::get(ui);
     let ink = theme::ink(!ui.visuals().dark_mode);
 
@@ -367,29 +371,31 @@ fn keymap_editor(ui: &mut egui::Ui, overrides: &mut KeymapOverrides, state: &mut
     };
 
     ui.add_space(2.0);
-    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-        for cat in shortcuts::Category::ORDER {
-            let rows: Vec<&shortcuts::Command> = shortcuts::COMMANDS
-                .iter()
-                .filter(|c| c.category == cat && matches(c))
-                .collect();
-            if rows.is_empty() {
-                continue;
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .show(ui, |ui| {
+            for cat in shortcuts::Category::ORDER {
+                let rows: Vec<&shortcuts::Command> = shortcuts::COMMANDS
+                    .iter()
+                    .filter(|c| c.category == cat && matches(c))
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(cat.title()).small().strong().color(ink.muted));
+                Grid::new(("keymap-grid", cat.title()))
+                    .num_columns(3)
+                    .spacing([10.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for cmd in rows {
+                            keymap_row(ui, overrides, state, cmd, &conflicting, &pal);
+                            ui.end_row();
+                        }
+                    });
             }
-            ui.add_space(4.0);
-            ui.label(RichText::new(cat.title()).small().strong().color(ink.muted));
-            Grid::new(("keymap-grid", cat.title()))
-                .num_columns(3)
-                .spacing([10.0, 4.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    for cmd in rows {
-                        keymap_row(ui, overrides, state, cmd, &conflicting, &pal);
-                        ui.end_row();
-                    }
-                });
-        }
-    });
+        });
 }
 
 /// One command row: label · effective-shortcut chip (rebind on click) · reset +
@@ -444,7 +450,11 @@ fn keymap_row(
         resp.on_hover_text("Click, then press a key chord to rebind")
     };
     if resp.clicked() {
-        state.capturing = if capturing { None } else { Some(id.to_string()) };
+        state.capturing = if capturing {
+            None
+        } else {
+            Some(id.to_string())
+        };
     }
 
     // Col 3 — reset + disable.
@@ -469,7 +479,11 @@ fn keymap_row(
             let mut off = disabled;
             if ui
                 .toggle_value(&mut off, theme::icon::EYE_OFF)
-                .on_hover_text(if disabled { "Disabled — click to re-enable" } else { "Disable this shortcut" })
+                .on_hover_text(if disabled {
+                    "Disabled — click to re-enable"
+                } else {
+                    "Disable this shortcut"
+                })
                 .clicked()
             {
                 if off {

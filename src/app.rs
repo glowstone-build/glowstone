@@ -142,11 +142,17 @@ impl ApplicationHandler for App {
         }
 
         // Profiling: GLOWSTONE_STEPS overrides the volumetric max step budget.
-        if let Some(s) = std::env::var("GLOWSTONE_STEPS").ok().and_then(|s| s.parse().ok()) {
+        if let Some(s) = std::env::var("GLOWSTONE_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             self.state.as_mut().unwrap().ui.settings.steps = s;
         }
         // GLOWSTONE_CHROMA overrides the haze chroma read-up strength (0 = off) for A/B.
-        if let Some(c) = std::env::var("GLOWSTONE_CHROMA").ok().and_then(|s| s.parse().ok()) {
+        if let Some(c) = std::env::var("GLOWSTONE_CHROMA")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             self.state.as_mut().unwrap().ui.settings.chroma_haze = c;
         }
 
@@ -183,7 +189,10 @@ impl ApplicationHandler for App {
                     state.scene.fixtures[idx].tilt = 20.0;
                     // GLOWSTONE_OPTZOOM=<0..1> forces the optics zoom (narrow→wide) for
                     // testing narrow-beam haze rendering headlessly.
-                    if let Some(z) = std::env::var("GLOWSTONE_OPTZOOM").ok().and_then(|s| s.parse().ok()) {
+                    if let Some(z) = std::env::var("GLOWSTONE_OPTZOOM")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                    {
                         state.scene.fixtures[idx].optics.zoom = z;
                     }
                     // GLOWSTONE_GDTF_MODE=<index or name substring> selects the DMX
@@ -197,7 +206,9 @@ impl ApplicationHandler for App {
                             .filter(|&i| i < gdtf.modes.len())
                             .or_else(|| {
                                 let s = sel.to_lowercase();
-                                gdtf.modes.iter().position(|m| m.name.to_lowercase().contains(&s))
+                                gdtf.modes
+                                    .iter()
+                                    .position(|m| m.name.to_lowercase().contains(&s))
                             });
                         if let Some(mi) = mi {
                             f.mode_index = mi;
@@ -289,7 +300,9 @@ impl ApplicationHandler for App {
         if std::env::var("GLOWSTONE_LED").is_ok() {
             let state = self.state.as_mut().unwrap();
             let lib = crate::scene::Library::standard();
-            let want = std::env::var("GLOWSTONE_LED").unwrap_or_default().to_lowercase();
+            let want = std::env::var("GLOWSTONE_LED")
+                .unwrap_or_default()
+                .to_lowercase();
             let prof = lib
                 .screens
                 .iter()
@@ -303,7 +316,8 @@ impl ApplicationHandler for App {
                 s.panels_wide = 8;
                 s.panels_high = 5;
                 let h = s.size_m()[1];
-                s.transform = glam::Mat4::from_translation(glam::Vec3::new(0.0, h * 0.5 + 0.2, -4.0));
+                s.transform =
+                    glam::Mat4::from_translation(glam::Vec3::new(0.0, h * 0.5 + 0.2, -4.0));
                 if let Ok(c) = std::env::var("GLOWSTONE_LED_CONTENT") {
                     s.content = match c.to_lowercase().as_str() {
                         "bars" => ScreenContent::TestPattern(TestPattern::Bars),
@@ -331,7 +345,10 @@ impl ApplicationHandler for App {
                     }
                 }
                 // GLOWSTONE_LED_CURVE=deg bends the wall into a horizontal arc.
-                if let Some(d) = std::env::var("GLOWSTONE_LED_CURVE").ok().and_then(|s| s.parse::<f32>().ok()) {
+                if let Some(d) = std::env::var("GLOWSTONE_LED_CURVE")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                {
                     s.curvature_deg = d;
                 }
                 // GLOWSTONE_LED_PIXEL=round|square|rgb selects the LED package shape.
@@ -346,7 +363,10 @@ impl ApplicationHandler for App {
             }
             // For the pixel-map case, inject a synthetic Art-Net feed (a rainbow
             // grid) and decode it so the wall shows live DMX content headlessly.
-            if std::env::var("GLOWSTONE_LED_CONTENT").map(|c| c.eq_ignore_ascii_case("dmx")).unwrap_or(false) {
+            if std::env::var("GLOWSTONE_LED_CONTENT")
+                .map(|c| c.eq_ignore_ascii_case("dmx"))
+                .unwrap_or(false)
+            {
                 let (cols, rows) = (8u32, 5u32);
                 let mut spec = String::new();
                 for j in 0..rows {
@@ -381,20 +401,30 @@ impl ApplicationHandler for App {
             use crate::scene::pyro::PyroKind;
             let state = self.state.as_mut().unwrap();
             let lib = crate::scene::Library::standard();
-            let mode = std::env::var("GLOWSTONE_PYRO").unwrap_or_default().to_lowercase();
+            let mode = std::env::var("GLOWSTONE_PYRO")
+                .unwrap_or_default()
+                .to_lowercase();
             let sparks = mode != "co2";
             let co2 = mode != "spark";
             // Rebuild the stage: drop the single demo PAR.
             state.scene.fixtures.clear();
             if sparks {
-                let prof = lib.pyro.iter().find(|p| p.kind == PyroKind::ColdSpark).unwrap();
+                let prof = lib
+                    .pyro
+                    .iter()
+                    .find(|p| p.kind == PyroKind::ColdSpark)
+                    .unwrap();
                 for k in 0..6 {
                     let x = -5.0 + k as f32 * 2.0;
                     state.scene.add_pyro_at(prof, glam::Vec3::new(x, 0.0, 1.5));
                 }
             }
             if co2 {
-                let prof = lib.pyro.iter().find(|p| p.kind == PyroKind::Co2Jet).unwrap();
+                let prof = lib
+                    .pyro
+                    .iter()
+                    .find(|p| p.kind == PyroKind::Co2Jet)
+                    .unwrap();
                 for &x in &[-3.5f32, 0.0, 3.5] {
                     let i = state.scene.add_pyro_at(prof, glam::Vec3::new(x, 0.0, -3.0));
                     state.scene.pyro[i].density = 1.0; // free-run blast for the still
@@ -491,7 +521,10 @@ impl ApplicationHandler for App {
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or(path);
-                    if let Ok(b) = std::env::var("GLOWSTONE_HDRI_BRIGHT").unwrap_or_default().parse::<f32>() {
+                    if let Ok(b) = std::env::var("GLOWSTONE_HDRI_BRIGHT")
+                        .unwrap_or_default()
+                        .parse::<f32>()
+                    {
                         w.brightness = b;
                     }
                 }
@@ -512,8 +545,12 @@ impl ApplicationHandler for App {
                 .map(|n| (total / n).max(1))
                 .unwrap_or(1);
             // GLOWSTONE_TILT / GLOWSTONE_PAN aim the lit fixtures (degrees).
-            let tilt = std::env::var("GLOWSTONE_TILT").ok().and_then(|s| s.parse::<f32>().ok());
-            let pan = std::env::var("GLOWSTONE_PAN").ok().and_then(|s| s.parse::<f32>().ok());
+            let tilt = std::env::var("GLOWSTONE_TILT")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok());
+            let pan = std::env::var("GLOWSTONE_PAN")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok());
             for (i, f) in state.scene.fixtures.iter_mut().enumerate() {
                 if i % step == 0 {
                     // The level lives in the dimmer (intensity is the master, =1);
@@ -577,7 +614,10 @@ impl ApplicationHandler for App {
         // (typically after a GLOWSTONE_MVR import) back out and exits — for
         // round-trip verification.
         if let Ok(out) = std::env::var("GLOWSTONE_MVR_EXPORT") {
-            match crate::mvr::export_path(&self.state.as_ref().unwrap().scene, std::path::Path::new(&out)) {
+            match crate::mvr::export_path(
+                &self.state.as_ref().unwrap().scene,
+                std::path::Path::new(&out),
+            ) {
                 Ok(()) => log::info!("exported MVR: {out}"),
                 Err(e) => log::error!("MVR export failed: {e}"),
             }
@@ -645,10 +685,16 @@ impl ApplicationHandler for App {
             }
             // GLOWSTONE_ZOOM scales the camera dolly distance (<1 = closer);
             // GLOWSTONE_CAM_Y nudges the look-at height (metres).
-            if let Some(z) = std::env::var("GLOWSTONE_ZOOM").ok().and_then(|s| s.parse::<f32>().ok()) {
+            if let Some(z) = std::env::var("GLOWSTONE_ZOOM")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+            {
                 state.camera.distance *= z;
             }
-            if let Some(dy) = std::env::var("GLOWSTONE_CAM_Y").ok().and_then(|s| s.parse::<f32>().ok()) {
+            if let Some(dy) = std::env::var("GLOWSTONE_CAM_Y")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+            {
                 state.camera.target.y += dy;
             }
             // Full camera override: GLOWSTONE_CAM_TARGET=x,y,z and GLOWSTONE_CAM_YAW /
@@ -718,11 +764,15 @@ impl ApplicationHandler for App {
             let total = state.scene.render.max_samples.max(1);
             state.renderer.ensure_render_view(res);
             for _ in 0..total {
-                state.renderer.record_render_view(&state.scene, &state.camera, &settings);
+                state
+                    .renderer
+                    .record_render_view(&state.scene, &state.camera, &settings);
             }
-            match state.renderer.read_render_view_ldr().and_then(|(w, h, px)| {
-                image::RgbaImage::from_raw(w, h, px).map(|img| (w, h, img))
-            }) {
+            match state
+                .renderer
+                .read_render_view_ldr()
+                .and_then(|(w, h, px)| image::RgbaImage::from_raw(w, h, px).map(|img| (w, h, img)))
+            {
                 Some((w, h, img)) => match img.save(&path) {
                     Ok(()) => log::info!("wrote render {path} ({w}x{h}, {total} samples)"),
                     Err(e) => log::error!("failed to write {path}: {e}"),
@@ -757,18 +807,26 @@ impl ApplicationHandler for App {
             for i in 0..10 {
                 apply_bench_color_chase(&mut state.scene, color_chase.as_deref(), i);
                 if readback {
-                    let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
+                    let _ = state
+                        .renderer
+                        .capture(&state.scene, &state.camera, &state.ui.settings);
                 } else {
-                    state.renderer.bench_render(&state.scene, &state.camera, &state.ui.settings);
+                    state
+                        .renderer
+                        .bench_render(&state.scene, &state.camera, &state.ui.settings);
                 }
             }
             let t0 = Instant::now();
             for i in 0..n {
                 apply_bench_color_chase(&mut state.scene, color_chase.as_deref(), i + 10);
                 if readback {
-                    let _ = state.renderer.capture(&state.scene, &state.camera, &state.ui.settings);
+                    let _ = state
+                        .renderer
+                        .capture(&state.scene, &state.camera, &state.ui.settings);
                 } else {
-                    state.renderer.bench_render(&state.scene, &state.camera, &state.ui.settings);
+                    state
+                        .renderer
+                        .bench_render(&state.scene, &state.camera, &state.ui.settings);
                 }
             }
             let per = t0.elapsed().as_secs_f32() / n as f32;
@@ -777,7 +835,11 @@ impl ApplicationHandler for App {
                 "BENCH {w}x{h}: {:.2} ms/frame = {:.0} fps ({})",
                 per * 1000.0,
                 1.0 / per,
-                if readback { "incl. readback" } else { "render-only" }
+                if readback {
+                    "incl. readback"
+                } else {
+                    "render-only"
+                }
             );
             let timings = state.renderer.last_timings;
             let frame_ms = per * 1000.0;
@@ -1010,7 +1072,14 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
     // Each preset configures the fixture's optics + a fixed motion phase.
     // Wheel components are addressed by kind+number (the chain is dynamic).
     use crate::gdtf::WheelKind as K;
-    fn wheel(f: &mut crate::scene::Fixture, kind: crate::gdtf::WheelKind, n: u32, value: f32, spin: f32, phase: f32) {
+    fn wheel(
+        f: &mut crate::scene::Fixture,
+        kind: crate::gdtf::WheelKind,
+        n: u32,
+        value: f32,
+        spin: f32,
+        phase: f32,
+    ) {
         if let Some(w) = f.wheel_control_mut(kind, n) {
             w.value = value;
             w.spin = spin;
@@ -1019,7 +1088,8 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
             *p = phase;
         }
     }
-    let presets: [(&str, fn(&mut crate::scene::Fixture)); 17] = [
+    type FixturePreset = (&'static str, fn(&mut crate::scene::Fixture));
+    let presets: [FixturePreset; 17] = [
         ("01_neutral", |_f| {}),
         ("18_dim_via_blade", |f| {
             // The dimmer IS the shutter: dimming a blade fixture closes the blade.
@@ -1032,16 +1102,31 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
             f.optics.dimmer = 0.45;
             f.optics.zoom = 0.3;
         }),
-        ("02_gobo_target", |f| { wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0); f.optics.zoom = 0.25; }),
+        ("02_gobo_target", |f| {
+            wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0);
+            f.optics.zoom = 0.25;
+        }),
         ("03_gobo_vortex_spin", |f| {
             wheel(f, K::Gobo, 1, 4.0 / 6.0, 0.85, 0.8);
             f.optics.zoom = 0.25;
         }),
-        ("04_gobo2_smokerings", |f| { wheel(f, K::Gobo, 2, 2.0 / 6.0, 0.5, 0.0); f.optics.zoom = 0.25; }),
-        ("05_color_red", |f| { wheel(f, K::Color, 1, 1.0, 0.5, 0.0); }),
-        ("06_cmy_magenta", |f| { f.optics.cmy = [0.0, 0.85, 0.0]; }),
-        ("07_cto_warm", |f| { f.optics.cto = 1.0; }),
-        ("08_prism5", |f| { wheel(f, K::Prism, 1, 1.0, 0.5, 0.0); f.optics.zoom = 0.0; }),
+        ("04_gobo2_smokerings", |f| {
+            wheel(f, K::Gobo, 2, 2.0 / 6.0, 0.5, 0.0);
+            f.optics.zoom = 0.25;
+        }),
+        ("05_color_red", |f| {
+            wheel(f, K::Color, 1, 1.0, 0.5, 0.0);
+        }),
+        ("06_cmy_magenta", |f| {
+            f.optics.cmy = [0.0, 0.85, 0.0];
+        }),
+        ("07_cto_warm", |f| {
+            f.optics.cto = 1.0;
+        }),
+        ("08_prism5", |f| {
+            wheel(f, K::Prism, 1, 1.0, 0.5, 0.0);
+            f.optics.zoom = 0.0;
+        }),
         ("08b_prism_gobo", |f| {
             wheel(f, K::Prism, 1, 1.0, 0.5, 0.0);
             wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0);
@@ -1052,14 +1137,22 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
             wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0);
             f.optics.zoom = 0.25;
         }),
-        ("10_zoom_narrow", |f| { f.optics.zoom = 0.0; }),
-        ("11_iris_closed", |f| { f.optics.iris = 0.25; }),
+        ("10_zoom_narrow", |f| {
+            f.optics.zoom = 0.0;
+        }),
+        ("11_iris_closed", |f| {
+            f.optics.iris = 0.25;
+        }),
         ("12_animation", |f| {
             wheel(f, K::Animation, 1, 1.0, 0.9, 0.3);
             wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0);
             f.optics.zoom = 0.25;
         }),
-        ("13_chromatic_ab", |f| { f.optics.ca = 1.0; wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0); f.optics.zoom = 0.12; }),
+        ("13_chromatic_ab", |f| {
+            f.optics.ca = 1.0;
+            wheel(f, K::Gobo, 1, 5.0 / 6.0, 0.5, 0.0);
+            f.optics.zoom = 0.12;
+        }),
         ("14_combo", |f| {
             // Color + gobo + prism + frost together (stages compose).
             f.optics.cmy = [0.6, 0.0, 0.0]; // cyan tint
@@ -1110,7 +1203,9 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
     cam.target = glam::Vec3::new(0.0, 0.0, 0.0);
     cam.pitch = 1.3; // look down
     cam.distance = 9.0;
-    let (w, h, px) = state.renderer.capture(&state.scene, &cam, &state.ui.settings);
+    let (w, h, px) = state
+        .renderer
+        .capture(&state.scene, &cam, &state.ui.settings);
     if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
         let _ = img.save(format!("{dir}/sheet_16_prism_top.png"));
     }
@@ -1132,7 +1227,9 @@ fn render_optics_sheet(state: &mut State, dir: &str) {
         cam.distance = 1.8;
         cam.pitch = -0.85;
         cam.yaw = std::f32::consts::PI;
-        let (w, h, px) = state.renderer.capture(&state.scene, &cam, &state.ui.settings);
+        let (w, h, px) = state
+            .renderer
+            .capture(&state.scene, &cam, &state.ui.settings);
         if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
             let _ = img.save(format!("{dir}/sheet_17_lens.png"));
         }
@@ -1242,7 +1339,9 @@ fn render_wheel_sequence(state: &mut State, dir: &str) {
     let mut t = 0.0_f32;
     for frame in 0..10 {
         state.renderer.set_anim_time(t);
-        let (w, h, px) = state.renderer.capture(&state.scene, &cam, &state.ui.settings);
+        let (w, h, px) = state
+            .renderer
+            .capture(&state.scene, &cam, &state.ui.settings);
         if let Some(img) = image::RgbaImage::from_raw(w, h, px) {
             let _ = img.save(format!("{dir}/wheel_{frame:02}.png"));
         }
@@ -1362,7 +1461,9 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         state.ui.debug_open_replace(&state.scene);
     }
     if let Ok(v) = std::env::var("GLOWSTONE_UI_BULK") {
-        state.ui.debug_select_n(&state.scene, v.parse().unwrap_or(3));
+        state
+            .ui
+            .debug_select_n(&state.scene, v.parse().unwrap_or(3));
     }
     // GLOWSTONE_UI_SHARE opens the online Fixture Library window; =demo injects rows.
     if let Ok(v) = std::env::var("GLOWSTONE_UI_SHARE") {
@@ -1391,7 +1492,9 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         let settings = state.scene.render.render_settings(&state.ui.settings);
         state.renderer.ensure_render_view(res);
         for _ in 0..8 {
-            state.renderer.record_render_view(&state.scene, &state.camera, &settings);
+            state
+                .renderer
+                .record_render_view(&state.scene, &state.camera, &settings);
         }
         let total = state.scene.render.max_samples.max(1);
         let sample = s.parse::<u32>().unwrap_or(total / 2).min(total);
@@ -1405,13 +1508,18 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         };
     }
     if let Ok(n) = std::env::var("GLOWSTONE_UI_SELECT_N") {
-        state.ui.debug_select_n(&state.scene, n.parse().unwrap_or(4));
+        state
+            .ui
+            .debug_select_n(&state.scene, n.parse().unwrap_or(4));
     }
     // Headless one-shot: any startup frame()/set_view() started a transition; land
     // on its final pose so the screenshot isn't captured mid-animation.
     state.camera.skip_anim();
     let mut jobs: Vec<egui::ClippedPrimitive> = Vec::new();
-    let mut sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
+    let mut sd = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [w, h],
+        pixels_per_point: 1.0,
+    };
     for i in 0..3 {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1424,7 +1532,8 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         let egui_ctx = state.egui_ctx.clone();
         let mut perf_timings = state.renderer.last_timings;
         perf_timings.frame_ms = 1000.0 / 60.0;
-        let out = egui_ctx.run(raw, |ctx| {
+        let out = egui_ctx.run_ui(raw, |ui| {
+            let ctx = ui.ctx();
             ctx.set_pixels_per_point(1.0);
             state.ui.show(
                 ctx,
@@ -1438,7 +1547,9 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
         });
         // Settle the atlas + size the 3D viewport to the panel's request.
         state.renderer.apply_egui_textures(&out.textures_delta);
-        state.renderer.resize_viewport(state.ui.requested_viewport_px);
+        state
+            .renderer
+            .resize_viewport(state.ui.requested_viewport_px);
         if i == 2 {
             sd = egui_wgpu::ScreenDescriptor {
                 size_in_pixels: [w, h],
@@ -1464,7 +1575,10 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     };
     // GLOWSTONE_UI_CROP="x,y,w,h" crops to a region (for inspecting one panel).
     if let Ok(spec) = std::env::var("GLOWSTONE_UI_CROP") {
-        let nums: Vec<u32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let nums: Vec<u32> = spec
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         if let [x, y, cw, ch] = nums[..] {
             let cw = cw.min(rw.saturating_sub(x));
             let ch = ch.min(rh.saturating_sub(y));
@@ -1474,6 +1588,77 @@ fn render_ui_screenshot(state: &mut State, path: &str, w: u32, h: u32) {
     match img.save(path) {
         Ok(()) => log::info!("UI screenshot: {path} ({}x{})", img.width(), img.height()),
         Err(e) => log::error!("UI screenshot save {path}: {e}"),
+    }
+}
+
+trait ScreenFrameClient {
+    fn retain(&mut self, active: &[String]);
+    fn frame_for(&mut self, source: &str) -> Option<Arc<crate::scene::screen::ScreenFrame>>;
+}
+
+impl ScreenFrameClient for crate::citp::CitpClient {
+    fn retain(&mut self, active: &[String]) {
+        crate::citp::CitpClient::retain(self, active);
+    }
+
+    fn frame_for(&mut self, source: &str) -> Option<Arc<crate::scene::screen::ScreenFrame>> {
+        crate::citp::CitpClient::frame_for(self, source)
+    }
+}
+
+impl ScreenFrameClient for crate::ndi::NdiClient {
+    fn retain(&mut self, active: &[String]) {
+        crate::ndi::NdiClient::retain(self, active);
+    }
+
+    fn frame_for(&mut self, source: &str) -> Option<Arc<crate::scene::screen::ScreenFrame>> {
+        crate::ndi::NdiClient::frame_for(self, source)
+    }
+}
+
+fn citp_source(content: &crate::scene::screen::ScreenContent) -> Option<&str> {
+    match content {
+        crate::scene::screen::ScreenContent::Citp { source } if !source.is_empty() => Some(source),
+        _ => None,
+    }
+}
+
+fn ndi_source(content: &crate::scene::screen::ScreenContent) -> Option<&str> {
+    match content {
+        crate::scene::screen::ScreenContent::Ndi { source } if !source.is_empty() => Some(source),
+        _ => None,
+    }
+}
+
+fn pump_screen_frame_sources<C>(
+    screens: &mut [crate::scene::screen::LedScreen],
+    client: &mut Option<C>,
+    make_client: impl FnOnce() -> C,
+    source_for: fn(&crate::scene::screen::ScreenContent) -> Option<&str>,
+) where
+    C: ScreenFrameClient,
+{
+    let sources: Vec<String> = screens
+        .iter()
+        .filter_map(|s| source_for(&s.content).map(ToOwned::to_owned))
+        .collect();
+    if sources.is_empty() {
+        if let Some(client) = client {
+            client.retain(&[]);
+        }
+        return;
+    }
+
+    let client = client.get_or_insert_with(make_client);
+    client.retain(&sources);
+    for screen in screens {
+        let source = source_for(&screen.content).map(ToOwned::to_owned);
+        if let Some(source) = source {
+            // Assign unconditionally so switching to a different source name clears
+            // the previous source's stale frame. `frame_for` returns the cached
+            // latest frame for a live source, so a steady stream does not flicker.
+            screen.frame = client.frame_for(&source);
+        }
     }
 }
 
@@ -1492,7 +1677,11 @@ impl State {
         self.last_frame = now;
         if dt > 0.0 {
             let inst = 1.0 / dt;
-            self.fps = if self.fps == 0.0 { inst } else { self.fps * 0.9 + inst * 0.1 };
+            self.fps = if self.fps == 0.0 {
+                inst
+            } else {
+                self.fps * 0.9 + inst * 0.1
+            };
         }
         let fps = self.fps;
 
@@ -1519,76 +1708,21 @@ impl State {
             self.dmx.decode(&mut self.scene);
         }
 
-        // Live CITP/MSEX: pump media-server stream frames onto CITP-sourced LED
-        // walls (lazily starting the discovery/stream client on first use).
+        // Live video: pump received frames onto CITP/NDI-sourced LED walls
+        // (lazily starting each client only when a matching screen exists).
         if !job_active {
-            use crate::scene::screen::ScreenContent;
-            let citp_sources: Vec<String> = self
-                .scene
-                .screens
-                .iter()
-                .filter_map(|s| match &s.content {
-                    ScreenContent::Citp { source } if !source.is_empty() => Some(source.clone()),
-                    _ => None,
-                })
-                .collect();
-            if citp_sources.is_empty() {
-                if let Some(c) = &mut self.citp {
-                    c.retain(&[]); // stop any leftover streams
-                }
-            } else {
-                let client = self.citp.get_or_insert_with(crate::citp::CitpClient::new);
-                client.retain(&citp_sources);
-                for s in &mut self.scene.screens {
-                    let src = match &s.content {
-                        ScreenContent::Citp { source } if !source.is_empty() => Some(source.clone()),
-                        _ => None,
-                    };
-                    if let Some(src) = src {
-                        // Assign unconditionally so switching to a different/empty
-                        // source name clears the previous source's stale frame.
-                        // (frame_for returns the cached latest frame for a live
-                        // source, so a steady stream does not flicker.)
-                        s.frame = client.frame_for(&src);
-                    }
-                }
-            }
-        }
-
-        // Live NDI: pump received frames onto NDI-sourced LED walls (lazily
-        // starting the receive client; a no-op stub without the `ndi` feature).
-        if !job_active {
-            use crate::scene::screen::ScreenContent;
-            let ndi_sources: Vec<String> = self
-                .scene
-                .screens
-                .iter()
-                .filter_map(|s| match &s.content {
-                    ScreenContent::Ndi { source } if !source.is_empty() => Some(source.clone()),
-                    _ => None,
-                })
-                .collect();
-            if ndi_sources.is_empty() {
-                if let Some(c) = &mut self.ndi {
-                    c.retain(&[]);
-                }
-            } else {
-                let client = self.ndi.get_or_insert_with(crate::ndi::NdiClient::new);
-                client.retain(&ndi_sources);
-                for s in &mut self.scene.screens {
-                    let src = match &s.content {
-                        ScreenContent::Ndi { source } if !source.is_empty() => Some(source.clone()),
-                        _ => None,
-                    };
-                    if let Some(src) = src {
-                        // Assign unconditionally so switching to a different/empty
-                        // source name clears the previous source's stale frame.
-                        // (frame_for returns the cached latest frame for a live
-                        // source, so a steady stream does not flicker.)
-                        s.frame = client.frame_for(&src);
-                    }
-                }
-            }
+            pump_screen_frame_sources(
+                &mut self.scene.screens,
+                &mut self.citp,
+                crate::citp::CitpClient::new,
+                citp_source,
+            );
+            pump_screen_frame_sources(
+                &mut self.scene.screens,
+                &mut self.ndi,
+                crate::ndi::NdiClient::new,
+                ndi_source,
+            );
         }
 
         // Crossfade any in-progress cue AFTER DMX decode (so an offline cue
@@ -1610,7 +1744,8 @@ impl State {
             // (same rule — never in the renderer's record_scene). Reads the
             // per-device trigger state DMX decode wrote above; the camera position
             // drives the distance LOD.
-            self.renderer.advance_pyro(&self.scene, self.camera.eye(), dt);
+            self.renderer
+                .advance_pyro(&self.scene, self.camera.eye(), dt);
 
             // Advance the renderer's animation clock by the SAME dt, so fog drift +
             // beam animation track the logical scene time (not wall-clock). Frozen
@@ -1619,7 +1754,8 @@ impl State {
         }
 
         // Crash-recovery autosave (debounced inside; writes to the cache dir).
-        self.ui.autosave_tick(&self.scene, &self.camera, &self.dmx, dt);
+        self.ui
+            .autosave_tick(&self.scene, &self.camera, &self.dmx, dt);
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let viewport_texture = self.renderer.viewport.texture_id;
@@ -1628,9 +1764,17 @@ impl State {
         // Refresh discovered live-video sources for the LED-screen content
         // pickers (NDI + CITP) before drawing the inspector.
         self.ui.screen_sources = crate::ui::ScreenSources {
-            ndi: self.ndi.as_ref().map(|c| c.server_names()).unwrap_or_default(),
+            ndi: self
+                .ndi
+                .as_ref()
+                .map(|c| c.server_names())
+                .unwrap_or_default(),
             ndi_available: self.ndi.as_ref().map(|c| c.available()).unwrap_or(false),
-            citp: self.citp.as_ref().map(|c| c.server_names()).unwrap_or_default(),
+            citp: self
+                .citp
+                .as_ref()
+                .map(|c| c.server_names())
+                .unwrap_or_default(),
         };
 
         // Per-pass GPU timings + scene counts for the perf overlay; the CPU EMA fps
@@ -1691,8 +1835,9 @@ impl State {
             crate::renderer::write_gpu_pref(&sel);
             self.gpu_pref_written = sel.clone();
             if sel != self.ui.render.gpu_active {
-                self.ui
-                    .notify_success(format!("GPU backend set to {sel} — restart glowstone to apply"));
+                self.ui.notify_success(format!(
+                    "GPU backend set to {sel} — restart glowstone to apply"
+                ));
             }
         }
 
@@ -1710,12 +1855,15 @@ impl State {
             // target (the live viewport is untouched — its tab keeps its last frame),
             // then present egui without re-recording the live scene. Use the camera
             // SNAPSHOT so live-camera moves can't reset the render's accumulation.
-            let (res, settings, cam, t) = (job.res, job.settings, job.camera.clone(), job.anim_time);
+            let (res, settings, cam, t) =
+                (job.res, job.settings, job.camera.clone(), job.anim_time);
             // FROZEN animation clock — every accumulation frame renders the fog +
             // beams at the exact instant the render started (no drift mid-render).
             self.renderer.set_anim_time(t);
             self.renderer.ensure_render_view(res);
-            let rendered = self.renderer.record_render_view(&self.scene, &cam, &settings);
+            let rendered = self
+                .renderer
+                .record_render_view(&self.scene, &cam, &settings);
             self.window.pre_present_notify();
             let presented = self.renderer.present_egui_only(
                 &paint_jobs,
@@ -1724,6 +1872,17 @@ impl State {
             );
             self.step_render_job(rendered);
             return presented;
+        }
+
+        if !self.ui.viewport_visible() {
+            // No live viewport texture was painted this egui frame, so keep the rest
+            // of the UI responsive without paying for scene prep + 3D render passes.
+            self.window.pre_present_notify();
+            return self.renderer.present_egui_only(
+                &paint_jobs,
+                &full_output.textures_delta,
+                &screen_descriptor,
+            );
         }
 
         // LIVE PATH: track the viewport panel's requested size + live look, and the
@@ -1862,15 +2021,17 @@ impl State {
         {
             let color =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
-            let tex = self
-                .egui_ctx
-                .load_texture("render-result", color, egui::TextureOptions::LINEAR);
+            let tex =
+                self.egui_ctx
+                    .load_texture("render-result", color, egui::TextureOptions::LINEAR);
             self.ui.render.result_tex = Some(tex);
 
             if write_on_done {
                 let path = std::path::PathBuf::from(&out_path);
                 match crate::ui::save_image(&img, &path, format) {
-                    Ok(()) => self.ui.notify_success(format!("Saved render → {}", path.display())),
+                    Ok(()) => self
+                        .ui
+                        .notify_success(format!("Saved render → {}", path.display())),
                     Err(e) => self.ui.notify_error(format!("Save render failed: {e}")),
                 }
             }
@@ -1901,10 +2062,10 @@ impl State {
         let mut dialog = rfd::FileDialog::new()
             .add_filter(fmt.label(), &[fmt.ext()])
             .set_file_name(crate::ui::default_filename(&self.scene.render));
-        if let Some(dir) = std::path::Path::new(&self.scene.render.out_path).parent() {
-            if dir.is_dir() {
-                dialog = dialog.set_directory(dir);
-            }
+        if let Some(dir) = std::path::Path::new(&self.scene.render.out_path).parent()
+            && dir.is_dir()
+        {
+            dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.save_file() {
             match crate::ui::save_image(&img, &path, fmt) {
@@ -1912,7 +2073,8 @@ impl State {
                     if !copy {
                         self.scene.render.out_path = path.to_string_lossy().into_owned();
                     }
-                    self.ui.notify_success(format!("Saved render → {}", path.display()));
+                    self.ui
+                        .notify_success(format!("Saved render → {}", path.display()));
                 }
                 Err(e) => self.ui.notify_error(format!("Save failed: {e}")),
             }

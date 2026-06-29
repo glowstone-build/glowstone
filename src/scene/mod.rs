@@ -317,32 +317,50 @@ pub struct Selection {
 impl Selection {
     /// Select a single fixture (clearing any other selection).
     pub fn fixture(i: usize) -> Self {
-        Self { fixtures: vec![i], ..Default::default() }
+        Self {
+            fixtures: vec![i],
+            ..Default::default()
+        }
     }
 
     /// Select a single static-geometry object (clearing any other selection).
     pub fn geometry(i: usize) -> Self {
-        Self { geometry: vec![i], ..Default::default() }
+        Self {
+            geometry: vec![i],
+            ..Default::default()
+        }
     }
 
     /// Select a single LED screen (clearing any other selection).
     pub fn screen(i: usize) -> Self {
-        Self { screens: vec![i], ..Default::default() }
+        Self {
+            screens: vec![i],
+            ..Default::default()
+        }
     }
 
     /// Select a single pyro device (clearing any other selection).
     pub fn pyro(i: usize) -> Self {
-        Self { pyro: vec![i], ..Default::default() }
+        Self {
+            pyro: vec![i],
+            ..Default::default()
+        }
     }
 
     /// Select a single environment.
     pub fn environment(i: usize) -> Self {
-        Self { environment: Some(i), ..Default::default() }
+        Self {
+            environment: Some(i),
+            ..Default::default()
+        }
     }
 
     /// Select the top-level World node (clearing any other selection).
     pub fn world() -> Self {
-        Self { world: true, ..Default::default() }
+        Self {
+            world: true,
+            ..Default::default()
+        }
     }
 
     /// Toggle the World node selection on/off (clearing everything else when on).
@@ -350,7 +368,11 @@ impl Selection {
     /// ⌘/Ctrl-click on the World node in a later pass.
     #[allow(dead_code)]
     pub fn toggle_world(&mut self) {
-        *self = if self.world { Self::default() } else { Self::world() };
+        *self = if self.world {
+            Self::default()
+        } else {
+            Self::world()
+        };
     }
 
     pub fn contains_fixture(&self, i: usize) -> bool {
@@ -462,6 +484,10 @@ impl Selection {
     /// Select a contiguous pyro-device data-index range (the by-index twin of
     /// [`set_fixture_range`]; the tree builds its slice from visible order instead,
     /// since sort/filter break contiguous data indices).
+    #[expect(
+        dead_code,
+        reason = "Pyro range selection is retained for the unified selection refactor."
+    )]
     pub fn set_pyro_range(&mut self, a: usize, b: usize) {
         self.world = false;
         self.environment = None;
@@ -545,6 +571,10 @@ impl Selection {
     }
 
     /// The primary (active) object — the first of whichever kind is selected.
+    #[expect(
+        dead_code,
+        reason = "Primary ObjectRef is retained for the unified object inspector/transform refactor."
+    )]
     pub fn primary_object(&self) -> Option<ObjectRef> {
         self.object_refs().into_iter().next()
     }
@@ -740,9 +770,13 @@ pub fn apply_select(current: &Selection, hits: &[SelItem], op: SelectOp) -> Sele
             // Operate within the active kind (extend the existing set) or, if
             // nothing is selected yet, the hits' dominant kind.
             let kind = active_kind.or_else(|| {
-                [0u8, 1, 2, 3].into_iter().find(|&k| !hit_kind(k).is_empty())
+                [0u8, 1, 2, 3]
+                    .into_iter()
+                    .find(|&k| !hit_kind(k).is_empty())
             });
-            let Some(kind) = kind else { return current.clone() };
+            let Some(kind) = kind else {
+                return current.clone();
+            };
             let mut set: Vec<usize> = match kind {
                 0 => current.fixtures.clone(),
                 1 => current.geometry.clone(),
@@ -803,7 +837,11 @@ pub fn apply_fixture_click(
         selection.set_fixture_range(a, i);
         // keep the anchor so chained shift-clicks grow/shrink from it
     } else {
-        let op = if toggle { SelectOp::Toggle } else { SelectOp::Replace };
+        let op = if toggle {
+            SelectOp::Toggle
+        } else {
+            SelectOp::Replace
+        };
         *selection = apply_select(selection, &[SelItem::Fixture(i)], op);
         *anchor = Some(i);
     }
@@ -953,7 +991,12 @@ impl Scene {
     /// The place-at-cursor entry point — `position` is the viewport cursor's
     /// ground/ray hit (see `panels::placement_point`).
     pub fn add_fixture_at(&mut self, profile: &FixtureProfile, position: Vec3) -> usize {
-        let n = self.fixtures.iter().filter(|f| f.profile == profile.name).count() + 1;
+        let n = self
+            .fixtures
+            .iter()
+            .filter(|f| f.profile == profile.name)
+            .count()
+            + 1;
         let name = format!("{} {}", profile.name, n);
         let mut fixture = Fixture::from_profile(profile, name, position);
         fixture.tilt = 30.0; // aimed down
@@ -1015,7 +1058,9 @@ impl Scene {
         match obj {
             ObjectRef::Fixture(i) => self.fixtures.get(i).map(|f| f.position),
             ObjectRef::Geometry(i) => self.geometry.get(i).map(|g| {
-                g.world_bounds().map(|(lo, hi)| (lo + hi) * 0.5).unwrap_or_else(|| g.transform.w_axis.truncate())
+                g.world_bounds()
+                    .map(|(lo, hi)| (lo + hi) * 0.5)
+                    .unwrap_or_else(|| g.transform.w_axis.truncate())
             }),
             ObjectRef::Screen(i) => self.screens.get(i).map(|s| s.world_center()),
             ObjectRef::Pyro(i) => self.pyro.get(i).map(|p| p.world_nozzle()),
@@ -1153,7 +1198,9 @@ impl Scene {
         if axis >= 3 {
             return;
         }
-        let Some(props) = self.object_transform_props(obj) else { return };
+        let Some(props) = self.object_transform_props(obj) else {
+            return;
+        };
         let (ry, rx, rz) = props.rotation.to_euler(glam::EulerRot::YXZ);
         let mut euler = Vec3::new(rx.to_degrees(), ry.to_degrees(), rz.to_degrees());
         euler[axis] = value;
@@ -1175,7 +1222,11 @@ impl Scene {
                 if let Some(g) = self.geometry.get_mut(i) {
                     let (_, rotation, _) = g.transform.to_scale_rotation_translation();
                     let position = g.transform.w_axis.truncate();
-                    g.transform = Mat4::from_scale_rotation_translation(Vec3::splat(value), rotation, position);
+                    g.transform = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(value),
+                        rotation,
+                        position,
+                    );
                     true
                 } else {
                     false
@@ -1185,7 +1236,11 @@ impl Scene {
                 if let Some(s) = self.screens.get_mut(i) {
                     let (_, rotation, _) = s.transform.to_scale_rotation_translation();
                     let position = s.transform.w_axis.truncate();
-                    s.transform = Mat4::from_scale_rotation_translation(Vec3::splat(value), rotation, position);
+                    s.transform = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(value),
+                        rotation,
+                        position,
+                    );
                     true
                 } else {
                     false
@@ -1253,12 +1308,18 @@ impl Scene {
     /// grab-duplicate (Shift+D) re-selects the result so the copies follow the
     /// cursor.
     pub fn duplicate_objects(&mut self, objs: &[ObjectRef]) -> Vec<ObjectRef> {
-        objs.iter().filter_map(|&o| self.duplicate_object(o)).collect()
+        objs.iter()
+            .filter_map(|&o| self.duplicate_object(o))
+            .collect()
     }
 
     /// Translate any placed object by a world-space delta — the unified move
     /// primitive. Used by the duplicate-array (Shift+D, type N) to space the
     /// extra clones evenly along the drag vector.
+    #[expect(
+        dead_code,
+        reason = "Unified object movement remains part of the planned ObjectRef cleanup."
+    )]
     pub fn translate_object(&mut self, obj: ObjectRef, delta: Vec3) {
         match obj {
             ObjectRef::Fixture(i) => {
@@ -1601,7 +1662,11 @@ impl Scene {
         let mut ids: Vec<usize> = if indices.is_empty() {
             (0..self.fixtures.len()).collect()
         } else {
-            indices.iter().copied().filter(|&i| i < self.fixtures.len()).collect()
+            indices
+                .iter()
+                .copied()
+                .filter(|&i| i < self.fixtures.len())
+                .collect()
         };
         if ids.is_empty() {
             return;
@@ -1703,7 +1768,11 @@ mod tests {
         let third_id = scene.fixtures[2].id; // was at index 2, should become 1
         scene.fixtures.remove(1);
         assert_eq!(scene.fixture_index_of(removed_id), None, "stale id → None");
-        assert_eq!(scene.fixture_index_of(third_id), Some(1), "survivor re-indexed");
+        assert_eq!(
+            scene.fixture_index_of(third_id),
+            Some(1),
+            "survivor re-indexed"
+        );
         for (i, f) in scene.fixtures.iter().enumerate() {
             assert_eq!(scene.fixture_index_of(f.id), Some(i));
         }
@@ -1711,7 +1780,10 @@ mod tests {
         // 4) A subsequent add never reuses the deleted id.
         let new_idx = scene.add_fixture(&library.fixtures[0]);
         let new_id = scene.fixtures[new_idx].id;
-        assert!(!ids.contains(&new_id), "fresh id is never a previously-used id");
+        assert!(
+            !ids.contains(&new_id),
+            "fresh id is never a previously-used id"
+        );
         assert_ne!(new_id, removed_id);
     }
 
@@ -1723,16 +1795,26 @@ mod tests {
         let pyro = scene.add_pyro_at(&library.pyro[0], Vec3::ZERO);
 
         scene.fixtures[0].position = Vec3::new(1.0, 2.0, 3.0);
-        scene.screens[screen].transform =
-            Mat4::from_scale_rotation_translation(Vec3::splat(2.0), Quat::IDENTITY, Vec3::new(4.0, 5.0, 6.0));
-        scene.pyro[pyro].transform = Mat4::from_rotation_translation(Quat::IDENTITY, Vec3::new(7.0, 8.0, 9.0));
+        scene.screens[screen].transform = Mat4::from_scale_rotation_translation(
+            Vec3::splat(2.0),
+            Quat::IDENTITY,
+            Vec3::new(4.0, 5.0, 6.0),
+        );
+        scene.pyro[pyro].transform =
+            Mat4::from_rotation_translation(Quat::IDENTITY, Vec3::new(7.0, 8.0, 9.0));
 
         scene.set_object_position_axis(ObjectRef::Fixture(0), 0, 10.0);
         scene.set_object_position_axis(ObjectRef::Screen(screen), 1, 20.0);
         scene.set_object_position_axis(ObjectRef::Pyro(pyro), 2, 30.0);
         assert_eq!(scene.fixtures[0].position, Vec3::new(10.0, 2.0, 3.0));
-        assert_eq!(scene.screens[screen].transform.w_axis.truncate(), Vec3::new(4.0, 20.0, 6.0));
-        assert_eq!(scene.pyro[pyro].transform.w_axis.truncate(), Vec3::new(7.0, 8.0, 30.0));
+        assert_eq!(
+            scene.screens[screen].transform.w_axis.truncate(),
+            Vec3::new(4.0, 20.0, 6.0)
+        );
+        assert_eq!(
+            scene.pyro[pyro].transform.w_axis.truncate(),
+            Vec3::new(7.0, 8.0, 30.0)
+        );
 
         scene.set_object_rotation_axis_deg(ObjectRef::Fixture(0), 1, 45.0);
         scene.set_object_rotation_axis_deg(ObjectRef::Pyro(pyro), 0, 30.0);
@@ -1743,24 +1825,34 @@ mod tests {
 
         assert!(scene.set_object_uniform_scale(ObjectRef::Screen(screen), 3.0));
         assert!(!scene.set_object_uniform_scale(ObjectRef::Pyro(pyro), 3.0));
-        let (scale, _, _) = scene.screens[screen].transform.to_scale_rotation_translation();
+        let (scale, _, _) = scene.screens[screen]
+            .transform
+            .to_scale_rotation_translation();
         assert!((scale.x - 3.0).abs() < 1e-3);
-        assert_eq!(scene.screens[screen].transform.w_axis.truncate(), Vec3::new(4.0, 20.0, 6.0));
+        assert_eq!(
+            scene.screens[screen].transform.w_axis.truncate(),
+            Vec3::new(4.0, 20.0, 6.0)
+        );
     }
 
     // --- SelectOp truth table (#24) ---------------------------------------
 
     fn fsel(idx: &[usize]) -> Selection {
-        let mut s = Selection::default();
-        s.fixtures = idx.to_vec();
-        s
+        Selection {
+            fixtures: idx.to_vec(),
+            ..Default::default()
+        }
     }
 
     // --- Select All / None / Invert within the active kind (#88) ----------
 
     #[test]
     fn active_kind_follows_the_selected_collection() {
-        assert_eq!(Selection::default().active_kind(), SelKind::Fixtures, "empty defaults to fixtures");
+        assert_eq!(
+            Selection::default().active_kind(),
+            SelKind::Fixtures,
+            "empty defaults to fixtures"
+        );
         assert_eq!(fsel(&[1, 2]).active_kind(), SelKind::Fixtures);
         assert_eq!(Selection::geometry(0).active_kind(), SelKind::Objects);
         assert_eq!(Selection::screen(0).active_kind(), SelKind::Screens);
@@ -1774,7 +1866,10 @@ mod tests {
         let mut s = Selection::geometry(0);
         s.select_all_of(SelKind::Fixtures, counts);
         assert_eq!(s.fixtures, vec![0, 1, 2]);
-        assert!(s.geometry.is_empty() && s.screens.is_empty(), "other kinds cleared");
+        assert!(
+            s.geometry.is_empty() && s.screens.is_empty(),
+            "other kinds cleared"
+        );
 
         let mut s = Selection::default();
         s.select_all_of(SelKind::Screens, counts);
@@ -1814,7 +1909,11 @@ mod tests {
     #[test]
     fn select_replace_from_empty_and_nonempty() {
         // Replace with one hit: whole selection becomes that hit.
-        let s = apply_select(&Selection::default(), &[SelItem::Fixture(3)], SelectOp::Replace);
+        let s = apply_select(
+            &Selection::default(),
+            &[SelItem::Fixture(3)],
+            SelectOp::Replace,
+        );
         assert_eq!(s, fsel(&[3]));
         // Replace over an existing multi-selection discards the old set.
         let s = apply_select(&fsel(&[0, 1, 2]), &[SelItem::Fixture(7)], SelectOp::Replace);
@@ -1835,7 +1934,11 @@ mod tests {
     fn select_add_subtract_toggle_within_kind() {
         let cur = fsel(&[0, 1]);
         // Add: union, dedup (1 already present).
-        let s = apply_select(&cur, &[SelItem::Fixture(1), SelItem::Fixture(2)], SelectOp::Add);
+        let s = apply_select(
+            &cur,
+            &[SelItem::Fixture(1), SelItem::Fixture(2)],
+            SelectOp::Add,
+        );
         assert_eq!(s, fsel(&[0, 1, 2]));
         // Subtract: remove the hit, keep the rest.
         let s = apply_select(&cur, &[SelItem::Fixture(1)], SelectOp::Subtract);
@@ -1844,7 +1947,11 @@ mod tests {
         let s = apply_select(&cur, &[SelItem::Fixture(9)], SelectOp::Subtract);
         assert_eq!(s, cur);
         // Toggle flips membership per hit (1 off, 5 on).
-        let s = apply_select(&cur, &[SelItem::Fixture(1), SelItem::Fixture(5)], SelectOp::Toggle);
+        let s = apply_select(
+            &cur,
+            &[SelItem::Fixture(1), SelItem::Fixture(5)],
+            SelectOp::Toggle,
+        );
         assert_eq!(s, fsel(&[0, 5]));
         // Add from empty seeds the hits' own kind.
         let s = apply_select(&Selection::default(), &[SelItem::Fixture(2)], SelectOp::Add);
@@ -1859,8 +1966,10 @@ mod tests {
         assert_eq!(s, fsel(&[0]));
         // But Replace switches kind to the (dominant) hit kind.
         let s = apply_select(&fsel(&[0]), &[SelItem::Geometry(3)], SelectOp::Replace);
-        let mut want = Selection::default();
-        want.geometry = vec![3];
+        let want = Selection {
+            geometry: vec![3],
+            ..Default::default()
+        };
         assert_eq!(s, want);
     }
 
@@ -1870,8 +1979,10 @@ mod tests {
         // selection to it (matching the old toggle_geometry/screen clear-and-switch),
         // instead of no-op'ing because the active kind was fixtures (the regression).
         let s = apply_select(&fsel(&[0, 1]), &[SelItem::Geometry(3)], SelectOp::Toggle);
-        let mut want = Selection::default();
-        want.geometry = vec![3];
+        let want = Selection {
+            geometry: vec![3],
+            ..Default::default()
+        };
         assert_eq!(s, want);
         // A SAME-kind single Toggle still toggles within the set (deselects one).
         let s = apply_select(&fsel(&[0, 1]), &[SelItem::Fixture(1)], SelectOp::Toggle);
@@ -1956,7 +2067,10 @@ mod tests {
         }
         scene.ensure_sequences();
         assert_eq!(scene.fixtures[0].sequence, 42, "existing sequence kept");
-        assert_ne!(scene.screens[0].sequence, 42, "duplicate sequence reassigned");
+        assert_ne!(
+            scene.screens[0].sequence, 42,
+            "duplicate sequence reassigned"
+        );
     }
 
     #[test]

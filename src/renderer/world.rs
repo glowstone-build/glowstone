@@ -40,11 +40,21 @@ impl WorldTexture {
     }
 
     /// Build the texture + full mip chain from mip-0 RGBA f32 pixels.
-    fn build(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, mip0: Vec<[f32; 4]>) -> Self {
+    fn build(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        mip0: Vec<[f32; 4]>,
+    ) -> Self {
         let mip_count = 32 - (w.max(h)).leading_zeros(); // floor(log2(max))+1
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("world-hdri"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -76,7 +86,11 @@ impl WorldTexture {
                     bytes_per_row: Some(cw * 8), // 4 × f16
                     rows_per_image: Some(ch),
                 },
-                wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: cw,
+                    height: ch,
+                    depth_or_array_layers: 1,
+                },
             );
             if mip + 1 < mip_count {
                 let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
@@ -89,7 +103,7 @@ impl WorldTexture {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("world-sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,      // azimuth wraps
+            address_mode_u: wgpu::AddressMode::Repeat, // azimuth wraps
             address_mode_v: wgpu::AddressMode::ClampToEdge, // poles clamp
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,

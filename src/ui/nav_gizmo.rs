@@ -99,7 +99,9 @@ pub fn hit_test(balls: &[AxisBall], p: Pos2) -> Option<CameraView> {
         // viewer (larger depth).
         let better = match best {
             None => true,
-            Some((bd2, bdepth, _)) => d2 < bd2 - 0.5 || ((d2 - bd2).abs() <= 0.5 && b.depth > bdepth),
+            Some((bd2, bdepth, _)) => {
+                d2 < bd2 - 0.5 || ((d2 - bd2).abs() <= 0.5 && b.depth > bdepth)
+            }
         };
         if better {
             best = Some((d2, b.depth, b.view));
@@ -156,13 +158,22 @@ mod tests {
         let zpos = find(CameraView::Front);
         let zneg = find(CameraView::Back);
         // Looking down −Z: +Z points at the viewer → near; −Z away → far.
-        assert!(zpos.depth > zneg.depth, "+Z should be nearer than −Z in Front view");
+        assert!(
+            zpos.depth > zneg.depth,
+            "+Z should be nearer than −Z in Front view"
+        );
 
         // +X (Right) sits on the screen +x side, +Y (Top) on the screen −y (up) side.
         let xpos = find(CameraView::Right);
         let ypos = find(CameraView::Top);
-        assert!(xpos.pos.x > center.x + 1.0, "+X ball should be to the right");
-        assert!(ypos.pos.y < center.y - 1.0, "+Y ball should be above centre");
+        assert!(
+            xpos.pos.x > center.x + 1.0,
+            "+X ball should be to the right"
+        );
+        assert!(
+            ypos.pos.y < center.y - 1.0,
+            "+Y ball should be above centre"
+        );
 
         // Clicking the +X / +Y ball centres resolves to Right / Top.
         assert_eq!(hit_test(&bs, xpos.pos), Some(CameraView::Right));
@@ -182,9 +193,19 @@ mod tests {
             positive: true,
             depth: 1.0,
         };
-        let far = AxisBall { depth: -1.0, view: CameraView::Back, ..near };
+        let far = AxisBall {
+            depth: -1.0,
+            view: CameraView::Back,
+            ..near
+        };
         // far listed first, near second — depth tie-break must still pick `near`.
-        assert_eq!(hit_test(&[far, near], Pos2::new(50.0, 50.0)), Some(CameraView::Front));
-        assert_eq!(hit_test(&[near, far], Pos2::new(50.0, 50.0)), Some(CameraView::Front));
+        assert_eq!(
+            hit_test(&[far, near], Pos2::new(50.0, 50.0)),
+            Some(CameraView::Front)
+        );
+        assert_eq!(
+            hit_test(&[near, far], Pos2::new(50.0, 50.0)),
+            Some(CameraView::Front)
+        );
     }
 }

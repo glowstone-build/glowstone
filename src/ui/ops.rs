@@ -18,8 +18,13 @@ impl Ui {
     /// BEFORE running a mutation, then pair with [`undo_push`](Self::undo_push)
     /// after. Borrows `self` immutably so it can read cues/groups alongside
     /// `scene` + `patch` (the snapshot keeps the parsed-GDTF `Arc`s out of band).
-    pub(super) fn undo_begin(&self, scene: &Scene, patch: &crate::dmx::PatchTable) -> op::DocSnapshot {
-        self.undo.begin(scene, patch, &self.cues, &self.groups, &self.selection)
+    pub(super) fn undo_begin(
+        &self,
+        scene: &Scene,
+        patch: &crate::dmx::PatchTable,
+    ) -> op::DocSnapshot {
+        self.undo
+            .begin(scene, patch, &self.cues, &self.groups, &self.selection)
     }
 
     /// Record a finished edit (`before` from [`undo_begin`](Self::undo_begin),
@@ -31,7 +36,9 @@ impl Ui {
         scene: &Scene,
         patch: &crate::dmx::PatchTable,
     ) {
-        let after = self.undo.begin(scene, patch, &self.cues, &self.groups, &self.selection);
+        let after = self
+            .undo
+            .begin(scene, patch, &self.cues, &self.groups, &self.selection);
         self.undo.push(name, before, after);
     }
 
@@ -73,6 +80,10 @@ impl Ui {
     /// use). Wraps its arguments in an [`op::ClosureOp`] and dispatches through
     /// [`run_operator`](Self::run_operator), so inline and (future) struct
     /// operators share one pipeline. `poll` is pre-computed by the caller.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Operator closures intentionally receive the scene, DMX, flags, polling state, and executor at this boundary."
+    )]
     pub(super) fn run_op(
         &mut self,
         id: &'static str,
@@ -83,7 +94,13 @@ impl Ui {
         poll: bool,
         exec: impl FnOnce(&mut op::OpCtx) -> op::OpStatus,
     ) -> op::OpStatus {
-        let op = op::ClosureOp { id, label, flags, poll, exec: Some(exec) };
+        let op = op::ClosureOp {
+            id,
+            label,
+            flags,
+            poll,
+            exec: Some(exec),
+        };
         self.run_operator(op, scene, dmx)
     }
 
@@ -181,7 +198,13 @@ impl Ui {
         }
 
         if coalesce {
-            let after = self.undo.begin(scene, dmx.patch(), &self.cues, &self.groups, &self.selection);
+            let after = self.undo.begin(
+                scene,
+                dmx.patch(),
+                &self.cues,
+                &self.groups,
+                &self.selection,
+            );
             self.undo.amend_after(after);
         } else if let Some(before) = before {
             self.undo_push("Nudge", before, scene, dmx.patch());
@@ -228,10 +251,7 @@ impl Ui {
                         }
                     }
                     NodeKey::Group(GroupKind::Devices) => {
-                        let hide = scene
-                            .fixtures
-                            .iter()
-                            .any(|f| !f.hidden)
+                        let hide = scene.fixtures.iter().any(|f| !f.hidden)
                             || scene.screens.iter().any(|s| !s.hidden)
                             || scene.pyro.iter().any(|p| !p.hidden);
                         for f in &mut scene.fixtures {
@@ -354,7 +374,9 @@ impl Ui {
         // path — Dialog ops open their parameter dialog (its confirm runs the op),
         // Direct ops run immediately. The `id` then selects the specific dialog /
         // closure, keeping each op's single real run-site intact.
-        let Some(entry) = op::catalog_op(id) else { return };
+        let Some(entry) = op::catalog_op(id) else {
+            return;
+        };
         match entry.invoke {
             // Parameterized — open the dialog (its confirm runs the op).
             op::OpInvoke::Dialog => match id {
@@ -448,7 +470,9 @@ impl Ui {
         camera: &mut OrbitCamera,
         dmx: &mut crate::dmx::DmxIo,
     ) {
-        let Some(cmd) = shortcuts::command(id) else { return };
+        let Some(cmd) = shortcuts::command(id) else {
+            return;
+        };
         if cmd.invoke.is_some() {
             self.run_catalog_op(ctx, id, scene, dmx);
         } else {
@@ -465,7 +489,12 @@ impl Ui {
     /// palette deliberately does NOT route through here — it runs the op fresh.
     /// (If a re-opened dialog is cancelled, the prior result stays undone but is
     /// recoverable with Redo — acceptable for adjust-last.)
-    pub(super) fn adjust_last_op(&mut self, ctx: &egui::Context, scene: &mut Scene, dmx: &mut crate::dmx::DmxIo) {
+    pub(super) fn adjust_last_op(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        dmx: &mut crate::dmx::DmxIo,
+    ) {
         let Some((id, label)) = self.undo.last_op().map(|l| (l.id, l.label.clone())) else {
             return;
         };
@@ -521,8 +550,13 @@ impl Ui {
 /// pushed for an empty delete).
 fn delete_selection(cx: &mut op::OpCtx) -> op::OpStatus {
     // --- fixtures: remove + remap every index-keyed structure in lock-step ---
-    let mut removed: Vec<usize> =
-        cx.selection.fixtures.iter().copied().filter(|&i| i < cx.scene.fixtures.len()).collect();
+    let mut removed: Vec<usize> = cx
+        .selection
+        .fixtures
+        .iter()
+        .copied()
+        .filter(|&i| i < cx.scene.fixtures.len())
+        .collect();
     removed.sort_unstable();
     removed.dedup();
     if !removed.is_empty() {
@@ -535,29 +569,48 @@ fn delete_selection(cx: &mut op::OpCtx) -> op::OpStatus {
         // Groups store arbitrary index references: remap each through the
         // shift, dropping deleted members, then drop any group left empty.
         for g in cx.groups.iter_mut() {
-            g.fixtures = g.fixtures.iter().filter_map(|&idx| remap_index(idx, &removed)).collect();
+            g.fixtures = g
+                .fixtures
+                .iter()
+                .filter_map(|&idx| remap_index(idx, &removed))
+                .collect();
         }
         cx.groups.retain(|g| !g.fixtures.is_empty());
     }
     // --- static geometry: a plain removal (no patch/cue/group keyed by it) ---
-    let mut geo: Vec<usize> =
-        cx.selection.geometry.iter().copied().filter(|&i| i < cx.scene.geometry.len()).collect();
+    let mut geo: Vec<usize> = cx
+        .selection
+        .geometry
+        .iter()
+        .copied()
+        .filter(|&i| i < cx.scene.geometry.len())
+        .collect();
     geo.sort_unstable();
     geo.dedup();
     for &i in geo.iter().rev() {
         cx.scene.geometry.remove(i);
     }
     // --- LED screens: a plain removal (no patch/cue/group keyed by it) ---
-    let mut scr: Vec<usize> =
-        cx.selection.screens.iter().copied().filter(|&i| i < cx.scene.screens.len()).collect();
+    let mut scr: Vec<usize> = cx
+        .selection
+        .screens
+        .iter()
+        .copied()
+        .filter(|&i| i < cx.scene.screens.len())
+        .collect();
     scr.sort_unstable();
     scr.dedup();
     for &i in scr.iter().rev() {
         cx.scene.screens.remove(i);
     }
     // --- pyro devices: a plain removal (patched inline, not in PatchTable) ---
-    let mut pyro: Vec<usize> =
-        cx.selection.pyro.iter().copied().filter(|&i| i < cx.scene.pyro.len()).collect();
+    let mut pyro: Vec<usize> = cx
+        .selection
+        .pyro
+        .iter()
+        .copied()
+        .filter(|&i| i < cx.scene.pyro.len())
+        .collect();
     pyro.sort_unstable();
     pyro.dedup();
     for &i in pyro.iter().rev() {
@@ -578,7 +631,12 @@ fn delete_selection(cx: &mut op::OpCtx) -> op::OpStatus {
 pub(super) fn next_free_slot(patch: &mut crate::dmx::PatchTable, scene: &Scene) -> (u16, u16) {
     patch.sync(scene);
     let ranges = occupied_ranges(patch, scene, crate::scene::SelKind::Objects, &[]);
-    ranges.iter().map(|r| r.end).max().map(abs_to_slot).unwrap_or((1, 1))
+    ranges
+        .iter()
+        .map(|r| r.end)
+        .max()
+        .map(abs_to_slot)
+        .unwrap_or((1, 1))
 }
 
 /// How many of the active selection are DMX-patchable via the Patch dialog
@@ -612,18 +670,29 @@ fn abs_to_slot(abs: u32) -> (u16, u16) {
 
 fn patch_range(universe: u16, address: u16, footprint: u16) -> DmxRange {
     let start = slot_to_abs(universe, address);
-    DmxRange { start, end: start + footprint.max(1) as u32 }
+    DmxRange {
+        start,
+        end: start + footprint.max(1) as u32,
+    }
 }
 
 fn ranges_overlap(a: DmxRange, b: DmxRange) -> bool {
     a.start < b.end && b.start < a.end
 }
 
-fn next_free_from_ranges(ranges: &[DmxRange], universe: u16, address: u16, footprint: u16) -> (u16, u16) {
+fn next_free_from_ranges(
+    ranges: &[DmxRange],
+    universe: u16,
+    address: u16,
+    footprint: u16,
+) -> (u16, u16) {
     let width = footprint.max(1) as u32;
     let mut start = slot_to_abs(universe, address);
     loop {
-        let candidate = DmxRange { start, end: start + width };
+        let candidate = DmxRange {
+            start,
+            end: start + width,
+        };
         let mut blocked_to = None;
         for &range in ranges {
             if ranges_overlap(candidate, range) {
@@ -681,7 +750,12 @@ fn advance_slot(universe: u16, address: u16, footprint: u16) -> (u16, u16) {
 /// Sequentially patch the active device selection from a start slot. All
 /// desk-controlled device kinds pack against the same occupied DMX ranges, while
 /// fixtures still store their resulting entries in the side [`PatchTable`].
-pub(super) fn patch_selection(cx: &mut op::OpCtx, kind: crate::scene::SelKind, start_u: u16, start_a: u16) {
+pub(super) fn patch_selection(
+    cx: &mut op::OpCtx,
+    kind: crate::scene::SelKind,
+    start_u: u16,
+    start_a: u16,
+) {
     use crate::dmx::patch::{PatchSource, Patchable, PatchableMut};
     use crate::scene::SelKind;
 
@@ -795,13 +869,16 @@ mod tests {
 
         // Undo the single step → no further undo (proves replace, not stack).
         ui.do_undo(&mut scene, &mut dmx);
-        assert!(!ui.undo.can_undo(), "adjust-last must replace, not stack a 2nd unpatch");
+        assert!(
+            !ui.undo.can_undo(),
+            "adjust-last must replace, not stack a 2nd unpatch"
+        );
     }
 
     #[test]
     fn patch_selection_patches_led_screen_as_device() {
         use crate::dmx::patch::Patchable;
-        use crate::scene::{screen::ScreenContent, SelKind};
+        use crate::scene::{SelKind, screen::ScreenContent};
 
         let mut ui = Ui::new();
         let mut scene = Scene::default();

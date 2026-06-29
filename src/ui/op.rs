@@ -28,8 +28,8 @@ use crate::dmx::PatchTable;
 use crate::gdtf::GdtfFixture;
 use crate::scene::{Library, Scene, Selection};
 
-use super::cues::CueEngine;
 use super::SelectionGroup;
+use super::cues::CueEngine;
 
 /// Max steps retained before the oldest is dropped.
 const LIMIT_STEPS: usize = 64;
@@ -56,7 +56,10 @@ impl Blob {
     /// bytes rather than panicking the editor — matching the prior `enc` closure.
     fn encode<T: serde::Serialize>(value: &T) -> Blob {
         let bytes = bincode::serialize(value).unwrap_or_default();
-        Blob { hash: fnv1a(&bytes), bytes: bytes.into() }
+        Blob {
+            hash: fnv1a(&bytes),
+            bytes: bytes.into(),
+        }
     }
 
     /// If `prev` holds byte-identical content (same hash AND bytes), adopt its
@@ -180,8 +183,11 @@ impl DocSnapshot {
         }
         // Reattach the GDTF handles the bincode dropped, in fixture order, then
         // re-align per-mode state (cells / wheels / motion) for each.
-        for ((f, saved), saved_model) in
-            scene.fixtures.iter_mut().zip(self.gdtf.iter()).zip(self.model_src.iter())
+        for ((f, saved), saved_model) in scene
+            .fixtures
+            .iter_mut()
+            .zip(self.gdtf.iter())
+            .zip(self.model_src.iter())
         {
             f.gdtf = saved.clone();
             f.model_src = saved_model.clone();
@@ -247,7 +253,11 @@ impl DragTx {
     /// Begin a transaction: snapshot the current document as the `before` end. The
     /// caller passes the already-captured snapshot (it holds the doc borrows).
     pub fn begin(before: DocSnapshot, op_id: &'static str, label: &'static str) -> DragTx {
-        DragTx { before, op_id, label }
+        DragTx {
+            before,
+            op_id,
+            label,
+        }
     }
 }
 
@@ -294,7 +304,12 @@ impl UndoStack {
     /// Record a finished edit: `before` (from [`begin`](Self::begin)) and `after`
     /// (the post-mutation state). Truncates the redo tail, then enforces the step
     /// + byte caps by dropping from the oldest end.
-    pub fn push(&mut self, name: impl Into<String>, mut before: DocSnapshot, mut after: DocSnapshot) {
+    pub fn push(
+        &mut self,
+        name: impl Into<String>,
+        mut before: DocSnapshot,
+        mut after: DocSnapshot,
+    ) {
         // Drop any redo tail past the cursor — a new edit forks the history.
         self.steps.truncate(self.cursor);
         // Delta-compress along the timeline (#12): a new step's `before` is the
@@ -307,7 +322,12 @@ impl UndoStack {
         }
         after.share_unchanged_from(&before);
         self.next_id += 1;
-        self.steps.push(UndoStep { id: self.next_id, name: name.into(), before, after });
+        self.steps.push(UndoStep {
+            id: self.next_id,
+            name: name.into(),
+            before,
+            after,
+        });
         self.cursor = self.steps.len();
         self.enforce_limits();
     }
@@ -363,7 +383,11 @@ impl UndoStack {
             self.steps.remove(0);
             self.cursor = self.cursor.saturating_sub(1);
         }
-        let mut total: usize = self.steps.iter().map(|s| s.before.bytes() + s.after.bytes()).sum();
+        let mut total: usize = self
+            .steps
+            .iter()
+            .map(|s| s.before.bytes() + s.after.bytes())
+            .sum();
         while total > LIMIT_BYTES && self.steps.len() > 1 {
             let dropped = self.steps.remove(0);
             total -= dropped.before.bytes() + dropped.after.bytes();
@@ -383,7 +407,10 @@ impl UndoStack {
 
     /// Name of the edit that [`undo`](Self::undo) would reverse (for the menu).
     pub fn undo_name(&self) -> Option<&str> {
-        self.cursor.checked_sub(1).and_then(|i| self.steps.get(i)).map(|s| s.name.as_str())
+        self.cursor
+            .checked_sub(1)
+            .and_then(|i| self.steps.get(i))
+            .map(|s| s.name.as_str())
     }
 
     /// Name of the edit that [`redo`](Self::redo) would re-apply (for the menu).
@@ -404,7 +431,9 @@ impl UndoStack {
             return;
         }
         self.cursor -= 1;
-        self.steps[self.cursor].before.restore(scene, patch, cues, groups, selection);
+        self.steps[self.cursor]
+            .before
+            .restore(scene, patch, cues, groups, selection);
     }
 
     /// Step forward one edit: restore the `after` end of the next step.
@@ -419,7 +448,9 @@ impl UndoStack {
         if !self.can_redo() {
             return;
         }
-        self.steps[self.cursor].after.restore(scene, patch, cues, groups, selection);
+        self.steps[self.cursor]
+            .after
+            .restore(scene, patch, cues, groups, selection);
         self.cursor += 1;
     }
 }
@@ -568,7 +599,10 @@ impl UndoStack {
 
     /// Record the last registered op (called by [`Ui::run_op`](super::Ui::run_op)).
     pub fn set_last_op(&mut self, id: &'static str, label: impl Into<String>) {
-        self.last_op = Some(LastOp { id, label: label.into() });
+        self.last_op = Some(LastOp {
+            id,
+            label: label.into(),
+        });
     }
 }
 
@@ -621,7 +655,12 @@ impl CatalogOp {
     /// Project a registry [`Command`](super::shortcuts::Command) carrying an
     /// `invoke` into a catalog descriptor.
     fn from_command(c: &super::shortcuts::Command) -> Option<CatalogOp> {
-        c.invoke.map(|invoke| CatalogOp { id: c.id, label: c.label, category: c.category, invoke })
+        c.invoke.map(|invoke| CatalogOp {
+            id: c.id,
+            label: c.label,
+            category: c.category,
+            invoke,
+        })
     }
 }
 
@@ -633,7 +672,10 @@ impl CatalogOp {
 /// `id`s still match the run sites that [`Ui::run_catalog_op`] routes back to).
 #[cfg(test)]
 pub fn catalog() -> Vec<CatalogOp> {
-    super::shortcuts::COMMANDS.iter().filter_map(CatalogOp::from_command).collect()
+    super::shortcuts::COMMANDS
+        .iter()
+        .filter_map(CatalogOp::from_command)
+        .collect()
 }
 
 /// Look up a catalog entry by its operator `id` (for F9 adjust-last) — resolves
@@ -647,11 +689,9 @@ mod tests {
     use super::*;
     use glam::{Mat4, Vec3};
 
-    use crate::gdtf::{
-        BeamData, DmxMode, EmitterDef, GdtfFixture, Geometry, GeometryKind,
-    };
-    use crate::scene::fixture::Fixture;
+    use crate::gdtf::{BeamData, DmxMode, EmitterDef, GdtfFixture, Geometry, GeometryKind};
     use crate::scene::Library;
+    use crate::scene::fixture::Fixture;
 
     /// A minimal GDTF with two emitters so a fixture built from it carries two
     /// `cells` — the per-mode state that `sync_mode` must rebuild on restore.
@@ -716,7 +756,9 @@ mod tests {
         // Add a GDTF-backed fixture (the mutation we wrap with undo).
         let before = stack.begin(&scene, &patch, &cues, &groups, &selection);
         let gdtf = Arc::new(test_gdtf());
-        scene.fixtures.push(Fixture::from_gdtf(gdtf, "GDTF Fix", Vec3::ZERO));
+        scene
+            .fixtures
+            .push(Fixture::from_gdtf(gdtf, "GDTF Fix", Vec3::ZERO));
         selection = Selection::fixture(scene.fixtures.len() - 1);
         let after = stack.begin(&scene, &patch, &cues, &groups, &selection);
         stack.push("Add Fixture", before, after);
@@ -726,11 +768,23 @@ mod tests {
         assert_eq!(scene.fixtures.last().unwrap().cells.len(), 2);
 
         // Undo: fixture gone, count back to base.
-        stack.undo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        stack.undo(
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(scene.fixtures.len(), base);
 
         // Redo: fixture back, GDTF link reattached out of band, cells rebuilt.
-        stack.redo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        stack.redo(
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(scene.fixtures.len(), base + 1);
         let f = scene.fixtures.last().unwrap();
         assert!(f.is_gdtf(), "GDTF Arc reattached after redo");
@@ -796,7 +850,14 @@ mod tests {
         groups: &mut Vec<SelectionGroup>,
         selection: &mut Selection,
     ) -> OpStatus {
-        let mut cx = OpCtx { scene, patch, cues, groups, selection, library: &Library::standard() };
+        let mut cx = OpCtx {
+            scene,
+            patch,
+            cues,
+            groups,
+            selection,
+            library: &Library::standard(),
+        };
         if !op.poll(&cx) {
             return OpStatus::PassThrough;
         }
@@ -827,27 +888,67 @@ mod tests {
         let base = scene.fixtures.len();
 
         // Finished → mutates + pushes + registers.
-        let mut op = AddBlankFixture { status: OpStatus::Finished };
-        let st = drive(&mut op, &mut stack, &mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        let mut op = AddBlankFixture {
+            status: OpStatus::Finished,
+        };
+        let st = drive(
+            &mut op,
+            &mut stack,
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(st, OpStatus::Finished);
         assert_eq!(scene.fixtures.len(), base + 1);
         assert_eq!(stack.steps.len(), 1);
         assert_eq!(stack.last_op().map(|l| l.id), Some("test.add_blank"));
 
         // Cancelled → no mutation, no push.
-        let mut op = AddBlankFixture { status: OpStatus::Cancelled };
-        let st = drive(&mut op, &mut stack, &mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        let mut op = AddBlankFixture {
+            status: OpStatus::Cancelled,
+        };
+        let st = drive(
+            &mut op,
+            &mut stack,
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(st, OpStatus::Cancelled);
-        assert_eq!(scene.fixtures.len(), base + 1, "Cancelled op mutated nothing");
+        assert_eq!(
+            scene.fixtures.len(),
+            base + 1,
+            "Cancelled op mutated nothing"
+        );
         assert_eq!(stack.steps.len(), 1, "Cancelled op pushed no step");
 
         // RunningModal → likewise no push (the modal op pushes itself on confirm).
-        let mut op = AddBlankFixture { status: OpStatus::RunningModal };
-        drive(&mut op, &mut stack, &mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        let mut op = AddBlankFixture {
+            status: OpStatus::RunningModal,
+        };
+        drive(
+            &mut op,
+            &mut stack,
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(stack.steps.len(), 1, "RunningModal pushed no step");
 
         // Undo reverts the one Finished step.
-        stack.undo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        stack.undo(
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(scene.fixtures.len(), base);
     }
 
@@ -870,11 +971,26 @@ mod tests {
         assert!(catalog_op("fixture.duplicate").is_some());
         assert!(catalog_op("nope.missing").is_none());
         // The parameterized ops open dialogs; the rest run directly.
-        assert_eq!(catalog_op("fixture.duplicate").map(|c| c.invoke), Some(OpInvoke::Dialog));
-        assert_eq!(catalog_op("fixture.patch").map(|c| c.invoke), Some(OpInvoke::Dialog));
-        assert_eq!(catalog_op("object.add").map(|c| c.invoke), Some(OpInvoke::Dialog));
-        assert_eq!(catalog_op("object.delete").map(|c| c.invoke), Some(OpInvoke::Direct));
-        assert_eq!(catalog_op("fixture.unpatch").map(|c| c.invoke), Some(OpInvoke::Direct));
+        assert_eq!(
+            catalog_op("fixture.duplicate").map(|c| c.invoke),
+            Some(OpInvoke::Dialog)
+        );
+        assert_eq!(
+            catalog_op("fixture.patch").map(|c| c.invoke),
+            Some(OpInvoke::Dialog)
+        );
+        assert_eq!(
+            catalog_op("object.add").map(|c| c.invoke),
+            Some(OpInvoke::Dialog)
+        );
+        assert_eq!(
+            catalog_op("object.delete").map(|c| c.invoke),
+            Some(OpInvoke::Direct)
+        );
+        assert_eq!(
+            catalog_op("fixture.unpatch").map(|c| c.invoke),
+            Some(OpInvoke::Direct)
+        );
         // No duplicate ids in the catalog (the palette would list one twice).
         let cat = catalog();
         for (i, a) in cat.iter().enumerate() {
@@ -917,7 +1033,9 @@ mod tests {
     #[test]
     fn delta_snapshot_shares_unchanged_blobs() {
         let mut scene = Scene::default();
-        scene.fixtures.push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
+        scene
+            .fixtures
+            .push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
         let patch = PatchTable::default();
         let cues = CueEngine::default();
         let mut groups: Vec<SelectionGroup> = Vec::new();
@@ -931,7 +1049,10 @@ mod tests {
 
         // Step 2: change ONLY the groups, leaving scene/patch/cues untouched.
         let b1 = stack.begin(&scene, &patch, &cues, &groups, &selection);
-        groups.push(SelectionGroup { name: "G".into(), fixtures: vec![0] });
+        groups.push(SelectionGroup {
+            name: "G".into(),
+            fixtures: vec![0],
+        });
         let a1 = stack.begin(&scene, &patch, &cues, &groups, &selection);
         stack.push("group", b1, a1);
 
@@ -940,13 +1061,28 @@ mod tests {
         let cur_a = &stack.steps[1].after;
 
         // The unchanged sub-documents share the prior step's allocations…
-        assert!(Arc::ptr_eq(&cur_b.scene.bytes, &prev.scene.bytes), "scene blob shared");
-        assert!(Arc::ptr_eq(&cur_b.patch.bytes, &prev.patch.bytes), "patch blob shared");
-        assert!(Arc::ptr_eq(&cur_b.cues.bytes, &prev.cues.bytes), "cues blob shared");
+        assert!(
+            Arc::ptr_eq(&cur_b.scene.bytes, &prev.scene.bytes),
+            "scene blob shared"
+        );
+        assert!(
+            Arc::ptr_eq(&cur_b.patch.bytes, &prev.patch.bytes),
+            "patch blob shared"
+        );
+        assert!(
+            Arc::ptr_eq(&cur_b.cues.bytes, &prev.cues.bytes),
+            "cues blob shared"
+        );
         // …and within step 2, `after`'s scene still shares (only groups changed).
-        assert!(Arc::ptr_eq(&cur_a.scene.bytes, &cur_b.scene.bytes), "scene shared across step ends");
+        assert!(
+            Arc::ptr_eq(&cur_a.scene.bytes, &cur_b.scene.bytes),
+            "scene shared across step ends"
+        );
         // The groups blob actually changed between the two ends → NOT shared.
-        assert!(!Arc::ptr_eq(&cur_a.groups.bytes, &cur_b.groups.bytes), "changed groups blob is fresh");
+        assert!(
+            !Arc::ptr_eq(&cur_a.groups.bytes, &cur_b.groups.bytes),
+            "changed groups blob is fresh"
+        );
     }
 
     /// #12: delta-sharing is transparent to undo/redo — restoring a step whose
@@ -963,27 +1099,63 @@ mod tests {
 
         // Step 1: add a fixture (scene changes).
         let b0 = stack.begin(&scene, &patch, &cues, &groups, &selection);
-        scene.fixtures.push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
+        scene
+            .fixtures
+            .push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
         let a0 = stack.begin(&scene, &patch, &cues, &groups, &selection);
         stack.push("add", b0, a0);
 
         // Step 2: change only the groups (scene blob will be shared with step 1).
         let b1 = stack.begin(&scene, &patch, &cues, &groups, &selection);
-        groups.push(SelectionGroup { name: "G".into(), fixtures: vec![0] });
+        groups.push(SelectionGroup {
+            name: "G".into(),
+            fixtures: vec![0],
+        });
         let a1 = stack.begin(&scene, &patch, &cues, &groups, &selection);
         stack.push("group", b1, a1);
-        assert!(Arc::ptr_eq(&stack.steps[1].after.scene.bytes, &stack.steps[0].after.scene.bytes));
+        assert!(Arc::ptr_eq(
+            &stack.steps[1].after.scene.bytes,
+            &stack.steps[0].after.scene.bytes
+        ));
 
         // Undo step 2 → scene unchanged (still has the added fixture), groups reverted.
-        stack.undo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
-        assert_eq!(scene.fixtures.len(), base + 1, "shared scene blob restored intact");
+        stack.undo(
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
+        assert_eq!(
+            scene.fixtures.len(),
+            base + 1,
+            "shared scene blob restored intact"
+        );
         assert!(groups.is_empty(), "groups reverted");
         // Undo step 1 → added fixture gone.
-        stack.undo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        stack.undo(
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(scene.fixtures.len(), base);
         // Redo both → back to the added fixture (shared blob redoes intact).
-        stack.redo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
-        stack.redo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        stack.redo(
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
+        stack.redo(
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(scene.fixtures.len(), base + 1);
     }
 
@@ -993,7 +1165,9 @@ mod tests {
     #[test]
     fn drag_transaction_is_one_step() {
         let mut scene = Scene::default();
-        scene.fixtures.push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
+        scene
+            .fixtures
+            .push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
         let mut patch = PatchTable::default();
         let mut cues = CueEngine::default();
         let mut groups: Vec<SelectionGroup> = Vec::new();
@@ -1019,8 +1193,17 @@ mod tests {
         assert_eq!(stack.last_op().map(|l| l.id), Some("inspector.edit"));
 
         // One undo reverts the entire drag back to the pre-drag value.
-        stack.undo(&mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
-        assert_eq!(scene.fixtures[0].position.x, start_x, "drag fully reverted in one undo");
+        stack.undo(
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
+        assert_eq!(
+            scene.fixtures[0].position.x, start_x,
+            "drag fully reverted in one undo"
+        );
     }
 
     /// #13: `cancel_drag` restores the pre-drag document and pushes nothing (the
@@ -1028,7 +1211,9 @@ mod tests {
     #[test]
     fn drag_transaction_cancel_restores() {
         let mut scene = Scene::default();
-        scene.fixtures.push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
+        scene
+            .fixtures
+            .push(Fixture::from_gdtf(Arc::new(test_gdtf()), "A", Vec3::ZERO));
         let mut patch = PatchTable::default();
         let mut cues = CueEngine::default();
         let mut groups: Vec<SelectionGroup> = Vec::new();
@@ -1040,8 +1225,18 @@ mod tests {
         let tx = DragTx::begin(before, "inspector.edit", "Edit Value");
         scene.fixtures[0].position.x = 42.0; // preview
 
-        stack.cancel_drag(tx, &mut scene, &mut patch, &mut cues, &mut groups, &mut selection);
+        stack.cancel_drag(
+            tx,
+            &mut scene,
+            &mut patch,
+            &mut cues,
+            &mut groups,
+            &mut selection,
+        );
         assert_eq!(stack.steps.len(), 0, "cancel pushes nothing");
-        assert_eq!(scene.fixtures[0].position.x, 5.0, "cancel restored pre-drag value");
+        assert_eq!(
+            scene.fixtures[0].position.x, 5.0,
+            "cancel restored pre-drag value"
+        );
     }
 }

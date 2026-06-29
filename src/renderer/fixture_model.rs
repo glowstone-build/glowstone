@@ -53,10 +53,12 @@ fn le_u16(b: &[u8], o: usize) -> Option<u16> {
     b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
 }
 fn le_u32(b: &[u8], o: usize) -> Option<u32> {
-    b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    b.get(o..o + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 fn le_f32(b: &[u8], o: usize) -> Option<f32> {
-    b.get(o..o + 4).map(|s| f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    b.get(o..o + 4)
+        .map(|s| f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 /// Recursively scan a region of 3DS chunks, emitting triangles for every
@@ -76,7 +78,11 @@ fn scan_3ds(buf: &[u8], out: &mut Vec<MeshVertex>, depth: u32) {
             0x4D4D | 0x3D3D => scan_3ds(body, out, depth + 1), // MAIN3DS / EDIT3DS
             0x4000 => {
                 // EDIT_OBJECT: null-terminated name, then sub-chunks.
-                let name_end = body.iter().position(|&b| b == 0).map(|p| p + 1).unwrap_or(body.len());
+                let name_end = body
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| p + 1)
+                    .unwrap_or(body.len());
                 scan_3ds(&body[name_end.min(body.len())..], out, depth + 1);
             }
             0x4100 => emit_3ds_trimesh(body, out), // OBJ_TRIMESH
@@ -132,9 +138,11 @@ fn emit_3ds_trimesh(body: &[u8], out: &mut Vec<MeshVertex>) {
     // mm → m here, else the geometry renders ~1000× too large.
     const MM_TO_M: f32 = 0.001;
     for f in &faces {
-        if let (Some(&v0), Some(&v1), Some(&v2)) =
-            (verts.get(f[0] as usize), verts.get(f[1] as usize), verts.get(f[2] as usize))
-        {
+        if let (Some(&v0), Some(&v1), Some(&v2)) = (
+            verts.get(f[0] as usize),
+            verts.get(f[1] as usize),
+            verts.get(f[2] as usize),
+        ) {
             let n = (v1 - v0).cross(v2 - v0).normalize_or_zero();
             for &p in &[v0, v1, v2] {
                 out.push(MeshVertex {
@@ -240,10 +248,13 @@ fn collect_node(node: &gltf::Node, parent: Mat4, blob: Option<&[u8]>, out: &mut 
                 let i = i as usize;
                 // Bounds-guard the index buffer: a malformed GLB (now reachable
                 // via untrusted MVR/GDTF import) can reference out-of-range verts.
-                let Some(&pos) = positions.get(i) else { continue };
+                let Some(&pos) = positions.get(i) else {
+                    continue;
+                };
                 let p = world.transform_point3(Vec3::from(pos));
-                let n = (normal_mat * Vec3::from(normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])))
-                    .normalize_or_zero();
+                let n = (normal_mat
+                    * Vec3::from(normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])))
+                .normalize_or_zero();
                 out.push(MeshVertex {
                     position: p.to_array(),
                     normal: n.to_array(),
@@ -334,7 +345,11 @@ pub fn assemble(
     // channel covering a STRICT SUBSET of the mode's cells is a per-head axis (its
     // angle comes from cell_pan/cell_tilt[cell]); one covering every cell — or a
     // single-emitter fixture — is the fixture-wide yoke/head (the scalar).
-    let n_cells = fixture.modes.get(mode_index).map(|m| m.emitters.len()).unwrap_or(0);
+    let n_cells = fixture
+        .modes
+        .get(mode_index)
+        .map(|m| m.emitters.len())
+        .unwrap_or(0);
     let mut axes: std::collections::HashMap<&str, AxisDrive> = std::collections::HashMap::new();
     if let Some(mode) = fixture.modes.get(mode_index) {
         for rc in &mode.resolved {
@@ -438,12 +453,19 @@ fn walk(
         let dir = world.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
         let right = world.transform_vector3(Vec3::X).normalize_or_zero();
         let up = world.transform_vector3(Vec3::Y).normalize_or_zero();
-        beams.push(BeamFrame { origin, dir, right, up });
+        beams.push(BeamFrame {
+            origin,
+            dir,
+            right,
+            up,
+        });
         *beam_idx += 1;
     }
 
     for child in &node.children {
-        walk(child, world, pan, tilt, cell_pan, cell_tilt, axes, parts, beams, beam_idx);
+        walk(
+            child, world, pan, tilt, cell_pan, cell_tilt, axes, parts, beams, beam_idx,
+        );
     }
 }
 
@@ -480,7 +502,10 @@ mod tests_3ds {
         let out = load_3ds(&main);
         assert_eq!(out.len(), 3, "one triangle = three vertices");
         // Triangle lies in the XY plane → flat normal along Z.
-        assert!(out[0].normal[2].abs() > 0.9, "flat normal should point along +/-Z");
+        assert!(
+            out[0].normal[2].abs() > 0.9,
+            "flat normal should point along +/-Z"
+        );
         // Vertices are scaled mm → m (×0.001).
         assert!((out[1].position[0] - 0.001).abs() < 1e-6);
     }
@@ -489,12 +514,19 @@ mod tests_3ds {
     /// box; a well-authored part is left untouched.
     #[test]
     fn fit_to_declared_rescales_only_bad_exports() {
-        let v = |x: f32, y: f32, z: f32| MeshVertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], emissive: 0.0 };
+        let v = |x: f32, y: f32, z: f32| MeshVertex {
+            position: [x, y, z],
+            normal: [0.0, 1.0, 0.0],
+            emissive: 0.0,
+        };
         // Oversized: a 685 m disc declared at 0.41 m (the Zonda effect bug).
         let mut bad = vec![v(-342.0, -5.0, -342.0), v(342.0, 5.0, 342.0)];
         super::fit_to_declared(&mut bad, [0.41, 0.005, 0.41]);
         let span = bad[1].position[0] - bad[0].position[0];
-        assert!((span - 0.41).abs() < 0.02, "rescaled to declared box, span {span}");
+        assert!(
+            (span - 0.41).abs() < 0.02,
+            "rescaled to declared box, span {span}"
+        );
         // Well-authored: baked ≈ declared → unchanged.
         let mut good = vec![v(-0.2, -0.05, -0.2), v(0.2, 0.05, 0.2)];
         let before = good.clone();

@@ -21,7 +21,9 @@
 use glam::{Mat4, Quat, Vec3};
 
 /// Which pyro device this is — selects the rendering model + parameter ranges.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize, Default,
+)]
 pub enum PyroKind {
     /// CO2 cannon / cryo jet — a rising white fog column.
     #[default]
@@ -42,7 +44,9 @@ impl PyroKind {
 /// DMX footprint mode. Both modes share the same channel order, so the minimal
 /// mode is a strict prefix of the rich one (mirrors GDTF modes / the two-mode
 /// LED-screen idea). Channel counts: CO2 → 1 / 7, Spark → 3 / 5.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize, Default,
+)]
 pub enum PyroMode {
     /// CO2 "Blast" (1ch) / Spark "Spark" (3ch).
     #[default]
@@ -75,7 +79,7 @@ impl PyroMode {
 /// An inline DMX patch for a pyro device (universe + 1-based start address).
 /// Patched directly on the device like [`PixelMap`](super::screen::PixelMap), so
 /// it never churns fixture fingerprints and persists with the show.
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PyroPatch {
     pub universe: u16,
@@ -85,7 +89,10 @@ pub struct PyroPatch {
 
 impl Default for PyroPatch {
     fn default() -> Self {
-        Self { universe: 1, address: 1 }
+        Self {
+            universe: 1,
+            address: 1,
+        }
     }
 }
 
@@ -224,7 +231,6 @@ impl crate::dmx::patch::PatchableMut for PyroDevice {
     }
 }
 
-
 impl PyroDevice {
     /// Build a device from a library profile at `transform` (nozzle at origin,
     /// aiming +Y).
@@ -261,7 +267,11 @@ impl PyroDevice {
             quality: 2,
             hidden: false,
             dissipation: default_dissipation(),
-            speed: if spark { (profile.default_throw_m * 1.3).max(6.0) } else { 11.7 },
+            speed: if spark {
+                (profile.default_throw_m * 1.3).max(6.0)
+            } else {
+                11.7
+            },
             viewport_hq: false,
             thickness: default_thickness(),
             driven: false,
@@ -346,7 +356,11 @@ mod tests {
 
     fn spark() -> PyroDevice {
         let lib = Library::standard();
-        let p = lib.pyro.iter().find(|p| p.kind == PyroKind::ColdSpark).unwrap();
+        let p = lib
+            .pyro
+            .iter()
+            .find(|p| p.kind == PyroKind::ColdSpark)
+            .unwrap();
         PyroDevice::from_profile(p, "Spark", Mat4::IDENTITY)
     }
 

@@ -16,12 +16,12 @@ mod shortcuts;
 mod unpatch_dialog;
 
 pub use about::about_window;
-pub use add_menu::{add_menu_window, AddAction, AddMenuState};
-pub use operator_search::{operator_search_window, OperatorSearchState};
-pub use patch_dialog::{patch_dialog_window, PatchDialog};
+pub use add_menu::{AddAction, AddMenuState, add_menu_window};
+pub use operator_search::{OperatorSearchState, operator_search_window};
+pub use patch_dialog::{PatchDialog, patch_dialog_window};
 pub use perf_overlay::perf_overlay_window;
-pub use preferences::{preferences_window, KeymapEditorState, LabelMode, Preferences};
-pub use profile_editor::{profile_editor_window, ProfileEditor};
+pub use preferences::{KeymapEditorState, LabelMode, Preferences, preferences_window};
+pub use profile_editor::{ProfileEditor, profile_editor_window};
 pub use quick_select::quick_select_window;
 pub use shortcuts::shortcuts_window;
-pub use unpatch_dialog::{unpatch_dialog_window, UnpatchDialog};
+pub use unpatch_dialog::{UnpatchDialog, unpatch_dialog_window};

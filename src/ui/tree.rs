@@ -27,9 +27,9 @@ use egui::{Color32, Sense};
 
 use super::outliner::{self, SceneSort};
 use super::theme;
-use crate::dmx::patch::{FixturePatchRef, Patchable};
 use crate::dmx::PatchTable;
-use crate::scene::{apply_fixture_click, EntityId, Scene, Selection};
+use crate::dmx::patch::{FixturePatchRef, Patchable};
+use crate::scene::{EntityId, Scene, Selection, apply_fixture_click};
 
 /// The outliner's type-filter chip (catalog #62): which entity kinds the tree
 /// shows. `All` is the unfiltered default; the rest restrict to one collection
@@ -46,8 +46,13 @@ pub enum TypeChip {
 
 impl TypeChip {
     /// The chip strip's left-to-right order + labels.
-    pub const ORDER: [TypeChip; 5] =
-        [TypeChip::All, TypeChip::Devices, TypeChip::Objects, TypeChip::Screens, TypeChip::Pyro];
+    pub const ORDER: [TypeChip; 5] = [
+        TypeChip::All,
+        TypeChip::Devices,
+        TypeChip::Objects,
+        TypeChip::Screens,
+        TypeChip::Pyro,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             TypeChip::All => "All",
@@ -303,7 +308,9 @@ pub fn scene_tree(
     // state chip puts the tree in device-focus mode and hides them.
     let show_others = !filter.state.any();
     let visible_objects: Vec<usize> = if filter.kind.objects() && show_others {
-        (0..scene.geometry.len()).filter(|&i| matches(&scene.geometry[i].name)).collect()
+        (0..scene.geometry.len())
+            .filter(|&i| matches(&scene.geometry[i].name))
+            .collect()
     } else {
         Vec::new()
     };
@@ -332,7 +339,9 @@ pub fn scene_tree(
         Vec::new()
     };
     let visible_envs: Vec<usize> = if filter.kind.world() && show_others {
-        (0..scene.environments.len()).filter(|&i| matches(&scene.environments[i].name)).collect()
+        (0..scene.environments.len())
+            .filter(|&i| matches(&scene.environments[i].name))
+            .collect()
     } else {
         Vec::new()
     };
@@ -360,11 +369,10 @@ pub fn scene_tree(
     // work, not thousands of widget allocations (the perf gate for large rigs).
     let line_col = ink.tertiary.gamma_multiply(0.20);
     let total = rows.len();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("scene-tree").show_rows(
-        ui,
-        ROW_H,
-        total,
-        |ui, range| {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .id_salt("scene-tree")
+        .show_rows(ui, ROW_H, total, |ui, range| {
             let full_w = ui.available_width();
             // `show_rows` parks the cursor at the first VISIBLE row's y; recover the
             // virtual content top so guide-line geometry references absolute indices
@@ -401,7 +409,10 @@ pub fn scene_tree(
                 let x = left + PAD_X + r.depth as f32 * INDENT + DISCLOSURE_W * 0.5;
                 let y0 = row_y(i) + ROW_H * 0.5 + ROW_H * 0.25;
                 let y1 = row_y(last) + ROW_H * 0.5;
-                ui.painter().line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], egui::Stroke::new(1.0, line_col));
+                ui.painter().line_segment(
+                    [egui::pos2(x, y0), egui::pos2(x, y1)],
+                    egui::Stroke::new(1.0, line_col),
+                );
             }
 
             // ---- the on-screen rows ----
@@ -425,9 +436,7 @@ pub fn scene_tree(
                     &mut action,
                 );
             }
-
-        },
-    );
+        });
 
     // Click on the empty band BELOW the tree's content clears the selection
     // (Blender outliner). Handled outside `show_rows` (which owns its content
@@ -465,8 +474,11 @@ fn build_rows(
     let open = |k: NodeKey| expanded.contains(&k);
 
     // 1) Root — the project.
-    let total =
-        scene.fixtures.len() + scene.geometry.len() + scene.screens.len() + scene.pyro.len() + scene.environments.len();
+    let total = scene.fixtures.len()
+        + scene.geometry.len()
+        + scene.screens.len()
+        + scene.pyro.len()
+        + scene.environments.len();
     rows.push(TreeRow {
         key: NodeKey::Root,
         kind: RowKind::Root,
@@ -568,8 +580,16 @@ fn build_rows(
         if open(NodeKey::Group(GroupKind::Devices)) {
             for &i in visible_fixtures {
                 let f = &scene.fixtures[i];
-                let patch_tag = FixturePatchRef { fixture: f, patch: patch.get(i) }.patch_tag();
-                let row_icon = if f.is_laser { icon::COLOR } else { icon::FIXTURE };
+                let patch_tag = FixturePatchRef {
+                    fixture: f,
+                    patch: patch.get(i),
+                }
+                .patch_tag();
+                let row_icon = if f.is_laser {
+                    icon::COLOR
+                } else {
+                    icon::FIXTURE
+                };
                 rows.push(TreeRow {
                     key: NodeKey::Entity(f.id),
                     kind: RowKind::Fixture(i),
@@ -634,7 +654,12 @@ fn build_rows(
         if open(NodeKey::Group(GroupKind::Objects)) {
             for &i in visible_objects {
                 let g = &scene.geometry[i];
-                let kind = g.mvr.as_ref().map(|m| m.kind.as_str()).filter(|k| !k.is_empty()).unwrap_or("Object");
+                let kind = g
+                    .mvr
+                    .as_ref()
+                    .map(|m| m.kind.as_str())
+                    .filter(|k| !k.is_empty())
+                    .unwrap_or("Object");
                 rows.push(TreeRow {
                     key: NodeKey::Entity(g.id),
                     kind: RowKind::Object(i),
@@ -657,7 +682,14 @@ fn build_rows(
 
 /// Push a depth-1 group container row (Devices / Objects). A group
 /// with zero children still shows its header (Blender keeps empty collections).
-fn push_group(rows: &mut Vec<TreeRow>, kind: GroupKind, icon: &'static str, label: &str, count: usize, vis: VisState) {
+fn push_group(
+    rows: &mut Vec<TreeRow>,
+    kind: GroupKind,
+    icon: &'static str,
+    label: &str,
+    count: usize,
+    vis: VisState,
+) {
     rows.push(TreeRow {
         key: NodeKey::Group(kind),
         kind: RowKind::Group(kind),
@@ -675,11 +707,19 @@ fn push_group(rows: &mut Vec<TreeRow>, kind: GroupKind, icon: &'static str, labe
 
 /// A leaf's two-state visibility (leaves are never `Mixed`).
 fn leaf_vis(hidden: bool) -> VisState {
-    if hidden { VisState::Hidden } else { VisState::Shown }
+    if hidden {
+        VisState::Hidden
+    } else {
+        VisState::Shown
+    }
 }
 
 fn count_str(n: usize) -> String {
-    if n == 0 { "empty".into() } else { format!("{n}") }
+    if n == 0 {
+        "empty".into()
+    } else {
+        format!("{n}")
+    }
 }
 
 fn row_sequence(row: &TreeRow, scene: &Scene) -> Option<u32> {
@@ -784,8 +824,17 @@ fn draw_row(
     if selected {
         painter.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
         let w = if active { 1.5 } else { 1.0 };
-        let col = if active { accent } else { accent.gamma_multiply(0.6) };
-        painter.rect_stroke(rect, 4.0, egui::Stroke::new(w, col), egui::StrokeKind::Inside);
+        let col = if active {
+            accent
+        } else {
+            accent.gamma_multiply(0.6)
+        };
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(w, col),
+            egui::StrokeKind::Inside,
+        );
     } else if resp.hovered() {
         painter.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
     }
@@ -804,21 +853,29 @@ fn draw_row(
     let row_left = rect.left() + PAD_X;
     if let Some(sequence) = row_sequence(row, scene) {
         let seq_col = ink.tertiary.gamma_multiply(dim);
-        let g = painter.layout_no_wrap(
-            sequence.to_string(),
-            egui::FontId::monospace(11.0),
+        let g =
+            painter.layout_no_wrap(sequence.to_string(), egui::FontId::monospace(11.0), seq_col);
+        painter.galley(
+            egui::pos2(row_left, rect.center().y - g.size().y * 0.5),
+            g,
             seq_col,
         );
-        painter.galley(egui::pos2(row_left, rect.center().y - g.size().y * 0.5), g, seq_col);
     }
     let content_x = row_left + row.depth as f32 * INDENT;
-    let disc_rect = egui::Rect::from_min_size(egui::pos2(content_x, rect.top()), egui::vec2(DISCLOSURE_W, ROW_H));
+    let disc_rect = egui::Rect::from_min_size(
+        egui::pos2(content_x, rect.top()),
+        egui::vec2(DISCLOSURE_W, ROW_H),
+    );
     let icon_x = content_x + DISCLOSURE_W + ICON_DX;
     let name_x = icon_x + ICON_W + ICON_GAP;
 
     // ---- disclosure triangle ----
     if row.has_children {
-        let glyph = if expanded.contains(&row.key) { theme::icon::TREE_OPEN } else { theme::icon::TREE_CLOSED };
+        let glyph = if expanded.contains(&row.key) {
+            theme::icon::TREE_OPEN
+        } else {
+            theme::icon::TREE_CLOSED
+        };
         painter.text(
             disc_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -842,7 +899,10 @@ fn draw_row(
     // rows only, measured, so non-device rows reserve only the eye). `reserved_left`
     // becomes the right boundary the name must not cross.
     let mut cursor_r = rect.right() - EDGE_PAD;
-    let eye_rect = egui::Rect::from_min_size(egui::pos2(cursor_r - EYE_W, rect.top()), egui::vec2(EYE_W, ROW_H));
+    let eye_rect = egui::Rect::from_min_size(
+        egui::pos2(cursor_r - EYE_W, rect.top()),
+        egui::vec2(EYE_W, ROW_H),
+    );
     cursor_r -= EYE_W;
 
     if let Some(footprint) = row_footprint(row, scene) {
@@ -853,15 +913,27 @@ fn draw_row(
             ink.tertiary.gamma_multiply(dim),
         );
         cursor_r -= COL_GAP + g.size().x;
-        painter.galley(egui::pos2(cursor_r, rect.center().y - g.size().y * 0.5), g, ink.tertiary);
+        painter.galley(
+            egui::pos2(cursor_r, rect.center().y - g.size().y * 0.5),
+            g,
+            ink.tertiary,
+        );
     }
     if !row.patch_tag.is_empty() && row.patch_tag != "none" {
         // Patch "uni.addr" in a type-aware colour, conflict-red. Shown ONLY when
         // actually patched; unpatched devices read by the absence of an address.
         let col = row_patch_color(row, ink);
-        let g = painter.layout_no_wrap(row.patch_tag.clone(), egui::FontId::monospace(10.0), col.gamma_multiply(dim));
+        let g = painter.layout_no_wrap(
+            row.patch_tag.clone(),
+            egui::FontId::monospace(10.0),
+            col.gamma_multiply(dim),
+        );
         cursor_r -= COL_GAP + g.size().x;
-        painter.galley(egui::pos2(cursor_r, rect.center().y - g.size().y * 0.5), g, col);
+        painter.galley(
+            egui::pos2(cursor_r, rect.center().y - g.size().y * 0.5),
+            g,
+            col,
+        );
     }
     let reserved_left = cursor_r - COL_GAP;
 
@@ -870,7 +942,11 @@ fn draw_row(
     // Mixed (some-but-not-all children hidden) keeps the open eye but tints it
     // muted/accent so the parent reads as "partly hidden" (Blender greys the
     // restriction icon); clicking it hides the remaining visible children.
-    let glyph = if row.vis == VisState::Hidden { theme::icon::EYE_OFF } else { theme::icon::EYE };
+    let glyph = if row.vis == VisState::Hidden {
+        theme::icon::EYE_OFF
+    } else {
+        theme::icon::EYE
+    };
     let eye_col = match row.vis {
         VisState::Hidden => ink.muted,
         VisState::Mixed => {
@@ -888,7 +964,13 @@ fn draw_row(
             }
         }
     };
-    painter.text(eye_rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(13.0), eye_col);
+    painter.text(
+        eye_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(13.0),
+        eye_col,
+    );
     eye.clone().on_hover_text(match row.vis {
         VisState::Hidden => "Hidden — click to show",
         VisState::Mixed => "Partly hidden — click to hide the rest",
@@ -911,7 +993,10 @@ fn draw_row(
             let mut cancel = false;
             let focus_pending_id = egui::Id::new("glow_scene_rename_focus");
             ui.scope_builder(egui::UiBuilder::new().max_rect(edit_rect), |ui| {
-                let te = ui.put(edit_rect, egui::TextEdit::singleline(buf).margin(egui::vec2(2.0, 0.0)));
+                let te = ui.put(
+                    edit_rect,
+                    egui::TextEdit::singleline(buf).margin(egui::vec2(2.0, 0.0)),
+                );
                 // Grab focus ONCE, the first frame the editor appears; then let egui
                 // own focus so Enter / clicking away fire `lost_focus` → commit.
                 // (Re-requesting every frame re-grabbed focus so the field could never
@@ -973,7 +1058,10 @@ fn draw_row(
     // focus once on its first frame (see the editor above).
     if row.renameable && resp.double_clicked() {
         *rename = Some((row.key, row.label.clone()));
-        ui.memory_mut(|m| m.data.insert_temp(egui::Id::new("glow_scene_rename_focus"), true));
+        ui.memory_mut(|m| {
+            m.data
+                .insert_temp(egui::Id::new("glow_scene_rename_focus"), true)
+        });
         return;
     }
     if resp.clicked() {
@@ -999,10 +1087,22 @@ fn draw_row(
 fn row_selection_state(row: &TreeRow, selection: &Selection) -> (bool, bool) {
     match row.kind {
         RowKind::World => (selection.world, selection.world),
-        RowKind::Fixture(i) => (selection.contains_fixture(i), selection.primary_fixture() == Some(i)),
-        RowKind::Object(i) => (selection.contains_geometry(i), selection.primary_geometry() == Some(i)),
-        RowKind::Screen(i) => (selection.contains_screen(i), selection.primary_screen() == Some(i)),
-        RowKind::Pyro(i) => (selection.contains_pyro(i), selection.primary_pyro() == Some(i)),
+        RowKind::Fixture(i) => (
+            selection.contains_fixture(i),
+            selection.primary_fixture() == Some(i),
+        ),
+        RowKind::Object(i) => (
+            selection.contains_geometry(i),
+            selection.primary_geometry() == Some(i),
+        ),
+        RowKind::Screen(i) => (
+            selection.contains_screen(i),
+            selection.primary_screen() == Some(i),
+        ),
+        RowKind::Pyro(i) => (
+            selection.contains_pyro(i),
+            selection.primary_pyro() == Some(i),
+        ),
         RowKind::Environment(i) => {
             let s = selection.environment == Some(i);
             (s, s)
@@ -1165,13 +1265,27 @@ mod tests {
     /// shows only itself, and World/Environment only appear under `All`.
     #[test]
     fn type_chip_gates_kinds() {
-        assert!(TypeChip::All.fixtures() && TypeChip::All.objects() && TypeChip::All.screens() && TypeChip::All.world());
-        assert!(TypeChip::Devices.fixtures() && TypeChip::Devices.screens() && TypeChip::Devices.pyro());
+        assert!(
+            TypeChip::All.fixtures()
+                && TypeChip::All.objects()
+                && TypeChip::All.screens()
+                && TypeChip::All.world()
+        );
+        assert!(
+            TypeChip::Devices.fixtures() && TypeChip::Devices.screens() && TypeChip::Devices.pyro()
+        );
         assert!(!TypeChip::Devices.objects() && !TypeChip::Devices.world());
         assert!(TypeChip::Objects.objects() && !TypeChip::Objects.fixtures());
-        assert!(TypeChip::Screens.screens() && !TypeChip::Screens.fixtures() && !TypeChip::Screens.pyro());
+        assert!(
+            TypeChip::Screens.screens()
+                && !TypeChip::Screens.fixtures()
+                && !TypeChip::Screens.pyro()
+        );
         assert!(TypeChip::Pyro.pyro() && !TypeChip::Pyro.fixtures() && !TypeChip::Pyro.screens());
-        assert!(!TypeChip::Devices.world(), "World only shows under the All chip");
+        assert!(
+            !TypeChip::Devices.world(),
+            "World only shows under the All chip"
+        );
     }
 
     /// No state chip → every device passes (the predicate is the identity).
@@ -1190,24 +1304,58 @@ mod tests {
     /// Each state chip restricts to its state; the chips compose as AND.
     #[test]
     fn state_chips_filter_and_compose() {
-        let unpatched = OutlinerFilter { state: StateChips { unpatched: true, ..Default::default() }, ..Default::default() };
-        assert!(unpatched.device_passes(false, false, false), "an unpatched device passes the Unpatched chip");
-        assert!(!unpatched.device_passes(true, false, false), "a patched device fails the Unpatched chip");
+        let unpatched = OutlinerFilter {
+            state: StateChips {
+                unpatched: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            unpatched.device_passes(false, false, false),
+            "an unpatched device passes the Unpatched chip"
+        );
+        assert!(
+            !unpatched.device_passes(true, false, false),
+            "a patched device fails the Unpatched chip"
+        );
 
-        let selected = OutlinerFilter { state: StateChips { selected: true, ..Default::default() }, ..Default::default() };
+        let selected = OutlinerFilter {
+            state: StateChips {
+                selected: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(selected.device_passes(false, true, false));
-        assert!(!selected.device_passes(false, false, false), "an unselected device fails the Selected chip");
+        assert!(
+            !selected.device_passes(false, false, false),
+            "an unselected device fails the Selected chip"
+        );
 
-        let conflicts = OutlinerFilter { state: StateChips { conflicts: true, ..Default::default() }, ..Default::default() };
+        let conflicts = OutlinerFilter {
+            state: StateChips {
+                conflicts: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(conflicts.device_passes(false, false, true));
         assert!(!conflicts.device_passes(false, false, false));
 
         // AND composition: Selected + Conflicts needs BOTH.
         let both = OutlinerFilter {
-            state: StateChips { selected: true, conflicts: true, ..Default::default() },
+            state: StateChips {
+                selected: true,
+                conflicts: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
-        assert!(both.device_passes(false, true, true), "passes only when selected AND conflicting");
+        assert!(
+            both.device_passes(false, true, true),
+            "passes only when selected AND conflicting"
+        );
         assert!(!both.device_passes(false, true, false));
         assert!(!both.device_passes(false, false, true));
     }
@@ -1217,7 +1365,19 @@ mod tests {
     #[test]
     fn any_state_chip_signals_fixture_focus() {
         assert!(!StateChips::default().any());
-        assert!(StateChips { unpatched: true, ..Default::default() }.any());
-        assert!(StateChips { conflicts: true, ..Default::default() }.any());
+        assert!(
+            StateChips {
+                unpatched: true,
+                ..Default::default()
+            }
+            .any()
+        );
+        assert!(
+            StateChips {
+                conflicts: true,
+                ..Default::default()
+            }
+            .any()
+        );
     }
 }

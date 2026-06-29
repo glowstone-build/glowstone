@@ -6,7 +6,7 @@ use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 
 use super::gizmo::{self, GizmoCtx, Handle};
 use super::nav_gizmo;
-use super::outliner::{fixture_order, SceneSort};
+use super::outliner::{SceneSort, fixture_order};
 use super::shortcuts;
 use super::theme;
 use super::viewport_math::*;
@@ -14,12 +14,21 @@ use super::windows::{LabelMode, Preferences};
 use super::{
     ActiveTool, Axis, DuplicateDialog, NumInput, TransformKind, TransformOp, TransformPrefs,
 };
-use crate::dmx::patch::{channel_map, FixturePatchRef, Patchable};
-use crate::dmx::{DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot};
+use crate::dmx::address::{
+    push_span_universes as push_dmx_span_universes, push_unique_universe, slot_abs as dmx_slot_abs,
+    span_intersects_universe as dmx_span_intersects_universe,
+    span_slots_in_universe as dmx_span_slots_in_universe,
+};
+use crate::dmx::patch::{FixturePatchRef, Patchable, channel_map};
+use crate::dmx::{
+    DmxConfig, DmxStatus, MergePolicy, PatchSource, PatchTable, PendingNetCmd, UniverseSnapshot,
+};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::pyro::{PyroKind, PyroMode};
 use crate::scene::screen::ScreenContent;
-use crate::scene::{apply_fixture_click, apply_select, ObjectRef, Scene, SelItem, SelectOp, Selection};
+use crate::scene::{
+    ObjectRef, Scene, SelItem, SelectOp, Selection, apply_fixture_click, apply_select,
+};
 
 /// Universe is considered live if it updated within this window.
 const DMX_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
@@ -66,7 +75,11 @@ pub(super) fn paint_truncated(
     use egui::text::{LayoutJob, TextFormat, TextWrapping};
     let mut job = LayoutJob::single_section(
         text.to_owned(),
-        TextFormat { font_id: egui::FontId::proportional(size), color, ..Default::default() },
+        TextFormat {
+            font_id: egui::FontId::proportional(size),
+            color,
+            ..Default::default()
+        },
     );
     job.wrap = TextWrapping {
         max_width: max_w.max(8.0),
@@ -145,7 +158,10 @@ pub(super) fn apply_transform(
                     (Some(from), Some(to)) => to - from,
                     _ => Vec3::ZERO,
                 }
-            } else if let Some(normal) = op.gizmo_plane_normal.filter(|_| op.from_gizmo && op.viewport.area() > 0.0) {
+            } else if let Some(normal) = op
+                .gizmo_plane_normal
+                .filter(|_| op.from_gizmo && op.viewport.area() > 0.0)
+            {
                 // PLANE handle (#S2): intersect the start + live cursor rays with the
                 // plane through the pivot whose normal is the held axis (in the active
                 // orientation), and take the difference. The off-plane axis stays fixed
@@ -162,12 +178,15 @@ pub(super) fn apply_transform(
                     (Some(from), Some(to)) => to - from,
                     _ => Vec3::ZERO,
                 }
-            } else if op.from_gizmo && axis.is_some() && op.viewport.area() > 0.0 {
+            } else if op.from_gizmo
+                && op.viewport.area() > 0.0
+                && let Some(axis) = axis
+            {
                 // #40 ray-plane ABSOLUTE drag: project the start + live cursor rays onto
                 // the constraint axis line through the pivot; the world delta is the
                 // difference, so the grabbed handle STICKS to the cursor at any camera
                 // angle (vs the pixel-speed heuristic that drifts at grazing angles).
-                let a = axis_dir(axis.unwrap());
+                let a = axis_dir(axis);
                 let (ro0, rd0) = ray_at(op.start_screen);
                 let (ro1, rd1) = ray_at(cur);
                 let from = ray_axis_closest_point(ro0, rd0, op.pivot, a);
@@ -269,7 +288,11 @@ pub(super) fn apply_transform(
         TransformKind::Rotate => {
             // Typed degrees override the mouse-derived angle (radians); #4 snaps the
             // committed angle to the rotate increment (e.g. nearest 15°).
-            let angle = if typed { amount.to_radians() } else { d.x * 0.01 };
+            let angle = if typed {
+                amount.to_radians()
+            } else {
+                d.x * 0.01
+            };
             let angle = op.snap.snap_angle(angle, snap_on);
             // Rotate about the active axis IN THE CHOSEN ORIENTATION: Local spins about
             // the element's own axis (a raked head tilts about its local pitch axis),
@@ -295,7 +318,11 @@ pub(super) fn apply_transform(
             for (i, m0) in &op.geo_start {
                 // Individual Origins: pivot = each piece's own world-bounds centre at
                 // op start (read off m0); else the shared pivot.
-                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let pivot = if op.individual {
+                    geo_world_centre(*m0)
+                } else {
+                    op.pivot
+                };
                 let about = Mat4::from_translation(pivot)
                     * Mat4::from_quat(rot)
                     * Mat4::from_translation(-pivot);
@@ -304,7 +331,11 @@ pub(super) fn apply_transform(
                 }
             }
             for (i, m0) in &op.screen_start {
-                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let pivot = if op.individual {
+                    geo_world_centre(*m0)
+                } else {
+                    op.pivot
+                };
                 let about = Mat4::from_translation(pivot)
                     * Mat4::from_quat(rot)
                     * Mat4::from_translation(-pivot);
@@ -313,7 +344,11 @@ pub(super) fn apply_transform(
                 }
             }
             for (i, m0) in &op.pyro_start {
-                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
+                let pivot = if op.individual {
+                    geo_world_centre(*m0)
+                } else {
+                    op.pivot
+                };
                 let about = Mat4::from_translation(pivot)
                     * Mat4::from_quat(rot)
                     * Mat4::from_translation(-pivot);
@@ -371,28 +406,34 @@ pub(super) fn apply_transform(
             };
             let about4 = Mat4::from_mat3(scale_mat);
             for (i, m0) in &op.geo_start {
-                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
-                let about = Mat4::from_translation(pivot)
-                    * about4
-                    * Mat4::from_translation(-pivot);
+                let pivot = if op.individual {
+                    geo_world_centre(*m0)
+                } else {
+                    op.pivot
+                };
+                let about = Mat4::from_translation(pivot) * about4 * Mat4::from_translation(-pivot);
                 if let Some(g) = scene.geometry.get_mut(*i) {
                     g.transform = about * *m0;
                 }
             }
             for (i, m0) in &op.screen_start {
-                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
-                let about = Mat4::from_translation(pivot)
-                    * about4
-                    * Mat4::from_translation(-pivot);
+                let pivot = if op.individual {
+                    geo_world_centre(*m0)
+                } else {
+                    op.pivot
+                };
+                let about = Mat4::from_translation(pivot) * about4 * Mat4::from_translation(-pivot);
                 if let Some(s) = scene.screens.get_mut(*i) {
                     s.transform = about * *m0;
                 }
             }
             for (i, m0) in &op.pyro_start {
-                let pivot = if op.individual { geo_world_centre(*m0) } else { op.pivot };
-                let about = Mat4::from_translation(pivot)
-                    * about4
-                    * Mat4::from_translation(-pivot);
+                let pivot = if op.individual {
+                    geo_world_centre(*m0)
+                } else {
+                    op.pivot
+                };
+                let about = Mat4::from_translation(pivot) * about4 * Mat4::from_translation(-pivot);
                 if let Some(p) = scene.pyro.get_mut(*i) {
                     p.transform = about * *m0;
                 }
@@ -424,15 +465,35 @@ fn geo_world_centre(m: Mat4) -> Vec3 {
 /// current origin minus its op-start snapshot (the move is a pure translation).
 fn dup_grab_delta(op: &TransformOp, scene: &Scene) -> Vec3 {
     if let Some((i, p0, _)) = op.start.first() {
-        scene.fixtures.get(*i).map(|f| f.position - *p0).unwrap_or(Vec3::ZERO)
+        scene
+            .fixtures
+            .get(*i)
+            .map(|f| f.position - *p0)
+            .unwrap_or(Vec3::ZERO)
     } else if let Some((i, m0)) = op.geo_start.first() {
-        scene.geometry.get(*i).map(|g| (g.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
+        scene
+            .geometry
+            .get(*i)
+            .map(|g| (g.transform.w_axis - m0.w_axis).truncate())
+            .unwrap_or(Vec3::ZERO)
     } else if let Some((i, m0)) = op.screen_start.first() {
-        scene.screens.get(*i).map(|s| (s.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
+        scene
+            .screens
+            .get(*i)
+            .map(|s| (s.transform.w_axis - m0.w_axis).truncate())
+            .unwrap_or(Vec3::ZERO)
     } else if let Some((i, m0)) = op.pyro_start.first() {
-        scene.pyro.get(*i).map(|p| (p.transform.w_axis - m0.w_axis).truncate()).unwrap_or(Vec3::ZERO)
+        scene
+            .pyro
+            .get(*i)
+            .map(|p| (p.transform.w_axis - m0.w_axis).truncate())
+            .unwrap_or(Vec3::ZERO)
     } else if let Some((i, c0, _)) = op.env_start.first() {
-        scene.environments.get(*i).map(|e| e.center - *c0).unwrap_or(Vec3::ZERO)
+        scene
+            .environments
+            .get(*i)
+            .map(|e| e.center - *c0)
+            .unwrap_or(Vec3::ZERO)
     } else {
         Vec3::ZERO
     }
@@ -493,7 +554,9 @@ fn place_array_extra(scene: &mut Scene, op: &TransformOp, k: usize, b: usize, of
             }
         }
         ObjectRef::Environment(e) => {
-            if let (Some((_, c0, sz0)), Some(env)) = (op.env_start.get(b), scene.environments.get_mut(e)) {
+            if let (Some((_, c0, sz0)), Some(env)) =
+                (op.env_start.get(b), scene.environments.get_mut(e))
+            {
                 env.center = *c0 + off;
                 env.size = *sz0;
             }
@@ -512,7 +575,11 @@ pub(super) fn update_dup_array(op: &mut TransformOp, scene: &mut Scene) {
         return;
     }
     let base_len = op.dup_base.len();
-    let n = if op.num.active { (op.num.value().round() as i64).clamp(1, 1000) as u32 } else { 1 };
+    let n = if op.num.active {
+        (op.num.value().round() as i64).clamp(1, 1000) as u32
+    } else {
+        1
+    };
     let desired = (n.saturating_sub(1) as usize) * base_len; // count of EXTRA clones (#2..N)
     if op.dup_extra.len() > desired {
         let remove = op.dup_extra.len() - desired;
@@ -579,6 +646,10 @@ impl AimState {
 /// Keep the Move/origin gizmo visible while a modal Move owns the viewport. This
 /// is draw-only: hit-testing stays disabled until the current transform commits
 /// or cancels, so the live drag state cannot be stolen by another handle.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Draw-only viewport helper still mirrors the viewport state boundary."
+)]
 fn draw_passive_move_origin_gizmo(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -589,16 +660,35 @@ fn draw_passive_move_origin_gizmo(
     cursor_3d: Vec3,
     aspect: f32,
 ) -> Option<egui::Pos2> {
-    let fids: Vec<usize> =
-        selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
-    let gids: Vec<usize> =
-        selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-    let sids: Vec<usize> =
-        selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
-    let pids: Vec<usize> =
-        selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
-    let eids: Vec<usize> =
-        selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+    let fids: Vec<usize> = selection
+        .fixtures
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.fixtures.len())
+        .collect();
+    let gids: Vec<usize> = selection
+        .geometry
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.geometry.len())
+        .collect();
+    let sids: Vec<usize> = selection
+        .screens
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.screens.len())
+        .collect();
+    let pids: Vec<usize> = selection
+        .pyro
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.pyro.len())
+        .collect();
+    let eids: Vec<usize> = selection
+        .environment
+        .into_iter()
+        .filter(|&i| i < scene.environments.len())
+        .collect();
     let objs = obj_refs(&fids, &gids, &sids, &pids, &eids);
     if objs.is_empty() {
         return None;
@@ -633,12 +723,16 @@ fn pick_world_point(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Vec3> {
         }
     };
     for f in &scene.fixtures {
-        if !f.hidden && let Some(t) = ray_sphere(ro, rd, f.position, 0.5) {
+        if !f.hidden
+            && let Some(t) = ray_sphere(ro, rd, f.position, 0.5)
+        {
             consider(t);
         }
     }
     for s in &scene.screens {
-        if !s.hidden && let Some(t) = s.ray_hit(ro, rd) {
+        if !s.hidden
+            && let Some(t) = s.ray_hit(ro, rd)
+        {
             consider(t);
         }
     }
@@ -689,11 +783,7 @@ pub fn placement_point(scene: &Scene, camera: &OrbitCamera) -> Vec3 {
     }
     // Ground/surface miss → place in front of the camera at the orbit distance.
     let front = ro + rd * camera.distance.max(1.0);
-    if front.is_finite() {
-        front
-    } else {
-        Vec3::ZERO
-    }
+    if front.is_finite() { front } else { Vec3::ZERO }
 }
 
 /// Central tab: the 3D scene, rendered offscreen and shown as a texture.
@@ -818,10 +908,16 @@ pub fn viewport(
         let red = egui::Color32::from_rgb(230, 70, 70);
         let white = egui::Color32::from_rgb(235, 235, 235);
         p.circle_stroke(sc, r, egui::Stroke::new(1.0, red));
-        for (i, (dx, dy)) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        for (i, (dx, dy)) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+            .iter()
+            .enumerate()
+        {
             let col = if i % 2 == 0 { red } else { white };
             let dir = egui::vec2(*dx, *dy);
-            p.line_segment([sc + dir * (r - 1.0), sc + dir * (r + 5.0)], egui::Stroke::new(1.0, col));
+            p.line_segment(
+                [sc + dir * (r - 1.0), sc + dir * (r + 5.0)],
+                egui::Stroke::new(1.0, col),
+            );
         }
     }
 
@@ -852,16 +948,35 @@ pub fn viewport(
         && selection.has_object()
         && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
     {
-        let fids: Vec<usize> =
-            selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
-        let gids: Vec<usize> =
-            selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-        let sids: Vec<usize> =
-            selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
-        let pids: Vec<usize> =
-            selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
-        let eids: Vec<usize> =
-            selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+        let fids: Vec<usize> = selection
+            .fixtures
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.fixtures.len())
+            .collect();
+        let gids: Vec<usize> = selection
+            .geometry
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.geometry.len())
+            .collect();
+        let sids: Vec<usize> = selection
+            .screens
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.screens.len())
+            .collect();
+        let pids: Vec<usize> = selection
+            .pyro
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.pyro.len())
+            .collect();
+        let eids: Vec<usize> = selection
+            .environment
+            .into_iter()
+            .filter(|&i| i < scene.environments.len())
+            .collect();
         let objs = obj_refs(&fids, &gids, &sids, &pids, &eids);
         if !objs.is_empty() {
             let pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
@@ -902,25 +1017,43 @@ pub fn viewport(
         && *viewport_focused
         && !selection.world
         && selection.has_object();
-    if gizmo_targets
-        && let Some(group) = gizmo::for_tool(active_tool)
-    {
+    if gizmo_targets && let Some(group) = gizmo::for_tool(active_tool) {
         // #5: the gizmo draws at the mode-resolved pivot (Median centroid / Active /
         // 3D-cursor; Individual Origins also draws at the median, matching Blender).
-        let fids: Vec<usize> =
-            selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
-        let gids: Vec<usize> =
-            selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-        let sids: Vec<usize> =
-            selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
-        let pids: Vec<usize> =
-            selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
-        let eids: Vec<usize> =
-            selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+        let fids: Vec<usize> = selection
+            .fixtures
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.fixtures.len())
+            .collect();
+        let gids: Vec<usize> = selection
+            .geometry
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.geometry.len())
+            .collect();
+        let sids: Vec<usize> = selection
+            .screens
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.screens.len())
+            .collect();
+        let pids: Vec<usize> = selection
+            .pyro
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.pyro.len())
+            .collect();
+        let eids: Vec<usize> = selection
+            .environment
+            .into_iter()
+            .filter(|&i| i < scene.environments.len())
+            .collect();
         let objs = obj_refs(&fids, &gids, &sids, &pids, &eids);
         if !objs.is_empty() {
             let gizmo_pivot = compute_pivot(scene, &objs, xform.pivot, *cursor_3d);
-            gizmo_screen = OrbitCamera::project_to_screen(gizmo_pivot, camera.view_proj(aspect), rect);
+            gizmo_screen =
+                OrbitCamera::project_to_screen(gizmo_pivot, camera.view_proj(aspect), rect);
             let cx = GizmoCtx {
                 pivot: gizmo_pivot,
                 vp: camera.view_proj(aspect),
@@ -955,7 +1088,11 @@ pub fn viewport(
                     // Move locks via `gizmo_hovered_axis` (matching P3a); rotate/scale
                     // carry their axis in `axis` (apply_transform reads it directly,
                     // and the uniform-scale centre yields None = scale all axes).
-                    axis: if start_spec.kind == TransformKind::Move { None } else { start_spec.axis },
+                    axis: if start_spec.kind == TransformKind::Move {
+                        None
+                    } else {
+                        start_spec.axis
+                    },
                     start_screen: cur,
                     viewport: rect,
                     pivot: cx.pivot,
@@ -982,7 +1119,8 @@ pub fn viewport(
                     snap: xform.snap,
                     orientation: xform.orientation,
                     from_duplicate: false,
-                    dup_base: Vec::new(), dup_extra: Vec::new(),
+                    dup_base: Vec::new(),
+                    dup_extra: Vec::new(),
                 });
                 *transform_started = true;
             }
@@ -1030,12 +1168,14 @@ pub fn viewport(
             let vp = camera.view_proj(aspect);
             // The far end: the committed B, else a live preview under the cursor.
             let live_b = measure.b.or_else(|| {
-                ui.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p)).and_then(|pos| {
-                    let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
-                    let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-                    let (ro, rd) = camera.ray(ndc, aspect);
-                    pick_world_point(scene, ro, rd)
-                })
+                ui.input(|i| i.pointer.latest_pos())
+                    .filter(|p| rect.contains(*p))
+                    .and_then(|pos| {
+                        let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
+                        let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+                        let (ro, rd) = camera.ray(ndc, aspect);
+                        pick_world_point(scene, ro, rd)
+                    })
             });
             let sa = OrbitCamera::project_to_screen(a, vp, rect);
             let sb = live_b.and_then(|b| OrbitCamera::project_to_screen(b, vp, rect));
@@ -1085,19 +1225,24 @@ pub fn viewport(
     // also orbits or click-selects. Non-fixture selections are left untouched.
     if active_tool == ActiveTool::Aim && transform.is_none() {
         // The selected, in-range fixtures we aim (geometry/screen selections ignored).
-        let fids: Vec<usize> =
-            selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+        let fids: Vec<usize> = selection
+            .fixtures
+            .iter()
+            .copied()
+            .filter(|&i| i < scene.fixtures.len())
+            .collect();
         if !consumed && !fids.is_empty() && *viewport_focused {
             // World target under the cursor (ground-plane fallback like Measure), used
             // both to aim and to draw the marker/lines this frame.
-            let cursor_target = ui.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p)).and_then(
-                |pos| {
+            let cursor_target = ui
+                .input(|i| i.pointer.latest_pos())
+                .filter(|p| rect.contains(*p))
+                .and_then(|pos| {
                     let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
                     let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
                     let (ro, rd) = camera.ray(ndc, aspect);
                     pick_world_point(scene, ro, rd)
-                },
-            );
+                });
             // A press begins the aim drag → snapshot the undo `before` once.
             if response.drag_started() {
                 *transform_started = true;
@@ -1117,7 +1262,8 @@ pub fn viewport(
                 }
             }
             // Release commits the single undo step and ends the drag.
-            if aim.active() && (response.drag_stopped() || !ui.input(|i| i.pointer.primary_down())) {
+            if aim.active() && (response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()))
+            {
                 *transform_finished = true;
                 aim.target = None;
             }
@@ -1136,11 +1282,22 @@ pub fn viewport(
             if let Some(st) = OrbitCamera::project_to_screen(target, vp, rect) {
                 // A small crosshair-in-circle target marker.
                 painter.circle_stroke(st, 7.0, egui::Stroke::new(2.0, accent));
-                painter.line_segment([st - egui::vec2(10.0, 0.0), st + egui::vec2(10.0, 0.0)], egui::Stroke::new(1.5, accent));
-                painter.line_segment([st - egui::vec2(0.0, 10.0), st + egui::vec2(0.0, 10.0)], egui::Stroke::new(1.5, accent));
+                painter.line_segment(
+                    [st - egui::vec2(10.0, 0.0), st + egui::vec2(10.0, 0.0)],
+                    egui::Stroke::new(1.5, accent),
+                );
+                painter.line_segment(
+                    [st - egui::vec2(0.0, 10.0), st + egui::vec2(0.0, 10.0)],
+                    egui::Stroke::new(1.5, accent),
+                );
                 for &i in &fids {
-                    if let Some(sf) = OrbitCamera::project_to_screen(scene.fixtures[i].position, vp, rect) {
-                        painter.line_segment([sf, st], egui::Stroke::new(1.5, accent.gamma_multiply(0.7)));
+                    if let Some(sf) =
+                        OrbitCamera::project_to_screen(scene.fixtures[i].position, vp, rect)
+                    {
+                        painter.line_segment(
+                            [sf, st],
+                            egui::Stroke::new(1.5, accent.gamma_multiply(0.7)),
+                        );
                     }
                 }
             }
@@ -1286,14 +1443,7 @@ pub fn viewport(
             }
             if op.kind == TransformKind::Move
                 && let Some(sc) = draw_passive_move_origin_gizmo(
-                    ui,
-                    rect,
-                    scene,
-                    selection,
-                    camera,
-                    &xform,
-                    *cursor_3d,
-                    aspect,
+                    ui, rect, scene, selection, camera, &xform, *cursor_3d, aspect,
                 )
             {
                 gizmo_screen = Some(sc);
@@ -1308,7 +1458,11 @@ pub fn viewport(
                     .active_axis()
                     .map(|a| {
                         let [r, g, b] = a.color();
-                        egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+                        egui::Color32::from_rgb(
+                            (r * 255.0) as u8,
+                            (g * 255.0) as u8,
+                            (b * 255.0) as u8,
+                        )
                     })
                     .unwrap_or(egui::Color32::from_rgb(255, 220, 120));
                 theme::overlay_label(
@@ -1342,7 +1496,11 @@ pub fn viewport(
         // quick-select) and `R` to Rotate (Shift+R = Replace stays in Global).
         let kind = shortcuts::poll(
             ui.ctx(),
-            shortcuts::ActiveContext { viewport_focused: true, transform_active: false, box_select_active: false },
+            shortcuts::ActiveContext {
+                viewport_focused: true,
+                transform_active: false,
+                box_select_active: false,
+            },
             &ov,
         )
         .into_iter()
@@ -1353,16 +1511,35 @@ pub fn viewport(
         if let Some(kind) = kind
             && let Some(cur) = ui.input(|i| i.pointer.latest_pos())
         {
-            let fids: Vec<usize> =
-                selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
-            let gids: Vec<usize> =
-                selection.geometry.iter().copied().filter(|&i| i < scene.geometry.len()).collect();
-            let sids: Vec<usize> =
-                selection.screens.iter().copied().filter(|&i| i < scene.screens.len()).collect();
-            let pids: Vec<usize> =
-                selection.pyro.iter().copied().filter(|&i| i < scene.pyro.len()).collect();
-            let eids: Vec<usize> =
-                selection.environment.into_iter().filter(|&i| i < scene.environments.len()).collect();
+            let fids: Vec<usize> = selection
+                .fixtures
+                .iter()
+                .copied()
+                .filter(|&i| i < scene.fixtures.len())
+                .collect();
+            let gids: Vec<usize> = selection
+                .geometry
+                .iter()
+                .copied()
+                .filter(|&i| i < scene.geometry.len())
+                .collect();
+            let sids: Vec<usize> = selection
+                .screens
+                .iter()
+                .copied()
+                .filter(|&i| i < scene.screens.len())
+                .collect();
+            let pids: Vec<usize> = selection
+                .pyro
+                .iter()
+                .copied()
+                .filter(|&i| i < scene.pyro.len())
+                .collect();
+            let eids: Vec<usize> = selection
+                .environment
+                .into_iter()
+                .filter(|&i| i < scene.environments.len())
+                .collect();
             let objs = obj_refs(&fids, &gids, &sids, &pids, &eids);
             if !objs.is_empty() {
                 // #5: pivot per the chosen mode (Median / Active / 3D-Cursor; the
@@ -1391,7 +1568,8 @@ pub fn viewport(
                     snap: xform.snap,
                     orientation: xform.orientation,
                     from_duplicate: false,
-                    dup_base: Vec::new(), dup_extra: Vec::new(),
+                    dup_base: Vec::new(),
+                    dup_extra: Vec::new(),
                 });
                 *transform_started = true;
                 consumed = true;
@@ -1470,7 +1648,11 @@ pub fn viewport(
             if down {
                 // Rubber-band: 30% gray fill + a dashed border a shade lighter (spec).
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(marquee, 0.0, egui::Color32::from_rgba_unmultiplied(130, 130, 130, 77));
+                painter.rect_filled(
+                    marquee,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(130, 130, 130, 77),
+                );
                 let pts = [
                     marquee.left_top(),
                     marquee.right_top(),
@@ -1503,7 +1685,6 @@ pub fn viewport(
                     *selection = apply_select(selection, &hits, op);
                     *scene_anchor = None;
                 }
-                box_anchor = None;
                 *box_select_armed = false;
                 ui.data_mut(|d| {
                     d.remove_temp::<egui::Pos2>(box_anchor_id);
@@ -1514,8 +1695,14 @@ pub fn viewport(
             // Armed, not yet dragging: full-viewport crosshair + the active filter cue.
             let painter = ui.painter_at(rect);
             let s = egui::Stroke::new(1.0, egui::Color32::from_gray(170).gamma_multiply(0.5));
-            painter.line_segment([egui::pos2(rect.left(), p.y), egui::pos2(rect.right(), p.y)], s);
-            painter.line_segment([egui::pos2(p.x, rect.top()), egui::pos2(p.x, rect.bottom())], s);
+            painter.line_segment(
+                [egui::pos2(rect.left(), p.y), egui::pos2(rect.right(), p.y)],
+                s,
+            );
+            painter.line_segment(
+                [egui::pos2(p.x, rect.top()), egui::pos2(p.x, rect.bottom())],
+                s,
+            );
             let label = match ui.data(|d| d.get_temp::<u8>(box_filter_id).unwrap_or(0)) {
                 1 => "Box: fixtures  (O = objects)",
                 2 => "Box: objects  (F = fixtures)",
@@ -1554,7 +1741,11 @@ pub fn viewport(
             let marquee = egui::Rect::from_two_pos(anchor, cur);
             if response.dragged() {
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(marquee, 0.0, egui::Color32::from_rgba_unmultiplied(130, 130, 130, 77));
+                painter.rect_filled(
+                    marquee,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(130, 130, 130, 77),
+                );
                 let pts = [
                     marquee.left_top(),
                     marquee.right_top(),
@@ -1616,26 +1807,43 @@ pub fn viewport(
         let hovered = hover_pos.and_then(|p| nav_gizmo::hit_test(&balls, p));
         let painter = ui.painter_at(rect);
         // Faint backing disc so the cluster reads against any scene.
-        painter.circle_filled(center, nav_gizmo::GIZMO_RADIUS + 6.0, egui::Color32::from_black_alpha(70));
+        painter.circle_filled(
+            center,
+            nav_gizmo::GIZMO_RADIUS + 6.0,
+            egui::Color32::from_black_alpha(70),
+        );
         // Draw far balls first so near ones overlap them (painter order = depth).
         let mut order: Vec<usize> = (0..balls.len()).collect();
-        order.sort_by(|&a, &b| balls[a].depth.partial_cmp(&balls[b].depth).unwrap_or(std::cmp::Ordering::Equal));
+        order.sort_by(|&a, &b| {
+            balls[a]
+                .depth
+                .partial_cmp(&balls[b].depth)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for &i in &order {
             let b = balls[i];
             let [r, g, bl] = b.color;
-            let base = egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (bl * 255.0) as u8);
+            let base =
+                egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (bl * 255.0) as u8);
             let hot = hovered == Some(b.view);
             // Connecting arm from centre to the ball.
             painter.line_segment(
                 [center, b.pos],
-                egui::Stroke::new(1.0, base.gamma_multiply(if b.depth >= 0.0 { 0.6 } else { 0.3 })),
+                egui::Stroke::new(
+                    1.0,
+                    base.gamma_multiply(if b.depth >= 0.0 { 0.6 } else { 0.3 }),
+                ),
             );
             if b.positive || hot {
                 // Positive (and any hovered) balls are solid + labelled.
                 let col = if hot { egui::Color32::WHITE } else { base };
                 painter.circle_filled(b.pos, nav_gizmo::BALL_RADIUS, base);
                 if hot {
-                    painter.circle_stroke(b.pos, nav_gizmo::BALL_RADIUS, egui::Stroke::new(1.5, col));
+                    painter.circle_stroke(
+                        b.pos,
+                        nav_gizmo::BALL_RADIUS,
+                        egui::Stroke::new(1.5, col),
+                    );
                 }
                 painter.text(
                     b.pos,
@@ -1646,7 +1854,11 @@ pub fn viewport(
                 );
             } else {
                 // Negative balls are hollow rings (so the cluster reads as a sphere).
-                painter.circle_stroke(b.pos, nav_gizmo::BALL_RADIUS - 1.0, egui::Stroke::new(1.5, base.gamma_multiply(0.8)));
+                painter.circle_stroke(
+                    b.pos,
+                    nav_gizmo::BALL_RADIUS - 1.0,
+                    egui::Stroke::new(1.5, base.gamma_multiply(0.8)),
+                );
             }
         }
         // A click on a ball snaps the view + consumes the press (no orbit).
@@ -1710,7 +1922,14 @@ pub fn viewport(
         let toggle = m.command || m.ctrl;
         let hit = pick(scene, ro, rd);
         if let Some(Hit::Fixture(i)) = hit {
-            apply_fixture_click(selection, scene_anchor, i, m.shift, toggle, scene.fixtures.len());
+            apply_fixture_click(
+                selection,
+                scene_anchor,
+                i,
+                m.shift,
+                toggle,
+                scene.fixtures.len(),
+            );
         } else {
             // Modifier → op: plain = replace, ⌘/Ctrl = toggle, Shift = add.
             let op = if toggle {
@@ -1743,15 +1962,14 @@ pub fn viewport(
         && response.secondary_clicked()
         && ui.input(|i| i.modifiers.shift)
         && *viewport_focused;
-    if shift_rclick
-        && let Some(pos) = response.interact_pointer_pos()
-    {
+    if shift_rclick && let Some(pos) = response.interact_pointer_pos() {
         let uv = (pos - rect.min) / rect.size().max(egui::vec2(1.0, 1.0));
         let ndc = Vec2::new(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
         let (ro, rd) = camera.ray(ndc, aspect);
         // Ground/geometry hit, else a sensible point in front of the camera so the
         // cursor still lands somewhere visible when the ray misses the world.
-        let p = pick_world_point(scene, ro, rd).unwrap_or_else(|| ro + rd * camera.distance.max(1.0));
+        let p =
+            pick_world_point(scene, ro, rd).unwrap_or_else(|| ro + rd * camera.distance.max(1.0));
         if p.is_finite() {
             *cursor_3d = p;
             *cursor_3d_set = true;
@@ -1794,8 +2012,15 @@ pub fn viewport(
             if !selection.geometry.is_empty() {
                 // Static-geometry (Objects) selection menu.
                 let n = selection.geometry.len();
-                ui.label(egui::RichText::new(format!("{n} object{}", if n == 1 { "" } else { "s" })).small().weak());
-                if ui.button(format!("{}  Frame selection", theme::icon::FRAME)).clicked() {
+                ui.label(
+                    egui::RichText::new(format!("{n} object{}", if n == 1 { "" } else { "s" }))
+                        .small()
+                        .weak(),
+                );
+                if ui
+                    .button(format!("{}  Frame selection", theme::icon::FRAME))
+                    .clicked()
+                {
                     let mut lo = Vec3::splat(f32::INFINITY);
                     let mut hi = Vec3::splat(f32::NEG_INFINITY);
                     for &i in &selection.geometry {
@@ -1809,7 +2034,10 @@ pub fn viewport(
                     }
                     ui.close();
                 }
-                if ui.button(format!("{}  Hide", theme::icon::EYE_OFF)).clicked() {
+                if ui
+                    .button(format!("{}  Hide", theme::icon::EYE_OFF))
+                    .clicked()
+                {
                     for &i in &selection.geometry {
                         if let Some(g) = scene.geometry.get_mut(i) {
                             g.hidden = true;
@@ -1823,7 +2051,10 @@ pub fn viewport(
                     ui.close();
                 }
                 if ui
-                    .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
+                    .button(
+                        egui::RichText::new(format!("{}  Delete", theme::icon::TRASH))
+                            .color(theme::CONFLICT),
+                    )
                     .clicked()
                 {
                     *delete_requested = true;
@@ -1832,8 +2063,15 @@ pub fn viewport(
             } else if !selection.screens.is_empty() {
                 // LED-screen selection menu.
                 let n = selection.screens.len();
-                ui.label(egui::RichText::new(format!("{n} screen{}", if n == 1 { "" } else { "s" })).small().weak());
-                if ui.button(format!("{}  Frame selection", theme::icon::FRAME)).clicked() {
+                ui.label(
+                    egui::RichText::new(format!("{n} screen{}", if n == 1 { "" } else { "s" }))
+                        .small()
+                        .weak(),
+                );
+                if ui
+                    .button(format!("{}  Frame selection", theme::icon::FRAME))
+                    .clicked()
+                {
                     let mut lo = Vec3::splat(f32::INFINITY);
                     let mut hi = Vec3::splat(f32::NEG_INFINITY);
                     for &i in &selection.screens {
@@ -1848,7 +2086,10 @@ pub fn viewport(
                     }
                     ui.close();
                 }
-                if ui.button(format!("{}  Hide", theme::icon::EYE_OFF)).clicked() {
+                if ui
+                    .button(format!("{}  Hide", theme::icon::EYE_OFF))
+                    .clicked()
+                {
                     for &i in &selection.screens {
                         if let Some(s) = scene.screens.get_mut(i) {
                             s.hidden = true;
@@ -1862,7 +2103,10 @@ pub fn viewport(
                     ui.close();
                 }
                 if ui
-                    .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
+                    .button(
+                        egui::RichText::new(format!("{}  Delete", theme::icon::TRASH))
+                            .color(theme::CONFLICT),
+                    )
                     .clicked()
                 {
                     *delete_requested = true;
@@ -1871,8 +2115,18 @@ pub fn viewport(
             } else if !selection.pyro.is_empty() {
                 // Pyro-device selection menu (mirrors the screens menu).
                 let n = selection.pyro.len();
-                ui.label(egui::RichText::new(format!("{n} pyro device{}", if n == 1 { "" } else { "s" })).small().weak());
-                if ui.button(format!("{}  Frame selection", theme::icon::FRAME)).clicked() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{n} pyro device{}",
+                        if n == 1 { "" } else { "s" }
+                    ))
+                    .small()
+                    .weak(),
+                );
+                if ui
+                    .button(format!("{}  Frame selection", theme::icon::FRAME))
+                    .clicked()
+                {
                     let mut lo = Vec3::splat(f32::INFINITY);
                     let mut hi = Vec3::splat(f32::NEG_INFINITY);
                     for &i in &selection.pyro {
@@ -1887,7 +2141,10 @@ pub fn viewport(
                     }
                     ui.close();
                 }
-                if ui.button(format!("{}  Hide", theme::icon::EYE_OFF)).clicked() {
+                if ui
+                    .button(format!("{}  Hide", theme::icon::EYE_OFF))
+                    .clicked()
+                {
                     for &i in &selection.pyro {
                         if let Some(p) = scene.pyro.get_mut(i) {
                             p.hidden = true;
@@ -1901,14 +2158,20 @@ pub fn viewport(
                     ui.close();
                 }
                 if ui
-                    .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
+                    .button(
+                        egui::RichText::new(format!("{}  Delete", theme::icon::TRASH))
+                            .color(theme::CONFLICT),
+                    )
                     .clicked()
                 {
                     *delete_requested = true;
                     ui.close();
                 }
             } else if selection.fixtures.is_empty() {
-                if ui.button(format!("{}  Select all", theme::icon::FIXTURE)).clicked() {
+                if ui
+                    .button(format!("{}  Select all", theme::icon::FIXTURE))
+                    .clicked()
+                {
                     selection.fixtures = (0..scene.fixtures.len()).collect();
                     selection.environment = None;
                     selection.geometry.clear();
@@ -1916,17 +2179,26 @@ pub fn viewport(
                 }
             } else {
                 ui.label(
-                    egui::RichText::new(format!("{} selected", selection.fixtures.len())).small().weak(),
+                    egui::RichText::new(format!("{} selected", selection.fixtures.len()))
+                        .small()
+                        .weak(),
                 );
                 if ui.button("Select same type").clicked() {
                     select_same_type(scene, selection);
                     ui.close();
                 }
-                if ui.button(format!("{}  Frame selection", theme::icon::FRAME)).clicked() {
+                if ui
+                    .button(format!("{}  Frame selection", theme::icon::FRAME))
+                    .clicked()
+                {
                     frame_selection(scene, selection, camera);
                     ui.close();
                 }
-                if duplicate.is_none() && ui.button(format!("{}  Duplicate / Array…", theme::icon::DUPLICATE)).clicked() {
+                if duplicate.is_none()
+                    && ui
+                        .button(format!("{}  Duplicate / Array…", theme::icon::DUPLICATE))
+                        .clicked()
+                {
                     if let Some(idx) = selection.primary_fixture() {
                         *duplicate = Some(super::duplicate_dialog_for(ui.ctx(), idx));
                     }
@@ -1946,7 +2218,10 @@ pub fn viewport(
                     ui.close();
                 }
                 if ui
-                    .button(egui::RichText::new(format!("{}  Delete", theme::icon::TRASH)).color(theme::CONFLICT))
+                    .button(
+                        egui::RichText::new(format!("{}  Delete", theme::icon::TRASH))
+                            .color(theme::CONFLICT),
+                    )
                     .clicked()
                 {
                     // Committed after the dock so the patch/groups/cues remap too.
@@ -1962,7 +2237,11 @@ pub fn viewport(
     // started transform, so the poll asks the Viewport keymap with no modal active.
     let dup_pressed = shortcuts::poll(
         ui.ctx(),
-        shortcuts::ActiveContext { viewport_focused: *viewport_focused, transform_active: false, box_select_active: false },
+        shortcuts::ActiveContext {
+            viewport_focused: *viewport_focused,
+            transform_active: false,
+            box_select_active: false,
+        },
         &ov,
     )
     .iter()
@@ -2022,24 +2301,52 @@ pub fn viewport(
         scene.environments.get(ei).map(|e| e.name.clone())
     } else if !selection.geometry.is_empty() {
         let extra = selection.geometry.len().saturating_sub(1);
-        selection.primary_geometry().and_then(|i| scene.geometry.get(i)).map(|g| {
-            if extra > 0 { format!("{}  +{extra}", g.name) } else { g.name.clone() }
-        })
+        selection
+            .primary_geometry()
+            .and_then(|i| scene.geometry.get(i))
+            .map(|g| {
+                if extra > 0 {
+                    format!("{}  +{extra}", g.name)
+                } else {
+                    g.name.clone()
+                }
+            })
     } else if !selection.screens.is_empty() {
         let extra = selection.screens.len().saturating_sub(1);
-        selection.primary_screen().and_then(|i| scene.screens.get(i)).map(|s| {
-            if extra > 0 { format!("{}  +{extra}", s.name) } else { s.name.clone() }
-        })
+        selection
+            .primary_screen()
+            .and_then(|i| scene.screens.get(i))
+            .map(|s| {
+                if extra > 0 {
+                    format!("{}  +{extra}", s.name)
+                } else {
+                    s.name.clone()
+                }
+            })
     } else if !selection.pyro.is_empty() {
         let extra = selection.pyro.len().saturating_sub(1);
-        selection.primary_pyro().and_then(|i| scene.pyro.get(i)).map(|p| {
-            if extra > 0 { format!("{}  +{extra}", p.name) } else { p.name.clone() }
-        })
+        selection
+            .primary_pyro()
+            .and_then(|i| scene.pyro.get(i))
+            .map(|p| {
+                if extra > 0 {
+                    format!("{}  +{extra}", p.name)
+                } else {
+                    p.name.clone()
+                }
+            })
     } else if !selection.fixtures.is_empty() {
         let extra = selection.fixtures.len().saturating_sub(1);
-        selection.primary_fixture().and_then(|i| scene.fixtures.get(i)).map(|f| {
-            if extra > 0 { format!("{}  +{extra}", f.name) } else { f.name.clone() }
-        })
+        selection
+            .primary_fixture()
+            .and_then(|i| scene.fixtures.get(i))
+            .map(|f| {
+                if extra > 0 {
+                    format!("{}  +{extra}", f.name)
+                } else {
+                    f.name.clone()
+                }
+            })
     } else {
         None
     };
@@ -2254,7 +2561,11 @@ pub fn connectivity(
             .on_hover_text("Bind the sockets and decode live DMX into the rig (input only)")
             .changed()
         {
-            *pending = if enabled { PendingNetCmd::Start } else { PendingNetCmd::Stop };
+            *pending = if enabled {
+                PendingNetCmd::Start
+            } else {
+                PendingNetCmd::Stop
+            };
         }
         if running {
             let bound = match (status.bound_artnet, status.bound_sacn) {
@@ -2263,7 +2574,11 @@ pub fn connectivity(
                 (false, true) => "sACN",
                 (false, false) => "no sockets bound",
             };
-            super::status_dot(ui, theme::OK, &format!("{bound} · {} source(s)", status.sources.len()));
+            super::status_dot(
+                ui,
+                theme::OK,
+                &format!("{bound} · {} source(s)", status.sources.len()),
+            );
         } else {
             super::status_dot(ui, theme::IDLE, "stopped");
         }
@@ -2328,7 +2643,9 @@ pub fn connectivity(
     ui.horizontal(|ui| {
         if ui
             .add_enabled(running, egui::Button::new("Reapply"))
-            .on_hover_text("Re-bind sockets / re-join multicast after a protocol or interface change")
+            .on_hover_text(
+                "Re-bind sockets / re-join multicast after a protocol or interface change",
+            )
             .clicked()
         {
             *pending = PendingNetCmd::Reapply;
@@ -2351,40 +2668,50 @@ pub fn connectivity(
         ui.label(RichText::new(msg).weak().small());
         return;
     }
-    egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
-        Grid::new("dmx-sources")
-            .num_columns(7)
-            .striped(true)
-            .spacing([12.0, 3.0])
-            .show(ui, |ui| {
-                for h in ["Proto", "Source", "Universes", "Prio", "FPS", "Lost", "Seen"] {
-                    ui.strong(RichText::new(h).small());
-                }
-                ui.end_row();
-                for s in &status.sources {
-                    ui.label(RichText::new(s.proto.label()).small());
-                    let name = if s.name.is_empty() {
-                        s.label.clone()
-                    } else {
-                        format!("{} ({})", s.name, s.label)
-                    };
-                    ui.label(RichText::new(name).small());
-                    ui.label(RichText::new(format_universes(&s.universes)).small());
-                    ui.label(RichText::new(s.priority.to_string()).small());
-                    let fps_col = if s.fps >= 30.0 {
-                        theme::OK
-                    } else if s.fps >= 10.0 {
-                        theme::WARN
-                    } else {
-                        theme::CONFLICT
-                    };
-                    ui.colored_label(fps_col, RichText::new(format!("{:.0}", s.fps)).small());
-                    ui.label(RichText::new(s.seq_errors.to_string()).small());
-                    ui.label(RichText::new(format!("{:.1}s", s.age().as_secs_f32())).small());
+    egui::ScrollArea::vertical()
+        .max_height(170.0)
+        .show(ui, |ui| {
+            Grid::new("dmx-sources")
+                .num_columns(7)
+                .striped(true)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    for h in [
+                        "Proto",
+                        "Source",
+                        "Universes",
+                        "Prio",
+                        "FPS",
+                        "Lost",
+                        "Seen",
+                    ] {
+                        ui.strong(RichText::new(h).small());
+                    }
                     ui.end_row();
-                }
-            });
-    });
+                    for s in &status.sources {
+                        ui.label(RichText::new(s.proto.label()).small());
+                        let name = if s.name.is_empty() {
+                            s.label.clone()
+                        } else {
+                            format!("{} ({})", s.name, s.label)
+                        };
+                        ui.label(RichText::new(name).small());
+                        ui.label(RichText::new(format_universes(&s.universes)).small());
+                        ui.label(RichText::new(s.priority.to_string()).small());
+                        let fps_col = if s.fps >= 30.0 {
+                            theme::OK
+                        } else if s.fps >= 10.0 {
+                            theme::WARN
+                        } else {
+                            theme::CONFLICT
+                        };
+                        ui.colored_label(fps_col, RichText::new(format!("{:.0}", s.fps)).small());
+                        ui.label(RichText::new(s.seq_errors.to_string()).small());
+                        ui.label(RichText::new(format!("{:.1}s", s.age().as_secs_f32())).small());
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 /// Bottom tab: the live 512-channel universe grid with patch occupants (replaces
@@ -2431,42 +2758,6 @@ struct DmxOcc {
     tint: Color32,
 }
 
-fn dmx_slot_abs(universe: u16, address: u16) -> u32 {
-    let u0 = universe.max(1) as u32 - 1;
-    let a0 = address.clamp(1, 512) as u32 - 1;
-    u0.saturating_mul(512).saturating_add(a0)
-}
-
-fn dmx_abs_to_slot(abs: u32) -> (u16, u16) {
-    let universe = (abs / 512 + 1).min(u16::MAX as u32) as u16;
-    let address = (abs % 512 + 1) as u16;
-    (universe, address)
-}
-
-fn push_unique_universe(universes: &mut Vec<u16>, universe: u16) {
-    if !universes.contains(&universe) {
-        universes.push(universe);
-    }
-}
-
-fn push_dmx_span_universes(universes: &mut Vec<u16>, universe: u16, address: u16, footprint: u16) {
-    let start = dmx_slot_abs(universe, address);
-    let end = start.saturating_add(footprint.max(1) as u32 - 1);
-    let first = dmx_abs_to_slot(start).0;
-    let last = dmx_abs_to_slot(end).0;
-    for u in first..=last {
-        push_unique_universe(universes, u);
-    }
-}
-
-fn dmx_span_intersects_universe(universe: u16, address: u16, footprint: u16, selected_universe: u16) -> bool {
-    let start = dmx_slot_abs(universe, address);
-    let end = start.saturating_add(footprint.max(1) as u32);
-    let universe_start = dmx_slot_abs(selected_universe, 1);
-    let universe_end = universe_start.saturating_add(512);
-    start < universe_end && end > universe_start
-}
-
 fn dmx_monitor_universes(
     scene: &Scene,
     patch: &PatchTable,
@@ -2477,7 +2768,10 @@ fn dmx_monitor_universes(
 
     for (i, fixture) in scene.fixtures.iter().enumerate() {
         let patch_entry = patch.get(i).filter(|p| p.enabled);
-        let device = FixturePatchRef { fixture, patch: patch_entry };
+        let device = FixturePatchRef {
+            fixture,
+            patch: patch_entry,
+        };
         if let Some((universe, address)) = device.patch_slot() {
             push_dmx_span_universes(&mut universes, universe, address, device.footprint());
         }
@@ -2504,7 +2798,12 @@ fn dmx_monitor_universes(
     universes
 }
 
-fn put_dmx_occ(occ: &mut [Option<DmxOcc>], conflict_cells: &mut [bool; 512], slot: usize, item: DmxOcc) {
+fn put_dmx_occ(
+    occ: &mut [Option<DmxOcc>],
+    conflict_cells: &mut [bool; 512],
+    slot: usize,
+    item: DmxOcc,
+) {
     if let Some(existing) = occ.get_mut(slot) {
         if existing.is_some() {
             conflict_cells[slot] = true;
@@ -2517,20 +2816,11 @@ fn put_dmx_occ(occ: &mut [Option<DmxOcc>], conflict_cells: &mut [bool; 512], slo
 fn add_dmx_channel_span(
     occ: &mut [Option<DmxOcc>],
     conflict_cells: &mut [bool; 512],
-    selected_universe: u16,
-    base_universe: u16,
-    base_address: u16,
-    offset: u32,
-    width: u16,
+    slots: impl IntoIterator<Item = usize>,
     item: DmxOcc,
 ) {
-    let start = dmx_slot_abs(base_universe, base_address).saturating_add(offset);
-    let end = start.saturating_add(width.max(1) as u32);
-    for abs in start..end {
-        let (universe, address) = dmx_abs_to_slot(abs);
-        if universe == selected_universe {
-            put_dmx_occ(occ, conflict_cells, (address - 1) as usize, item.clone());
-        }
+    for slot in slots {
+        put_dmx_occ(occ, conflict_cells, slot, item.clone());
     }
 }
 
@@ -2544,7 +2834,10 @@ fn add_screen_dmx_occupancy(
 ) {
     let cols = pm.cols.clamp(1, 256);
     let rows = pm.rows.clamp(1, 256);
-    let footprint = cols.saturating_mul(rows).saturating_mul(3).clamp(1, u16::MAX as u32);
+    let footprint = cols
+        .saturating_mul(rows)
+        .saturating_mul(3)
+        .clamp(1, u16::MAX as u32);
     let base = dmx_slot_abs(pm.universe, pm.start_address);
     let screen_start = base;
     let screen_end = base.saturating_add(footprint);
@@ -2580,9 +2873,19 @@ fn add_screen_dmx_occupancy(
 fn pyro_channel_names(kind: PyroKind, mode: PyroMode) -> &'static [&'static str] {
     match (kind, mode) {
         (PyroKind::Co2Jet, PyroMode::Minimal) => &["Blast"],
-        (PyroKind::Co2Jet, PyroMode::Rich) => &["Arm", "Blast", "Intensity", "Duration", "Pan", "Tilt", "Speed"],
+        (PyroKind::Co2Jet, PyroMode::Rich) => &[
+            "Arm",
+            "Blast",
+            "Intensity",
+            "Duration",
+            "Pan",
+            "Tilt",
+            "Speed",
+        ],
         (PyroKind::ColdSpark, PyroMode::Minimal) => &["Safety", "Spark", "Height"],
-        (PyroKind::ColdSpark, PyroMode::Rich) => &["Safety", "Spark", "Height", "Function", "Oscillation"],
+        (PyroKind::ColdSpark, PyroMode::Rich) => {
+            &["Safety", "Spark", "Height", "Function", "Oscillation"]
+        }
     }
 }
 
@@ -2595,7 +2898,9 @@ fn dmx_occupancy_for_universe(
     let mut conflict_cells = [false; 512];
 
     for (i, fixture) in scene.fixtures.iter().enumerate() {
-        let Some(p) = patch.get(i).filter(|p| p.enabled) else { continue };
+        let Some(p) = patch.get(i).filter(|p| p.enabled) else {
+            continue;
+        };
         if !dmx_span_intersects_universe(p.universe, p.address, p.footprint, selected_universe) {
             continue;
         }
@@ -2610,23 +2915,36 @@ fn dmx_occupancy_for_universe(
             add_dmx_channel_span(
                 &mut occ,
                 &mut conflict_cells,
-                selected_universe,
-                p.universe,
-                p.address,
-                mc.offset as u32,
-                mc.width.max(1) as u16,
+                dmx_span_slots_in_universe(
+                    p.universe,
+                    p.address,
+                    mc.offset as u32,
+                    mc.width.max(1) as u16,
+                    selected_universe,
+                ),
                 item,
             );
         }
     }
 
     for (i, screen) in scene.screens.iter().enumerate() {
-        let ScreenContent::PixelMapDmx(pm) = &screen.content else { continue };
-        add_screen_dmx_occupancy(&mut occ, &mut conflict_cells, selected_universe, i, &screen.name, *pm);
+        let ScreenContent::PixelMapDmx(pm) = &screen.content else {
+            continue;
+        };
+        add_screen_dmx_occupancy(
+            &mut occ,
+            &mut conflict_cells,
+            selected_universe,
+            i,
+            &screen.name,
+            *pm,
+        );
     }
 
     for (i, pyro) in scene.pyro.iter().enumerate() {
-        let Some((universe, address)) = pyro.patch_slot() else { continue };
+        let Some((universe, address)) = pyro.patch_slot() else {
+            continue;
+        };
         if !dmx_span_intersects_universe(universe, address, pyro.footprint(), selected_universe) {
             continue;
         }
@@ -2646,11 +2964,7 @@ fn dmx_occupancy_for_universe(
             add_dmx_channel_span(
                 &mut occ,
                 &mut conflict_cells,
-                selected_universe,
-                universe,
-                address,
-                offset as u32,
-                1,
+                dmx_span_slots_in_universe(universe, address, offset as u32, 1, selected_universe),
                 item,
             );
         }
@@ -2708,7 +3022,11 @@ pub fn dmx_universe_grid(
             if nconf > 0 {
                 ui.colored_label(
                     theme::CONFLICT,
-                    RichText::new(format!("{} {nconf} conflict ch{}", theme::icon::WARNING, if nconf == 1 { "" } else { "s" })),
+                    RichText::new(format!(
+                        "{} {nconf} conflict ch{}",
+                        theme::icon::WARNING,
+                        if nconf == 1 { "" } else { "s" }
+                    )),
                 );
             }
             if live {
@@ -2719,15 +3037,27 @@ pub fn dmx_universe_grid(
             }
         });
     });
-    let active = (1..=512u16).filter(|&c| snapshot.level(u, c).unwrap_or(0) > 0).count();
+    let active = (1..=512u16)
+        .filter(|&c| snapshot.level(u, c).unwrap_or(0) > 0)
+        .count();
     let patched = occ.iter().filter(|o| o.is_some()).count();
 
     // --- summary strip ---
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{active}")).monospace().strong().color(if active > 0 { accent } else { ink.muted }));
+        ui.label(
+            RichText::new(format!("{active}"))
+                .monospace()
+                .strong()
+                .color(if active > 0 { accent } else { ink.muted }),
+        );
         ui.label(RichText::new("active").small().color(ink.tertiary));
         ui.add_space(8.0);
-        ui.label(RichText::new(format!("{patched}")).monospace().strong().color(ink.secondary));
+        ui.label(
+            RichText::new(format!("{patched}"))
+                .monospace()
+                .strong()
+                .color(ink.secondary),
+        );
         ui.label(RichText::new("patched / 512").small().color(ink.tertiary));
     });
     ui.separator();
@@ -2738,108 +3068,145 @@ pub fn dmx_universe_grid(
 
     const COLS: usize = 16;
     const ROWS: usize = 32;
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        let avail = ui.available_width().max(360.0);
-        let cell_w = (avail / COLS as f32).clamp(40.0, 96.0);
-        let cell_h = 30.0;
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(cell_w * COLS as f32, cell_h * ROWS as f32),
-            Sense::click(),
-        );
-        let painter = ui.painter_at(rect);
-        for r in 0..ROWS {
-            for c in 0..COLS {
-                let ch = r * COLS + c; // 0-based channel index
-                let cell = egui::Rect::from_min_size(
-                    rect.min + egui::vec2(c as f32 * cell_w, r as f32 * cell_h),
-                    egui::vec2(cell_w - 1.0, cell_h - 1.0),
-                );
-                let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
-                let occupied = occ[ch].as_ref();
-                let selected = occupied.is_some_and(|item| item.target.is_selected(selection));
-                let tint = occupied.map(|item| item.tint).unwrap_or(accent);
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let avail = ui.available_width().max(360.0);
+            let cell_w = (avail / COLS as f32).clamp(40.0, 96.0);
+            let cell_h = 30.0;
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(cell_w * COLS as f32, cell_h * ROWS as f32),
+                Sense::click(),
+            );
+            let painter = ui.painter_at(rect);
+            for r in 0..ROWS {
+                for c in 0..COLS {
+                    let ch = r * COLS + c; // 0-based channel index
+                    let cell = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(c as f32 * cell_w, r as f32 * cell_h),
+                        egui::vec2(cell_w - 1.0, cell_h - 1.0),
+                    );
+                    let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
+                    let occupied = occ[ch].as_ref();
+                    let selected = occupied.is_some_and(|item| item.target.is_selected(selection));
+                    let tint = occupied.map(|item| item.tint).unwrap_or(accent);
 
-                // Base + a value-fill bar rising from the bottom (∝ level).
-                painter.rect_filled(cell, 3.0, if occupied.is_some() { base_patched } else { base_empty });
-                if level > 0 {
-                    let frac = level as f32 / 255.0;
-                    let fill = egui::Rect::from_min_max(
-                        egui::pos2(cell.left(), cell.bottom() - cell.height() * frac),
-                        cell.right_bottom(),
-                    );
-                    painter.rect_filled(fill, 0.0, tint.gamma_multiply(0.22 + 0.55 * frac));
-                }
-                // Device-identity stripe down the left edge.
-                if occupied.is_some() {
+                    // Base + a value-fill bar rising from the bottom (∝ level).
                     painter.rect_filled(
-                        egui::Rect::from_min_max(cell.left_top(), egui::pos2(cell.left() + 2.5, cell.bottom())),
-                        0.0,
-                        tint,
+                        cell,
+                        3.0,
+                        if occupied.is_some() {
+                            base_patched
+                        } else {
+                            base_empty
+                        },
                     );
-                }
-                // Border / conflict / selection ring.
-                painter.rect_stroke(cell, 3.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
-                if conflict_cells[ch] {
-                    painter.rect_stroke(cell, 3.0, egui::Stroke::new(1.5, theme::CONFLICT), egui::StrokeKind::Inside);
-                } else if selected {
-                    painter.rect_stroke(cell, 3.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
-                }
-                // Channel number (top-left) + value % (bottom-right), tabular.
-                painter.text(
-                    cell.left_top() + egui::vec2(4.0, 2.0),
-                    egui::Align2::LEFT_TOP,
-                    (ch + 1).to_string(),
-                    egui::FontId::monospace(9.0),
-                    ink.muted,
-                );
-                if level > 0 {
-                    let pct = (level as f32 / 255.0 * 100.0).round() as u32;
-                    painter.text(
-                        cell.right_bottom() + egui::vec2(-4.0, -2.0),
-                        egui::Align2::RIGHT_BOTTOM,
-                        format!("{pct}"),
-                        egui::FontId::monospace(11.5),
-                        ink.primary,
-                    );
-                }
-            }
-        }
-        // Hover tooltip with the channel's full occupant + value.
-        if let Some(pos) = resp.hover_pos() {
-            let rel = pos - rect.min;
-            let (c, r) = ((rel.x / cell_w) as usize, (rel.y / cell_h) as usize);
-            if c < COLS && r < ROWS {
-                let ch = r * COLS + c;
-                let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
-                let pct = (level as f32 / 255.0 * 100.0).round() as u32;
-                let detail = match &occ[ch] {
-                    Some(item) => {
-                        let kind = item.target.label();
-                        let name = &item.name;
-                        let attr = &item.attr;
-                        format!("Ch {} · {kind} · {name} · {attr}\n{level}  ({pct}%)", ch + 1)
+                    if level > 0 {
+                        let frac = level as f32 / 255.0;
+                        let fill = egui::Rect::from_min_max(
+                            egui::pos2(cell.left(), cell.bottom() - cell.height() * frac),
+                            cell.right_bottom(),
+                        );
+                        painter.rect_filled(fill, 0.0, tint.gamma_multiply(0.22 + 0.55 * frac));
                     }
-                    None => format!("Ch {} · unpatched\n{level}  ({pct}%)", ch + 1),
-                };
-                egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new("dmx-cell-tip"), |ui| {
-                    ui.label(detail);
-                });
+                    // Device-identity stripe down the left edge.
+                    if occupied.is_some() {
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                cell.left_top(),
+                                egui::pos2(cell.left() + 2.5, cell.bottom()),
+                            ),
+                            0.0,
+                            tint,
+                        );
+                    }
+                    // Border / conflict / selection ring.
+                    painter.rect_stroke(
+                        cell,
+                        3.0,
+                        egui::Stroke::new(1.0, border),
+                        egui::StrokeKind::Inside,
+                    );
+                    if conflict_cells[ch] {
+                        painter.rect_stroke(
+                            cell,
+                            3.0,
+                            egui::Stroke::new(1.5, theme::CONFLICT),
+                            egui::StrokeKind::Inside,
+                        );
+                    } else if selected {
+                        painter.rect_stroke(
+                            cell,
+                            3.0,
+                            egui::Stroke::new(1.5, accent),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    // Channel number (top-left) + value % (bottom-right), tabular.
+                    painter.text(
+                        cell.left_top() + egui::vec2(4.0, 2.0),
+                        egui::Align2::LEFT_TOP,
+                        (ch + 1).to_string(),
+                        egui::FontId::monospace(9.0),
+                        ink.muted,
+                    );
+                    if level > 0 {
+                        let pct = (level as f32 / 255.0 * 100.0).round() as u32;
+                        painter.text(
+                            cell.right_bottom() + egui::vec2(-4.0, -2.0),
+                            egui::Align2::RIGHT_BOTTOM,
+                            format!("{pct}"),
+                            egui::FontId::monospace(11.5),
+                            ink.primary,
+                        );
+                    }
+                }
             }
-        }
-        if resp.clicked()
-            && let Some(pos) = resp.interact_pointer_pos()
-        {
-            let rel = pos - rect.min;
-            let (c, r) = ((rel.x / cell_w) as usize, (rel.y / cell_h) as usize);
-            // Select from the same occupancy map the grid is painted/hovered from
-            // (so a click agrees with the cell's shown identity, including gaps).
-            if c < COLS && r < ROWS
-                && let Some(item) = &occ[r * COLS + c]
+            // Hover tooltip with the channel's full occupant + value.
+            if let Some(pos) = resp.hover_pos() {
+                let rel = pos - rect.min;
+                let (c, r) = ((rel.x / cell_w) as usize, (rel.y / cell_h) as usize);
+                if c < COLS && r < ROWS {
+                    let ch = r * COLS + c;
+                    let level = snapshot.level(u, (ch + 1) as u16).unwrap_or(0);
+                    let pct = (level as f32 / 255.0 * 100.0).round() as u32;
+                    let detail = match &occ[ch] {
+                        Some(item) => {
+                            let kind = item.target.label();
+                            let name = &item.name;
+                            let attr = &item.attr;
+                            format!(
+                                "Ch {} · {kind} · {name} · {attr}\n{level}  ({pct}%)",
+                                ch + 1
+                            )
+                        }
+                        None => format!("Ch {} · unpatched\n{level}  ({pct}%)", ch + 1),
+                    };
+                    egui::show_tooltip_at_pointer(
+                        ui.ctx(),
+                        ui.layer_id(),
+                        egui::Id::new("dmx-cell-tip"),
+                        |ui| {
+                            ui.label(detail);
+                        },
+                    );
+                }
+            }
+            if resp.clicked()
+                && let Some(pos) = resp.interact_pointer_pos()
             {
-                *selection = item.target.selection();
+                let rel = pos - rect.min;
+                let (c, r) = ((rel.x / cell_w) as usize, (rel.y / cell_h) as usize);
+                // Select from the same occupancy map the grid is painted/hovered from
+                // (so a click agrees with the cell's shown identity, including gaps).
+                if c < COLS
+                    && r < ROWS
+                    && let Some(item) = &occ[r * COLS + c]
+                {
+                    *selection = item.target.selection();
+                }
             }
-        }
-    });
+        });
 }
 
 /// A stable identity colour for a fixture index — golden-ratio hue spacing so
@@ -2930,12 +3297,20 @@ pub fn fixture_manager(
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{}  Fixtures", icon::FIXTURE)).heading());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(theme::ico(icon::RESET)).on_hover_text("Reset addresses to the import (MVR/GDTF), discarding manual edits").clicked() {
+            if ui
+                .button(theme::ico(icon::RESET))
+                .on_hover_text("Reset addresses to the import (MVR/GDTF), discarding manual edits")
+                .clicked()
+            {
                 patch.reconcile_from_scene(scene);
             }
             let nsel = selection.fixtures.len();
             if nsel > 0 {
-                ui.label(RichText::new(format!("{nsel} selected")).small().color(accent));
+                ui.label(
+                    RichText::new(format!("{nsel} selected"))
+                        .small()
+                        .color(accent),
+                );
             }
         });
     });
@@ -2967,7 +3342,12 @@ pub fn fixture_manager(
     });
 
     // --- bulk toolbar (only when fixtures are selected) ---
-    let sel: Vec<usize> = selection.fixtures.iter().copied().filter(|&i| i < scene.fixtures.len()).collect();
+    let sel: Vec<usize> = selection
+        .fixtures
+        .iter()
+        .copied()
+        .filter(|&i| i < scene.fixtures.len())
+        .collect();
     if !sel.is_empty() {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(format!("Bulk · {}", sel.len())).small().strong().color(accent));
@@ -3058,7 +3438,11 @@ pub fn fixture_manager(
     ui.separator();
 
     if scene.fixtures.is_empty() {
-        ui.label(RichText::new("No fixtures — add from the Library or import an MVR.").weak().small());
+        ui.label(
+            RichText::new("No fixtures — add from the Library or import an MVR.")
+                .weak()
+                .small(),
+        );
         return;
     }
 
@@ -3068,7 +3452,10 @@ pub fn fixture_manager(
         .into_iter()
         .filter(|&i| {
             let f = &scene.fixtures[i];
-            if !q.is_empty() && !f.name.to_lowercase().contains(&q) && !f.profile.to_lowercase().contains(&q) {
+            if !q.is_empty()
+                && !f.name.to_lowercase().contains(&q)
+                && !f.profile.to_lowercase().contains(&q)
+            {
                 return false;
             }
             if fm.conflicts_only && !conflicted[i] {
@@ -3082,87 +3469,120 @@ pub fn fixture_manager(
         .collect();
 
     let mut click: Option<(usize, bool, bool)> = None;
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        Grid::new("fixtures-grid").num_columns(8).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
-            for h in ["Seq", "Fixture", "Type", "Univ", "Addr", "Mode", "Ch", ""] {
-                ui.strong(RichText::new(h).small().color(ink.tertiary));
-            }
-            ui.end_row();
-
-            for &i in &order {
-                // Seq cell (editable): the user-facing sequence/channel number, first
-                // (console-style). Mutates the fixture, so it precedes the immutable
-                // borrow used for the rest of the row.
-                ui.add(DragValue::new(&mut scene.fixtures[i].sequence).range(1..=u32::MAX).speed(0.2));
-                let fixture = &scene.fixtures[i];
-                // Name cell: selects the row (syncs the 3D/Inspector selection);
-                // shift = range, ⌘/Ctrl = toggle.
-                let selected = selection.contains_fixture(i);
-                let resp = ui.selectable_label(selected, RichText::new(fixture.name.as_str()).small());
-                if resp.clicked() {
-                    let m = ui.input(|x| x.modifiers);
-                    click = Some((i, m.shift, m.command || m.ctrl));
-                }
-                ui.label(RichText::new(fixture.profile.as_str()).weak().small());
-
-                // Universe / address.
-                if let Some(p) = patch.get_mut(i) {
-                    let mut edited = ui.add(DragValue::new(&mut p.universe).range(1..=63999).speed(0.1)).changed();
-                    edited |= ui.add(DragValue::new(&mut p.address).range(1..=512).speed(0.2)).changed();
-                    if edited {
-                        p.enabled = true;
-                        p.source = PatchSource::Manual;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            Grid::new("fixtures-grid")
+                .num_columns(8)
+                .striped(true)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    for h in ["Seq", "Fixture", "Type", "Univ", "Addr", "Mode", "Ch", ""] {
+                        ui.strong(RichText::new(h).small().color(ink.tertiary));
                     }
-                } else {
-                    ui.label("");
-                    ui.label("");
-                }
+                    ui.end_row();
 
-                // Mode selector (GDTF modes; plain fixtures are synthetic).
-                let mut new_mode = None;
-                match fixture.gdtf.as_ref() {
-                    Some(gdtf) if !gdtf.modes.is_empty() => {
-                        let cur = patch.get(i).map(|p| p.mode_index).unwrap_or(0);
-                        let cur_name = gdtf.modes.get(cur).map(|m| m.name.clone()).unwrap_or_default();
-                        egui::ComboBox::from_id_salt(("fm-mode", i))
-                            .selected_text(RichText::new(cur_name).small())
-                            .show_ui(ui, |ui| {
-                                for (mi, m) in gdtf.modes.iter().enumerate() {
-                                    if ui.selectable_label(mi == cur, &m.name).clicked() {
-                                        new_mode = Some(mi);
-                                    }
-                                }
-                            });
-                    }
-                    _ => {
-                        ui.label(RichText::new("—").weak().small());
-                    }
-                }
-                if let Some(mi) = new_mode {
-                    patch.set_mode(fixture, i, mi);
-                }
+                    for &i in &order {
+                        // Seq cell (editable): the user-facing sequence/channel number, first
+                        // (console-style). Mutates the fixture, so it precedes the immutable
+                        // borrow used for the rest of the row.
+                        ui.add(
+                            DragValue::new(&mut scene.fixtures[i].sequence)
+                                .range(1..=u32::MAX)
+                                .speed(0.2),
+                        );
+                        let fixture = &scene.fixtures[i];
+                        // Name cell: selects the row (syncs the 3D/Inspector selection);
+                        // shift = range, ⌘/Ctrl = toggle.
+                        let selected = selection.contains_fixture(i);
+                        let resp = ui.selectable_label(
+                            selected,
+                            RichText::new(fixture.name.as_str()).small(),
+                        );
+                        if resp.clicked() {
+                            let m = ui.input(|x| x.modifiers);
+                            click = Some((i, m.shift, m.command || m.ctrl));
+                        }
+                        ui.label(RichText::new(fixture.profile.as_str()).weak().small());
 
-                ui.label(RichText::new(patch.get(i).map(|p| p.footprint.to_string()).unwrap_or_default()).small());
-                if conflicted[i] {
-                    ui.colored_label(theme::CONFLICT, theme::icon::WARNING).on_hover_text("Address conflict");
-                } else if patch.get(i).is_some_and(|p| !p.enabled) {
-                    ui.label(RichText::new("off").weak().small());
-                } else {
-                    ui.label("");
-                }
-                ui.end_row();
-            }
+                        // Universe / address.
+                        if let Some(p) = patch.get_mut(i) {
+                            let mut edited = ui
+                                .add(DragValue::new(&mut p.universe).range(1..=63999).speed(0.1))
+                                .changed();
+                            edited |= ui
+                                .add(DragValue::new(&mut p.address).range(1..=512).speed(0.2))
+                                .changed();
+                            if edited {
+                                p.enabled = true;
+                                p.source = PatchSource::Manual;
+                            }
+                        } else {
+                            ui.label("");
+                            ui.label("");
+                        }
+
+                        // Mode selector (GDTF modes; plain fixtures are synthetic).
+                        let mut new_mode = None;
+                        match fixture.gdtf.as_ref() {
+                            Some(gdtf) if !gdtf.modes.is_empty() => {
+                                let cur = patch.get(i).map(|p| p.mode_index).unwrap_or(0);
+                                let cur_name = gdtf
+                                    .modes
+                                    .get(cur)
+                                    .map(|m| m.name.clone())
+                                    .unwrap_or_default();
+                                egui::ComboBox::from_id_salt(("fm-mode", i))
+                                    .selected_text(RichText::new(cur_name).small())
+                                    .show_ui(ui, |ui| {
+                                        for (mi, m) in gdtf.modes.iter().enumerate() {
+                                            if ui.selectable_label(mi == cur, &m.name).clicked() {
+                                                new_mode = Some(mi);
+                                            }
+                                        }
+                                    });
+                            }
+                            _ => {
+                                ui.label(RichText::new("—").weak().small());
+                            }
+                        }
+                        if let Some(mi) = new_mode {
+                            patch.set_mode(fixture, i, mi);
+                        }
+
+                        ui.label(
+                            RichText::new(
+                                patch
+                                    .get(i)
+                                    .map(|p| p.footprint.to_string())
+                                    .unwrap_or_default(),
+                            )
+                            .small(),
+                        );
+                        if conflicted[i] {
+                            ui.colored_label(theme::CONFLICT, theme::icon::WARNING)
+                                .on_hover_text("Address conflict");
+                        } else if patch.get(i).is_some_and(|p| !p.enabled) {
+                            ui.label(RichText::new("off").weak().small());
+                        } else {
+                            ui.label("");
+                        }
+                        ui.end_row();
+                    }
+                });
         });
-    });
     if let Some((i, shift, toggle)) = click {
         if shift {
             // Re-anchor if the shared anchor is stale (deleted, or filtered out of
             // the visible list) so the range can't span to a phantom row.
-            if anchor.map_or(true, |a| !order.contains(&a)) {
+            if anchor.is_none_or(|a| !order.contains(&a)) {
                 *anchor = Some(i);
             }
             let cpos = order.iter().position(|&x| x == i).unwrap_or(0);
-            let apos = order.iter().position(|&x| Some(x) == *anchor).unwrap_or(cpos);
+            let apos = order
+                .iter()
+                .position(|&x| Some(x) == *anchor)
+                .unwrap_or(cpos);
             let (lo, hi) = (apos.min(cpos), apos.max(cpos));
             selection.fixtures = order[lo..=hi].to_vec();
             selection.environment = None;
@@ -3174,7 +3594,10 @@ pub fn fixture_manager(
 
 /// Compact a sorted universe list for the source table (e.g. `1,2,5`).
 fn format_universes(us: &[u16]) -> String {
-    us.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",")
+    us.iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// What a viewport ray hit.
@@ -3290,14 +3713,18 @@ fn pick(scene: &Scene, ro: Vec3, rd: Vec3) -> Option<Hit> {
 /// Objects whose screen-projected origin falls inside the marquee. `filter`: 0 = all,
 /// 1 = fixtures/pyro/screens ("devices", the `F` filter), 2 = geometry ("objects", `O`).
 /// Environments (fog boxes) are NEVER box-selectable, by design.
-fn marquee_hits(scene: &Scene, vp: glam::Mat4, rect: egui::Rect, marquee: egui::Rect, filter: u8) -> Vec<SelItem> {
+fn marquee_hits(
+    scene: &Scene,
+    vp: glam::Mat4,
+    rect: egui::Rect,
+    marquee: egui::Rect,
+    filter: u8,
+) -> Vec<SelItem> {
     let devices = filter != 2; // include fixtures/pyro/screens unless "objects only"
     let objects = filter != 1; // include geometry unless "devices only"
     let mut hits = Vec::new();
-    let inside = |p: Vec3| {
-        OrbitCamera::project_to_screen(p, vp, rect)
-            .is_some_and(|s| marquee.contains(s))
-    };
+    let inside =
+        |p: Vec3| OrbitCamera::project_to_screen(p, vp, rect).is_some_and(|s| marquee.contains(s));
     if devices {
         for (i, f) in scene.fixtures.iter().enumerate() {
             if !f.hidden && inside(f.position) {
@@ -3363,12 +3790,11 @@ fn ray_aabb(ro: Vec3, rd: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     Some(if near > 0.0 { near } else { far })
 }
 
-
 #[cfg(test)]
 mod pick_tests {
     use super::*;
-    use crate::dmx::patch::PatchTable;
     use crate::dmx::UniverseSnapshot;
+    use crate::dmx::patch::PatchTable;
     use crate::scene::Library;
     use crate::ui::PivotMode;
 
@@ -3395,7 +3821,9 @@ mod pick_tests {
         assert!(universes.contains(&4));
 
         let (u3, _) = dmx_occupancy_for_universe(&scene, &patch, 3);
-        let item = u3[510].as_ref().expect("screen R channel shown in universe 3");
+        let item = u3[510]
+            .as_ref()
+            .expect("screen R channel shown in universe 3");
         assert_eq!(item.target, DmxTarget::Screen(screen));
         assert_eq!(item.name, "Wall A");
         assert_eq!(item.attr, "Pixel 1,1 R");
@@ -3416,7 +3844,10 @@ mod pick_tests {
         let pyro = scene.add_pyro_at(&library.pyro[0], Vec3::ZERO);
         scene.pyro[pyro].name = "Spark A".to_string();
         scene.pyro[pyro].mode = PyroMode::Rich;
-        scene.pyro[pyro].patch = Some(PyroPatch { universe: 5, address: 20 });
+        scene.pyro[pyro].patch = Some(PyroPatch {
+            universe: 5,
+            address: 20,
+        });
 
         let patch = PatchTable::default();
         let snapshot = UniverseSnapshot::default();
@@ -3482,15 +3913,18 @@ mod pick_tests {
         // A 40px box centred on the dot encloses its centre → hit.
         let around = egui::Rect::from_center_size(dot, egui::vec2(40.0, 40.0));
         let hits = marquee_hits(&scene, vp, rect, around, 0);
-        assert!(hits.contains(&SelItem::Fixture(0)), "dot-in-rect → selected");
+        assert!(
+            hits.contains(&SelItem::Fixture(0)),
+            "dot-in-rect → selected"
+        );
 
         // A tiny box far from the dot → no hit.
-        let far = egui::Rect::from_min_size(
-            dot + egui::vec2(300.0, 300.0),
-            egui::vec2(8.0, 8.0),
-        );
+        let far = egui::Rect::from_min_size(dot + egui::vec2(300.0, 300.0), egui::vec2(8.0, 8.0));
         let none = marquee_hits(&scene, vp, rect, far, 0);
-        assert!(!none.contains(&SelItem::Fixture(0)), "off-dot rect → not selected");
+        assert!(
+            !none.contains(&SelItem::Fixture(0)),
+            "off-dot rect → not selected"
+        );
 
         // A hidden fixture is skipped even when its dot is inside the marquee.
         let mut hidden = Scene::demo();
@@ -3502,10 +3936,14 @@ mod pick_tests {
 
         // Filter (F/O): a fixture is caught with "all" (0) and "fixtures" (1) but NOT
         // with "objects" (2).
-        assert!(marquee_hits(&scene, vp, rect, around, 1).contains(&SelItem::Fixture(0)),
-            "F filter keeps fixtures");
-        assert!(!marquee_hits(&scene, vp, rect, around, 2).contains(&SelItem::Fixture(0)),
-            "O filter (objects-only) drops fixtures");
+        assert!(
+            marquee_hits(&scene, vp, rect, around, 1).contains(&SelItem::Fixture(0)),
+            "F filter keeps fixtures"
+        );
+        assert!(
+            !marquee_hits(&scene, vp, rect, around, 2).contains(&SelItem::Fixture(0)),
+            "O filter (objects-only) drops fixtures"
+        );
     }
 
     #[test]
@@ -3536,7 +3974,11 @@ mod pick_tests {
         cam.set_view(crate::renderer::camera::CameraView::Top); // straight down
         cam.set_aspect(16.0 / 9.0);
         let p = placement_point(&scene, &cam);
-        assert!(p.y.abs() < 1e-2, "expected a ground (y≈0) hit, got y={}", p.y);
+        assert!(
+            p.y.abs() < 1e-2,
+            "expected a ground (y≈0) hit, got y={}",
+            p.y
+        );
     }
 
     #[test]
@@ -3548,8 +3990,10 @@ mod pick_tests {
         scene.screens.clear();
         scene.geometry.clear();
         scene.environments.clear();
-        let mut cam = OrbitCamera::default();
-        cam.pitch = -1.2; // look upward, away from the floor
+        let mut cam = OrbitCamera {
+            pitch: -1.2, // look upward, away from the floor
+            ..Default::default()
+        };
         cam.set_aspect(16.0 / 9.0);
         let p = placement_point(&scene, &cam);
         assert!(p.is_finite(), "placement must be finite, got {p:?}");
@@ -3589,7 +4033,11 @@ mod pick_tests {
         let rd = Vec3::new(0.0, -1.0, 0.0);
         let dist = 12.0_f32;
         let p = pick_world_point(&scene, ro, rd).unwrap_or_else(|| ro + rd * dist.max(1.0));
-        assert!((p.y).abs() < 1e-3, "cursor lands on the floor, got y={}", p.y);
+        assert!(
+            (p.y).abs() < 1e-3,
+            "cursor lands on the floor, got y={}",
+            p.y
+        );
         assert!((p.x - 5.0).abs() < 1e-3 && (p.z + 2.0).abs() < 1e-3);
     }
 
@@ -3624,11 +4072,22 @@ mod pick_tests {
         scene.fixtures.push(demo.fixtures[0].clone());
         scene.fixtures[0].position = Vec3::new(10.0, 0.0, 10.0);
         let cursor = Vec3::new(-3.0, 1.5, 4.0);
-        let pivot = compute_pivot(&scene, &[ObjectRef::Fixture(0)], PivotMode::Cursor3d, cursor);
-        assert_eq!(pivot, cursor, "Cursor3d pivot ignores selection, uses the cursor");
+        let pivot = compute_pivot(
+            &scene,
+            &[ObjectRef::Fixture(0)],
+            PivotMode::Cursor3d,
+            cursor,
+        );
+        assert_eq!(
+            pivot, cursor,
+            "Cursor3d pivot ignores selection, uses the cursor"
+        );
         // The Median pivot, by contrast, is the fixture's own position.
         let median = compute_pivot(&scene, &[ObjectRef::Fixture(0)], PivotMode::Median, cursor);
-        assert!((median - Vec3::new(10.0, 0.0, 10.0)).length() < 1.0, "median ≠ cursor");
+        assert!(
+            (median - Vec3::new(10.0, 0.0, 10.0)).length() < 1.0,
+            "median ≠ cursor"
+        );
     }
 
     /// S1-viewport-overlays: the stats overlay emits a line per non-empty category
@@ -3641,8 +4100,8 @@ mod pick_tests {
         assert_eq!(
             lines,
             vec![
-                "1 fixture".to_string(),   // singular
-                "3 objects".to_string(),   // plural
+                "1 fixture".to_string(), // singular
+                "3 objects".to_string(), // plural
                 // screens == 0 → skipped entirely
                 "2 environments".to_string(),
                 "4 selected".to_string(), // always present, last

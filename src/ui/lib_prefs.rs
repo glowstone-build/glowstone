@@ -39,7 +39,10 @@ pub fn entry_key(library: &Library, item: LibItem) -> Option<String> {
             .fixtures
             .get(i)
             .map(|p| format!("fixture:{}/{}", p.category, p.name)),
-        LibItem::Env(i) => library.environments.get(i).map(|p| format!("env:{}", p.name)),
+        LibItem::Env(i) => library
+            .environments
+            .get(i)
+            .map(|p| format!("env:{}", p.name)),
         LibItem::Screen(i) => library.screens.get(i).map(|p| format!("screen:{}", p.name)),
         LibItem::Pyro(i) => library.pyro.get(i).map(|p| format!("pyro:{}", p.name)),
     }
@@ -59,8 +62,12 @@ pub struct LibraryPrefs {
 impl LibraryPrefs {
     /// Load from disk (config dir); a missing/garbled file yields the default.
     pub fn load() -> Self {
-        let Some(p) = prefs_path() else { return Self::default() };
-        let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
+        let Some(p) = prefs_path() else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return Self::default();
+        };
         serde_json::from_str(&text).unwrap_or_default()
     }
 

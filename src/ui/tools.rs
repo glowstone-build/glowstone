@@ -179,10 +179,7 @@ impl ActiveTool {
     /// (pinned by a unit test), so the lookup never fails in practice; the fallback
     /// row (`Select`) keeps it total.
     pub fn def(self) -> &'static ToolDef {
-        TOOLS
-            .iter()
-            .find(|d| d.tool == self)
-            .unwrap_or(&TOOLS[0])
+        TOOLS.iter().find(|d| d.tool == self).unwrap_or(&TOOLS[0])
     }
 
     /// The Phosphor glyph shown on the rail button (semantic, never emoji).
@@ -231,7 +228,10 @@ mod tests {
     fn every_tool_has_exactly_one_def() {
         for tool in ActiveTool::TOOLBAR {
             let n = TOOLS.iter().filter(|d| d.tool == tool).count();
-            assert_eq!(n, 1, "{tool:?} must have exactly one ToolDef row, found {n}");
+            assert_eq!(
+                n, 1,
+                "{tool:?} must have exactly one ToolDef row, found {n}"
+            );
         }
         assert_eq!(
             TOOLS.len(),
@@ -245,7 +245,10 @@ mod tests {
     #[test]
     fn toolbar_matches_table_order() {
         for (i, tool) in ActiveTool::TOOLBAR.iter().enumerate() {
-            assert_eq!(*tool, TOOLS[i].tool, "rail order diverges from TOOLS at {i}");
+            assert_eq!(
+                *tool, TOOLS[i].tool,
+                "rail order diverges from TOOLS at {i}"
+            );
         }
     }
 
@@ -268,7 +271,11 @@ mod tests {
                 tool,
                 ActiveTool::Move | ActiveTool::Rotate | ActiveTool::Scale
             );
-            assert_eq!(tool.shows_xform_gizmo(), expected, "{tool:?} gizmo gate changed");
+            assert_eq!(
+                tool.shows_xform_gizmo(),
+                expected,
+                "{tool:?} gizmo gate changed"
+            );
         }
     }
 
@@ -276,7 +283,11 @@ mod tests {
     #[test]
     fn all_tools_fall_back_to_click_select() {
         for tool in ActiveTool::TOOLBAR {
-            assert_eq!(tool.fallback_op(), Some("select.replace"), "{tool:?} fallback changed");
+            assert_eq!(
+                tool.fallback_op(),
+                Some("select.replace"),
+                "{tool:?} fallback changed"
+            );
         }
     }
 }

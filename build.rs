@@ -14,7 +14,9 @@ fn main() {
     let ico = "assets/icons/glowstone.ico";
     println!("cargo:rerun-if-changed={ico}");
     if !std::path::Path::new(ico).exists() {
-        println!("cargo:warning=missing {ico} — run scripts/gen-icons.sh (the .exe will have no icon)");
+        println!(
+            "cargo:warning=missing {ico} — run scripts/gen-icons.sh (the .exe will have no icon)"
+        );
         return;
     }
 

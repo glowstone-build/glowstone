@@ -44,8 +44,12 @@ impl Bookmarks {
     /// Load from disk (config dir); a missing/garbled file yields the default
     /// (empty) set, so a fresh install / corrupt file never blocks startup.
     pub fn load() -> Self {
-        let Some(p) = bookmarks_path() else { return Self::default() };
-        let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
+        let Some(p) = bookmarks_path() else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return Self::default();
+        };
         serde_json::from_str(&text).unwrap_or_default()
     }
 
@@ -68,7 +72,11 @@ impl Bookmarks {
     /// when full). Names it "View N"; keeps `items` slot-sorted; persists.
     pub fn save_pose(&mut self, pose: CameraPose) -> Option<usize> {
         let slot = self.next_free_slot()?;
-        self.items.push(Bookmark { slot, name: format!("View {slot}"), pose });
+        self.items.push(Bookmark {
+            slot,
+            name: format!("View {slot}"),
+            pose,
+        });
         self.items.sort_by_key(|b| b.slot);
         self.save();
         Some(slot)
@@ -86,7 +94,11 @@ impl Bookmarks {
         if let Some(b) = self.items.iter_mut().find(|b| b.slot == slot) {
             b.pose = pose;
         } else {
-            self.items.push(Bookmark { slot, name: format!("View {slot}"), pose });
+            self.items.push(Bookmark {
+                slot,
+                name: format!("View {slot}"),
+                pose,
+            });
             self.items.sort_by_key(|b| b.slot);
         }
         self.save();
@@ -127,15 +139,30 @@ mod tests {
     use super::*;
 
     fn pose(x: f32) -> CameraPose {
-        CameraPose { target: [x, 1.0, -2.0], yaw: 0.5, pitch: 0.1, distance: 8.0, fov_y: 0.9, ortho: false }
+        CameraPose {
+            target: [x, 1.0, -2.0],
+            yaw: 0.5,
+            pitch: 0.1,
+            distance: 8.0,
+            fov_y: 0.9,
+            ortho: false,
+        }
     }
 
     /// A bookmark set round-trips through JSON unchanged (the persistence path).
     #[test]
     fn bookmarks_round_trip_through_json() {
         let mut b = Bookmarks::default();
-        b.items.push(Bookmark { slot: 1, name: "FOH".into(), pose: pose(3.0) });
-        b.items.push(Bookmark { slot: 2, name: "Side".into(), pose: pose(-4.0) });
+        b.items.push(Bookmark {
+            slot: 1,
+            name: "FOH".into(),
+            pose: pose(3.0),
+        });
+        b.items.push(Bookmark {
+            slot: 2,
+            name: "Side".into(),
+            pose: pose(-4.0),
+        });
         let text = serde_json::to_string(&b).unwrap();
         let back: Bookmarks = serde_json::from_str(&text).unwrap();
         assert_eq!(back.items.len(), 2);

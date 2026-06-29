@@ -13,16 +13,22 @@ impl Ui {
         let fixture_specs: Vec<Option<String>> = scene
             .fixtures
             .iter()
-            .map(|f| f.gdtf.as_ref().map(|g| g.spec.clone()).filter(|s| !s.is_empty()))
+            .map(|f| {
+                f.gdtf
+                    .as_ref()
+                    .map(|g| g.spec.clone())
+                    .filter(|s| !s.is_empty())
+            })
             .collect();
         let mut gdtf_assets: HashMap<String, Vec<u8>> = HashMap::new();
         for f in &scene.fixtures {
-            if let Some(g) = &f.gdtf {
-                if !g.spec.is_empty() {
-                    if let Some(raw) = &g.raw {
-                        gdtf_assets.entry(g.spec.clone()).or_insert_with(|| raw.as_ref().clone());
-                    }
-                }
+            if let Some(g) = &f.gdtf
+                && !g.spec.is_empty()
+                && let Some(raw) = &g.raw
+            {
+                gdtf_assets
+                    .entry(g.spec.clone())
+                    .or_insert_with(|| raw.as_ref().clone());
             }
         }
         let pr = project::ProjectRef {
@@ -43,7 +49,12 @@ impl Ui {
     }
 
     /// Save to the current path, or fall back to Save As if untitled.
-    pub(super) fn save_project(&mut self, scene: &Scene, camera: &OrbitCamera, dmx: &crate::dmx::DmxIo) {
+    pub(super) fn save_project(
+        &mut self,
+        scene: &Scene,
+        camera: &OrbitCamera,
+        dmx: &crate::dmx::DmxIo,
+    ) {
         match self.current_path.clone() {
             Some(path) => self.save_to(&path, scene, camera, dmx),
             None => self.save_project_as(scene, camera, dmx),
@@ -51,7 +62,12 @@ impl Ui {
     }
 
     /// Prompt for a destination, then save (forcing the `.glow` extension).
-    pub(super) fn save_project_as(&mut self, scene: &Scene, camera: &OrbitCamera, dmx: &crate::dmx::DmxIo) {
+    pub(super) fn save_project_as(
+        &mut self,
+        scene: &Scene,
+        camera: &OrbitCamera,
+        dmx: &crate::dmx::DmxIo,
+    ) {
         let name = self
             .current_path
             .as_ref()
@@ -84,7 +100,8 @@ impl Ui {
                 project::push_recent(path);
                 self.recent = project::load_recent();
                 let name = path.file_name().map(|s| s.to_string_lossy().into_owned());
-                self.notify.success(format!("Saved {}", name.as_deref().unwrap_or("project")));
+                self.notify
+                    .success(format!("Saved {}", name.as_deref().unwrap_or("project")));
             }
             Err(e) => self.notify.error(format!("Save failed: {e}")),
         }
@@ -148,7 +165,9 @@ impl Ui {
         // the GPU wheel atlas stay deduped).
         let mut cache: HashMap<String, Arc<crate::gdtf::GdtfFixture>> = HashMap::new();
         for (i, f) in scene.fixtures.iter_mut().enumerate() {
-            let Some(spec) = p.fixture_specs.get(i).cloned().flatten() else { continue };
+            let Some(spec) = p.fixture_specs.get(i).cloned().flatten() else {
+                continue;
+            };
             let arc = if let Some(a) = cache.get(&spec) {
                 a.clone()
             } else if let Some(bytes) = p.gdtf_assets.get(&spec) {
@@ -161,7 +180,8 @@ impl Ui {
                         a
                     }
                     Err(e) => {
-                        self.notify.warn(format!("Could not re-link GDTF {spec}: {e}"));
+                        self.notify
+                            .warn(format!("Could not re-link GDTF {spec}: {e}"));
                         continue;
                     }
                 }
@@ -189,7 +209,12 @@ impl Ui {
     }
 
     /// Start a fresh, empty project.
-    pub(super) fn new_project(&mut self, scene: &mut Scene, camera: &mut OrbitCamera, dmx: &mut crate::dmx::DmxIo) {
+    pub(super) fn new_project(
+        &mut self,
+        scene: &mut Scene,
+        camera: &mut OrbitCamera,
+        dmx: &mut crate::dmx::DmxIo,
+    ) {
         *scene = Scene::default();
         *dmx.patch_mut() = crate::dmx::PatchTable::default();
         self.groups.clear();
@@ -218,24 +243,37 @@ impl Ui {
         if scene.fixtures.is_empty() && scene.geometry.is_empty() {
             return;
         }
-        if let Some(path) = project::autosave_path() {
-            if let Err(e) = self.write_project(&path, scene, camera, dmx) {
-                self.notify.warn(format!("Autosave failed: {e}"));
-            }
+        if let Some(path) = project::autosave_path()
+            && let Err(e) = self.write_project(&path, scene, camera, dmx)
+        {
+            self.notify.warn(format!("Autosave failed: {e}"));
         }
     }
 
     /// Import any `.gdtf` / `.mvr` files dropped onto the window.
-    pub(super) fn handle_dropped_files(&mut self, ctx: &egui::Context, scene: &mut Scene, camera: &mut OrbitCamera) {
+    pub(super) fn handle_dropped_files(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &mut Scene,
+        camera: &mut OrbitCamera,
+    ) {
         // The common case is nothing dropped — avoid the per-frame allocation.
         if ctx.input(|i| i.raw.dropped_files.is_empty()) {
             return;
         }
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
-            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
         });
         for path in dropped {
-            match path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) {
+            match path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+            {
                 Some(ext) if ext == "gdtf" => match self.library.import_gdtf(&path) {
                     Ok(idx) => {
                         let arc = self.library.gdtf[idx].clone();
@@ -254,8 +292,10 @@ impl Ui {
                             camera.frame(c, r * 1.15);
                         }
                         self.selection = Selection::default();
-                        self.notify
-                            .success(format!("Imported MVR · {} fixtures", scene.fixtures.len() - before));
+                        self.notify.success(format!(
+                            "Imported MVR · {} fixtures",
+                            scene.fixtures.len() - before
+                        ));
                     }
                     Err(e) => self.notify.error(format!("Import MVR failed: {e}")),
                 },
@@ -274,13 +314,25 @@ mod tests {
     /// Extract one GDTF archive's bytes from the bundled Basic Festival MVR.
     fn gdtf_bytes(member: &str) -> Option<Vec<u8>> {
         let candidates = [
-            format!("{}/.context/attachments/05W1Dh/Basic Festival.mvr", env!("CARGO_MANIFEST_DIR")),
-            format!("{}/Downloads/Basic Festival/Basic Festival.mvr", std::env::var("HOME").unwrap_or_default()),
+            format!(
+                "{}/.context/attachments/05W1Dh/Basic Festival.mvr",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            format!(
+                "{}/Downloads/Basic Festival/Basic Festival.mvr",
+                std::env::var("HOME").unwrap_or_default()
+            ),
         ];
         for path in candidates {
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else { continue };
-            let Ok(mut f) = zip.by_name(member) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+                continue;
+            };
+            let Ok(mut f) = zip.by_name(member) else {
+                continue;
+            };
             let mut buf = Vec::new();
             if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() {
                 return Some(buf);
@@ -310,12 +362,15 @@ mod tests {
         scene.fixtures[idx].beam = 0.5;
         scene.fixtures[idx].optics.dimmer = 0.8;
         let cells = scene.fixtures[idx].cells.len();
-        let mut camera = OrbitCamera::default();
-        camera.distance = 21.0;
+        let camera = OrbitCamera {
+            distance: 21.0,
+            ..Default::default()
+        };
         let dmx = DmxIo::new();
 
         let path = std::env::temp_dir().join("glowstone-relink-test.glow");
-        ui.write_project(&path, &scene, &camera, &dmx).expect("write project");
+        ui.write_project(&path, &scene, &camera, &dmx)
+            .expect("write project");
 
         // Open into a completely fresh app state.
         let project = project::read(&path).expect("read project");

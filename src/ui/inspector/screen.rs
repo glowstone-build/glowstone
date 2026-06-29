@@ -1,9 +1,9 @@
 //! LED-screen inspector editor. Pure code move out of [`super`] (the inspector
 //! `mod.rs`): the editor shown when an LED screen is selected.
 
-use super::theme;
-use super::{category, row, slider_row, vec3_rows, InspectorState};
 use super::ScreenSources;
+use super::theme;
+use super::{InspectorState, category, row, slider_row, vec3_rows};
 use crate::scene::screen::{LedScreen, PixelShape, ScreenContent, TestPattern};
 use egui::{DragValue, Grid, RichText, Slider};
 use glam::{Mat4, Vec3};
@@ -24,15 +24,20 @@ pub(super) fn led_screen_inspector(
     let [rx, ry] = s.resolution();
     let [mw, mh] = s.size_m();
     ui.label(
-        RichText::new(format!("{} · {} × {} px · {:.2} × {:.2} m", s.panel_type, rx, ry, mw, mh))
-            .weak()
-            .small(),
+        RichText::new(format!(
+            "{} · {} × {} px · {:.2} × {:.2} m",
+            s.panel_type, rx, ry, mw, mh
+        ))
+        .weak()
+        .small(),
     );
     if count > 1 {
         ui.label(
-            RichText::new(format!("{count} screens — transform applies to all; other edits affect the active screen"))
-                .weak()
-                .small(),
+            RichText::new(format!(
+                "{count} screens — transform applies to all; other edits affect the active screen"
+            ))
+            .weak()
+            .small(),
         );
     }
     ui.separator();
@@ -44,7 +49,11 @@ pub(super) fn led_screen_inspector(
         }
         ui.separator();
         ui.label(RichText::new("Seq").weak().small());
-        ui.add(DragValue::new(&mut s.sequence).range(1..=u32::MAX).speed(0.2));
+        ui.add(
+            DragValue::new(&mut s.sequence)
+                .range(1..=u32::MAX)
+                .speed(0.2),
+        );
     });
 
     if show_transform {
@@ -64,21 +73,37 @@ pub(super) fn led_screen_inspector(
             true,
             &["Position", "Rotation", "Scale"],
             |ui, fs| {
-                Grid::new("led-transform").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                    // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
-                    pos_changed |= vec3_rows(
-                        ui, fs, "Position", false, 0.05, "",
-                        &mut pos.x, &mut pos.y, &mut pos.z,
-                    );
-                    rs_changed |= vec3_rows(ui, fs, "Rotation", false, 0.5, "°", &mut ex, &mut ey, &mut ez);
-                    row(ui, fs, "Scale", false, |ui| {
-                        rs_changed |= ui.add(DragValue::new(&mut uscale).speed(0.005).range(0.001..=1000.0)).changed();
+                Grid::new("led-transform")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        // Position/Rotation STACK X/Y/Z (Blender-style) — readable at any width.
+                        pos_changed |= vec3_rows(
+                            ui, fs, "Position", false, 0.05, "", &mut pos.x, &mut pos.y, &mut pos.z,
+                        );
+                        rs_changed |= vec3_rows(
+                            ui, fs, "Rotation", false, 0.5, "°", &mut ex, &mut ey, &mut ez,
+                        );
+                        row(ui, fs, "Scale", false, |ui| {
+                            rs_changed |= ui
+                                .add(
+                                    DragValue::new(&mut uscale)
+                                        .speed(0.005)
+                                        .range(0.001..=1000.0),
+                                )
+                                .changed();
+                        });
                     });
-                });
             },
         );
         if rs_changed {
-            let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, ey.to_radians(), ex.to_radians(), ez.to_radians());
+            let rot = glam::Quat::from_euler(
+                glam::EulerRot::YXZ,
+                ey.to_radians(),
+                ex.to_radians(),
+                ez.to_radians(),
+            );
             s.transform = Mat4::from_scale_rotation_translation(Vec3::splat(uscale), rot, pos);
         } else if pos_changed {
             s.transform.w_axis = pos.extend(1.0);
@@ -94,29 +119,59 @@ pub(super) fn led_screen_inspector(
         true,
         &["Cabinet (mm)", "Pixels / cabinet", "Pitch"],
         |ui, fs| {
-            Grid::new("led-panel").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                row(ui, fs, "Cabinet (mm)", false, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(DragValue::new(&mut s.cabinet_mm[0]).speed(1.0).range(50.0..=2000.0).prefix("w "));
-                        ui.add(DragValue::new(&mut s.cabinet_mm[1]).speed(1.0).range(50.0..=2000.0).prefix("h "));
+            Grid::new("led-panel")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    row(ui, fs, "Cabinet (mm)", false, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                DragValue::new(&mut s.cabinet_mm[0])
+                                    .speed(1.0)
+                                    .range(50.0..=2000.0)
+                                    .prefix("w "),
+                            );
+                            ui.add(
+                                DragValue::new(&mut s.cabinet_mm[1])
+                                    .speed(1.0)
+                                    .range(50.0..=2000.0)
+                                    .prefix("h "),
+                            );
+                        });
+                    });
+                    row(ui, fs, "Pixels / cabinet", false, |ui| {
+                        ui.horizontal(|ui| {
+                            let mut px = s.cabinet_px[0] as i32;
+                            let mut py = s.cabinet_px[1] as i32;
+                            if ui
+                                .add(
+                                    DragValue::new(&mut px)
+                                        .speed(1.0)
+                                        .range(8..=1024)
+                                        .prefix("x "),
+                                )
+                                .changed()
+                            {
+                                s.cabinet_px[0] = px.max(1) as u32;
+                            }
+                            if ui
+                                .add(
+                                    DragValue::new(&mut py)
+                                        .speed(1.0)
+                                        .range(8..=1024)
+                                        .prefix("y "),
+                                )
+                                .changed()
+                            {
+                                s.cabinet_px[1] = py.max(1) as u32;
+                            }
+                        });
+                    });
+                    row(ui, fs, "Pitch", false, |ui| {
+                        ui.label(RichText::new(format!("{:.2} mm", s.pitch_mm())).weak());
                     });
                 });
-                row(ui, fs, "Pixels / cabinet", false, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut px = s.cabinet_px[0] as i32;
-                        let mut py = s.cabinet_px[1] as i32;
-                        if ui.add(DragValue::new(&mut px).speed(1.0).range(8..=1024).prefix("x ")).changed() {
-                            s.cabinet_px[0] = px.max(1) as u32;
-                        }
-                        if ui.add(DragValue::new(&mut py).speed(1.0).range(8..=1024).prefix("y ")).changed() {
-                            s.cabinet_px[1] = py.max(1) as u32;
-                        }
-                    });
-                });
-                row(ui, fs, "Pitch", false, |ui| {
-                    ui.label(RichText::new(format!("{:.2} mm", s.pitch_mm())).weak());
-                });
-            });
         },
     );
 
@@ -129,30 +184,47 @@ pub(super) fn led_screen_inspector(
         true,
         &["Panels", "Gap"],
         |ui, fs| {
-            Grid::new("led-array").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                row(ui, fs, "Panels", false, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut w = s.panels_wide as i32;
-                        let mut h = s.panels_high as i32;
-                        if ui.add(DragValue::new(&mut w).speed(0.1).range(1..=64).prefix("w ")).changed() {
-                            s.panels_wide = w.max(1) as u32;
-                        }
-                        if ui.add(DragValue::new(&mut h).speed(0.1).range(1..=64).prefix("h ")).changed() {
-                            s.panels_high = h.max(1) as u32;
-                        }
+            Grid::new("led-array")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    row(ui, fs, "Panels", false, |ui| {
+                        ui.horizontal(|ui| {
+                            let mut w = s.panels_wide as i32;
+                            let mut h = s.panels_high as i32;
+                            if ui
+                                .add(DragValue::new(&mut w).speed(0.1).range(1..=64).prefix("w "))
+                                .changed()
+                            {
+                                s.panels_wide = w.max(1) as u32;
+                            }
+                            if ui
+                                .add(DragValue::new(&mut h).speed(0.1).range(1..=64).prefix("h "))
+                                .changed()
+                            {
+                                s.panels_high = h.max(1) as u32;
+                            }
+                        });
+                    });
+                    row(ui, fs, "Gap", false, |ui| {
+                        ui.add(
+                            DragValue::new(&mut s.gap_mm)
+                                .speed(0.1)
+                                .range(0.0..=50.0)
+                                .suffix(" mm"),
+                        );
                     });
                 });
-                row(ui, fs, "Gap", false, |ui| {
-                    ui.add(DragValue::new(&mut s.gap_mm).speed(0.1).range(0.0..=50.0).suffix(" mm"));
-                });
-            });
             let [rx, ry] = s.resolution();
             let [mw, mh] = s.size_m();
             let mpx = (rx as f64 * ry as f64) / 1_000_000.0;
             ui.label(
-                RichText::new(format!("{rx} × {ry} px  ·  {mpx:.2} Mpx  ·  {mw:.2} × {mh:.2} m"))
-                    .strong()
-                    .small(),
+                RichText::new(format!(
+                    "{rx} × {ry} px  ·  {mpx:.2} Mpx  ·  {mw:.2} × {mh:.2} m"
+                ))
+                .strong()
+                .small(),
             );
         },
     );
@@ -164,7 +236,14 @@ pub(super) fn led_screen_inspector(
         "Surface",
         format!("{}  Surface", theme::icon::COLOR),
         true,
-        &["Brightness", "Light emit", "Gamma", "Transparency", "Curvature", "Pixel"],
+        &[
+            "Brightness",
+            "Light emit",
+            "Gamma",
+            "Transparency",
+            "Curvature",
+            "Pixel",
+        ],
         |ui, fs| {
             Grid::new("led-surface").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
                 row(ui, fs, "Brightness", false, |ui| {
@@ -210,7 +289,9 @@ pub(super) fn led_screen_inspector(
         "Content",
         format!("{}  Content", theme::icon::IMAGE),
         true,
-        &["Content", "Source", "Pattern", "Colour", "Image", "Grid", "Patch"],
+        &[
+            "Content", "Source", "Pattern", "Colour", "Image", "Grid", "Patch",
+        ],
         |ui, _fs| {
             #[derive(PartialEq, Clone, Copy)]
             enum Kind {
@@ -232,26 +313,35 @@ pub(super) fn led_screen_inspector(
             let mut sel = cur;
             ui.horizontal(|ui| {
                 ui.label("Source");
-                egui::ComboBox::from_id_salt("led-source").selected_text(s.content.label()).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut sel, Kind::Test, "Test Pattern");
-                    ui.selectable_value(&mut sel, Kind::Solid, "Solid Colour");
-                    ui.selectable_value(&mut sel, Kind::Image, "Image…");
-                    ui.selectable_value(&mut sel, Kind::Ndi, "NDI");
-                    ui.selectable_value(&mut sel, Kind::Citp, "CITP");
-                    ui.selectable_value(&mut sel, Kind::Dmx, "Pixel-map DMX");
-                });
+                egui::ComboBox::from_id_salt("led-source")
+                    .selected_text(s.content.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut sel, Kind::Test, "Test Pattern");
+                        ui.selectable_value(&mut sel, Kind::Solid, "Solid Colour");
+                        ui.selectable_value(&mut sel, Kind::Image, "Image…");
+                        ui.selectable_value(&mut sel, Kind::Ndi, "NDI");
+                        ui.selectable_value(&mut sel, Kind::Citp, "CITP");
+                        ui.selectable_value(&mut sel, Kind::Dmx, "Pixel-map DMX");
+                    });
             });
             if sel != cur {
                 s.frame = None; // drop any live frame from the previous source
                 s.content = match sel {
                     Kind::Test => ScreenContent::TestPattern(TestPattern::Grid),
                     Kind::Solid => ScreenContent::SolidColor([0.1, 0.4, 0.9]),
-                    Kind::Image => {
-                        ScreenContent::Image { name: String::new(), bytes: std::sync::Arc::new(Vec::new()) }
+                    Kind::Image => ScreenContent::Image {
+                        name: String::new(),
+                        bytes: std::sync::Arc::new(Vec::new()),
+                    },
+                    Kind::Ndi => ScreenContent::Ndi {
+                        source: String::new(),
+                    },
+                    Kind::Citp => ScreenContent::Citp {
+                        source: String::new(),
+                    },
+                    Kind::Dmx => {
+                        ScreenContent::PixelMapDmx(crate::scene::screen::PixelMap::default())
                     }
-                    Kind::Ndi => ScreenContent::Ndi { source: String::new() },
-                    Kind::Citp => ScreenContent::Citp { source: String::new() },
-                    Kind::Dmx => ScreenContent::PixelMapDmx(crate::scene::screen::PixelMap::default()),
                 };
             }
             ui.add_space(2.0);
@@ -274,7 +364,13 @@ pub(super) fn led_screen_inspector(
                     ui.horizontal(|ui| {
                         if ui.button("Choose image…").clicked()
                             && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tga", "exr", "hdr"])
+                                .add_filter(
+                                    "Image",
+                                    &[
+                                        "png", "jpg", "jpeg", "bmp", "gif", "webp", "tga", "exr",
+                                        "hdr",
+                                    ],
+                                )
                                 .pick_file()
                         {
                             match std::fs::read(&path) {
@@ -289,7 +385,11 @@ pub(super) fn led_screen_inspector(
                                 Err(e) => log::error!("read screen image: {e}"),
                             }
                         }
-                        let label = if name.is_empty() { "no image".to_string() } else { name.clone() };
+                        let label = if name.is_empty() {
+                            "no image".to_string()
+                        } else {
+                            name.clone()
+                        };
                         ui.label(RichText::new(label).weak());
                     });
                 }
@@ -337,32 +437,68 @@ pub(super) fn led_screen_inspector(
                     );
                 }
                 ScreenContent::PixelMapDmx(pm) => {
-                    Grid::new("led-pixelmap").num_columns(2).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                        ui.label("Grid");
-                        ui.horizontal(|ui| {
-                            let mut c = pm.cols as i32;
-                            let mut r = pm.rows as i32;
-                            if ui.add(DragValue::new(&mut c).speed(0.1).range(1..=64).prefix("cols ")).changed() {
-                                pm.cols = c.max(1) as u32;
-                            }
-                            if ui.add(DragValue::new(&mut r).speed(0.1).range(1..=64).prefix("rows ")).changed() {
-                                pm.rows = r.max(1) as u32;
-                            }
+                    Grid::new("led-pixelmap")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("Grid");
+                            ui.horizontal(|ui| {
+                                let mut c = pm.cols as i32;
+                                let mut r = pm.rows as i32;
+                                if ui
+                                    .add(
+                                        DragValue::new(&mut c)
+                                            .speed(0.1)
+                                            .range(1..=64)
+                                            .prefix("cols "),
+                                    )
+                                    .changed()
+                                {
+                                    pm.cols = c.max(1) as u32;
+                                }
+                                if ui
+                                    .add(
+                                        DragValue::new(&mut r)
+                                            .speed(0.1)
+                                            .range(1..=64)
+                                            .prefix("rows "),
+                                    )
+                                    .changed()
+                                {
+                                    pm.rows = r.max(1) as u32;
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Patch");
+                            ui.horizontal(|ui| {
+                                let mut u = pm.universe as i32;
+                                let mut a = pm.start_address as i32;
+                                if ui
+                                    .add(
+                                        DragValue::new(&mut u)
+                                            .speed(0.1)
+                                            .range(0..=63999)
+                                            .prefix("univ "),
+                                    )
+                                    .changed()
+                                {
+                                    pm.universe = u.clamp(0, 63999) as u16;
+                                }
+                                if ui
+                                    .add(
+                                        DragValue::new(&mut a)
+                                            .speed(0.5)
+                                            .range(1..=512)
+                                            .prefix("addr "),
+                                    )
+                                    .changed()
+                                {
+                                    pm.start_address = a.clamp(1, 512) as u16;
+                                }
+                            });
+                            ui.end_row();
                         });
-                        ui.end_row();
-                        ui.label("Patch");
-                        ui.horizontal(|ui| {
-                            let mut u = pm.universe as i32;
-                            let mut a = pm.start_address as i32;
-                            if ui.add(DragValue::new(&mut u).speed(0.1).range(0..=63999).prefix("univ ")).changed() {
-                                pm.universe = u.clamp(0, 63999) as u16;
-                            }
-                            if ui.add(DragValue::new(&mut a).speed(0.5).range(1..=512).prefix("addr ")).changed() {
-                                pm.start_address = a.clamp(1, 512) as u16;
-                            }
-                        });
-                        ui.end_row();
-                    });
                     let chans = pm.cols * pm.rows * 3;
                     ui.label(
                         RichText::new(format!(

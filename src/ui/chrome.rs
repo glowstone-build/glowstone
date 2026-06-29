@@ -23,7 +23,10 @@ impl Ui {
                         self.show_welcome();
                         ui.close();
                     }
-                    if ui.button(format!("{}  Open Project…", icon::IMPORT_MVR)).clicked() {
+                    if ui
+                        .button(format!("{}  Open Project…", icon::IMPORT_MVR))
+                        .clicked()
+                    {
                         self.open_project_dialog(scene, camera, dmx);
                         ui.close();
                     }
@@ -35,7 +38,11 @@ impl Ui {
                                     .file_name()
                                     .map(|s| s.to_string_lossy().into_owned())
                                     .unwrap_or_default();
-                                if ui.button(name).on_hover_text(p.display().to_string()).clicked() {
+                                if ui
+                                    .button(name)
+                                    .on_hover_text(p.display().to_string())
+                                    .clicked()
+                                {
                                     self.open_project(p, scene, camera, dmx);
                                     ui.close();
                                 }
@@ -43,7 +50,10 @@ impl Ui {
                         });
                     }
                     ui.separator();
-                    if ui.button(format!("{}  Save  (Ctrl+S)", icon::EXPORT)).clicked() {
+                    if ui
+                        .button(format!("{}  Save  (Ctrl+S)", icon::EXPORT))
+                        .clicked()
+                    {
                         self.save_project(scene, camera, dmx);
                         ui.close();
                     }
@@ -52,31 +62,51 @@ impl Ui {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button(format!("{}  Import GDTF Fixture…", icon::IMPORT_GDTF)).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("GDTF", &["gdtf"]).pick_file() {
-                            if let Ok(idx) = self.library.import_gdtf(&path) {
-                                let arc = self.library.gdtf[idx].clone();
-                                let f = scene.add_gdtf(arc, Vec3::new(0.0, 4.0, 0.0));
-                                self.selection = Selection::fixture(f);
-                            }
+                    if ui
+                        .button(format!("{}  Import GDTF Fixture…", icon::IMPORT_GDTF))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("GDTF", &["gdtf"])
+                            .pick_file()
+                            && let Ok(idx) = self.library.import_gdtf(&path)
+                        {
+                            let arc = self.library.gdtf[idx].clone();
+                            let f = scene.add_gdtf(arc, Vec3::new(0.0, 4.0, 0.0));
+                            self.selection = Selection::fixture(f);
                         }
                         ui.close();
                     }
-                    if ui.button(format!("{}  Import MVR Scene…", icon::IMPORT_MVR)).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("MVR", &["mvr"]).pick_file() {
-                            if let Ok(import) = crate::mvr::MvrImport::load_path(&path) {
-                                scene.import_mvr(import);
-                                if let Some((c, r)) = scene.scene_frame() {
-                                    camera.frame(c, r * 1.15);
-                                }
-                                self.selection = Selection::default();
+                    if ui
+                        .button(format!("{}  Import MVR Scene…", icon::IMPORT_MVR))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("MVR", &["mvr"])
+                            .pick_file()
+                            && let Ok(import) = crate::mvr::MvrImport::load_path(&path)
+                        {
+                            scene.import_mvr(import);
+                            if let Some((c, r)) = scene.scene_frame() {
+                                camera.frame(c, r * 1.15);
                             }
+                            self.selection = Selection::default();
                         }
                         ui.close();
                     }
                     let can_export = !scene.fixtures.is_empty() || !scene.geometry.is_empty();
-                    if ui.add_enabled(can_export, egui::Button::new(format!("{}  Export MVR Scene…", icon::EXPORT))).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("MVR", &["mvr"]).set_file_name("scene.mvr").save_file() {
+                    if ui
+                        .add_enabled(
+                            can_export,
+                            egui::Button::new(format!("{}  Export MVR Scene…", icon::EXPORT)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("MVR", &["mvr"])
+                            .set_file_name("scene.mvr")
+                            .save_file()
+                        {
                             match crate::mvr::export_path(scene, &path) {
                                 Ok(()) => self.notify.success("Exported MVR scene"),
                                 Err(e) => self.notify.error(format!("Export MVR failed: {e}")),
@@ -85,7 +115,10 @@ impl Ui {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button(format!("{}  Preferences…", icon::SETTINGS)).clicked() {
+                    if ui
+                        .button(format!("{}  Preferences…", icon::SETTINGS))
+                        .clicked()
+                    {
                         self.show_prefs = true;
                         ui.close();
                     }
@@ -96,7 +129,10 @@ impl Ui {
                         Some(n) => format!("{}  Undo {n}", icon::UNDO),
                         None => format!("{}  Undo", icon::UNDO),
                     };
-                    if ui.add_enabled(self.undo.can_undo(), egui::Button::new(undo_label)).clicked() {
+                    if ui
+                        .add_enabled(self.undo.can_undo(), egui::Button::new(undo_label))
+                        .clicked()
+                    {
                         self.do_undo(scene, dmx);
                         ui.close();
                     }
@@ -104,13 +140,19 @@ impl Ui {
                         Some(n) => format!("{}  Redo {n}", icon::REDO),
                         None => format!("{}  Redo", icon::REDO),
                     };
-                    if ui.add_enabled(self.undo.can_redo(), egui::Button::new(redo_label)).clicked() {
+                    if ui
+                        .add_enabled(self.undo.can_redo(), egui::Button::new(redo_label))
+                        .clicked()
+                    {
                         self.do_redo(scene, dmx);
                         ui.close();
                     }
                     ui.separator();
                     // Operator search (F3) — run any registered op by name.
-                    if ui.button(format!("{}  Run Operator…  (F3)", icon::SEARCH)).clicked() {
+                    if ui
+                        .button(format!("{}  Run Operator…  (F3)", icon::SEARCH))
+                        .clicked()
+                    {
                         self.op_search.show();
                         ui.close();
                     }
@@ -129,13 +171,25 @@ impl Ui {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.add_enabled(self.selection.primary_fixture().is_some(), egui::Button::new(format!("{}  Duplicate / Array…", icon::DUPLICATE))).clicked() {
+                    if ui
+                        .add_enabled(
+                            self.selection.primary_fixture().is_some(),
+                            egui::Button::new(format!("{}  Duplicate / Array…", icon::DUPLICATE)),
+                        )
+                        .clicked()
+                    {
                         if let Some(idx) = self.selection.primary_fixture() {
                             self.duplicate = Some(duplicate_dialog_for(ctx, idx));
                         }
                         ui.close();
                     }
-                    if ui.add_enabled(!self.selection.fixtures.is_empty(), egui::Button::new(format!("{}  Delete Selected", icon::TRASH))).clicked() {
+                    if ui
+                        .add_enabled(
+                            !self.selection.fixtures.is_empty(),
+                            egui::Button::new(format!("{}  Delete Selected", icon::TRASH)),
+                        )
+                        .clicked()
+                    {
                         self.pending_delete = true; // committed after the dock (remaps patch/groups/cues)
                         ui.close();
                     }
@@ -143,15 +197,30 @@ impl Ui {
                     // Select All / Invert / None (#88) — route through dispatch_action
                     // so the menu, the keymap (A / Ctrl+I / Alt+A) and the F3 palette
                     // all share one effect. These act within the ACTIVE selection kind.
-                    if ui.button(format!("{}  Select All  (A)", icon::TOOL_SELECT)).clicked() {
+                    if ui
+                        .button(format!("{}  Select All  (A)", icon::TOOL_SELECT))
+                        .clicked()
+                    {
                         self.dispatch_action(ctx, shortcuts::Action::SelectAll, scene, camera, dmx);
                         ui.close();
                     }
-                    if ui.button(format!("{}  Invert Selection  (Ctrl+I)", icon::TOOL_SELECT)).clicked() {
-                        self.dispatch_action(ctx, shortcuts::Action::SelectInvert, scene, camera, dmx);
+                    if ui
+                        .button(format!("{}  Invert Selection  (Ctrl+I)", icon::TOOL_SELECT))
+                        .clicked()
+                    {
+                        self.dispatch_action(
+                            ctx,
+                            shortcuts::Action::SelectInvert,
+                            scene,
+                            camera,
+                            dmx,
+                        );
                         ui.close();
                     }
-                    if ui.button(format!("{}  Deselect All  (Alt+A)", icon::DESELECT)).clicked() {
+                    if ui
+                        .button(format!("{}  Deselect All  (Alt+A)", icon::DESELECT))
+                        .clicked()
+                    {
                         self.dispatch_action(ctx, shortcuts::Action::Deselect, scene, camera, dmx);
                         ui.close();
                     }
@@ -165,20 +234,29 @@ impl Ui {
                             }
                         }
                     });
-                    if ui.button(format!("{}  Frame Selection  (F)", icon::FRAME)).clicked() {
+                    if ui
+                        .button(format!("{}  Frame Selection  (F)", icon::FRAME))
+                        .clicked()
+                    {
                         if let Some((lo, hi)) = self.frame_bounds(scene, true) {
                             camera.frame_aabb(lo, hi);
                         }
                         ui.close();
                     }
-                    if ui.button(format!("{}  Frame All  (Shift+F)", icon::FRAME)).clicked() {
+                    if ui
+                        .button(format!("{}  Frame All  (Shift+F)", icon::FRAME))
+                        .clicked()
+                    {
                         if let Some((lo, hi)) = self.frame_bounds(scene, false) {
                             camera.frame_aabb(lo, hi);
                         }
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button(format!("{}  Toggle Fullscreen  (F11)", icon::FULLSCREEN)).clicked() {
+                    if ui
+                        .button(format!("{}  Toggle Fullscreen  (F11)", icon::FULLSCREEN))
+                        .clicked()
+                    {
                         self.pending_fullscreen_toggle = true;
                         ui.close();
                     }
@@ -198,13 +276,26 @@ impl Ui {
                     });
                 });
                 ui.menu_button("Fixture", |ui| {
-                    if ui.button(format!("{}  Online Library…", icon::ONLINE)).clicked() {
+                    if ui
+                        .button(format!("{}  Online Library…", icon::ONLINE))
+                        .clicked()
+                    {
                         self.show_share = true;
                         ui.close();
                     }
                     ui.separator();
-                    let has = self.selection.primary_fixture().map(|i| i < scene.fixtures.len() && scene.fixtures[i].is_gdtf()).unwrap_or(false);
-                    if ui.add_enabled(has, egui::Button::new(format!("{}  Edit Profile…", icon::PROFILE))).clicked() {
+                    let has = self
+                        .selection
+                        .primary_fixture()
+                        .map(|i| i < scene.fixtures.len() && scene.fixtures[i].is_gdtf())
+                        .unwrap_or(false);
+                    if ui
+                        .add_enabled(
+                            has,
+                            egui::Button::new(format!("{}  Edit Profile…", icon::PROFILE)),
+                        )
+                        .clicked()
+                    {
                         if let Some(i) = self.selection.primary_fixture() {
                             self.profile = Some(ProfileEditor::new(i));
                         }
@@ -214,23 +305,34 @@ impl Ui {
                 ui.menu_button("Render", |ui| {
                     let rendering = self.render.status.phase == RenderPhase::Rendering;
                     if ui
-                        .add_enabled(!rendering, egui::Button::new(format!("{}  Render Image  (F12)", icon::RENDER_GO)))
+                        .add_enabled(
+                            !rendering,
+                            egui::Button::new(format!("{}  Render Image  (F12)", icon::RENDER_GO)),
+                        )
                         .clicked()
                     {
                         self.render.request_start();
                         self.ensure_render_tab_focused();
                         ui.close();
                     }
-                    ui.add_enabled(false, egui::Button::new(format!("{}  Render Animation", icon::ANIMATION)))
-                        .on_hover_text("Animation rendering — coming soon");
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(format!("{}  Render Animation", icon::ANIMATION)),
+                    )
+                    .on_hover_text("Animation rendering — coming soon");
                     if rendering
-                        && ui.button(format!("{}  Cancel Render", icon::RENDER_STOP)).clicked()
+                        && ui
+                            .button(format!("{}  Cancel Render", icon::RENDER_STOP))
+                            .clicked()
                     {
                         self.render.request_cancel();
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button(format!("{}  Open Render View", icon::RENDER)).clicked() {
+                    if ui
+                        .button(format!("{}  Open Render View", icon::RENDER))
+                        .clicked()
+                    {
                         self.ensure_render_tab_focused();
                         ui.close();
                     }
@@ -257,14 +359,20 @@ impl Ui {
                                     activate = Some(i);
                                 }
                                 if !builtin
-                                    && ui.small_button(icon::TRASH).on_hover_text("Delete workspace").clicked()
+                                    && ui
+                                        .small_button(icon::TRASH)
+                                        .on_hover_text("Delete workspace")
+                                        .clicked()
                                 {
                                     delete = Some(i);
                                 }
                             });
                         }
                         ui.separator();
-                        if ui.button(format!("{}  Save Current as Workspace…", icon::EXPORT)).clicked() {
+                        if ui
+                            .button(format!("{}  Save Current as Workspace…", icon::EXPORT))
+                            .clicked()
+                        {
                             // Seed the name buffer with the active workspace's name.
                             self.save_workspace = Some(self.workspaces.active().name.clone());
                             ui.close();
@@ -282,7 +390,10 @@ impl Ui {
                     ui.menu_button(format!("{}  View Bookmarks", icon::CAMERA), |ui| {
                         let full = self.bookmarks.next_free_slot().is_none();
                         if ui
-                            .add_enabled(!full, egui::Button::new(format!("{}  Save Current View", icon::FRAME)))
+                            .add_enabled(
+                                !full,
+                                egui::Button::new(format!("{}  Save Current View", icon::FRAME)),
+                            )
                             .clicked()
                         {
                             if let Some(slot) = self.bookmarks.save_pose(camera.pose()) {
@@ -297,8 +408,12 @@ impl Ui {
                             ui.separator();
                             // Snapshot the slots so the recall/delete borrow doesn't
                             // overlap the iteration over `self.bookmarks.items`.
-                            let rows: Vec<(usize, String)> =
-                                self.bookmarks.items.iter().map(|b| (b.slot, b.name.clone())).collect();
+                            let rows: Vec<(usize, String)> = self
+                                .bookmarks
+                                .items
+                                .iter()
+                                .map(|b| (b.slot, b.name.clone()))
+                                .collect();
                             for (slot, name) in rows {
                                 ui.horizontal(|ui| {
                                     if ui.button(format!("{slot}.  {name}")).clicked() {
@@ -307,7 +422,11 @@ impl Ui {
                                         }
                                         ui.close();
                                     }
-                                    if ui.small_button(icon::TRASH).on_hover_text("Delete bookmark").clicked() {
+                                    if ui
+                                        .small_button(icon::TRASH)
+                                        .on_hover_text("Delete bookmark")
+                                        .clicked()
+                                    {
                                         self.bookmarks.delete_slot(slot);
                                     }
                                 });
@@ -316,7 +435,10 @@ impl Ui {
                     });
                     ui.separator();
                     ui.checkbox(&mut self.show_perf, format!("{}  Performance", icon::PERF));
-                    ui.checkbox(&mut self.show_report_log, format!("{}  Report Log", icon::LOG));
+                    ui.checkbox(
+                        &mut self.show_report_log,
+                        format!("{}  Report Log", icon::LOG),
+                    );
                     if ui.button(format!("{}  Welcome", icon::INFO)).clicked() {
                         self.show_welcome();
                         ui.close();
@@ -325,12 +447,18 @@ impl Ui {
                     ui.label(egui::RichText::new("Panels").small().weak());
                     for tab in Tab::TOGGLEABLE {
                         let mut open = self.is_tab_open(tab);
-                        if ui.checkbox(&mut open, format!("{}  {}", tab.icon(), tab.title())).changed() {
+                        if ui
+                            .checkbox(&mut open, format!("{}  {}", tab.icon(), tab.title()))
+                            .changed()
+                        {
                             self.toggle_tab(tab);
                         }
                     }
                     ui.separator();
-                    if ui.button(format!("{}  Reset Layout", icon::LAYOUT)).clicked() {
+                    if ui
+                        .button(format!("{}  Reset Layout", icon::LAYOUT))
+                        .clicked()
+                    {
                         // Re-apply the active workspace's saved layout (revert any live
                         // panel dragging) without changing its tool/overlay emphasis.
                         let dock = self.default_dock();
@@ -339,11 +467,17 @@ impl Ui {
                     }
                 });
                 ui.menu_button("Help", |ui| {
-                    if ui.button(format!("{}  Keyboard Shortcuts", icon::KEYBOARD)).clicked() {
+                    if ui
+                        .button(format!("{}  Keyboard Shortcuts", icon::KEYBOARD))
+                        .clicked()
+                    {
                         self.show_shortcuts = true;
                         ui.close();
                     }
-                    if ui.button(format!("{}  About glowstone", icon::INFO)).clicked() {
+                    if ui
+                        .button(format!("{}  About glowstone", icon::INFO))
+                        .clicked()
+                    {
                         self.show_about = true;
                         ui.close();
                     }

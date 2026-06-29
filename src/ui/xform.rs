@@ -42,8 +42,12 @@ pub enum PivotMode {
 
 impl PivotMode {
     /// Dropdown order + the three non-cursor entries the header cycles through.
-    pub const ALL: [PivotMode; 4] =
-        [PivotMode::Median, PivotMode::Active, PivotMode::Individual, PivotMode::Cursor3d];
+    pub const ALL: [PivotMode; 4] = [
+        PivotMode::Median,
+        PivotMode::Active,
+        PivotMode::Individual,
+        PivotMode::Cursor3d,
+    ];
 
     /// Short menu label.
     pub fn label(self) -> &'static str {
@@ -102,8 +106,11 @@ pub enum TransformOrientation {
 
 impl TransformOrientation {
     /// Dropdown order, matching Blender's Global → Local → View.
-    pub const ALL: [TransformOrientation; 3] =
-        [TransformOrientation::Global, TransformOrientation::Local, TransformOrientation::View];
+    pub const ALL: [TransformOrientation; 3] = [
+        TransformOrientation::Global,
+        TransformOrientation::Local,
+        TransformOrientation::View,
+    ];
 
     /// Short menu / header label.
     pub fn label(self) -> &'static str {
@@ -197,7 +204,13 @@ pub struct SnapSettings {
 
 impl Default for SnapSettings {
     fn default() -> Self {
-        Self { on: false, mode: SnapMode::Increment, move_step: 1.0, rotate_deg: 15.0, scale_step: 0.1 }
+        Self {
+            on: false,
+            mode: SnapMode::Increment,
+            move_step: 1.0,
+            rotate_deg: 15.0,
+            scale_step: 0.1,
+        }
     }
 }
 
@@ -276,7 +289,11 @@ mod tests {
 
     #[test]
     fn snap_move_quantizes_each_axis_when_enabled() {
-        let s = SnapSettings { on: true, move_step: 1.0, ..Default::default() };
+        let s = SnapSettings {
+            on: true,
+            move_step: 1.0,
+            ..Default::default()
+        };
         // Disabled → identity even though `on` is true (Ctrl-inverted off).
         let raw = Vec3::new(1.4, -0.6, 2.5);
         assert_eq!(s.snap_move(raw, false), raw);
@@ -286,7 +303,10 @@ mod tests {
 
     #[test]
     fn snap_angle_rounds_to_degree_step() {
-        let s = SnapSettings { rotate_deg: 15.0, ..Default::default() };
+        let s = SnapSettings {
+            rotate_deg: 15.0,
+            ..Default::default()
+        };
         // 20° → nearest 15° = 15°.
         let got = s.snap_angle(20f32.to_radians(), true).to_degrees();
         assert!((got - 15.0).abs() < 1e-3, "got {got}");
@@ -300,7 +320,10 @@ mod tests {
 
     #[test]
     fn snap_scale_rounds_and_never_collapses() {
-        let s = SnapSettings { scale_step: 0.1, ..Default::default() };
+        let s = SnapSettings {
+            scale_step: 0.1,
+            ..Default::default()
+        };
         assert!((s.snap_scale(1.04, true) - 1.0).abs() < 1e-6);
         assert!((s.snap_scale(1.36, true) - 1.4).abs() < 1e-6);
         // A near-zero factor clamps up to one step, never 0 (no collapse).

@@ -24,8 +24,8 @@ pub(super) fn header(viewer: &mut PanelViewer, ui: &mut egui::Ui, tab: &mut Tab)
     if *tab != Tab::Viewport {
         return;
     }
-    egui::TopBottomPanel::top(ui.id().with("viewport-header"))
-        .exact_height(HEADER_H)
+    egui::Panel::top(ui.id().with("viewport-header"))
+        .exact_size(HEADER_H)
         .show_inside(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 // Right-aligned display controls (Blender keeps shading controls in
@@ -77,8 +77,11 @@ fn viewport_controls(ui: &mut egui::Ui, viewer: &mut PanelViewer) {
 
     let settings = &mut *viewer.settings;
     // Beam gizmos + grid toggles (right-most).
-    ui.checkbox(&mut settings.show_beam_wireframes, RichText::new("Beam").small())
-        .on_hover_text("Beam gizmo wireframes");
+    ui.checkbox(
+        &mut settings.show_beam_wireframes,
+        RichText::new("Beam").small(),
+    )
+    .on_hover_text("Beam gizmo wireframes");
     ui.checkbox(&mut settings.show_grid, RichText::new("Grid").small());
     ui.separator();
     // Exposure.
@@ -155,11 +158,16 @@ fn transform_options(ui: &mut egui::Ui, xform: &mut super::TransformPrefs) {
                 }
             })
             .response
-            .on_hover_text("Snap mode — Grid increment / Vertex (nearest origin) / Surface (under cursor)");
+            .on_hover_text(
+                "Snap mode — Grid increment / Vertex (nearest origin) / Surface (under cursor)",
+            );
     });
     // Snap toggle (Ctrl held mid-drag inverts it — see apply_transform).
     if ui
-        .selectable_label(xform.snap.on, RichText::new(format!("{} Snap", theme::icon::SNAP)).small())
+        .selectable_label(
+            xform.snap.on,
+            RichText::new(format!("{} Snap", theme::icon::SNAP)).small(),
+        )
         .on_hover_text("Grid/increment snap — hold Ctrl mid-drag to invert")
         .clicked()
     {

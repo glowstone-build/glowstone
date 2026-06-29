@@ -31,10 +31,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::SelectionGroup;
 use super::cues::CueEngine;
 use super::outliner::SceneSort;
 use super::windows::Preferences;
-use super::SelectionGroup;
 use crate::dmx::{DmxConfig, PatchTable};
 use crate::renderer::camera::OrbitCamera;
 use crate::scene::{RenderSettings, Scene};
@@ -185,8 +185,12 @@ fn recent_path() -> Option<PathBuf> {
 
 /// The recent-project list, most-recent first, pruned to existing files.
 pub fn load_recent() -> Vec<PathBuf> {
-    let Some(p) = recent_path() else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&p) else { return Vec::new() };
+    let Some(p) = recent_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return Vec::new();
+    };
     let list: Vec<PathBuf> = serde_json::from_str(&text).unwrap_or_default();
     list.into_iter().filter(|p| p.exists()).take(12).collect()
 }
@@ -245,8 +249,10 @@ mod tests {
         scene.render.format = crate::scene::RenderFormat::Exr;
         scene.render.out_path = "/tmp/shot.exr".to_string();
         let fixtures = scene.fixtures.len();
-        let mut camera = OrbitCamera::default();
-        camera.distance = 33.0;
+        let camera = OrbitCamera {
+            distance: 33.0,
+            ..Default::default()
+        };
         let settings = RenderSettings::default();
         let prefs = Preferences::default();
         let cues = CueEngine::default();
@@ -269,7 +275,10 @@ mod tests {
         assert_eq!(loaded.scene.render.res_y, 2160);
         assert_eq!(loaded.scene.render.resolution_percentage, 75);
         assert_eq!(loaded.scene.render.max_samples, 128);
-        assert!(matches!(loaded.scene.render.format, crate::scene::RenderFormat::Exr));
+        assert!(matches!(
+            loaded.scene.render.format,
+            crate::scene::RenderFormat::Exr
+        ));
         assert_eq!(loaded.scene.render.out_path, "/tmp/shot.exr");
     }
 
@@ -315,7 +324,11 @@ mod tests {
             brightness: f32,
             rotation: f32,
         }
-        let bytes = rmp_serde::to_vec_named(&OldWorld { brightness: 4.0, rotation: 0.25 }).unwrap();
+        let bytes = rmp_serde::to_vec_named(&OldWorld {
+            brightness: 4.0,
+            rotation: 0.25,
+        })
+        .unwrap();
         let w: crate::scene::World = rmp_serde::from_slice(&bytes).expect("older World loads");
         assert_eq!(w.brightness, 4.0); // a field the old save HAD is preserved
         assert_eq!(w.rotation, 0.25);
@@ -331,7 +344,11 @@ mod tests {
         use crate::scene::pyro::{PyroDevice, PyroKind};
         let mut scene = Scene::default();
         let lib = crate::scene::Library::standard();
-        let prof = lib.pyro.iter().find(|p| p.kind == PyroKind::Co2Jet).unwrap();
+        let prof = lib
+            .pyro
+            .iter()
+            .find(|p| p.kind == PyroKind::Co2Jet)
+            .unwrap();
         let mut dev = PyroDevice::from_profile(prof, "Cannon 1", glam::Mat4::IDENTITY);
         dev.throw_m = 14.0;
         dev.thickness = 3.3;

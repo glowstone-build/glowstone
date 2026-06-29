@@ -4,8 +4,8 @@
 //! section and the wheel/DMX-mode galleries) stays in the dispatch functions; those
 //! are not "properties", they're bespoke read-outs.
 
-use super::props::{Inspect, Props};
 use super::FixtureDefaults;
+use super::props::{Inspect, Props};
 use crate::scene::Fixture;
 use crate::ui::theme::icon;
 
@@ -14,8 +14,11 @@ impl Inspect for Fixture {
         let def = FixtureDefaults::for_fixture(self);
         let is_gdtf = self.gdtf.is_some();
         // GDTF heads tilt ±135°; the legacy/built-in body allows the full ±180.
-        let tilt_range: std::ops::RangeInclusive<f32> =
-            if is_gdtf { -135.0..=135.0 } else { -180.0..=180.0 };
+        let tilt_range: std::ops::RangeInclusive<f32> = if is_gdtf {
+            -135.0..=135.0
+        } else {
+            -180.0..=180.0
+        };
 
         // TRANSFORM = rig placement: hang Position + Rotation + the pan/tilt motor speed.
         p.group("Transform", icon::INSPECTOR, true, |p| {
@@ -35,7 +38,11 @@ impl Inspect for Fixture {
         let (pan_now, tilt_now) = (self.pan_actual, self.tilt_actual);
         p.group("Fixture", icon::COLOR, true, |p| {
             p.custom("Sequence", true, |ui| {
-                ui.add(egui::DragValue::new(&mut self.sequence).range(1..=u32::MAX).speed(0.2));
+                ui.add(
+                    egui::DragValue::new(&mut self.sequence)
+                        .range(1..=u32::MAX)
+                        .speed(0.2),
+                );
             });
             p.f32("Pan", &mut self.pan)
                 .speed(0.5)
@@ -49,7 +56,10 @@ impl Inspect for Fixture {
                 .suffix("°")
                 .default(def.tilt)
                 .tip(format!("commanded · now {tilt_now:.0}°"));
-            p.f32("Dimmer", &mut self.optics.dimmer).speed(0.005).range(0.0..=1.0).default(def.dimmer);
+            p.f32("Dimmer", &mut self.optics.dimmer)
+                .speed(0.005)
+                .range(0.0..=1.0)
+                .default(def.dimmer);
             // Colour only shows a revert arrow when its template is known (GDTF white
             // master); a built-in's library tint isn't stored (def.color = None).
             p.color("Color", &mut self.color, def.color);

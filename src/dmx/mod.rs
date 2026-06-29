@@ -12,6 +12,7 @@
 //! the shared handle. The render thread reads it with a pointer-clone in
 //! [`DmxIo::poll`] and applies it with [`DmxIo::decode`] — never blocking on I/O.
 
+pub mod address;
 pub mod artnet;
 pub mod decode;
 pub mod feed;
@@ -20,6 +21,7 @@ pub mod patch;
 pub mod sacn;
 pub mod universe;
 
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -137,6 +139,13 @@ pub struct DmxIo {
     /// Headless synthetic feed (no socket), used by `GLOWSTONE_DMX_FEED/INJECT`.
     injected: Option<Arc<UniverseSnapshot>>,
     stale: Duration,
+    last_fixture_decode_patch_sig: u64,
+    last_fixture_decode_generation: u64,
+    last_fixture_decode_at: Instant,
+    last_screen_decode_generation: u64,
+    last_screen_decode_sig: u64,
+    last_pyro_decode_generation: u64,
+    last_pyro_decode_sig: u64,
 }
 
 impl DmxIo {
@@ -165,6 +174,13 @@ impl DmxIo {
             pending: PendingNetCmd::Start,
             injected: None,
             stale: Duration::from_millis(2500),
+            last_fixture_decode_patch_sig: 0,
+            last_fixture_decode_generation: u64::MAX,
+            last_fixture_decode_at: Instant::now(),
+            last_screen_decode_generation: u64::MAX,
+            last_screen_decode_sig: 0,
+            last_pyro_decode_generation: u64::MAX,
+            last_pyro_decode_sig: 0,
         }
     }
 
@@ -190,6 +206,9 @@ impl DmxIo {
         self.snapshot = Arc::new(UniverseSnapshot::default());
         self.status = DmxStatus::default();
         *self.shared.status.lock().unwrap() = DmxStatus::default();
+        self.last_fixture_decode_generation = u64::MAX;
+        self.last_screen_decode_generation = u64::MAX;
+        self.last_pyro_decode_generation = u64::MAX;
     }
 
     /// Apply any deferred UI command and push config edits to the worker. Call
@@ -226,15 +245,39 @@ impl DmxIo {
     /// and any pixel-map-DMX LED screens.
     pub fn decode(&mut self, scene: &mut Scene) {
         self.patch.sync(scene);
-        decode::apply(
-            &mut scene.fixtures,
-            &self.patch,
-            &self.snapshot,
-            &mut self.live_mask,
-            self.stale,
-        );
-        decode::apply_screens(&mut scene.screens, &self.snapshot);
-        decode::apply_pyro(&mut scene.pyro, &self.snapshot);
+        let patch_sig = self.patch.signature();
+        let snapshot_generation = self.snapshot.generation;
+        let fixture_decode_current = self.last_fixture_decode_patch_sig == patch_sig
+            && self.last_fixture_decode_generation == snapshot_generation
+            && self.last_fixture_decode_at.elapsed() < self.stale;
+        if !fixture_decode_current {
+            decode::apply(
+                &mut scene.fixtures,
+                &self.patch,
+                &self.snapshot,
+                &mut self.live_mask,
+                self.stale,
+            );
+            self.last_fixture_decode_patch_sig = patch_sig;
+            self.last_fixture_decode_generation = snapshot_generation;
+            self.last_fixture_decode_at = Instant::now();
+        }
+        let screen_sig = screen_dmx_signature(&scene.screens);
+        if self.last_screen_decode_generation != snapshot_generation
+            || self.last_screen_decode_sig != screen_sig
+        {
+            decode::apply_screens(&mut scene.screens, &self.snapshot);
+            self.last_screen_decode_generation = snapshot_generation;
+            self.last_screen_decode_sig = screen_sig;
+        }
+        let pyro_sig = pyro_dmx_signature(&scene.pyro);
+        if self.last_pyro_decode_generation != snapshot_generation
+            || self.last_pyro_decode_sig != pyro_sig
+        {
+            decode::apply_pyro(&mut scene.pyro, &self.snapshot);
+            self.last_pyro_decode_generation = snapshot_generation;
+            self.last_pyro_decode_sig = pyro_sig;
+        }
     }
 
     /// Auto-assign addresses to every unpatched fixture (the "Auto-patch" action).
@@ -243,8 +286,11 @@ impl DmxIo {
     }
 
     /// Inject a synthetic snapshot (headless feed; no socket).
-    pub fn inject(&mut self, snap: UniverseSnapshot) {
-        self.injected = Some(Arc::new(snap));
+    pub fn inject(&mut self, mut snap: UniverseSnapshot) {
+        snap.generation = self.snapshot.generation.wrapping_add(1);
+        let snapshot = Arc::new(snap);
+        self.snapshot = snapshot.clone();
+        self.injected = Some(snapshot);
     }
 
     pub fn patch(&self) -> &PatchTable {
@@ -303,6 +349,34 @@ impl Drop for DmxIo {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn screen_dmx_signature(screens: &[crate::scene::screen::LedScreen]) -> u64 {
+    use crate::scene::screen::ScreenContent;
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    screens.len().hash(&mut h);
+    for screen in screens {
+        match &screen.content {
+            ScreenContent::PixelMapDmx(pixel_map) => {
+                1_u8.hash(&mut h);
+                pixel_map.hash(&mut h);
+            }
+            _ => 0_u8.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
+fn pyro_dmx_signature(pyro: &[crate::scene::PyroDevice]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    pyro.len().hash(&mut h);
+    for device in pyro {
+        device.kind.hash(&mut h);
+        device.mode.hash(&mut h);
+        device.patch.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// A bundle of disjoint borrows of [`DmxIo`] for the UI panels.
@@ -409,7 +483,10 @@ pub fn apply_env_knobs(dmx: &mut DmxIo, scene: &mut Scene) {
 /// arrives (and the sources) for `secs` seconds, then exit. A non-GUI smoke test
 /// for live reception. Honours `GLOWSTONE_DMX_BIND` / `GLOWSTONE_DMX_UNIVERSES`.
 fn listen_and_exit(dmx: &mut DmxIo, scene: &mut Scene, secs: u64) -> ! {
-    if let Some(ip) = std::env::var("GLOWSTONE_DMX_BIND").ok().and_then(|s| s.parse::<IpAddr>().ok()) {
+    if let Some(ip) = std::env::var("GLOWSTONE_DMX_BIND")
+        .ok()
+        .and_then(|s| s.parse::<IpAddr>().ok())
+    {
         dmx.config.bind_ip = ip;
     }
     if let Ok(list) = std::env::var("GLOWSTONE_DMX_UNIVERSES") {
@@ -450,7 +527,11 @@ fn listen_and_exit(dmx: &mut DmxIo, scene: &mut Scene, secs: u64) -> ! {
     }
     for u in us {
         let f = &dmx.snapshot.frames[&u];
-        log::info!("  universe {u}: {} src, ch1..16 = {:?}", f.sources, &f.levels[..16]);
+        log::info!(
+            "  universe {u}: {} src, ch1..16 = {:?}",
+            f.sources,
+            &f.levels[..16]
+        );
     }
     for s in &dmx.status.sources {
         let who = if s.name.is_empty() { &s.label } else { &s.name };

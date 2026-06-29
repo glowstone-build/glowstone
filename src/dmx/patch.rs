@@ -74,12 +74,16 @@ impl Patchable for FixturePatchRef<'_> {
     }
 
     fn patch_slot(&self) -> Option<(u16, u16)> {
-        self.patch.filter(|p| p.enabled).map(|p| (p.universe, p.address))
+        self.patch
+            .filter(|p| p.enabled)
+            .map(|p| (p.universe, p.address))
     }
 }
 
 /// Where a fixture's patch entry came from (display + auto-assign policy).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize, Default,
+)]
 pub enum PatchSource {
     /// Imported from an MVR scene's `<Addresses>`.
     #[default]
@@ -105,7 +109,7 @@ impl PatchSource {
 }
 
 /// One fixture's DMX patch entry.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Clone, Debug, Hash, serde::Serialize, serde::Deserialize, Default)]
 #[serde(default)]
 pub struct Patch {
     /// 1-based universe.
@@ -223,7 +227,7 @@ pub fn channel_map(fixture: &Fixture, mode_index: usize) -> ChannelMap {
 /// Internal: one fixture's patch plus a fingerprint of the fixture it was built
 /// for, so [`PatchTable::sync`] can tell an *append* (keep entries) from a
 /// *wholesale replacement* like an MVR import (rebuild entries).
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(Hash, serde::Serialize, serde::Deserialize, Default)]
 #[serde(default)]
 struct Entry {
     fp: u64,
@@ -251,6 +255,14 @@ impl PatchTable {
         self.entries.get_mut(i).and_then(|e| e.patch.as_mut())
     }
 
+    /// Hash of the aligned patch entries. Used by the live DMX path to skip fixture
+    /// decode on frames where neither patch nor universe snapshot changed.
+    pub fn signature(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.entries.hash(&mut h);
+        h.finish()
+    }
+
     /// Remove the patch entry for a deleted fixture, keeping the table aligned to
     /// `scene.fixtures` so the *other* fixtures' addresses survive (a plain
     /// `sync()` after a middle-delete would fingerprint-mismatch and reconcile the
@@ -269,7 +281,9 @@ impl PatchTable {
     /// and rebuild the whole table. A larger new footprint may now overlap a
     /// neighbour → surfaced as a conflict for the user to re-patch.
     pub fn replace_at(&mut self, i: usize, fixture: &Fixture) {
-        let Some(entry) = self.entries.get_mut(i) else { return };
+        let Some(entry) = self.entries.get_mut(i) else {
+            return;
+        };
         entry.fp = fingerprint(fixture);
         let fp = footprint_for(fixture, fixture.mode_index);
         match entry.patch.as_mut() {
@@ -474,7 +488,11 @@ impl PatchTable {
     pub fn occupant(&self, universe: u16, channel: u16) -> Option<(usize, u16)> {
         self.entries.iter().enumerate().find_map(|(i, e)| {
             let p = e.patch.as_ref()?;
-            if p.enabled && p.universe == universe && channel >= p.address && channel < p.address + p.footprint {
+            if p.enabled
+                && p.universe == universe
+                && channel >= p.address
+                && channel < p.address + p.footprint
+            {
                 Some((i, channel - p.address))
             } else {
                 None
@@ -487,10 +505,14 @@ impl PatchTable {
         let mut out = Vec::new();
         let n = self.entries.len();
         for i in 0..n {
-            let Some(pi) = self.enabled_at(i) else { continue };
+            let Some(pi) = self.enabled_at(i) else {
+                continue;
+            };
             let (ilo, ihi) = (pi.address, pi.address + pi.footprint.saturating_sub(1));
             for j in (i + 1)..n {
-                let Some(pj) = self.enabled_at(j) else { continue };
+                let Some(pj) = self.enabled_at(j) else {
+                    continue;
+                };
                 if pj.universe != pi.universe {
                     continue;
                 }
@@ -530,7 +552,10 @@ fn reconcile_one(fixture: &Fixture) -> Option<Patch> {
         });
     }
     let (footprint, source) = if fixture.gdtf.is_some() {
-        (footprint_for(fixture, fixture.mode_index), PatchSource::Gdtf)
+        (
+            footprint_for(fixture, fixture.mode_index),
+            PatchSource::Gdtf,
+        )
     } else {
         (SYNTH_FOOTPRINT, PatchSource::Synthetic)
     };
@@ -566,9 +591,11 @@ mod tests {
         let mut scene = Scene::demo();
         scene.fixtures.clear();
         for i in 0..n {
-            scene
-                .fixtures
-                .push(Fixture::from_profile(&lib.fixtures[0], format!("PAR {i}"), Vec3::ZERO));
+            scene.fixtures.push(Fixture::from_profile(
+                &lib.fixtures[0],
+                format!("PAR {i}"),
+                Vec3::ZERO,
+            ));
         }
         scene
     }
@@ -605,7 +632,10 @@ mod tests {
             let mut f = Fixture::from_profile(&lib.fixtures[0], "Imported", Vec3::ZERO);
             f.mvr = Some(Box::new(MvrFixtureMeta {
                 // absolute 513 -> universe 2, channel 1 (1-based MvrAddress math).
-                addresses: vec![MvrAddress { break_id: 0, absolute: 513 }],
+                addresses: vec![MvrAddress {
+                    break_id: 0,
+                    absolute: 513,
+                }],
                 ..Default::default()
             }));
             s.fixtures.push(f);
@@ -627,12 +657,37 @@ mod tests {
         let scene = plain_scene(65);
         let mut table = PatchTable::new();
         table.auto_assign(&scene, 1, 1);
-        assert_eq!((table.get(0).unwrap().universe, table.get(0).unwrap().address), (1, 1));
-        assert_eq!((table.get(1).unwrap().universe, table.get(1).unwrap().address), (1, 9));
-        assert_eq!((table.get(63).unwrap().universe, table.get(63).unwrap().address), (1, 505));
+        assert_eq!(
+            (
+                table.get(0).unwrap().universe,
+                table.get(0).unwrap().address
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                table.get(1).unwrap().universe,
+                table.get(1).unwrap().address
+            ),
+            (1, 9)
+        );
+        assert_eq!(
+            (
+                table.get(63).unwrap().universe,
+                table.get(63).unwrap().address
+            ),
+            (1, 505)
+        );
         let last = table.get(64).unwrap();
-        assert_eq!((last.universe, last.address), (2, 1), "65th fixture wraps to universe 2");
-        assert!(table.conflicts().is_empty(), "sequential pack has no overlaps");
+        assert_eq!(
+            (last.universe, last.address),
+            (2, 1),
+            "65th fixture wraps to universe 2"
+        );
+        assert!(
+            table.conflicts().is_empty(),
+            "sequential pack has no overlaps"
+        );
     }
 
     #[test]
@@ -645,7 +700,10 @@ mod tests {
             s.fixtures.clear();
             let mut mvr = Fixture::from_profile(&lib.fixtures[0], "Desk", Vec3::ZERO);
             mvr.mvr = Some(Box::new(MvrFixtureMeta {
-                addresses: vec![MvrAddress { break_id: 0, absolute: 1 }],
+                addresses: vec![MvrAddress {
+                    break_id: 0,
+                    absolute: 1,
+                }],
                 ..Default::default()
             }));
             s.fixtures.push(mvr);
@@ -655,8 +713,20 @@ mod tests {
         };
         let mut table = PatchTable::new();
         table.auto_assign(&scene, 1, 1);
-        assert_eq!((table.get(0).unwrap().universe, table.get(0).unwrap().address), (1, 1));
-        assert_eq!((table.get(1).unwrap().universe, table.get(1).unwrap().address), (1, 9));
+        assert_eq!(
+            (
+                table.get(0).unwrap().universe,
+                table.get(0).unwrap().address
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                table.get(1).unwrap().universe,
+                table.get(1).unwrap().address
+            ),
+            (1, 9)
+        );
         assert!(table.conflicts().is_empty());
     }
 
@@ -692,13 +762,22 @@ mod tests {
         // User edits fixture 0's address.
         table.get_mut(0).unwrap().address = 100;
         // Add a fixture; sync should append, not wipe the edit.
-        scene
-            .fixtures
-            .push(Fixture::from_profile(&lib.fixtures[0], "PAR new", Vec3::ZERO));
+        scene.fixtures.push(Fixture::from_profile(
+            &lib.fixtures[0],
+            "PAR new",
+            Vec3::ZERO,
+        ));
         table.sync(&scene);
         assert!(table.get(2).is_none(), "table synced to 2 fixtures");
-        assert_eq!(table.get(0).unwrap().address, 100, "edit preserved across append");
-        assert!(!table.get(1).unwrap().enabled, "new fixture starts unpatched");
+        assert_eq!(
+            table.get(0).unwrap().address,
+            100,
+            "edit preserved across append"
+        );
+        assert!(
+            !table.get(1).unwrap().enabled,
+            "new fixture starts unpatched"
+        );
     }
 
     #[test]

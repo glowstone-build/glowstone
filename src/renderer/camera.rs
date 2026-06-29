@@ -24,8 +24,7 @@ pub struct CameraUniform {
 }
 
 /// A camera that orbits a target point: drag to rotate, scroll to dolly.
-#[derive(Clone, Debug)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct OrbitCamera {
     /// Point the camera looks at and orbits around (world space).
@@ -171,7 +170,14 @@ impl OrbitCamera {
     /// the start; the animation interpolates from here to the goal over
     /// [`Self::ANIM_SECS`]. Yaw takes the shortest arc; ortho flips blend across.
     /// A near-identical goal applies instantly (no animation churn).
-    fn animate_to(&mut self, to_target: Vec3, to_yaw: f32, to_pitch: f32, to_distance: f32, to_ortho: bool) {
+    fn animate_to(
+        &mut self,
+        to_target: Vec3,
+        to_yaw: f32,
+        to_pitch: f32,
+        to_distance: f32,
+        to_ortho: bool,
+    ) {
         let to_pitch = to_pitch.clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
         let to_distance = to_distance.clamp(0.5, 200.0);
         let to_ortho_blend = if to_ortho { 1.0 } else { 0.0 };
@@ -215,7 +221,9 @@ impl OrbitCamera {
     /// into the live fields. Returns `true` while an animation is running (the
     /// caller should keep requesting redraws). Cheap no-op when idle.
     pub fn advance(&mut self, dt: f32) -> bool {
-        let Some(a) = self.anim.as_mut() else { return false };
+        let Some(a) = self.anim.as_mut() else {
+            return false;
+        };
         a.elapsed += dt.max(0.0);
         let t = (a.elapsed / a.duration).clamp(0.0, 1.0);
         let e = ease_out_cubic(t);
@@ -289,7 +297,13 @@ impl OrbitCamera {
     /// animation churn), exactly like a canned-view jump.
     pub fn apply_pose(&mut self, p: &CameraPose) {
         self.fov_y = p.fov_y;
-        self.animate_to(Vec3::from_array(p.target), p.yaw, p.pitch, p.distance, p.ortho);
+        self.animate_to(
+            Vec3::from_array(p.target),
+            p.yaw,
+            p.pitch,
+            p.distance,
+            p.ortho,
+        );
     }
 
     /// numpad-5: pure persp↔ortho toggle, no angle change (Blender
@@ -364,8 +378,8 @@ impl OrbitCamera {
         const SENSITIVITY: f32 = 0.005;
         self.anim = None;
         self.yaw -= delta_x * SENSITIVITY;
-        self.pitch = (self.pitch + delta_y * SENSITIVITY)
-            .clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
+        self.pitch =
+            (self.pitch + delta_y * SENSITIVITY).clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
     }
 
     /// Frame a bounding sphere (`center`, `radius`): aim at the center and dolly
@@ -575,8 +589,10 @@ mod tests {
     /// the proj matrix has no perspective divide (last row = (0,0,0,1)).
     #[test]
     fn ortho_proj_is_parallel() {
-        let mut cam = OrbitCamera::default();
-        cam.ortho = true;
+        let mut cam = OrbitCamera {
+            ortho: true,
+            ..Default::default()
+        };
         let p = cam.proj_matrix(16.0 / 9.0);
         let row3 = p.row(3);
         assert!((row3.x).abs() < 1e-6);
@@ -593,8 +609,10 @@ mod tests {
     /// direction (= forward) but distinct origins.
     #[test]
     fn ortho_rays_are_parallel() {
-        let mut cam = OrbitCamera::default();
-        cam.ortho = true;
+        let cam = OrbitCamera {
+            ortho: true,
+            ..Default::default()
+        };
         let aspect = 16.0 / 9.0;
         let (o0, d0) = cam.ray(Vec2::new(-0.5, -0.5), aspect);
         let (o1, d1) = cam.ray(Vec2::new(0.5, 0.5), aspect);
@@ -685,7 +703,10 @@ mod tests {
         cam.advance(OrbitCamera::ANIM_SECS * 0.5);
         assert!(cam.anim.is_some());
         let (gy, gp) = OrbitCamera::view_angles(CameraView::Top);
-        assert!((cam.pitch - gp).abs() > 1e-3, "should not be there mid-flight");
+        assert!(
+            (cam.pitch - gp).abs() > 1e-3,
+            "should not be there mid-flight"
+        );
         // Settle.
         settle(&mut cam);
         assert!(cam.anim.is_none(), "animation should retire");
@@ -706,7 +727,11 @@ mod tests {
         assert!((cam.target - center).length() < 1e-3);
         // Distance fits the radius for the vertical FOV.
         let want = 5.0 / (cam.fov_y * 0.5).max(0.1).sin();
-        assert!((cam.distance - want).abs() < 1e-2, "{} vs {want}", cam.distance);
+        assert!(
+            (cam.distance - want).abs() < 1e-2,
+            "{} vs {want}",
+            cam.distance
+        );
     }
 
     /// frame_aabb widens the fit radius for a wide viewport (aspect>1) and leaves
@@ -726,7 +751,12 @@ mod tests {
         settle(&mut tall);
 
         // Wider viewport ⇒ camera pulls further back so the wide AABB fits.
-        assert!(wide.distance > tall.distance, "{} !> {}", wide.distance, tall.distance);
+        assert!(
+            wide.distance > tall.distance,
+            "{} !> {}",
+            wide.distance,
+            tall.distance
+        );
     }
 
     /// Zoom-to-cursor keeps the anchor world point fixed on screen: after a dolly
@@ -745,8 +775,18 @@ mod tests {
         let after = cam.view_proj(aspect) * anchor.extend(1.0);
         let ndc_after = after.truncate() / after.w;
         // x/y NDC of the anchor are preserved (z/depth naturally changes).
-        assert!((ndc_before.x - ndc_after.x).abs() < 1e-3, "x moved: {} vs {}", ndc_before.x, ndc_after.x);
-        assert!((ndc_before.y - ndc_after.y).abs() < 1e-3, "y moved: {} vs {}", ndc_before.y, ndc_after.y);
+        assert!(
+            (ndc_before.x - ndc_after.x).abs() < 1e-3,
+            "x moved: {} vs {}",
+            ndc_before.x,
+            ndc_after.x
+        );
+        assert!(
+            (ndc_before.y - ndc_after.y).abs() < 1e-3,
+            "y moved: {} vs {}",
+            ndc_before.y,
+            ndc_after.y
+        );
         // And we actually got closer to the anchor.
         assert!(cam.distance < OrbitCamera::default().distance);
     }
@@ -765,14 +805,16 @@ mod tests {
     /// stored target / angles / distance / fov / projection (the bookmark path).
     #[test]
     fn pose_recall_sets_target_pose() {
-        let mut cam = OrbitCamera::default();
         // Author a distinct pose to save.
-        cam.target = Vec3::new(4.0, 1.5, -2.0);
-        cam.yaw = 1.1;
-        cam.pitch = 0.3;
-        cam.distance = 12.0;
-        cam.fov_y = 0.7;
-        cam.ortho = true;
+        let cam = OrbitCamera {
+            target: Vec3::new(4.0, 1.5, -2.0),
+            yaw: 1.1,
+            pitch: 0.3,
+            distance: 12.0,
+            fov_y: 0.7,
+            ortho: true,
+            ..Default::default()
+        };
         let saved = cam.pose();
 
         // Move the camera somewhere else, then recall.
@@ -790,10 +832,12 @@ mod tests {
     /// A pose round-trips through JSON unchanged (the bookmark-persistence path).
     #[test]
     fn pose_round_trips_through_json() {
-        let mut cam = OrbitCamera::default();
-        cam.target = Vec3::new(-1.0, 9.0, 3.0);
-        cam.yaw = -0.4;
-        cam.distance = 22.0;
+        let cam = OrbitCamera {
+            target: Vec3::new(-1.0, 9.0, 3.0),
+            yaw: -0.4,
+            distance: 22.0,
+            ..Default::default()
+        };
         let p = cam.pose();
         let text = serde_json::to_string(&p).unwrap();
         let back: CameraPose = serde_json::from_str(&text).unwrap();
@@ -804,8 +848,10 @@ mod tests {
     /// (the perspective ray does too — framing is preserved on toggle).
     #[test]
     fn ortho_center_ray_passes_through_target_plane() {
-        let mut cam = OrbitCamera::default();
-        cam.ortho = true;
+        let cam = OrbitCamera {
+            ortho: true,
+            ..Default::default()
+        };
         let (o, d) = cam.ray(Vec2::ZERO, 16.0 / 9.0);
         // The target lies on the centre ray: (target - o) is parallel to d.
         let to_target = cam.target - o;

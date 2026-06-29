@@ -123,7 +123,12 @@ pub fn for_tool(tool: ActiveTool) -> Option<Box<dyn GizmoGroup>> {
 /// egui colour for an axis at a given alpha, from the single [`Axis::color`] source.
 fn axis_color(ax: Axis, alpha: u8) -> egui::Color32 {
     let [r, g, b] = ax.color();
-    egui::Color32::from_rgba_unmultiplied((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, alpha)
+    egui::Color32::from_rgba_unmultiplied(
+        (r * 255.0) as u8,
+        (g * 255.0) as u8,
+        (b * 255.0) as u8,
+        alpha,
+    )
 }
 
 // --------------------------------------------------------------------------------
@@ -221,30 +226,52 @@ impl GizmoGroup for MoveGizmo {
     }
 
     fn draw(&self, painter: &egui::Painter, cx: &GizmoCtx, hover: Option<Handle>) {
-        let Some(origin) = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect) else { return };
+        let Some(origin) = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect) else {
+            return;
+        };
         for ax in [Axis::X, Axis::Y, Axis::Z] {
-            let Some((_, tip)) = Self::arm_screen(ax, cx) else { continue };
+            let Some((_, tip)) = Self::arm_screen(ax, cx) else {
+                continue;
+            };
             let hot = hover == Some(Handle::Axis(ax));
-            let col = if hot { axis_color(ax, 255) } else { axis_color(ax, 150) };
-            painter.line_segment([origin, tip], egui::Stroke::new(if hot { 3.0 } else { 2.0 }, col));
+            let col = if hot {
+                axis_color(ax, 255)
+            } else {
+                axis_color(ax, 150)
+            };
+            painter.line_segment(
+                [origin, tip],
+                egui::Stroke::new(if hot { 3.0 } else { 2.0 }, col),
+            );
             painter.circle_filled(tip, if hot { 5.0 } else { 4.0 }, col);
         }
         // Plane quads: a translucent fill tinted toward the normal's axis colour, a
         // brighter outline, and full opacity when hovered (Blender's plane handles).
         for normal in [Axis::X, Axis::Y, Axis::Z] {
-            let Some(c) = Self::plane_center(normal, cx) else { continue };
+            let Some(c) = Self::plane_center(normal, cx) else {
+                continue;
+            };
             let hot = hover == Some(Handle::Plane(normal));
             let r = Self::plane_rect(c);
             let fill = axis_color(normal, if hot { 150 } else { 70 });
             let edge = axis_color(normal, if hot { 255 } else { 170 });
             painter.rect_filled(r, 1.0, fill);
-            painter.rect_stroke(r, 1.0, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+            painter.rect_stroke(
+                r,
+                1.0,
+                egui::Stroke::new(1.0, edge),
+                egui::StrokeKind::Inside,
+            );
         }
         // Centre VIEW square (#72): a small white screen-parallel move handle on the
         // pivot, brightening on hover. Drawn last so it sits over the arm origins.
         if let Some(r) = Self::view_rect(cx) {
             let vhot = hover == Some(Handle::View);
-            let vcol = if vhot { egui::Color32::WHITE } else { egui::Color32::from_gray(220) };
+            let vcol = if vhot {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_gray(220)
+            };
             painter.rect_filled(r, 1.0, vcol);
         } else {
             painter.circle_filled(origin, 3.0, egui::Color32::from_gray(220));
@@ -259,17 +286,26 @@ impl GizmoGroup for MoveGizmo {
                 plane_normal: Some(normal),
                 view: false,
             },
-            Handle::Axis(a) => {
-                GizmoStart { kind: TransformKind::Move, axis: Some(a), plane_normal: None, view: false }
-            }
+            Handle::Axis(a) => GizmoStart {
+                kind: TransformKind::Move,
+                axis: Some(a),
+                plane_normal: None,
+                view: false,
+            },
             // The centre square moves on the screen-parallel plane (normal = camera
             // forward), resolved in apply_transform from the live camera basis.
-            Handle::View => {
-                GizmoStart { kind: TransformKind::Move, axis: None, plane_normal: None, view: true }
-            }
-            Handle::Uniform => {
-                GizmoStart { kind: TransformKind::Move, axis: None, plane_normal: None, view: false }
-            }
+            Handle::View => GizmoStart {
+                kind: TransformKind::Move,
+                axis: None,
+                plane_normal: None,
+                view: true,
+            },
+            Handle::Uniform => GizmoStart {
+                kind: TransformKind::Move,
+                axis: None,
+                plane_normal: None,
+                view: false,
+            },
         }
     }
 }
@@ -299,7 +335,12 @@ impl RotateGizmo {
     fn ring_screen(ax: Axis, cx: &GizmoCtx) -> Vec<Pos2> {
         // Two unit vectors spanning the plane perpendicular to the ring axis.
         let n = ax.vec();
-        let u = if n.x.abs() < 0.9 { n.cross(Vec3::X) } else { n.cross(Vec3::Y) }.normalize_or_zero();
+        let u = if n.x.abs() < 0.9 {
+            n.cross(Vec3::X)
+        } else {
+            n.cross(Vec3::Y)
+        }
+        .normalize_or_zero();
         let v = n.cross(u).normalize_or_zero();
         let mut pts = Vec::with_capacity(RING_SEGMENTS + 1);
         for k in 0..=RING_SEGMENTS {
@@ -318,7 +359,9 @@ impl RotateGizmo {
         if pts.len() < 2 {
             return f32::INFINITY;
         }
-        pts.windows(2).map(|w| dist_point_segment(p, w[0], w[1])).fold(f32::INFINITY, f32::min)
+        pts.windows(2)
+            .map(|w| dist_point_segment(p, w[0], w[1]))
+            .fold(f32::INFINITY, f32::min)
     }
 
     /// The projected screen points of the outer VIEW ring (#72): a circle in the
@@ -327,7 +370,12 @@ impl RotateGizmo {
     fn view_ring_screen(cx: &GizmoCtx) -> Vec<Pos2> {
         // Two unit vectors spanning the screen plane (perpendicular to forward).
         let n = cx.forward.normalize_or_zero();
-        let u = if n.x.abs() < 0.9 { n.cross(Vec3::X) } else { n.cross(Vec3::Y) }.normalize_or_zero();
+        let u = if n.x.abs() < 0.9 {
+            n.cross(Vec3::X)
+        } else {
+            n.cross(Vec3::Y)
+        }
+        .normalize_or_zero();
         let v = n.cross(u).normalize_or_zero();
         let r = cx.arm * VIEW_RING_SCALE;
         let mut pts = Vec::with_capacity(RING_SEGMENTS + 1);
@@ -347,7 +395,9 @@ impl RotateGizmo {
         if pts.len() < 2 {
             return f32::INFINITY;
         }
-        pts.windows(2).map(|w| dist_point_segment(p, w[0], w[1])).fold(f32::INFINITY, f32::min)
+        pts.windows(2)
+            .map(|w| dist_point_segment(p, w[0], w[1]))
+            .fold(f32::INFINITY, f32::min)
     }
 }
 
@@ -375,8 +425,15 @@ impl GizmoGroup for RotateGizmo {
         let vpts = Self::view_ring_screen(cx);
         if vpts.len() >= 2 {
             let vhot = hover == Some(Handle::View);
-            let vcol = if vhot { egui::Color32::WHITE } else { egui::Color32::from_gray(170) };
-            painter.add(egui::Shape::line(vpts, egui::Stroke::new(if vhot { 3.0 } else { 1.5 }, vcol)));
+            let vcol = if vhot {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_gray(170)
+            };
+            painter.add(egui::Shape::line(
+                vpts,
+                egui::Stroke::new(if vhot { 3.0 } else { 1.5 }, vcol),
+            ));
         }
         for ax in [Axis::X, Axis::Y, Axis::Z] {
             let pts = Self::ring_screen(ax, cx);
@@ -384,8 +441,15 @@ impl GizmoGroup for RotateGizmo {
                 continue;
             }
             let hot = hover == Some(Handle::Axis(ax));
-            let col = if hot { axis_color(ax, 255) } else { axis_color(ax, 150) };
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(if hot { 3.0 } else { 1.5 }, col)));
+            let col = if hot {
+                axis_color(ax, 255)
+            } else {
+                axis_color(ax, 150)
+            };
+            painter.add(egui::Shape::line(
+                pts,
+                egui::Stroke::new(if hot { 3.0 } else { 1.5 }, col),
+            ));
         }
         if let Some(origin) = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect) {
             painter.circle_filled(origin, 3.0, egui::Color32::from_gray(220));
@@ -396,15 +460,24 @@ impl GizmoGroup for RotateGizmo {
         // Rotate exposes the three axis rings + the outer VIEW ring; Plane/Uniform
         // never originate here.
         match h {
-            Handle::View => {
-                GizmoStart { kind: TransformKind::Rotate, axis: None, plane_normal: None, view: true }
-            }
-            Handle::Axis(a) => {
-                GizmoStart { kind: TransformKind::Rotate, axis: Some(a), plane_normal: None, view: false }
-            }
-            Handle::Plane(_) | Handle::Uniform => {
-                GizmoStart { kind: TransformKind::Rotate, axis: None, plane_normal: None, view: false }
-            }
+            Handle::View => GizmoStart {
+                kind: TransformKind::Rotate,
+                axis: None,
+                plane_normal: None,
+                view: true,
+            },
+            Handle::Axis(a) => GizmoStart {
+                kind: TransformKind::Rotate,
+                axis: Some(a),
+                plane_normal: None,
+                view: false,
+            },
+            Handle::Plane(_) | Handle::Uniform => GizmoStart {
+                kind: TransformKind::Rotate,
+                axis: None,
+                plane_normal: None,
+                view: false,
+            },
         }
     }
 }
@@ -445,7 +518,9 @@ impl GizmoGroup for ScaleGizmo {
         for ax in [Axis::X, Axis::Y, Axis::Z] {
             if let Some((o, t)) = Self::arm_screen(ax, cx) {
                 // The box at the tip, or the arm line itself, both grab the axis.
-                if Self::box_rect(t, BOX_HALF + 1.0).contains(p) || dist_point_segment(p, o, t) <= GRAB_PX {
+                if Self::box_rect(t, BOX_HALF + 1.0).contains(p)
+                    || dist_point_segment(p, o, t) <= GRAB_PX
+                {
                     return Some(Handle::Axis(ax));
                 }
             }
@@ -454,18 +529,41 @@ impl GizmoGroup for ScaleGizmo {
     }
 
     fn draw(&self, painter: &egui::Painter, cx: &GizmoCtx, hover: Option<Handle>) {
-        let Some(origin) = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect) else { return };
+        let Some(origin) = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect) else {
+            return;
+        };
         for ax in [Axis::X, Axis::Y, Axis::Z] {
-            let Some((_, tip)) = Self::arm_screen(ax, cx) else { continue };
+            let Some((_, tip)) = Self::arm_screen(ax, cx) else {
+                continue;
+            };
             let hot = hover == Some(Handle::Axis(ax));
-            let col = if hot { axis_color(ax, 255) } else { axis_color(ax, 150) };
-            painter.line_segment([origin, tip], egui::Stroke::new(if hot { 3.0 } else { 2.0 }, col));
-            painter.rect_filled(Self::box_rect(tip, if hot { BOX_HALF + 1.0 } else { BOX_HALF }), 0.0, col);
+            let col = if hot {
+                axis_color(ax, 255)
+            } else {
+                axis_color(ax, 150)
+            };
+            painter.line_segment(
+                [origin, tip],
+                egui::Stroke::new(if hot { 3.0 } else { 2.0 }, col),
+            );
+            painter.rect_filled(
+                Self::box_rect(tip, if hot { BOX_HALF + 1.0 } else { BOX_HALF }),
+                0.0,
+                col,
+            );
         }
         // Uniform centre box: white-ish, brighter when hovered.
         let uhot = hover == Some(Handle::Uniform);
-        let ucol = if uhot { egui::Color32::WHITE } else { egui::Color32::from_gray(220) };
-        painter.rect_filled(Self::box_rect(origin, if uhot { BOX_HALF + 1.0 } else { BOX_HALF }), 0.0, ucol);
+        let ucol = if uhot {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_gray(220)
+        };
+        painter.rect_filled(
+            Self::box_rect(origin, if uhot { BOX_HALF + 1.0 } else { BOX_HALF }),
+            0.0,
+            ucol,
+        );
     }
 
     fn invoke(&self, h: Handle) -> GizmoStart {
@@ -474,7 +572,12 @@ impl GizmoGroup for ScaleGizmo {
             Handle::Axis(a) => Some(a),
             Handle::Plane(_) | Handle::Uniform | Handle::View => None,
         };
-        GizmoStart { kind: TransformKind::Scale, axis, plane_normal: None, view: false }
+        GizmoStart {
+            kind: TransformKind::Scale,
+            axis,
+            plane_normal: None,
+            view: false,
+        }
     }
 }
 
@@ -489,7 +592,13 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let aspect = rect.width() / rect.height();
         let (_, _, fwd) = cam.view_basis();
-        GizmoCtx { pivot: cam.target, vp: cam.view_proj(aspect), rect, arm: 2.0, forward: fwd }
+        GizmoCtx {
+            pivot: cam.target,
+            vp: cam.view_proj(aspect),
+            rect,
+            arm: 2.0,
+            forward: fwd,
+        }
     }
 
     /// The plane→in-plane-axes map is the two axes that are NOT the normal.
@@ -585,11 +694,21 @@ mod tests {
         let cx = ctx();
         let origin = OrbitCamera::project_to_screen(cx.pivot, cx.vp, cx.rect).unwrap();
         let view_pts = RotateGizmo::view_ring_screen(&cx);
-        let view_r = view_pts.iter().map(|p| p.distance(origin)).fold(0.0_f32, f32::max);
+        let view_r = view_pts
+            .iter()
+            .map(|p| p.distance(origin))
+            .fold(0.0_f32, f32::max);
         for ax in [Axis::X, Axis::Y, Axis::Z] {
             let axis_pts = RotateGizmo::ring_screen(ax, &cx);
-            let axis_r = axis_pts.iter().map(|p| p.distance(origin)).fold(0.0_f32, f32::max);
-            assert!(view_r >= axis_r, "view ring should reach at least as far as {}", ax.label());
+            let axis_r = axis_pts
+                .iter()
+                .map(|p| p.distance(origin))
+                .fold(0.0_f32, f32::max);
+            assert!(
+                view_r >= axis_r,
+                "view ring should reach at least as far as {}",
+                ax.label()
+            );
         }
     }
 }

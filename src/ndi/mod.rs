@@ -51,11 +51,11 @@ mod imp {
     //! so an absent runtime is a graceful no-op and there is no build-time SDK link.
     use super::*;
     use std::collections::HashMap;
-    use std::ffi::{c_void, CStr, CString};
+    use std::ffi::{CStr, CString, c_void};
     use std::os::raw::c_char;
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -118,8 +118,13 @@ mod imp {
     type FindWaitForSources = unsafe extern "C" fn(*mut c_void, u32) -> bool;
     type FindDestroy = unsafe extern "C" fn(*mut c_void);
     type RecvCreateV3 = unsafe extern "C" fn(*const sys::RecvCreateV3) -> *mut c_void;
-    type RecvCaptureV3 =
-        unsafe extern "C" fn(*mut c_void, *mut sys::VideoFrame, *mut c_void, *mut c_void, u32) -> i32;
+    type RecvCaptureV3 = unsafe extern "C" fn(
+        *mut c_void,
+        *mut sys::VideoFrame,
+        *mut c_void,
+        *mut c_void,
+        u32,
+    ) -> i32;
     type RecvFreeVideoV2 = unsafe extern "C" fn(*mut c_void, *const sys::VideoFrame);
     type RecvDestroy = unsafe extern "C" fn(*mut c_void);
 
@@ -156,7 +161,10 @@ mod imp {
                         FindGetCurrentSources,
                         b"NDIlib_find_get_current_sources\0"
                     ),
-                    find_wait_for_sources: sym!(FindWaitForSources, b"NDIlib_find_wait_for_sources\0"),
+                    find_wait_for_sources: sym!(
+                        FindWaitForSources,
+                        b"NDIlib_find_wait_for_sources\0"
+                    ),
                     find_destroy: sym!(FindDestroy, b"NDIlib_find_destroy\0"),
                     recv_create_v3: sym!(RecvCreateV3, b"NDIlib_recv_create_v3\0"),
                     recv_capture_v3: sym!(RecvCaptureV3, b"NDIlib_recv_capture_v3\0"),
@@ -184,9 +192,17 @@ mod imp {
             "libndi.so.6"
         };
         let mut candidates: Vec<String> = vec![file.to_string()];
-        for var in ["NDI_RUNTIME_DIR_V6", "NDI_RUNTIME_DIR_V5", "NDI_RUNTIME_DIR_V4"] {
+        for var in [
+            "NDI_RUNTIME_DIR_V6",
+            "NDI_RUNTIME_DIR_V5",
+            "NDI_RUNTIME_DIR_V4",
+        ] {
             if let Ok(dir) = std::env::var(var) {
-                let sep = if cfg!(target_os = "windows") { '\\' } else { '/' };
+                let sep = if cfg!(target_os = "windows") {
+                    '\\'
+                } else {
+                    '/'
+                };
                 candidates.push(format!("{dir}{sep}{file}"));
             }
         }
@@ -227,10 +243,17 @@ mod imp {
                     let sources = Arc::new(Mutex::new(Vec::new()));
                     let finder_stop = Arc::new(AtomicBool::new(false));
                     spawn_finder(lib.clone(), sources.clone(), finder_stop.clone());
-                    NdiClient { lib: Some(lib), sources, streams: HashMap::new(), finder_stop }
+                    NdiClient {
+                        lib: Some(lib),
+                        sources,
+                        streams: HashMap::new(),
+                        finder_stop,
+                    }
                 }
                 None => {
-                    log::warn!("NDI runtime not found — NDI sources unavailable (install the NDI runtime to enable them)");
+                    log::warn!(
+                        "NDI runtime not found — NDI sources unavailable (install the NDI runtime to enable them)"
+                    );
                     NdiClient {
                         lib: None,
                         sources: Arc::new(Mutex::new(Vec::new())),
@@ -252,9 +275,12 @@ mod imp {
                 return None;
             }
             if !self.streams.contains_key(source) {
-                self.streams.insert(source.to_string(), spawn_receiver(lib, source.to_string()));
+                self.streams
+                    .insert(source.to_string(), spawn_receiver(lib, source.to_string()));
             }
-            self.streams.get(source).and_then(|s| s.frame.lock().unwrap().clone())
+            self.streams
+                .get(source)
+                .and_then(|s| s.frame.lock().unwrap().clone())
         }
         pub fn retain(&mut self, active: &[String]) {
             self.streams.retain(|k, s| {
@@ -297,7 +323,11 @@ mod imp {
     }
 
     fn new_find_create() -> sys::FindCreate {
-        sys::FindCreate { show_local_sources: true, p_groups: ptr::null(), p_extra_ips: ptr::null() }
+        sys::FindCreate {
+            show_local_sources: true,
+            p_groups: ptr::null(),
+            p_extra_ips: ptr::null(),
+        }
     }
 
     fn spawn_finder(lib: Arc<NdiLib>, sources: Arc<Mutex<Vec<String>>>, stop: Arc<AtomicBool>) {
@@ -331,7 +361,10 @@ mod imp {
         let stop = Arc::new(AtomicBool::new(false));
         let (frame_t, stop_t) = (frame.clone(), stop.clone());
         // The discovered name is "NAME@url"; match on the stable NAME part.
-        let want = source_name.rsplit_once('@').map(|(n, _)| n.to_string()).unwrap_or(source_name);
+        let want = source_name
+            .rsplit_once('@')
+            .map(|(n, _)| n.to_string())
+            .unwrap_or(source_name);
         thread::Builder::new()
             .name("ndi-recv".into())
             .spawn(move || {
@@ -353,7 +386,10 @@ mod imp {
                         for i in 0..n as isize {
                             let s = unsafe { &*arr.offset(i) };
                             let label = source_label(s);
-                            let nm = label.rsplit_once('@').map(|(x, _)| x).unwrap_or(label.as_str());
+                            let nm = label
+                                .rsplit_once('@')
+                                .map(|(x, _)| x)
+                                .unwrap_or(label.as_str());
                             if nm == want.as_str() {
                                 let name = unsafe { CStr::from_ptr(s.p_ndi_name) }.to_owned();
                                 let url = if s.p_url_address.is_null() {
@@ -395,7 +431,13 @@ mod imp {
                     while !stop_t.load(Ordering::Relaxed) {
                         let mut video: sys::VideoFrame = unsafe { std::mem::zeroed() };
                         let ft = unsafe {
-                            (lib.recv_capture_v3)(recv, &mut video, ptr::null_mut(), ptr::null_mut(), 1000)
+                            (lib.recv_capture_v3)(
+                                recv,
+                                &mut video,
+                                ptr::null_mut(),
+                                ptr::null_mut(),
+                                1000,
+                            )
                         };
                         match ft {
                             sys::FRAME_TYPE_VIDEO => {
@@ -412,7 +454,10 @@ mod imp {
                                 } else {
                                     // SAFETY: NDI guarantees `stride * yres` valid bytes.
                                     let data = unsafe {
-                                        std::slice::from_raw_parts(video.p_data, stride * h as usize)
+                                        std::slice::from_raw_parts(
+                                            video.p_data,
+                                            stride * h as usize,
+                                        )
                                     };
                                     pack_rgba(data, w, h, stride)
                                 };

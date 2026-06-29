@@ -8,8 +8,8 @@
 //! Gated on `Features::TIMESTAMP_QUERY` — absent on some drivers, so the whole thing
 //! is `Option`al and the overlay degrades to a CPU-frame-ms-only HUD when missing.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::shadow;
 
@@ -158,18 +158,6 @@ impl GpuTimers {
             return None;
         }
         Some(wgpu::RenderPassTimestampWrites {
-            query_set: &self.query_set,
-            beginning_of_pass_write_index: Some(pair * 2),
-            end_of_pass_write_index: Some(pair * 2 + 1),
-        })
-    }
-
-    /// `timestamp_writes` for a compute pass (twin of [`rp`]).
-    pub fn cp(&self, pair: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
-        if self.inflight[self.write_slot()] {
-            return None;
-        }
-        Some(wgpu::ComputePassTimestampWrites {
             query_set: &self.query_set,
             beginning_of_pass_write_index: Some(pair * 2),
             end_of_pass_write_index: Some(pair * 2 + 1),

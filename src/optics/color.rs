@@ -41,10 +41,10 @@ pub fn cct_to_xy(cct: f32) -> (f32, f32) {
     let t = cct.clamp(1000.0, 15000.0);
     let t2 = t * t;
     // CIE 1960 UCS u, v.
-    let u = (0.860117757 + 1.54118254e-4 * t + 1.28641212e-7 * t2)
-        / (1.0 + 8.42420235e-4 * t + 7.08145163e-7 * t2);
-    let v = (0.317398726 + 4.22806245e-5 * t + 4.20481691e-8 * t2)
-        / (1.0 - 2.89741816e-5 * t + 1.61456053e-7 * t2);
+    let u = (0.860_117_73 + 1.541_182_6e-4 * t + 1.286_412_2e-7 * t2)
+        / (1.0 + 8.424_202e-4 * t + 7.081_451_5e-7 * t2);
+    let v = (0.317_398_73 + 4.228_062_5e-5 * t + 4.204_817e-8 * t2)
+        / (1.0 - 2.897_418_2e-5 * t + 1.614_560_6e-7 * t2);
     let denom = 2.0 * u - 8.0 * v + 4.0;
     (3.0 * u / denom, 2.0 * v / denom)
 }
@@ -223,14 +223,21 @@ mod tests {
         // Convex ramp: half insertion is brighter than a linear-density midpoint
         // (10^-0.9 ≈ 0.126), i.e. saturation kicks in deeper into the fader.
         let half = cmy_transmittance([0.5, 0.0, 0.0]);
-        assert!(half[0] > 0.2, "convex ramp keeps half-insertion bright: {}", half[0]);
+        assert!(
+            half[0] > 0.2,
+            "convex ramp keeps half-insertion bright: {}",
+            half[0]
+        );
     }
 
     #[test]
     fn rgbw_fold_keeps_amber_amber() {
         let e = Emitters::default();
         let amber = fold_rgbwal([0.0, 0.0, 0.0, 0.0, 1.0, 0.0], &e);
-        assert!(amber[0] > amber[1] && amber[1] > amber[2], "amber reads warm: {amber:?}");
+        assert!(
+            amber[0] > amber[1] && amber[1] > amber[2],
+            "amber reads warm: {amber:?}"
+        );
         // White emitter folds neutral-ish (not a hue shift).
         let white = fold_rgbwal([0.0, 0.0, 0.0, 1.0, 0.0, 0.0], &e);
         assert!((white[0] - white[2]).abs() < 0.2, "W ≈ neutral: {white:?}");
@@ -243,6 +250,9 @@ mod tests {
         assert!(g[1] > g[0] && g[1] > g[2], "plus-green lifts green: {g:?}");
         let m = green_tint(base, -1.0);
         assert!(m[1] < m[0], "minus-green adds magenta: {m:?}");
-        assert!((luminance(g) - luminance(base)).abs() < 1e-3, "luma preserved");
+        assert!(
+            (luminance(g) - luminance(base)).abs() < 1e-3,
+            "luma preserved"
+        );
     }
 }

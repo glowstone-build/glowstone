@@ -232,7 +232,11 @@ impl Fixture {
     /// resolve, in which case it renders as a placeholder.
     pub fn from_mvr(imported: crate::mvr::ImportedFixture) -> Self {
         let (position, orientation) = crate::mvr::fixture_base(imported.world);
-        let beam_angle = imported.gdtf.as_ref().map(|g| g.beam_angle.max(1.0)).unwrap_or(15.0);
+        let beam_angle = imported
+            .gdtf
+            .as_ref()
+            .map(|g| g.beam_angle.max(1.0))
+            .unwrap_or(15.0);
         let (profile, category) = match &imported.gdtf {
             Some(g) => (g.name.clone(), g.manufacturer.clone()),
             None => (imported.meta.gdtf_spec.clone(), "Unresolved".to_string()),
@@ -241,14 +245,22 @@ impl Fixture {
         let mode_index = imported
             .gdtf
             .as_ref()
-            .and_then(|g| g.modes.iter().position(|m| m.name == imported.meta.gdtf_mode))
+            .and_then(|g| {
+                g.modes
+                    .iter()
+                    .position(|m| m.name == imported.meta.gdtf_mode)
+            })
             .unwrap_or(0);
         let is_laser = imported
             .gdtf
             .as_ref()
             .map(|g| g.beam.lamp_type.to_lowercase().contains("laser"))
             .unwrap_or(false);
-        let shutter = imported.gdtf.as_ref().map(|g| default_shutter(g)).unwrap_or(ShutterKind::None);
+        let shutter = imported
+            .gdtf
+            .as_ref()
+            .map(|g| default_shutter(g))
+            .unwrap_or(ShutterKind::None);
         let mut f = Self {
             name: imported.name,
             profile,
@@ -422,7 +434,11 @@ impl Fixture {
     /// Full-motor-speed pan/tilt ceiling (deg/s) by fixture class — beams are
     /// fastest, big LED washes (heavy front lens / large head) slowest.
     fn movement_class(&self) -> (f32, f32) {
-        let hay = format!("{} {}", self.category.to_lowercase(), self.profile.to_lowercase());
+        let hay = format!(
+            "{} {}",
+            self.category.to_lowercase(),
+            self.profile.to_lowercase()
+        );
         let has = |k: &str| hay.contains(k);
         if has("beam") {
             (260.0, 200.0)
@@ -445,8 +461,22 @@ impl Fixture {
         let (max_pan, max_tilt) = self.max_slew();
         // Reach cruise in ~0.18 s (the spec-sheet ramp time); also bounds decel.
         let accel = |max_v: f32| (max_v / 0.18).max(1.0);
-        self.pan_actual = slew_axis(self.pan_actual, &mut self.pan_vel, self.pan, max_pan, accel(max_pan), dt);
-        self.tilt_actual = slew_axis(self.tilt_actual, &mut self.tilt_vel, self.tilt, max_tilt, accel(max_tilt), dt);
+        self.pan_actual = slew_axis(
+            self.pan_actual,
+            &mut self.pan_vel,
+            self.pan,
+            max_pan,
+            accel(max_pan),
+            dt,
+        );
+        self.tilt_actual = slew_axis(
+            self.tilt_actual,
+            &mut self.tilt_vel,
+            self.tilt,
+            max_tilt,
+            accel(max_tilt),
+            dt,
+        );
     }
 
     /// World-space position of the lens (where the beam exits).
@@ -534,10 +564,16 @@ fn default_shutter(gdtf: &GdtfFixture) -> ShutterKind {
     let has_shutter = gdtf.modes.iter().any(|m| {
         m.channels.iter().any(|c| {
             c.attribute.starts_with("Shutter")
-                || c.functions.iter().any(|f| f.attribute.starts_with("Shutter"))
+                || c.functions
+                    .iter()
+                    .any(|f| f.attribute.starts_with("Shutter"))
         })
     });
-    if has_shutter { ShutterKind::Blade } else { ShutterKind::None }
+    if has_shutter {
+        ShutterKind::Blade
+    } else {
+        ShutterKind::None
+    }
 }
 
 #[cfg(test)]
@@ -568,9 +604,18 @@ mod tests {
         };
         let (max_fast, n_fast) = run(0.0);
         let (_max_slow, n_slow) = run(1.0);
-        assert!(max_fast <= 270.0 + 0.5, "no overshoot, peaked at {max_fast}");
-        assert!((max_fast - 270.0).abs() < 1.0, "reaches target, got {max_fast}");
-        assert!(n_slow > n_fast * 3, "slow motor is much slower: {n_slow} vs {n_fast}");
+        assert!(
+            max_fast <= 270.0 + 0.5,
+            "no overshoot, peaked at {max_fast}"
+        );
+        assert!(
+            (max_fast - 270.0).abs() < 1.0,
+            "reaches target, got {max_fast}"
+        );
+        assert!(
+            n_slow > n_fast * 3,
+            "slow motor is much slower: {n_slow} vs {n_fast}"
+        );
     }
 
     /// `aim_pan_tilt` is the inverse of `beam_direction`: solving pan/tilt for a

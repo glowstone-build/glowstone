@@ -17,6 +17,7 @@ impl Ui {
             settings: RenderSettings::default(),
             prefs: Preferences::default(),
             requested_viewport_px: (1, 1),
+            viewport_visible: false,
             render: RenderUiState::default(),
             pending_fullscreen_toggle: false,
             render_active: false,

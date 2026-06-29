@@ -59,13 +59,19 @@ impl Ui {
             let root = egui_dock::NodeIndex::root();
             match tab {
                 Tab::Scene | Tab::Library => {
-                    self.dock.main_surface_mut().split_left(root, 0.17, vec![tab]);
+                    self.dock
+                        .main_surface_mut()
+                        .split_left(root, 0.17, vec![tab]);
                 }
                 Tab::Inspector => {
-                    self.dock.main_surface_mut().split_right(root, 0.80, vec![tab]);
+                    self.dock
+                        .main_surface_mut()
+                        .split_right(root, 0.80, vec![tab]);
                 }
                 Tab::Patch | Tab::DmxMonitor | Tab::Cues | Tab::Connectivity => {
-                    self.dock.main_surface_mut().split_below(root, 0.7, vec![tab]);
+                    self.dock
+                        .main_surface_mut()
+                        .split_below(root, 0.7, vec![tab]);
                 }
                 // Viewport / Render: no canonical edge — fall back to the focused leaf.
                 _ => {
@@ -79,7 +85,11 @@ impl Ui {
     /// single source of the field mapping (called on workspace ACTIVATION). NOT a
     /// lock — the user can still toggle any of these afterward; a workspace just
     /// presets the emphasis (the design note: soft contexts, no gating).
-    fn apply_overlays(prefs: &mut Preferences, settings: &mut RenderSettings, ov: workspaces::Overlays) {
+    fn apply_overlays(
+        prefs: &mut Preferences,
+        settings: &mut RenderSettings,
+        ov: workspaces::Overlays,
+    ) {
         prefs.show_labels = ov.labels;
         prefs.show_stats = ov.stats;
         settings.show_grid = ov.grid;
@@ -91,7 +101,9 @@ impl Ui {
     /// index. Records the choice as active (persisted) so the app reopens here. This
     /// changes the STARTING arrangement only — nothing is locked or gated.
     pub(super) fn activate_workspace(&mut self, idx: usize) {
-        let Some(ws) = self.workspaces.items.get(idx).cloned() else { return };
+        let Some(ws) = self.workspaces.items.get(idx).cloned() else {
+            return;
+        };
         self.dock = ws.dock.clone();
         self.active_tool = ws.default_tool;
         Self::apply_overlays(&mut self.prefs, &mut self.settings, ws.overlays);
@@ -109,8 +121,13 @@ impl Ui {
             self.settings.show_grid,
             self.prefs.show_gizmos,
         );
-        let idx = self.workspaces.save_current(name, self.dock.clone(), self.active_tool, overlays);
-        self.notify.success(format!("Saved workspace: {}", self.workspaces.items[idx].name));
+        let idx = self
+            .workspaces
+            .save_current(name, self.dock.clone(), self.active_tool, overlays);
+        self.notify.success(format!(
+            "Saved workspace: {}",
+            self.workspaces.items[idx].name
+        ));
     }
 
     /// The workspace tab strip (Blender's workspace tabs / depence's preset row):
@@ -122,13 +139,23 @@ impl Ui {
         let active = self.workspaces.active;
         let mut activate: Option<usize> = None;
         let mut save_new = false;
-        egui::TopBottomPanel::top("workspace-strip").show(ctx, |ui| {
+        #[expect(
+            deprecated,
+            reason = "Top-level workspace strip still uses the context-based egui panel API."
+        )]
+        egui::Panel::top("workspace-strip").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
                 // Snapshot the names so the activate borrow doesn't overlap iteration.
-                let names: Vec<String> = self.workspaces.items.iter().map(|w| w.name.clone()).collect();
+                let names: Vec<String> = self
+                    .workspaces
+                    .items
+                    .iter()
+                    .map(|w| w.name.clone())
+                    .collect();
                 for (i, name) in names.into_iter().enumerate() {
-                    #[allow(deprecated)] // egui 0.34 SelectableLabel — Button::selectable migration later
+                    #[allow(deprecated)]
+                    // egui 0.34 SelectableLabel — Button::selectable migration later
                     if ui.selectable_label(i == active, name).clicked() {
                         activate = Some(i);
                     }
@@ -157,7 +184,9 @@ impl Ui {
     /// it captures the live layout + tool + overlays under the typed name (overwriting
     /// a same-named record). Drawn after the dock in `show`.
     pub(super) fn save_workspace_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut name) = self.save_workspace.take() else { return };
+        let Some(mut name) = self.save_workspace.take() else {
+            return;
+        };
         let mut open = true;
         let mut commit = false;
         let mut cancel = false;
@@ -203,11 +232,17 @@ mod tests {
     #[test]
     fn n_panel_reopens_as_its_own_pane_not_a_viewport_tab() {
         let mut ui = Ui::new();
-        assert!(ui.dock.find_tab(&Tab::Inspector).is_some(), "default has an Inspector");
+        assert!(
+            ui.dock.find_tab(&Tab::Inspector).is_some(),
+            "default has an Inspector"
+        );
         ui.toggle_tab(Tab::Inspector); // hide
         assert!(ui.dock.find_tab(&Tab::Inspector).is_none(), "N hides it");
         ui.toggle_tab(Tab::Inspector); // re-open
-        let insp = ui.dock.find_tab(&Tab::Inspector).expect("N re-opens the Inspector");
+        let insp = ui
+            .dock
+            .find_tab(&Tab::Inspector)
+            .expect("N re-opens the Inspector");
         let vp = ui.dock.find_tab(&Tab::Viewport).expect("viewport present");
         assert_ne!(
             (insp.surface, insp.node),
