@@ -17,7 +17,7 @@
 //! Advanced once per real frame (`Renderer::advance_pyro`, the app tick) — never
 //! in `record_scene` (the double-advance trap).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
 
 use bytemuck::{Pod, Zeroable};
@@ -463,6 +463,8 @@ fn vnoise3(p: Vec3) -> f32 {
 pub struct PyroSystem {
     sims: HashMap<EntityId, PyroSim>,
     co2_sims: HashMap<EntityId, Co2Sim>,
+    live_spark_ids: HashSet<EntityId>,
+    live_co2_ids: HashSet<EntityId>,
     /// Additive spark sprites built this frame (drawn by the spark pipeline).
     pub spark: Vec<ParticleInstance>,
     /// CO2 volume descriptors (one per active emitter, this frame). The renderer
@@ -483,6 +485,8 @@ impl PyroSystem {
         Self {
             sims: HashMap::new(),
             co2_sims: HashMap::new(),
+            live_spark_ids: HashSet::new(),
+            live_co2_ids: HashSet::new(),
             spark: Vec::new(),
             co2_vol: Vec::new(),
             co2_ids: Vec::new(),
@@ -500,16 +504,20 @@ impl PyroSystem {
     /// quality + sizes the texture to match). Call once per real frame from the app
     /// update tick.
     pub fn advance(&mut self, scene: &Scene, cam_pos: Vec3, time: f32, dt: f32, co2_res: u32) {
-        let mut live_spark: Vec<EntityId> = Vec::new();
-        let mut live_co2: Vec<EntityId> = Vec::new();
+        self.live_spark_ids.clear();
+        self.live_co2_ids.clear();
         for d in &scene.pyro {
             match d.kind {
-                PyroKind::ColdSpark => live_spark.push(d.id),
-                PyroKind::Co2Jet => live_co2.push(d.id),
+                PyroKind::ColdSpark => {
+                    self.live_spark_ids.insert(d.id);
+                }
+                PyroKind::Co2Jet => {
+                    self.live_co2_ids.insert(d.id);
+                }
             }
         }
-        self.sims.retain(|id, _| live_spark.contains(id));
-        self.co2_sims.retain(|id, _| live_co2.contains(id));
+        self.sims.retain(|id, _| self.live_spark_ids.contains(id));
+        self.co2_sims.retain(|id, _| self.live_co2_ids.contains(id));
 
         let dt = dt.clamp(0.0, 1.0 / 20.0);
         self.spark.clear();
