@@ -366,6 +366,15 @@ pub(super) fn render_properties(
         // --- Performance (Viewport vs Render) -------------------------------
         p.group("Performance", icon::SETTINGS, false, |p| {
             p.subhead("Viewport (preview)");
+            p.custom("Wash beam detail", true, |ui| {
+                ui.add(DragValue::new(&mut settings.wash_beam_lod).range(1..=64).speed(1.0))
+                    .on_hover_text(
+                        "Max volumetric shaft beams per multi-emitter wash / LED array in the \
+                         PREVIEW. Cells render one crisp shaft each up to this many, then bin \
+                         down to it. Higher = finer per-cell shaft colour & structure but more \
+                         GPU; lower = faster. The lens face always shows the full pixel map.",
+                    );
+            });
             p.custom("Shadow maps", true, |ui| {
                 ui.add(
                     DragValue::new(&mut settings.shadow_max)
@@ -380,6 +389,10 @@ pub(super) fn render_properties(
             });
 
             p.subhead("Render (final)");
+            p.custom("Wash beam detail", true, |ui| {
+                ui.add(DragValue::new(&mut scene.render.wash_beam_lod).range(1..=64).speed(1.0))
+                    .on_hover_text("Max wash/array shaft beams per fixture in the final render (a still can afford more than the preview)");
+            });
             p.custom("Shadow maps", true, |ui| {
                 ui.add(
                     DragValue::new(&mut scene.render.shadow_max)

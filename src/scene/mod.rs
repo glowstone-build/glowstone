@@ -183,6 +183,13 @@ pub struct RenderSettings {
     /// 0 = off (exact pre-feature look). A shared look setting — persisted with the
     /// show, shown in Render Properties ▸ Color Management.
     pub chroma_haze: f32,
+    /// Multi-emitter WASH beam detail: the max number of volumetric shaft beams one
+    /// wash / LED-array fixture spends on the raymarch. Its cells render one crisp
+    /// shaft each up to this many, then spatially bin down to it (the lens FACE always
+    /// shows the full pixel map regardless). Higher = finer per-cell shaft colour /
+    /// structure but more GPU; lower = faster. Shown in Render Properties ▸ Performance.
+    #[serde(default = "default_wash_beam_lod")]
+    pub wash_beam_lod: u32,
     /// Floor-pool gobo edge sharpening amount (0 = off). Drives the contour
     /// steepening in mesh.wgsl via `camera.render_mode.y`.
     pub gobo_sharpness: f32,
@@ -248,6 +255,10 @@ fn default_shadow_max() -> u32 {
     8
 }
 
+fn default_wash_beam_lod() -> u32 {
+    16
+}
+
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
@@ -262,6 +273,7 @@ impl Default for RenderSettings {
             steps: 80,
             froxel_volumetric: false,
             chroma_haze: 1.2,
+            wash_beam_lod: default_wash_beam_lod(),
             gobo_sharpness: 0.6,
             render_scale: default_render_scale(),
             auto_resolution: false,

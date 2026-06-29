@@ -134,6 +134,24 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Hue-preserving tonemap. Per-channel ACES desaturates bright saturated colours
+// toward WHITE (a bright pixel-pink LED cell clips R/G/B all to ~1 and reads as a
+// white blob, killing the pink-vs-magenta contrast that's the whole point of a
+// colour-pixel wash). So also tonemap by the PEAK channel and reapply the original
+// hue (R:G:B ratio) — that keeps a blazing pink as bright PINK, a magenta as
+// magenta. Blend the two: filmic roll-off shape (luminance) from per-channel,
+// saturation from the hue-preserving term. The two AGREE in the midtones/shadows
+// (c ≲ 1, no clipping), so this only changes the highlights — exactly where the
+// desaturation-to-white happens — leaving the rest of the look intact.
+const HUE_PRESERVE: f32 = 0.7;
+fn tonemap(c: vec3<f32>) -> vec3<f32> {
+    let filmic = aces(c);
+    let peak = max(c.r, max(c.g, c.b));
+    let hue = c / max(peak, 1e-4);
+    let preserved = aces(vec3<f32>(peak)) * hue;
+    return mix(filmic, preserved, HUE_PRESERVE);
+}
+
 // linear -> sRGB gamma (egui treats the user texture as gamma-encoded).
 fn to_srgb(c: vec3<f32>) -> vec3<f32> {
     let lo = c * 12.92;
@@ -147,7 +165,7 @@ fn fs_tonemap(in: VsOut) -> @location(0) vec4<f32> {
     let bloom = textureSample(bloom_tex, post_samp, in.uv).rgb;
     col += bloom * post.bloom;
     col *= post.exposure;
-    col = aces(col);
+    col = tonemap(col);
     col = to_srgb(col);
     return vec4<f32>(col, 1.0);
 }
