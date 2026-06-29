@@ -508,6 +508,9 @@ impl PyroSystem {
         self.live_spark_ids.clear();
         self.live_co2_ids.clear();
         for d in &scene.pyro {
+            if d.hidden {
+                continue;
+            }
             match d.kind {
                 PyroKind::ColdSpark => {
                     self.live_spark_ids.insert(d.id);
@@ -526,6 +529,9 @@ impl PyroSystem {
         self.co2_ids.clear();
 
         for dev in &scene.pyro {
+            if dev.hidden {
+                continue;
+            }
             match dev.kind {
                 PyroKind::ColdSpark => {
                     let dist = (cam_pos - dev.world_nozzle()).length();
@@ -535,9 +541,7 @@ impl PyroSystem {
                         .entry(dev.id)
                         .or_insert_with(|| PyroSim::new(dev.id));
                     sim.advance(dev, dt, lod);
-                    if !dev.hidden {
-                        sim.build_spark(dev, &mut self.spark);
-                    }
+                    sim.build_spark(dev, &mut self.spark);
                 }
                 PyroKind::Co2Jet => {
                     // OUTPUT is INSTANT: the spawn rate follows emit_amount DIRECTLY
@@ -556,8 +560,7 @@ impl PyroSystem {
                         sim.grid.resize((co2_res * co2_res * co2_res) as usize, 0.0);
                     }
                     sim.advance(dev.world_nozzle(), dev.world_dir(), output, time, dt, &tn);
-                    if !dev.hidden
-                        && self.co2_ids.len() < CO2_LAYERS as usize
+                    if self.co2_ids.len() < CO2_LAYERS as usize
                         && let Some(v) = sim.splat(&tn)
                     {
                         self.co2_vol.push(v);
@@ -774,4 +777,42 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::library::Library;
+    use glam::Mat4;
+
+    fn spark_device(id: EntityId, hidden: bool) -> PyroDevice {
+        let library = Library::standard();
+        let profile = library
+            .pyro
+            .iter()
+            .find(|profile| profile.kind == PyroKind::ColdSpark)
+            .expect("standard cold spark profile");
+        let mut device = PyroDevice::from_profile(profile, "Spark", Mat4::IDENTITY);
+        device.id = id;
+        device.density = 1.0;
+        device.max_particles = 16;
+        device.hidden = hidden;
+        device
+    }
+
+    #[test]
+    fn hidden_pyro_devices_do_not_advance_or_keep_sims() {
+        let mut scene = Scene::demo();
+        scene.pyro.push(spark_device(42, false));
+
+        let mut pyro = PyroSystem::new();
+        pyro.advance(&scene, Vec3::ZERO, 0.0, 1.0 / 30.0, CO2_RES_INIT);
+        assert!(!pyro.spark.is_empty());
+        assert!(pyro.sims.contains_key(&42));
+
+        scene.pyro[0].hidden = true;
+        pyro.advance(&scene, Vec3::ZERO, 1.0, 1.0 / 30.0, CO2_RES_INIT);
+        assert!(pyro.spark.is_empty());
+        assert!(!pyro.sims.contains_key(&42));
+    }
 }
