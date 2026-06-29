@@ -31,6 +31,7 @@ pub const ENGINE_NAME: &str = "Spectre";
 
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -468,6 +469,9 @@ pub struct Renderer {
     /// 5000-object crowd, so culling cuts the shadow-pass draw count ~100×.
     scene_geom_bounds: HashMap<usize, ([f32; 3], [f32; 3])>,
     scene_geom_instances: GrowBuffer,
+    scene_geom_sig: u64,
+    scene_geom_draws_cpu: Vec<(usize, u32, Vec3, Vec3)>,
+    scene_geom_groups_cpu: Vec<(usize, u32, u32)>,
 
     // Placeholder cone bodies for GDTF fixtures whose 3D models didn't bake
     // (absent / unsupported model format) — so the fixture is still visible.
@@ -1183,6 +1187,9 @@ impl Renderer {
             scene_geom_cache: HashMap::new(),
             scene_geom_bounds: HashMap::new(),
             scene_geom_instances,
+            scene_geom_sig: u64::MAX,
+            scene_geom_draws_cpu: Vec::new(),
+            scene_geom_groups_cpu: Vec::new(),
             gdtf_placeholder_instances,
             sky_pipeline,
             world_bgl,
@@ -1509,6 +1516,88 @@ impl Renderer {
             .get(&key)
             .and_then(|m| m.as_ref())
             .map(|_| key)
+    }
+
+    fn rebuild_scene_geometry_cache(&mut self, scene: &Scene, selection: &Selection, sig: u64) {
+        let glb_flip = crate::mvr::glb_yup_to_zup();
+        let mut scene_geom_instances: Vec<MeshInstance> = Vec::new();
+        // (mesh key, instance index, world-space AABB) — the AABB frustum-culls the
+        // draw out of shadow passes (and the camera-frustum forward pass).
+        let mut scene_geom_draws: Vec<(usize, u32, Vec3, Vec3)> = Vec::new();
+        // (mesh key, base instance, count) — one instanced forward draw per unique mesh.
+        let mut scene_geom_groups: Vec<(usize, u32, u32)> = Vec::new();
+        let mut total_models = 0usize;
+        for (oi, obj) in scene.geometry.iter().enumerate() {
+            if obj.hidden {
+                total_models += obj.models.len();
+                continue;
+            }
+            let selected = if selection.contains_geometry(oi) {
+                1.0
+            } else {
+                0.0
+            };
+            for model in &obj.models {
+                total_models += 1;
+                if let Some(key) = self.ensure_scene_geom_loaded(model) {
+                    let flip = if fixture_model::model_needs_yup_flip(&model.file) {
+                        glb_flip
+                    } else {
+                        Mat4::IDENTITY
+                    };
+                    let idx = scene_geom_instances.len() as u32;
+                    let m = obj.transform * model.matrix * flip;
+                    scene_geom_instances.push(MeshInstance {
+                        model: m.to_cols_array_2d(),
+                        color: [0.13, 0.13, 0.15],
+                        intensity: 1.0,
+                        selected,
+                        emissive: 0.0,
+                    });
+                    let (wlo, whi) = match self.scene_geom_bounds.get(&key) {
+                        Some(&(lo, hi)) => transform_aabb(&m, Vec3::from(lo), Vec3::from(hi)),
+                        None => (Vec3::splat(f32::NEG_INFINITY), Vec3::splat(f32::INFINITY)),
+                    };
+                    scene_geom_draws.push((key, idx, wlo, whi));
+                }
+            }
+        }
+
+        let mut order: Vec<usize> = (0..scene_geom_draws.len()).collect();
+        order.sort_by_key(|&i| scene_geom_draws[i].0); // stable by mesh key
+        let mut inst = Vec::with_capacity(scene_geom_instances.len());
+        let mut draws = Vec::with_capacity(scene_geom_draws.len());
+        for &old in &order {
+            let new_idx = inst.len() as u32;
+            inst.push(scene_geom_instances[old]);
+            let (key, _, lo, hi) = scene_geom_draws[old];
+            draws.push((key, new_idx, lo, hi));
+            match scene_geom_groups.last_mut() {
+                Some((k, _, count)) if *k == key => *count += 1,
+                _ => scene_geom_groups.push((key, new_idx, 1)),
+            }
+        }
+
+        if self.debug.geom_stats {
+            log_scene_geom_stats(&draws);
+        }
+
+        self.scene_geom_instances
+            .upload(&self.device, &self.queue, &inst);
+
+        if self.scene_geom_cache.len() > total_models {
+            let live: std::collections::HashSet<usize> = scene
+                .geometry
+                .iter()
+                .flat_map(|o| o.models.iter().map(|m| Arc::as_ptr(&m.glb) as usize))
+                .collect();
+            self.scene_geom_cache.retain(|k, _| live.contains(k));
+            self.scene_geom_bounds.retain(|k, _| live.contains(k));
+        }
+
+        self.scene_geom_sig = sig;
+        self.scene_geom_draws_cpu = draws;
+        self.scene_geom_groups_cpu = scene_geom_groups;
     }
 
     /// Render one frame. Returns `true` if a frame was presented (a `false`
@@ -2491,119 +2580,14 @@ impl Renderer {
                 .upload(&self.device, &self.queue, &gdtf_placeholders);
 
         // --- imported MVR static geometry (stage decks / truss / set pieces) ---
-        // Each model is baked once and drawn as one lit instance; the +Y-up GLB
-        // is flipped into the object's geometry frame before its world transform.
-        let glb_flip = crate::mvr::glb_yup_to_zup();
-        let mut scene_geom_instances: Vec<MeshInstance> = Vec::new();
-        // (mesh key, instance index, world-space AABB) — the AABB frustum-culls the
-        // draw out of shadow passes (and the camera-frustum forward pass).
-        let mut scene_geom_draws: Vec<(usize, u32, Vec3, Vec3)> = Vec::new();
-        // (mesh key, base instance, count) — one instanced forward draw per unique mesh.
-        let mut scene_geom_groups: Vec<(usize, u32, u32)> = Vec::new();
-        let mut total_models = 0usize;
-        for (oi, obj) in scene.geometry.iter().enumerate() {
-            if obj.hidden {
-                total_models += obj.models.len();
-                continue;
-            }
-            let selected = if selection.contains_geometry(oi) {
-                1.0
-            } else {
-                0.0
-            };
-            for model in &obj.models {
-                total_models += 1;
-                if let Some(key) = self.ensure_scene_geom_loaded(model) {
-                    // glTF is +Y-up and needs the flip into the +Z-up geometry
-                    // frame; native-Z-up .3ds does not.
-                    let flip = if fixture_model::model_needs_yup_flip(&model.file) {
-                        glb_flip
-                    } else {
-                        Mat4::IDENTITY
-                    };
-                    let idx = scene_geom_instances.len() as u32;
-                    let m = obj.transform * model.matrix * flip;
-                    scene_geom_instances.push(MeshInstance {
-                        // object placement · per-Geometry3D transform · up-flip.
-                        model: m.to_cols_array_2d(),
-                        color: [0.13, 0.13, 0.15],
-                        intensity: 1.0,
-                        selected,
-                        emissive: 0.0,
-                    });
-                    // World AABB = local mesh bounds transformed by the full instance
-                    // matrix (exact, so it accounts for model.matrix + flip too).
-                    let (wlo, whi) = match self.scene_geom_bounds.get(&key) {
-                        Some(&(lo, hi)) => transform_aabb(&m, Vec3::from(lo), Vec3::from(hi)),
-                        None => (Vec3::splat(f32::NEG_INFINITY), Vec3::splat(f32::INFINITY)),
-                    };
-                    scene_geom_draws.push((key, idx, wlo, whi));
-                }
-            }
+        // Rebuild and upload only when imported geometry or object selection changes;
+        // otherwise reuse the cached instanced draw groups and shadow-cull AABBs.
+        let scene_geom_sig = scene_geometry_signature(scene, selection);
+        if self.scene_geom_sig != scene_geom_sig {
+            self.rebuild_scene_geometry_cache(scene, selection, scene_geom_sig);
         }
-        // Regroup instances by mesh key so identical static meshes are contiguous in
-        // the buffer → ONE instanced forward draw per unique mesh instead of one per
-        // instance (the dominant FOH draw-call cost). `scene_geom_draws` keeps a
-        // per-instance entry (with REMAPPED idx) for the per-beam shadow LOD cull.
-        {
-            let mut order: Vec<usize> = (0..scene_geom_draws.len()).collect();
-            order.sort_by_key(|&i| scene_geom_draws[i].0); // stable by mesh key
-            let mut inst = Vec::with_capacity(scene_geom_instances.len());
-            let mut draws = Vec::with_capacity(scene_geom_draws.len());
-            for &old in &order {
-                let new_idx = inst.len() as u32;
-                inst.push(scene_geom_instances[old]);
-                let (key, _, lo, hi) = scene_geom_draws[old];
-                draws.push((key, new_idx, lo, hi));
-                match scene_geom_groups.last_mut() {
-                    Some((k, _, count)) if *k == key => *count += 1,
-                    _ => scene_geom_groups.push((key, new_idx, 1)),
-                }
-            }
-            scene_geom_instances = inst;
-            scene_geom_draws = draws;
-        }
-        if self.debug.geom_stats {
-            let mut keys: std::collections::HashMap<usize, usize> =
-                std::collections::HashMap::new();
-            for (k, _, _, _) in &scene_geom_draws {
-                *keys.entry(*k).or_default() += 1;
-            }
-            let mut counts: Vec<usize> = keys.values().copied().collect();
-            counts.sort_unstable_by(|a, b| b.cmp(a));
-            let mut diags: Vec<f32> = scene_geom_draws
-                .iter()
-                .map(|(_, _, lo, hi)| (*hi - *lo).length())
-                .collect();
-            diags.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-            let n_ge = |t: f32| diags.iter().filter(|&&d| d >= t).count();
-            log::info!(
-                "GEOM: {} draws, {} meshes; diag max={:.1} | #≥0.5m={} #≥1m={} #≥1.5m={} #≥2m={} #≥3m={}",
-                scene_geom_draws.len(),
-                keys.len(),
-                diags.first().copied().unwrap_or(0.0),
-                n_ge(0.5),
-                n_ge(1.0),
-                n_ge(1.5),
-                n_ge(2.0),
-                n_ge(3.0),
-            );
-        }
-        self.scene_geom_instances
-            .upload(&self.device, &self.queue, &scene_geom_instances);
-        // Drop baked meshes no longer referenced by the scene (e.g. after a new
-        // MVR import replaces the geometry) so the cache can't grow unbounded.
-        // Compare against the total model count (incl. cached failures) so the
-        // steady state — failures and all — pays nothing.
-        if self.scene_geom_cache.len() > total_models {
-            let live: std::collections::HashSet<usize> = scene
-                .geometry
-                .iter()
-                .flat_map(|o| o.models.iter().map(|m| Arc::as_ptr(&m.glb) as usize))
-                .collect();
-            self.scene_geom_cache.retain(|k, _| live.contains(k));
-            self.scene_geom_bounds.retain(|k, _| live.contains(k));
-        }
+        let scene_geom_draws = self.scene_geom_draws_cpu.clone();
+        let scene_geom_groups = self.scene_geom_groups_cpu.clone();
 
         // --- dynamic lines: fog-box wireframes + beam indicators ---
         let mut lines = std::mem::take(&mut self.line_vertices_cpu);
@@ -4600,6 +4584,53 @@ impl Renderer {
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+fn scene_geometry_signature(scene: &Scene, selection: &Selection) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    scene.geometry.len().hash(&mut h);
+    for obj in &scene.geometry {
+        obj.hidden.hash(&mut h);
+        hash_mat4(&mut h, &obj.transform);
+        obj.models.len().hash(&mut h);
+        for model in &obj.models {
+            model.file.hash(&mut h);
+            (Arc::as_ptr(&model.glb) as usize).hash(&mut h);
+            hash_mat4(&mut h, &model.matrix);
+        }
+    }
+    selection.geometry.hash(&mut h);
+    h.finish()
+}
+
+fn hash_mat4(h: &mut impl Hasher, matrix: &Mat4) {
+    for v in matrix.to_cols_array() {
+        v.to_bits().hash(h);
+    }
+}
+
+fn log_scene_geom_stats(scene_geom_draws: &[(usize, u32, Vec3, Vec3)]) {
+    let mut keys: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (k, _, _, _) in scene_geom_draws {
+        *keys.entry(*k).or_default() += 1;
+    }
+    let mut diags: Vec<f32> = scene_geom_draws
+        .iter()
+        .map(|(_, _, lo, hi)| (*hi - *lo).length())
+        .collect();
+    diags.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let n_ge = |t: f32| diags.iter().filter(|&&d| d >= t).count();
+    log::info!(
+        "GEOM: {} draws, {} meshes; diag max={:.1} | #>=0.5m={} #>=1m={} #>=1.5m={} #>=2m={} #>=3m={}",
+        scene_geom_draws.len(),
+        keys.len(),
+        diags.first().copied().unwrap_or(0.0),
+        n_ge(0.5),
+        n_ge(1.0),
+        n_ge(1.5),
+        n_ge(2.0),
+        n_ge(3.0),
+    );
 }
 
 /// Lightweight beam description for the wireframe indicator gizmo only.
